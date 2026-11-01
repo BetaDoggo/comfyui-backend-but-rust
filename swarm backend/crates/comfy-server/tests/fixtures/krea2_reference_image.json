@@ -1,0 +1,17 @@
+{
+  "4": { "class_type": "UNETLoader", "inputs": { "unet_name": "krea2/krea2_fp8_scaled.safetensors", "weight_dtype": "fp8_e4m3fn" } },
+  "100": { "class_type": "CLIPLoader", "inputs": { "clip_name": "qwen3vl_4b.safetensors", "type": "krea2", "device": "default" } },
+  "101": { "class_type": "VAELoader", "inputs": { "vae_name": "qwen_image_vae.safetensors" } },
+  "103": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": "$IMAGE_B64" } },
+  "104": { "class_type": "ImageScale", "inputs": { "image": ["103", 0], "width": 768, "height": 768, "crop": "disabled", "upscale_method": "lanczos" } },
+  "6": { "class_type": "SwarmTextEncodeAdvanced", "inputs": { "clip": ["100", 0], "lora_hooks": null, "steps": 12, "prompt": "the same character, now wearing a raincoat", "width": 768, "height": 768, "target_width": 768, "target_height": 768, "guidance": -1, "images": ["104", 0], "llama_template": "krea2" } },
+  "7": { "class_type": "SwarmTextEncodeAdvanced", "inputs": { "clip": ["100", 0], "lora_hooks": null, "steps": 12, "prompt": "", "width": 768, "height": 768, "target_width": 768, "target_height": 768, "guidance": -1, "images": ["104", 0], "llama_template": "krea2" } },
+  "105": { "class_type": "VAEEncode", "inputs": { "vae": ["101", 0], "pixels": ["104", 0] } },
+  "106": { "class_type": "ReferenceLatent", "inputs": { "conditioning": ["6", 0], "latent": ["105", 0] } },
+  "107": { "class_type": "FluxKontextMultiReferenceLatentMethod", "inputs": { "conditioning": ["106", 0], "reference_latents_method": "index" } },
+  "5": { "class_type": "EmptySD3LatentImage", "inputs": { "batch_size": 1, "height": 768, "width": 768 } },
+  "102": { "class_type": "SwarmAttnTokenWeights", "inputs": { "model": ["4", 0], "conditioning": ["107", 0] } },
+  "10": { "class_type": "SwarmKSampler", "inputs": { "model": ["102", 0], "noise_seed": 42, "steps": 12, "cfg": 4.0, "sampler_name": "euler", "scheduler": "simple", "positive": ["107", 0], "negative": ["7", 0], "latent_image": ["5", 0], "start_at_step": 0, "end_at_step": 10000, "return_with_leftover_noise": "disable", "add_noise": "enable", "var_seed": 0, "var_seed_strength": 0.0, "sigma_min": -1.0, "sigma_max": -1.0, "rho": 7.0, "previews": "default", "tile_sample": false, "tile_size": 1024, "model_negative": null } },
+  "8": { "class_type": "VAEDecode", "inputs": { "vae": ["101", 0], "samples": ["10", 0] } },
+  "9": { "class_type": "SwarmSaveImageWS", "inputs": { "images": ["8", 0], "bit_depth": "8bit" } }
+}

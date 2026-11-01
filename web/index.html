@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Krea 2 Studio</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1c1a; --muted: #6d6a64; --line: #e3e0da;
+    --accent: #c2410c; --accent-ink: #ffffff; --field: #fbfaf8; --bar: #ece9e3; --err: #b42318;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151514; --panel: #1f1e1c; --ink: #ecebe8; --muted: #9b978f; --line: #33312d;
+      --accent: #f97316; --accent-ink: #1b0f05; --field: #181816; --bar: #2c2a27; --err: #f97066; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+  header .status { color: var(--muted); font-size: 13px; }
+  header .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+  header .dot.ok { background: #22a06b; } header .dot.busy { background: var(--accent); }
+  main { display: grid; grid-template-columns: 360px 1fr; gap: 20px; padding: 20px; max-width: 1500px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 16px; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; }
+  textarea, input, select { width: 100%; background: var(--field); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 7px; padding: 8px 10px; font: inherit; }
+  textarea { min-height: 150px; resize: vertical; }
+  textarea:focus, input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .seed { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+  .check { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); white-space: nowrap; }
+  .check input { width: auto; }
+  button { font: inherit; cursor: pointer; border-radius: 7px; border: 1px solid var(--line); background: var(--field);
+    color: var(--ink); padding: 8px 12px; }
+  button.primary { width: 100%; margin-top: 16px; background: var(--accent); color: var(--accent-ink); border-color: var(--accent);
+    font-weight: 600; padding: 11px; }
+  button:disabled { opacity: .55; cursor: default; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .viewer { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .stage { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    min-height: 420px; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  .stage img { max-width: 100%; max-height: calc(100vh - 230px); display: block; }
+  .empty { color: var(--muted); text-align: center; padding: 40px; }
+  .progress { position: absolute; left: 0; right: 0; bottom: 0; height: 4px; background: var(--bar); display: none; }
+  .progress > div { height: 100%; width: 0; background: var(--accent); transition: width .25s; }
+  .meta { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; color: var(--muted); font-size: 13px; min-height: 34px; }
+  .meta .prompt { color: var(--ink); flex: 1 1 100%; overflow-wrap: anywhere; }
+  .meta a { color: var(--accent); }
+  .meta .err { color: var(--err); }
+  .history { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; }
+  .thumb { position: relative; aspect-ratio: 1; border-radius: 7px; overflow: hidden; border: 2px solid transparent;
+    background: var(--bar); cursor: pointer; padding: 0; }
+  .thumb.sel { border-color: var(--accent); }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb span { position: absolute; inset: auto 0 0 0; font-size: 11px; padding: 2px 4px; color: #fff; background: rgba(0,0,0,.55); }
+  .labelrow { display: flex; justify-content: space-between; align-items: baseline; }
+  .labelrow output { font-size: 12px; color: var(--ink); font-variant-numeric: tabular-nums; }
+  input[type=range] { padding: 0; border: 0; background: none; accent-color: var(--accent); }
+  .ratios { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .ratios button { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 7px 4px; font-size: 12px; }
+  .ratios button i { display: block; border: 1.5px solid var(--muted); border-radius: 2px; }
+  .ratios button.on { border-color: var(--accent); color: var(--accent); }
+  .ratios button.on i { border-color: var(--accent); }
+  .dims { margin-top: 6px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  h2 { font-size: 13px; font-weight: 600; margin: 4px 0 8px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Krea 2 Studio</h1>
+  <span class="status" id="status"><span class="dot"></span>connecting…</span>
+</header>
+<main>
+  <section class="panel">
+    <label for="prompt">Prompt</label>
+    <textarea id="prompt" placeholder="a red fox sitting in a snowy forest, golden hour, photograph"></textarea>
+    <div class="labelrow"><label for="side">Side length</label><output id="sideval"></output></div>
+    <input id="side" type="range" min="256" max="1024" step="16" value="1024">
+    <label>Aspect ratio</label>
+    <div class="ratios" id="ratios"></div>
+    <div class="dims" id="dims"></div>
+    <div class="row">
+      <div><label for="steps">Steps</label><input id="steps" type="number" min="1" max="100" value="8"></div>
+      <div><label for="count">Images</label><input id="count" type="number" min="1" max="16" value="1"></div>
+    </div>
+    <label for="seed">Seed</label>
+    <div class="seed">
+      <input id="seed" type="number" min="0" placeholder="random">
+      <label class="check"><input id="randomize" type="checkbox" checked> random</label>
+    </div>
+    <button class="primary" id="go">Generate</button>
+    <div class="hint">Ctrl+Enter to generate. Same seed and prompt gives the same image as ComfyUI's KSampler.</div>
+  </section>
+  <section class="viewer">
+    <div class="stage" id="stage">
+      <div class="empty" id="empty">Your images will appear here.</div>
+      <img id="img" alt="" hidden>
+      <div class="progress" id="progress"><div></div></div>
+    </div>
+    <div class="meta" id="meta"></div>
+    <div>
+      <h2>History</h2>
+      <div class="history" id="history"></div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const RATIOS = [[1,1],[4,3],[3,2],[16,9],[21,9],[3,4],[2,3],[9,16]];
+let ratio = [1, 1];
+const MAX_SIDE = 2048;
+let maxPixels = 0, selected = null, jobs = [], pending = new Set();
+
+// Width/height for the current side length and aspect ratio: about side² pixels, multiples of 16,
+// shrunk if rounding would exceed what the server's VRAM plan allows.
+function dims() {
+  const [a, b] = ratio;
+  let side = Number($("side").value);
+  for (;;) {
+    const w = Math.max(16, Math.round(side * Math.sqrt(a / b) / 16) * 16);
+    const h = Math.max(16, Math.round(side * Math.sqrt(b / a) / 16) * 16);
+    if (!maxPixels || w * h <= maxPixels || side <= 16) return [w, h];
+    side -= 16;
+  }
+}
+
+function updateDims() {
+  const [w, h] = dims();
+  $("sideval").textContent = $("side").value + " px";
+  $("dims").textContent = `${w} × ${h} · ${(w * h / 1e6).toFixed(2)} MP`;
+  for (const b of $("ratios").children) b.classList.toggle("on", b.dataset.r === ratio.join(":"));
+}
+
+function setFromSize(w, h) {
+  $("side").value = Math.round(Math.sqrt(w * h) / 16) * 16;
+  let best = RATIOS[0];
+  for (const r of RATIOS) if (Math.abs(Math.log(r[0] / r[1] * h / w)) < Math.abs(Math.log(best[0] / best[1] * h / w))) best = r;
+  ratio = best;
+  updateDims();
+}
+
+for (const r of RATIOS) {
+  const b = document.createElement("button");
+  b.type = "button"; b.dataset.r = r.join(":");
+  const k = 18 / Math.max(r[0], r[1]);
+  const icon = document.createElement("i");
+  icon.style.width = r[0] * k + "px"; icon.style.height = r[1] * k + "px";
+  b.append(icon, r.join(":"));
+  b.onclick = () => { ratio = r; updateDims(); };
+  $("ratios").appendChild(b);
+}
+$("side").oninput = updateDims;
+updateDims();
+
+function fmt(ms) { return ms >= 1000 ? (ms / 1000).toFixed(2) + " s" : Math.round(ms) + " ms"; }
+
+async function status() {
+  try {
+    const s = await (await fetch("/api/status")).json();
+    if (!maxPixels && s.max_pixels) {
+      maxPixels = s.max_pixels;
+      $("side").max = Math.min(MAX_SIDE, Math.floor(Math.sqrt(maxPixels) / 16) * 16);
+      setFromSize(s.defaults.width, s.defaults.height);
+      $("steps").value = s.defaults.steps;
+    }
+    const dot = s.error ? "" : s.ready ? (s.queue ? "busy" : "ok") : "";
+    const text = s.error ? "model load failed: " + s.error : !s.ready ? "loading models…"
+      : s.queue ? `generating · ${s.queue} in queue` : "ready";
+    $("status").innerHTML = `<span class="dot ${dot}"></span>`;
+    $("status").append(text);
+    $("go").disabled = !s.ready;
+  } catch { $("status").innerHTML = `<span class="dot"></span>server not reachable`; }
+}
+
+async function refresh() {
+  jobs = await (await fetch("/api/jobs")).json();
+  renderHistory();
+  const cur = jobs.find(j => j.id === selected);
+  if (cur) show(cur);
+  for (const j of jobs) if (j.state === "done" || j.state === "error") pending.delete(j.id);
+}
+
+function renderHistory() {
+  const h = $("history");
+  h.innerHTML = "";
+  for (const j of jobs) {
+    const b = document.createElement("button");
+    b.className = "thumb" + (j.id === selected ? " sel" : "");
+    b.title = j.prompt;
+    if (j.state === "done") { const im = document.createElement("img"); im.src = `/api/image/${j.id}.png`; im.loading = "lazy"; b.appendChild(im); }
+    const tag = document.createElement("span");
+    tag.textContent = j.state === "done" ? `${j.width}×${j.height}` : j.state === "error" ? "failed" : j.state === "running" ? `${j.step}/${j.steps}` : "queued";
+    b.appendChild(tag);
+    b.onclick = () => { selected = j.id; renderHistory(); show(j); };
+    h.appendChild(b);
+  }
+}
+
+function show(j) {
+  const img = $("img"), prog = $("progress");
+  $("empty").hidden = j.state === "done";
+  if (j.state === "done") {
+    const src = `/api/image/${j.id}.png`;
+    if (img.getAttribute("src") !== src) img.src = src;
+    img.hidden = false; img.alt = j.prompt;
+  } else {
+    img.hidden = true;
+    $("empty").textContent = j.state === "error" ? "Generation failed." : j.state === "running"
+      ? `Generating… step ${j.step} of ${j.steps}` : "Waiting in queue…";
+  }
+  prog.style.display = j.state === "running" || j.state === "queued" ? "block" : "none";
+  prog.firstElementChild.style.width = (100 * j.step / j.steps) + "%";
+  const m = $("meta");
+  m.innerHTML = "";
+  const p = document.createElement("div"); p.className = "prompt"; p.textContent = j.prompt; m.appendChild(p);
+  const add = (t) => { const s = document.createElement("span"); s.textContent = t; m.appendChild(s); return s; };
+  add(`${j.width} × ${j.height}`); add(`${j.steps} steps`);
+  const seed = add(`seed ${j.seed}`); seed.style.cursor = "pointer"; seed.title = "Use this seed";
+  seed.onclick = () => { $("seed").value = j.seed; $("randomize").checked = false; };
+  if (j.stats) add(`text ${fmt(j.stats.text_ms)} · sampling ${fmt(j.stats.sample_ms)} · VAE ${fmt(j.stats.vae_ms)} · total ${fmt(j.stats.total_ms)}`);
+  if (j.error) { const e = add(j.error); e.className = "err"; }
+  if (j.state === "done") {
+    const a = document.createElement("a"); a.href = `/api/image/${j.id}.png`; a.download = `krea2_${j.id}_${j.seed}.png`;
+    a.textContent = "download"; m.appendChild(a);
+    const r = document.createElement("a"); r.href = "#"; r.textContent = "reuse prompt";
+    r.onclick = (e) => { e.preventDefault(); $("prompt").value = j.prompt; $("steps").value = j.steps; setFromSize(j.width, j.height); };
+    m.appendChild(r);
+  }
+}
+
+async function generate() {
+  const prompt = $("prompt").value.trim();
+  if (!prompt) { $("prompt").focus(); return; }
+  const [width, height] = dims();
+  const steps = Number($("steps").value) || 8;
+  const count = Math.max(1, Math.min(16, Number($("count").value) || 1));
+  let seed = $("randomize").checked || $("seed").value === "" ? -1 : Number($("seed").value);
+  for (let i = 0; i < count; i++) {
+    const r = await fetch("/api/generate", { method: "POST", body: JSON.stringify({ prompt, width, height, steps, seed: seed < 0 ? -1 : seed + i }) });
+    const j = await r.json();
+    if (j.error) { alert(j.error); return; }
+    pending.add(j.id);
+    if (i === 0) selected = j.id;
+    if (i === 0 && !$("randomize").checked) $("seed").value = j.seed;
+  }
+  refresh(); status();
+}
+
+$("go").onclick = generate;
+$("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) generate(); });
+$("randomize").onchange = () => { if ($("randomize").checked) $("seed").value = ""; };
+$("seed").oninput = () => { $("randomize").checked = $("seed").value === ""; };
+
+status(); refresh();
+setInterval(() => { status(); if (pending.size) refresh(); }, 400);
+</script>
+</body>
+</html>

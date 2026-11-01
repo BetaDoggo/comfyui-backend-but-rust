@@ -1,0 +1,40 @@
+web UI on http://127.0.0.1:7861
+GPU memory: 10823 MB free (device-wide) / 12199 MB total
+[text encoder] 35 units: 0 resident (0.00 GB VRAM), 35 streamed from pinned RAM (3.54 GB) via 2 slots; packed in 0.4s
+VAE + text encoder ready in 5.3s
+[txtfusion] 5 units: 0 resident (0.00 GB VRAM), 5 streamed from pinned RAM (0.79 GB) via 2 slots; packed in 0.4s
+[dit blocks] 28 units: 16 resident (6.95 GB VRAM), 12 streamed from pinned RAM (5.21 GB) via 2 slots; packed in 2.1s
+DiT ready in 4.5s (activation reserve 2019 MB)
+startup total 9.9s
+ready
+[dit blocks] residency 16 -> 4 units in VRAM (24 streamed via 2 slots) in 802 ms
+text: 50 tokens (16 conditioning) in 252 ms
+step 1/8 sigma 1.0000: 3023 ms
+step 2/8 sigma 0.9567: 2967 ms
+step 3/8 sigma 0.9045: 2974 ms
+step 4/8 sigma 0.8403: 2987 ms
+VRAM pressure: free 0 MB < 256 MB
+[dit blocks] residency 4 -> 5 units in VRAM (23 streamed via 2 slots) in 20 ms
+step 5/8 sigma 0.7595: 3004 ms
+VRAM pressure: free 0 MB < 256 MB
+step 6/8 sigma 0.6546: 3351 ms
+VRAM pressure: free 0 MB < 256 MB
+step 7/8 sigma 0.5128: 3216 ms
+VRAM pressure: free 0 MB < 256 MB
+step 8/8 sigma 0.3109: 3212 ms
+sampling 24.73s (3092 ms/step avg, 83.00 GB streamed over PCIe)
+[dit blocks] residency 5 -> 1 units in VRAM (27 streamed via 2 slots) in 300 ms
+VAE decode 694 ms, image done in 26.13s
+[dit blocks] residency 1 -> 16 units in VRAM (12 streamed via 2 slots) in 236 ms
+step 1/8 sigma 1.0000: 603 ms
+VRAM pressure: free 0 MB < 256 MB
+[dit blocks] residency 16 -> 11 units in VRAM (17 streamed via 2 slots) in 19 ms
+step 2/8 sigma 0.9567: 619 ms
+step 3/8 sigma 0.9045: 612 ms
+step 4/8 sigma 0.8403: 614 ms
+step 5/8 sigma 0.7595: 614 ms
+step 6/8 sigma 0.6546: 616 ms
+step 7/8 sigma 0.5128: 614 ms
+step 8/8 sigma 0.3109: 616 ms
+sampling 4.91s (614 ms/step avg, 57.80 GB streamed over PCIe)
+VAE decode 127 ms, image done in 5.09s

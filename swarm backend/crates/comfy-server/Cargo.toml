@@ -1,0 +1,38 @@
+[package]
+name = "comfy-server"
+description = "A ComfyUI-API-compatible server that SwarmUI can use as a 'ComfyUI API By URL' backend, fronting a native Rust engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "comfy-server"
+path = "src/main.rs"
+
+[features]
+# The real Krea 2 engine. Needs the CUDA toolkit and MSVC, so the default build stays mock-only.
+krea2 = ["dep:krea2-engine"]
+
+[dependencies]
+swarm-engine-api.workspace = true
+krea2-engine = { path = "../krea2-engine", optional = true }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum = { version = "0.8", features = ["ws", "multipart"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.26"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }

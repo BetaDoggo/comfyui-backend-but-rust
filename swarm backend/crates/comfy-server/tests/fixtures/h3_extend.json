@@ -1,0 +1,439 @@
+{
+ "4": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "minimax_h3_fp8.safetensors",
+   "weight_dtype": "fp8_e4m3fn"
+  }
+ },
+ "100": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+   "type": "minimax",
+   "device": "default"
+  }
+ },
+ "101": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_video_vae_int8.safetensors"
+  }
+ },
+ "102": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_audio_vae.safetensors"
+  }
+ },
+ "103": {
+  "class_type": "MiniMaxH3SigmaShift",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "shift_video": 12.0,
+   "shift_audio": 3
+  }
+ },
+ "5": {
+  "class_type": "SwarmEmptyMiniMaxH3LatentAV",
+  "inputs": {
+   "length": 22,
+   "height": 256,
+   "width": 448
+  }
+ },
+ "6": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "100",
+    0
+   ],
+   "text": "a cat walks"
+  }
+ },
+ "7": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "100",
+    0
+   ],
+   "text": ""
+  }
+ },
+ "10": {
+  "class_type": "SwarmKSampler",
+  "inputs": {
+   "model": [
+    "103",
+    0
+   ],
+   "noise_seed": 2,
+   "steps": 6,
+   "cfg": 4.0,
+   "sampler_name": "res_multistep",
+   "scheduler": "simple",
+   "positive": [
+    "6",
+    0
+   ],
+   "negative": [
+    "7",
+    0
+   ],
+   "latent_image": [
+    "5",
+    0
+   ],
+   "start_at_step": 0,
+   "end_at_step": 10000,
+   "return_with_leftover_noise": "disable",
+   "add_noise": "enable",
+   "control_after_generate": "fixed",
+   "var_seed": 0,
+   "var_seed_strength": 0.0,
+   "sigma_min": -1.0,
+   "sigma_max": -1.0,
+   "rho": 7.0,
+   "previews": "animate",
+   "tile_sample": false,
+   "tile_size": 960,
+   "model_negative": null
+  }
+ },
+ "104": {
+  "class_type": "LTXVSeparateAVLatent",
+  "inputs": {
+   "av_latent": [
+    "10",
+    0
+   ]
+  }
+ },
+ "8": {
+  "class_type": "VAEDecodeTiled",
+  "inputs": {
+   "vae": [
+    "101",
+    0
+   ],
+   "samples": [
+    "104",
+    0
+   ],
+   "tile_size": 256,
+   "overlap": 64,
+   "temporal_size": 9999,
+   "temporal_overlap": 8
+  }
+ },
+ "105": {
+  "class_type": "VAEDecodeAudio",
+  "inputs": {
+   "vae": [
+    "102",
+    0
+   ],
+   "samples": [
+    "104",
+    1
+   ]
+  }
+ },
+ "30": {
+  "class_type": "SwarmSaveAnimationWS",
+  "inputs": {
+   "images": [
+    "8",
+    0
+   ],
+   "fps": 24,
+   "lossless": false,
+   "quality": 95,
+   "method": "default",
+   "format": "gif",
+   "audio": [
+    "105",
+    0
+   ]
+  }
+ },
+ "106": {
+  "class_type": "SwarmImageWidth",
+  "inputs": {
+   "image": [
+    "8",
+    0
+   ]
+  }
+ },
+ "107": {
+  "class_type": "SwarmImageHeight",
+  "inputs": {
+   "image": [
+    "8",
+    0
+   ]
+  }
+ },
+ "108": {
+  "class_type": "SwarmCountFrames",
+  "inputs": {
+   "image": [
+    "8",
+    0
+   ]
+  }
+ },
+ "109": {
+  "class_type": "SwarmIntAdd",
+  "inputs": {
+   "a": [
+    "108",
+    0
+   ],
+   "b": -9
+  }
+ },
+ "110": {
+  "class_type": "ImageFromBatch",
+  "inputs": {
+   "image": [
+    "8",
+    0
+   ],
+   "batch_index": [
+    "109",
+    0
+   ],
+   "length": 9
+  }
+ },
+ "111": {
+  "class_type": "ImageScale",
+  "inputs": {
+   "image": [
+    "110",
+    0
+   ],
+   "width": [
+    "106",
+    0
+   ],
+   "height": [
+    "107",
+    0
+   ],
+   "upscale_method": "lanczos",
+   "crop": "disabled"
+  }
+ },
+ "112": {
+  "class_type": "SwarmTextEncodeAdvanced",
+  "inputs": {
+   "clip": [
+    "100",
+    0
+   ],
+   "lora_hooks": null,
+   "steps": 6,
+   "prompt": "the cat runs",
+   "width": 640,
+   "height": 384,
+   "target_width": 448,
+   "target_height": 256,
+   "guidance": -1.0,
+   "images": [
+    "111",
+    0
+   ],
+   "minimax_refs": null
+  }
+ },
+ "113": {
+  "class_type": "ImageFromBatch",
+  "inputs": {
+   "image": [
+    "111",
+    0
+   ],
+   "batch_index": 0,
+   "length": 1
+  }
+ },
+ "114": {
+  "class_type": "SwarmEmptyMiniMaxH3LatentAV",
+  "inputs": {
+   "length": 22,
+   "height": [
+    "107",
+    0
+   ],
+   "width": [
+    "106",
+    0
+   ]
+  }
+ },
+ "115": {
+  "class_type": "SwarmMiniMaxH3AddKeyframes",
+  "inputs": {
+   "vae": [
+    "101",
+    0
+   ],
+   "latent": [
+    "114",
+    0
+   ],
+   "conditioning": [
+    "112",
+    0
+   ],
+   "first_frame": [
+    "113",
+    0
+   ],
+   "last_frame": null
+  }
+ },
+ "116": {
+  "class_type": "SwarmKSampler",
+  "inputs": {
+   "model": [
+    "103",
+    0
+   ],
+   "noise_seed": 603,
+   "steps": 6,
+   "cfg": 4.0,
+   "sampler_name": "res_multistep",
+   "scheduler": "simple",
+   "positive": [
+    "115",
+    0
+   ],
+   "negative": [
+    "7",
+    0
+   ],
+   "latent_image": [
+    "114",
+    0
+   ],
+   "start_at_step": 0,
+   "end_at_step": 10000,
+   "return_with_leftover_noise": "disable",
+   "add_noise": "enable",
+   "control_after_generate": "fixed",
+   "var_seed": 0,
+   "var_seed_strength": 0.0,
+   "sigma_min": 0.002,
+   "sigma_max": 1000.0,
+   "rho": 7.0,
+   "previews": "animate",
+   "tile_sample": false,
+   "tile_size": 960,
+   "model_negative": null
+  }
+ },
+ "117": {
+  "class_type": "LTXVSeparateAVLatent",
+  "inputs": {
+   "av_latent": [
+    "116",
+    0
+   ]
+  }
+ },
+ "118": {
+  "class_type": "VAEDecodeTiled",
+  "inputs": {
+   "vae": [
+    "101",
+    0
+   ],
+   "samples": [
+    "117",
+    0
+   ],
+   "tile_size": 256,
+   "overlap": 64,
+   "temporal_size": 9999,
+   "temporal_overlap": 8
+  }
+ },
+ "119": {
+  "class_type": "VAEDecodeAudio",
+  "inputs": {
+   "vae": [
+    "102",
+    0
+   ],
+   "samples": [
+    "117",
+    1
+   ]
+  }
+ },
+ "120": {
+  "class_type": "ImageFromBatch",
+  "inputs": {
+   "image": [
+    "118",
+    0
+   ],
+   "batch_index": 9,
+   "length": 11
+  }
+ },
+ "121": {
+  "class_type": "AudioConcat",
+  "inputs": {
+   "audio1": [
+    "105",
+    0
+   ],
+   "audio2": [
+    "119",
+    0
+   ],
+   "direction": "after"
+  }
+ },
+ "122": {
+  "class_type": "ImageBatch",
+  "inputs": {
+   "image1": [
+    "8",
+    0
+   ],
+   "image2": [
+    "120",
+    0
+   ]
+  }
+ },
+ "9": {
+  "class_type": "SwarmSaveAnimationWS",
+  "inputs": {
+   "images": [
+    "122",
+    0
+   ],
+   "fps": 24,
+   "lossless": false,
+   "quality": 95,
+   "method": "default",
+   "format": "gif",
+   "audio": [
+    "121",
+    0
+   ]
+  }
+ }
+}

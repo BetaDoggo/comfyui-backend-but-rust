@@ -1,0 +1,120 @@
+[32m[INFO][0m setup plugin alembic.autogenerate.schemas
+[32m[INFO][0m setup plugin alembic.autogenerate.tables
+[32m[INFO][0m setup plugin alembic.autogenerate.types
+[32m[INFO][0m setup plugin alembic.autogenerate.constraints
+[32m[INFO][0m setup plugin alembic.autogenerate.defaults
+[32m[INFO][0m setup plugin alembic.autogenerate.comments
+[32m[INFO][0m setup plugin alembic.ext.checkconstraint_byname
+[1m[33m[WARNING][0m On windows we are currently forcing single GPU mode in ComfyUI due to a Nvidia related issue, if you want to disable this use: --cuda-device all
+[32m[INFO][0m Adding extra search path diffusion_models G:\stable-diffusion-webui-forge\models\Stable-diffusion
+[32m[INFO][0m Adding extra search path text_encoders G:\stable-diffusion-webui-forge\models\clip
+[32m[INFO][0m Adding extra search path vae G:\stable-diffusion-webui-forge\models\VAE
+C:\Users\alexn\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\triton\windows_utils.py:425: UserWarning: Failed to find CUDA. Install CUDA Toolkit (https://developer.nvidia.com/cuda-downloads) or set CUDA_HOME / CUDA_PATH environment variable.
+  warnings.warn("Failed to find CUDA."
+[32m[INFO][0m Found comfy_kitchen backend hip: {'available': False, 'disabled': False, 'unavailable_reason': 'PyTorch ROCm/HIP runtime not available', 'capabilities': []}
+[32m[INFO][0m Found comfy_kitchen backend cuda: {'available': True, 'disabled': False, 'unavailable_reason': None, 'capabilities': ['adaln', 'apply_rope', 'apply_rope1', 'apply_rope1_', 'apply_rope_', 'apply_rope_split_half', 'apply_rope_split_half1', 'apply_rope_split_half1_', 'apply_rope_split_half_', 'closest_point_on_mesh', 'connected_components', 'convrot_w4a4_linear', 'delaunay3d', 'dequantize_convrot_w4a4_weight', 'dequantize_int8_convrot_weight', 'dequantize_int8_convrot_weight_dtype', 'dequantize_int8_simple', 'dequantize_int8_simple_dtype', 'dequantize_nvfp4', 'dequantize_per_tensor_fp8', 'dequantize_w4a8_int8_weight', 'edge_collapse_checks', 'fp16_conv3d', 'fp16_conv3d_out', 'fp16_linear', 'gemv_awq_w4a16', 'group_norm_silu_pad3d', 'group_norm_silu_pad3d_out', 'group_norm_stats3d', 'int8_linear', 'mesh_bvh', 'min_cut', 'na3d', 'prepare_int4_weight_for_int8_linear', 'quantize_and_rotate_rowwise', 'quantize_convrot_w4a4_weight', 'quantize_int8_convrot_weight', 'quantize_int8_rowwise', 'quantize_int8_tensorwise', 'quantize_mxfp8', 'quantize_nvfp4', 'quantize_per_tensor_fp8', 'quantize_svdquant_w4a4', 'quantize_w4a8_int8_weight', 'rms_adaln', 'rms_rope', 'rms_rope1', 'rms_rope1_', 'rms_rope_', 'rms_rope_split_half', 'rms_rope_split_half1', 'rms_rope_split_half1_', 'rms_rope_split_half_', 'rotate_int8_convrot_weight', 'scaled_mm_nvfp4', 'scaled_mm_svdquant_w4a4', 'sol_attn', 'stochastic_rounding_fp8', 'w4a8_int8_linear', 'w4a8_packed_linear']}
+[32m[INFO][0m Found comfy_kitchen backend ascend: {'available': False, 'disabled': False, 'unavailable_reason': "torch-npu is not installed: No module named 'torch_npu'", 'capabilities': []}
+[32m[INFO][0m Found comfy_kitchen backend triton: {'available': True, 'disabled': True, 'unavailable_reason': None, 'capabilities': ['adaln', 'apply_rope', 'apply_rope1', 'apply_rope1_', 'apply_rope_', 'apply_rope_split_half', 'apply_rope_split_half1', 'apply_rope_split_half1_', 'apply_rope_split_half_', 'dequantize_nvfp4', 'dequantize_per_tensor_fp8', 'int8_linear', 'na3d', 'quantize_and_rotate_rowwise', 'quantize_int8_rowwise', 'quantize_mxfp8', 'quantize_nvfp4', 'quantize_per_tensor_fp8', 'rms_adaln', 'rms_rope', 'rms_rope1', 'rms_rope1_', 'rms_rope_', 'rms_rope_split_half', 'rms_rope_split_half1', 'rms_rope_split_half1_', 'rms_rope_split_half_', 'w4a8_int8_linear']}
+[32m[INFO][0m Found comfy_kitchen backend eager: {'available': True, 'disabled': False, 'unavailable_reason': None, 'capabilities': ['adaln', 'apply_rope', 'apply_rope1', 'apply_rope1_', 'apply_rope_', 'apply_rope_split_half', 'apply_rope_split_half1', 'apply_rope_split_half1_', 'apply_rope_split_half_', 'convrot_w4a4_linear', 'dequantize_convrot_w4a4_weight', 'dequantize_int8_convrot_weight', 'dequantize_int8_convrot_weight_dtype', 'dequantize_int8_embedding', 'dequantize_int8_simple', 'dequantize_int8_simple_dtype', 'dequantize_mxfp8', 'dequantize_nvfp4', 'dequantize_per_tensor_fp8', 'dequantize_w4a8_int8_weight', 'fp16_conv3d', 'fp16_conv3d_out', 'fp16_linear', 'gemv_awq_w4a16', 'group_norm_silu_pad3d', 'group_norm_silu_pad3d_out', 'group_norm_stats3d', 'int8_linear', 'int8_linear_modulated', 'int8_linear_rms_modulated', 'na3d', 'prepare_int4_weight_for_int8_linear', 'quantize_and_rotate_rowwise', 'quantize_convrot_w4a4_weight', 'quantize_int8_convrot_weight', 'quantize_int8_rowwise', 'quantize_int8_tensorwise', 'quantize_mxfp8', 'quantize_nvfp4', 'quantize_per_tensor_fp8', 'quantize_svdquant_w4a4', 'quantize_w4a8_int8_weight', 'rms_adaln', 'rms_gated_residual', 'rms_rope', 'rms_rope1', 'rms_rope1_', 'rms_rope_', 'rms_rope_split_half', 'rms_rope_split_half1', 'rms_rope_split_half1_', 'rms_rope_split_half_', 'rotate_int8_convrot_weight', 'scaled_mm_mxfp8', 'scaled_mm_nvfp4', 'scaled_mm_svdquant_w4a4', 'sol_attn', 'stochastic_rounding_fp8', 'w4a8_int8_linear', 'w4a8_packed_linear']}
+[32m[INFO][0m Checkpoint files will always be loaded safely.
+[32m[INFO][0m Total VRAM 12199 MB, total RAM 65461 MB
+[32m[INFO][0m pytorch version: 2.11.0+cu130
+[32m[INFO][0m Set vram state to: NORMAL_VRAM
+[32m[INFO][0m Device: cuda:0 NVIDIA GeForce RTX 5070 : cudaMallocAsync
+[32m[INFO][0m Using async weight offloading with 2 streams
+[32m[INFO][0m Enabled pinned memory 26184.0
+[32m[INFO][0m Using pytorch attention
+[32m[INFO][0m aimdo: src-win/cuda-detour.c:38:INFO:aimdo_setup_hooks: installing 6 hooks
+[32m[INFO][0m aimdo: src/control.c:269:INFO:comfy-aimdo NVML pressure enabled
+[32m[INFO][0m aimdo: src-win/shmem-detect.c:76:INFO:comfy-aimdo DXCore adapter match: NVIDIA GeForce RTX 5070 runtime_luid=00000000:0000e1a5
+[32m[INFO][0m aimdo: src-win/shmem-detect.c:112:INFO:comfy-aimdo WDDM adapter match: NVIDIA GeForce RTX 5070 runtime_luid=00000000:0000e1a5 dxgi_luid=00000000:0000e1a5
+[32m[INFO][0m aimdo: src/control.c:284:INFO:comfy-aimdo inited for GPU: NVIDIA GeForce RTX 5070 (VRAM: 12199 MB)
+[32m[INFO][0m DynamicVRAM support detected and enabled
+[32m[INFO][0m Python version: 3.14.3 (tags/v3.14.3:323c59a, Feb  3 2026, 16:04:56) [MSC v.1944 64 bit (AMD64)]
+[32m[INFO][0m ComfyUI version: 0.42.0
+[32m[INFO][0m comfy-aimdo version: 0.6.0
+[32m[INFO][0m comfy-kitchen version: 0.2.40
+[32m[INFO][0m comfyui-frontend-package version: 1.57.1
+[32m[INFO][0m comfyui-embedded-docs version: 0.5.14
+[32m[INFO][0m comfy-aimdo version: 0.6.0
+[32m[INFO][0m comfy-kitchen version: 0.2.40
+[32m[INFO][0m [Prompt Server] web root: G:\cslop\krea rust\ref\venv\Lib\site-packages\comfyui_frontend_package\static
+[32m[INFO][0m Asset seeder disabled
+[1m[33m[WARNING][0m Traceback (most recent call last):
+  File "G:\cslop\krea rust\ref\ComfyUI\nodes.py", line 2276, in load_custom_node
+    module_spec.loader.exec_module(module)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "<frozen importlib._bootstrap_external>", line 759, in exec_module
+  File "<frozen importlib._bootstrap>", line 491, in _call_with_frames_removed
+  File "G:\cslop\krea rust\ref\ComfyUI\comfy_extras\nodes_glsl.py", line 12, in <module>
+    import comfy_angle
+ModuleNotFoundError: No module named 'comfy_angle'
+
+[1m[33m[WARNING][0m Cannot import G:\cslop\krea rust\ref\ComfyUI\comfy_extras\nodes_glsl.py module for custom nodes: No module named 'comfy_angle'
+[32m[INFO][0m 
+Import times for custom nodes:
+[32m[INFO][0m    0.0 seconds: G:\cslop\krea rust\ref\ComfyUI\custom_nodes\websocket_image_save.py
+[32m[INFO][0m 
+[1m[33m[WARNING][0m WARNING: some comfy_extras/ nodes did not import correctly. This may be because they are missing some dependencies.
+
+[1m[33m[WARNING][0m IMPORT FAILED: nodes_glsl.py
+[1m[33m[WARNING][0m 
+This issue might be caused by new missing dependencies added the last time you updated ComfyUI.
+[1m[33m[WARNING][0m Please do a: pip install -r requirements.txt
+[1m[33m[WARNING][0m 
+[1m[31m[ERROR][0m ********** ERROR ***********
+
+comfyui-workflow-templates is not installed.
+
+Please install the updated requirements.txt file by running:
+G:\cslop\krea rust\ref\venv\Scripts\python.exe -m pip install -r G:\cslop\krea rust\ref\ComfyUI\requirements.txt
+If you are on the portable package you can run: update\update_comfyui.bat to solve this problem.
+
+The ComfyUI frontend is shipped in a pip package so it needs to be updated separately from the ComfyUI code.
+
+********** ERROR ***********
+[32m[INFO][0m Using RAM pressure cache.
+[32m[INFO][0m ComfyUI is developed by Comfy Org. We also offer commercial products to deploy ComfyUI as scalable cloud endpoints. Visit platform.comfy.org/ascii for more information.
+[32m[INFO][0m Starting server
+
+[32m[INFO][0m To see the GUI go to: http://127.0.0.1:8199
+[32m[INFO][0m got prompt
+[32m[INFO][0m Model storage policy: fast_disk=False paths=['G:\\stable-diffusion-webui-forge\\models\\VAE\\qwen_image_vae.safetensors']
+[32m[INFO][0m Using pytorch attention in VAE
+[32m[INFO][0m Using pytorch attention in VAE
+[32m[INFO][0m VAE load device: cuda:0, offload device: cpu, dtype: torch.bfloat16
+[32m[INFO][0m Found quantization metadata version 1
+[32m[INFO][0m Using MixedPrecisionOps for text encoder
+[32m[INFO][0m Model storage policy: fast_disk=False paths=['G:\\stable-diffusion-webui-forge\\models\\clip\\qwen3vl_4b.safetensors']
+[32m[INFO][0m CLIP/text encoder model load device: cuda:0, offload device: cpu, current: cpu, dtype: torch.float16
+[32m[INFO][0m Requested to load Krea2TEModel_
+[32m[INFO][0m Model Krea2TEModel_ prepared for dynamic VRAM loading. 4632MB Staged. 0 patches attached. Force pre-loaded 249 weights: 627 KB.
+[32m[INFO][0m Found quantization metadata version 1
+[32m[INFO][0m Detected mixed precision quantization
+[32m[INFO][0m Using mixed precision operations
+[32m[INFO][0m Native ops: asym_w4a8_int8, float8_e5m2, int8_tensorwise, nvfp4, w6a8_int8, float8_e4m3fn, convrot_w4a4, mxfp8 
+[32m[INFO][0m model weight dtype torch.bfloat16, manual cast: torch.bfloat16
+[32m[INFO][0m model_type FLUX
+[32m[INFO][0m Model storage policy: fast_disk=False paths=['G:\\stable-diffusion-webui-forge\\models\\Stable-diffusion\\kroma-v0.3.1-turbo-opd-W8A8.safetensors']
+[32m[INFO][0m Requested to load Krea2
+[32m[INFO][0m Model Krea2 prepared for dynamic VRAM loading. 12864MB Staged. 0 patches attached. Force pre-loaded 160 weights: 2824 KB.
+  0%|          | 0/8 [00:00<?, ?it/s]  0%|          | 0/8 [00:00<?, ?it/s,   Model Initializing ...  ]  0%|          | 0/8 [00:04<?, ?it/s,  Model Initialization complete!  ] 12%|#2        | 1/8 [00:04<00:28,  4.06s/it,  Model Initialization complete!  ] 12%|#2        | 1/8 [00:00<00:28,  4.06s/it]                                    25%|##5       | 2/8 [00:00<00:02,  2.09it/s] 38%|###7      | 3/8 [00:01<00:05,  1.01s/it] 50%|#####     | 4/8 [00:02<00:04,  1.02s/it] 62%|######2   | 5/8 [00:04<00:03,  1.01s/it] 75%|#######5  | 6/8 [00:04<00:01,  1.01it/s] 88%|########7 | 7/8 [00:05<00:00,  1.01it/s]100%|##########| 8/8 [00:06<00:00,  1.01it/s]100%|##########| 8/8 [00:06<00:00,  1.15it/s]
+[32m[INFO][0m Requested to load WanVAE
+[32m[INFO][0m 0 models unloaded.
+[32m[INFO][0m Model WanVAE prepared for dynamic VRAM loading. 241MB Staged. 0 patches attached. Force pre-loaded 60 weights: 61 KB.
+[32m[INFO][0m [32mPrompt executed in 13.93 seconds[0m
+[32m[INFO][0m got prompt
+[32m[INFO][0m Model Krea2TEModel_ prepared for dynamic VRAM loading. 4632MB Staged. 0 patches attached. Force pre-loaded 249 weights: 627 KB.
+[32m[INFO][0m 0 models unloaded.
+[32m[INFO][0m Model Krea2 prepared for dynamic VRAM loading. 12864MB Staged. 0 patches attached. Force pre-loaded 160 weights: 2824 KB.
+  0%|          | 0/8 [00:00<?, ?it/s]  0%|          | 0/8 [00:00<?, ?it/s,   Model Initializing ...  ]  0%|          | 0/8 [00:01<?, ?it/s,  Model Initialization complete!  ] 12%|#2        | 1/8 [00:01<00:08,  1.17s/it,  Model Initialization complete!  ] 12%|#2        | 1/8 [00:01<00:08,  1.17s/it]                                    25%|##5       | 2/8 [00:01<00:05,  1.00it/s] 38%|###7      | 3/8 [00:02<00:02,  2.17it/s] 50%|#####     | 4/8 [00:03<00:03,  1.02it/s] 62%|######2   | 5/8 [00:04<00:02,  1.01it/s] 75%|#######5  | 6/8 [00:05<00:01,  1.02it/s] 88%|########7 | 7/8 [00:06<00:01,  1.01s/it]100%|##########| 8/8 [00:07<00:00,  1.01s/it]100%|##########| 8/8 [00:07<00:00,  1.08it/s]
+[32m[INFO][0m 0 models unloaded.
+[32m[INFO][0m Model WanVAE prepared for dynamic VRAM loading. 241MB Staged. 0 patches attached. Force pre-loaded 60 weights: 61 KB.
+[32m[INFO][0m [32mPrompt executed in 9.15 seconds[0m
+[32m[INFO][0m got prompt
+[32m[INFO][0m Model Krea2TEModel_ prepared for dynamic VRAM loading. 4632MB Staged. 0 patches attached. Force pre-loaded 249 weights: 627 KB.
+[32m[INFO][0m Model Krea2 prepared for dynamic VRAM loading. 12864MB Staged. 0 patches attached. Force pre-loaded 160 weights: 2824 KB.
+  0%|          | 0/8 [00:00<?, ?it/s]  0%|          | 0/8 [00:00<?, ?it/s,   Model Initializing ...  ]  0%|          | 0/8 [00:01<?, ?it/s,  Model Initialization complete!  ] 12%|#2        | 1/8 [00:01<00:07,  1.08s/it,  Model Initialization complete!  ] 12%|#2        | 1/8 [00:00<00:07,  1.08s/it]                                    25%|##5       | 2/8 [00:00<00:02,  2.10it/s] 38%|###7      | 3/8 [00:01<00:04,  1.03it/s] 50%|#####     | 4/8 [00:02<00:03,  1.01it/s] 62%|######2   | 5/8 [00:03<00:02,  1.00it/s] 75%|#######5  | 6/8 [00:04<00:02,  1.01s/it] 88%|########7 | 7/8 [00:05<00:00,  1.02it/s]100%|##########| 8/8 [00:06<00:00,  1.00it/s]100%|##########| 8/8 [00:06<00:00,  1.16it/s]
+[32m[INFO][0m 0 models unloaded.
+[32m[INFO][0m Model WanVAE prepared for dynamic VRAM loading. 241MB Staged. 0 patches attached. Force pre-loaded 60 weights: 61 KB.
+[32m[INFO][0m [32mPrompt executed in 8.92 seconds[0m

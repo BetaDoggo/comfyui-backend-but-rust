@@ -1,0 +1,20 @@
+{
+  "4": { "class_type": "UNETLoader", "inputs": { "unet_name": "minimax_h3_fp8.safetensors", "weight_dtype": "fp8_e4m3fn" } },
+  "100": { "class_type": "CLIPLoader", "inputs": { "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device": "default" } },
+  "101": { "class_type": "VAELoader", "inputs": { "vae_name": "minimax_h3_video_vae_int8.safetensors" } },
+  "102": { "class_type": "VAELoader", "inputs": { "vae_name": "minimax_h3_audio_vae.safetensors" } },
+  "103": { "class_type": "MiniMaxH3SigmaShift", "inputs": { "model": ["4", 0], "shift_video": 12.0, "shift_audio": 3 } },
+  "110": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": "$IMAGE_B64" } },
+  "111": { "class_type": "SwarmLoadAudioB64", "inputs": { "audio_base64": "$AUDIO_B64" } },
+  "112": { "class_type": "SwarmMiniMaxH3CollectReferences", "inputs": { "vae": ["101", 0], "audio_vae": ["102", 0], "width": 448, "height": 256, "length": 22, "ref_images.ref_image_0": ["110", 0], "ref_audios.ref_audio_0": ["111", 0] } },
+  "6": { "class_type": "SwarmTextEncodeAdvanced", "inputs": { "clip": ["100", 0], "lora_hooks": null, "steps": 8, "prompt": "<Picture 1> walks forward singing <Audio 1>", "width": 448, "height": 256, "target_width": 448, "target_height": 256, "guidance": -1, "images": null, "minimax_refs": ["112", 0] } },
+  "7": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["100", 0], "text": "" } },
+  "113": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": "$IMAGE_B64" } },
+  "5": { "class_type": "SwarmEmptyMiniMaxH3LatentAV", "inputs": { "length": 22, "height": 256, "width": 448 } },
+  "114": { "class_type": "SwarmMiniMaxH3AddKeyframes", "inputs": { "vae": ["101", 0], "latent": ["5", 0], "conditioning": ["6", 0], "first_frame": ["113", 0], "last_frame": null } },
+  "10": { "class_type": "SwarmKSampler", "inputs": { "model": ["103", 0], "noise_seed": 5, "steps": 8, "cfg": 1.0, "sampler_name": "res_multistep", "scheduler": "simple", "positive": ["114", 0], "negative": ["7", 0], "latent_image": ["5", 0], "start_at_step": 0, "end_at_step": 10000, "return_with_leftover_noise": "disable", "add_noise": "enable", "var_seed": 0, "var_seed_strength": 0.0, "sigma_min": -1.0, "sigma_max": -1.0, "rho": 7.0, "previews": "animate", "tile_sample": false, "tile_size": 960, "model_negative": null } },
+  "104": { "class_type": "LTXVSeparateAVLatent", "inputs": { "av_latent": ["10", 0] } },
+  "8": { "class_type": "VAEDecodeTiled", "inputs": { "vae": ["101", 0], "samples": ["104", 0], "tile_size": 256, "overlap": 64, "temporal_size": 9999, "temporal_overlap": 8 } },
+  "105": { "class_type": "VAEDecodeAudio", "inputs": { "vae": ["102", 0], "samples": ["104", 1] } },
+  "9": { "class_type": "SwarmSaveAnimationWS", "inputs": { "images": ["8", 0], "fps": 24, "lossless": false, "quality": 95, "method": "default", "format": "h264-mp4", "audio": ["105", 0] } }
+}

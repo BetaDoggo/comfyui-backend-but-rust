@@ -1,0 +1,2067 @@
+{
+ "IPAdapterUnifiedLoader": {
+  "input": {
+   "required": {
+    "model": [
+     "MODEL"
+    ],
+    "preset": [
+     [
+      "LIGHT - SD1.5 only (low strength)",
+      "STANDARD (medium strength)",
+      "VIT-G (medium strength)",
+      "PLUS (high strength)",
+      "PLUS FACE (portraits)",
+      "FULL FACE - SD1.5 only (portraits stronger)"
+     ]
+    ]
+   },
+   "optional": {
+    "ipadapter": [
+     "IPADAPTER"
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "preset"
+   ],
+   "optional": [
+    "ipadapter"
+   ]
+  },
+  "output": [
+   "MODEL",
+   "IPADAPTER"
+  ],
+  "output_is_list": [
+   false,
+   false
+  ],
+  "output_name": [
+   "model",
+   "ipadapter"
+  ],
+  "name": "IPAdapterUnifiedLoader",
+  "display_name": "IPAdapter Unified Loader",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "ipadapter",
+  "output_node": false
+ },
+ "IPAdapterModelLoader": {
+  "input": {
+   "required": {
+    "ipadapter_file": [
+     []
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "ipadapter_file"
+   ]
+  },
+  "output": [
+   "IPADAPTER"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "IPADAPTER"
+  ],
+  "name": "IPAdapterModelLoader",
+  "display_name": "IPAdapter Model Loader",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "ipadapter/loaders",
+  "output_node": false,
+  "x_model_folders": {
+   "ipadapter_file": "ipadapter"
+  }
+ },
+ "IPAdapter": {
+  "input": {
+   "required": {
+    "model": [
+     "MODEL"
+    ],
+    "ipadapter": [
+     "IPADAPTER"
+    ],
+    "image": [
+     "IMAGE"
+    ],
+    "weight": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": -1.0,
+      "max": 3.0,
+      "step": 0.05
+     }
+    ],
+    "start_at": [
+     "FLOAT",
+     {
+      "default": 0.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.001
+     }
+    ],
+    "end_at": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.001
+     }
+    ],
+    "weight_type": [
+     [
+      "standard",
+      "prompt is more important",
+      "style transfer"
+     ]
+    ]
+   },
+   "optional": {
+    "attn_mask": [
+     "MASK"
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "ipadapter",
+    "image",
+    "weight",
+    "start_at",
+    "end_at",
+    "weight_type"
+   ],
+   "optional": [
+    "attn_mask"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "MODEL"
+  ],
+  "name": "IPAdapter",
+  "display_name": "IPAdapter",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "ipadapter",
+  "output_node": false
+ },
+ "IPAdapterAdvanced": {
+  "input": {
+   "required": {
+    "model": [
+     "MODEL"
+    ],
+    "ipadapter": [
+     "IPADAPTER"
+    ],
+    "image": [
+     "IMAGE"
+    ],
+    "weight": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": -1.0,
+      "max": 5.0,
+      "step": 0.05
+     }
+    ],
+    "weight_type": [
+     [
+      "linear",
+      "ease in",
+      "ease out",
+      "ease in-out",
+      "reverse in-out",
+      "weak input",
+      "weak output",
+      "weak middle",
+      "strong middle",
+      "style transfer",
+      "composition",
+      "strong style transfer",
+      "style and composition",
+      "style transfer precise",
+      "composition precise"
+     ]
+    ],
+    "combine_embeds": [
+     [
+      "concat",
+      "add",
+      "subtract",
+      "average",
+      "norm average"
+     ]
+    ],
+    "start_at": [
+     "FLOAT",
+     {
+      "default": 0.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.001
+     }
+    ],
+    "end_at": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.001
+     }
+    ],
+    "embeds_scaling": [
+     [
+      "V only",
+      "K+V",
+      "K+V w/ C penalty",
+      "K+mean(V) w/ C penalty"
+     ]
+    ]
+   },
+   "optional": {
+    "image_negative": [
+     "IMAGE"
+    ],
+    "attn_mask": [
+     "MASK"
+    ],
+    "clip_vision": [
+     "CLIP_VISION"
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "ipadapter",
+    "image",
+    "weight",
+    "weight_type",
+    "combine_embeds",
+    "start_at",
+    "end_at",
+    "embeds_scaling"
+   ],
+   "optional": [
+    "image_negative",
+    "attn_mask",
+    "clip_vision"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "MODEL"
+  ],
+  "name": "IPAdapterAdvanced",
+  "display_name": "IPAdapter Advanced",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "ipadapter",
+  "output_node": false
+ },
+ "IPAdapterApply": {
+  "input": {
+   "required": {
+    "ipadapter": [
+     "IPADAPTER"
+    ],
+    "clip_vision": [
+     "CLIP_VISION"
+    ],
+    "image": [
+     "IMAGE"
+    ],
+    "model": [
+     "MODEL"
+    ],
+    "weight": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": -1.0,
+      "max": 3.0,
+      "step": 0.05
+     }
+    ],
+    "noise": [
+     "FLOAT",
+     {
+      "default": 0.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "weight_type": [
+     [
+      "original",
+      "linear",
+      "channel penalty"
+     ]
+    ]
+   },
+   "optional": {
+    "start_at": [
+     "FLOAT",
+     {
+      "default": 0.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.001
+     }
+    ],
+    "end_at": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.001
+     }
+    ],
+    "unfold_batch": [
+     "BOOLEAN",
+     {
+      "default": false
+     }
+    ],
+    "attn_mask": [
+     "MASK"
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "ipadapter",
+    "clip_vision",
+    "image",
+    "model",
+    "weight",
+    "noise",
+    "weight_type"
+   ],
+   "optional": [
+    "start_at",
+    "end_at",
+    "unfold_batch",
+    "attn_mask"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "MODEL"
+  ],
+  "name": "IPAdapterApply",
+  "display_name": "Apply IPAdapter",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "ipadapter",
+  "output_node": false
+ },
+ "MiDaS-DepthMapPreprocessor": {
+  "input": {
+   "required": {
+    "image": [
+     "IMAGE"
+    ]
+   },
+   "optional": {
+    "a": [
+     "FLOAT",
+     {
+      "default": 6.283185,
+      "min": 0.0,
+      "max": 15.707963,
+      "step": 0.05
+     }
+    ],
+    "bg_threshold": [
+     "FLOAT",
+     {
+      "default": 0.1,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.1
+     }
+    ],
+    "resolution": [
+     "INT",
+     {
+      "default": 512,
+      "min": 64,
+      "max": 16384,
+      "step": 64
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "image"
+   ],
+   "optional": [
+    "a",
+    "bg_threshold",
+    "resolution"
+   ]
+  },
+  "output": [
+   "IMAGE"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "IMAGE"
+  ],
+  "name": "MiDaS-DepthMapPreprocessor",
+  "display_name": "MiDaS Depth Map",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "ControlNet Preprocessors/Normal and Depth Estimators",
+  "output_node": false
+ },
+ "RIFE VFI": {
+  "input": {
+   "required": {
+    "ckpt_name": [
+     [
+      "rife40.pth",
+      "rife41.pth",
+      "rife42.pth",
+      "rife43.pth",
+      "rife44.pth",
+      "rife45.pth",
+      "rife46.pth",
+      "rife47.pth",
+      "rife48.pth",
+      "rife49.pth",
+      "sudo_rife4_269.662_testV1_scale1.pth"
+     ],
+     {
+      "default": "rife47.pth"
+     }
+    ],
+    "frames": [
+     "IMAGE"
+    ],
+    "clear_cache_after_n_frames": [
+     "INT",
+     {
+      "default": 10,
+      "min": 1,
+      "max": 1000,
+      "step": 1
+     }
+    ],
+    "multiplier": [
+     "INT",
+     {
+      "default": 2,
+      "min": 1,
+      "max": 18446744073709551615,
+      "step": 1
+     }
+    ],
+    "fast_mode": [
+     "BOOLEAN",
+     {
+      "default": true
+     }
+    ],
+    "ensemble": [
+     "BOOLEAN",
+     {
+      "default": true
+     }
+    ],
+    "scale_factor": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": 0.25,
+      "max": 4.0,
+      "step": 0.25
+     }
+    ]
+   },
+   "optional": {
+    "optional_interpolation_states": [
+     "INTERPOLATION_STATES"
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "ckpt_name",
+    "frames",
+    "clear_cache_after_n_frames",
+    "multiplier",
+    "fast_mode",
+    "ensemble",
+    "scale_factor"
+   ],
+   "optional": [
+    "optional_interpolation_states"
+   ]
+  },
+  "output": [
+   "IMAGE"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "IMAGE"
+  ],
+  "name": "RIFE VFI",
+  "display_name": "RIFE VFI (recommend rife47 and rife49)",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "ComfyUI-Frame-Interpolation/VFI",
+  "output_node": false
+ },
+ "FILM VFI": {
+  "input": {
+   "required": {
+    "ckpt_name": [
+     [
+      "film_net_fp32.pt"
+     ]
+    ],
+    "frames": [
+     "IMAGE"
+    ],
+    "clear_cache_after_n_frames": [
+     "INT",
+     {
+      "default": 10,
+      "min": 1,
+      "max": 1000,
+      "step": 1
+     }
+    ],
+    "multiplier": [
+     "INT",
+     {
+      "default": 2,
+      "min": 1,
+      "max": 18446744073709551615,
+      "step": 1
+     }
+    ]
+   },
+   "optional": {
+    "optional_interpolation_states": [
+     "INTERPOLATION_STATES"
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "ckpt_name",
+    "frames",
+    "clear_cache_after_n_frames",
+    "multiplier"
+   ],
+   "optional": [
+    "optional_interpolation_states"
+   ]
+  },
+  "output": [
+   "IMAGE"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "IMAGE"
+  ],
+  "name": "FILM VFI",
+  "display_name": "FILM VFI",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "ComfyUI-Frame-Interpolation/VFI",
+  "output_node": false
+ },
+ "DownloadAndLoadGIMMVFIModel": {
+  "input": {
+   "required": {
+    "model": [
+     [
+      "gimmvfi_r_arb_lpips_fp32.safetensors",
+      "gimmvfi_f_arb_lpips_fp32.safetensors"
+     ]
+    ],
+    "precision": [
+     [
+      "fp32",
+      "bf16",
+      "fp16"
+     ],
+     {
+      "default": "fp32"
+     }
+    ],
+    "torch_compile": [
+     "BOOLEAN",
+     {
+      "default": false
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "precision",
+    "torch_compile"
+   ]
+  },
+  "output": [
+   "GIMMVIF_MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "gimmvfi_model"
+  ],
+  "name": "DownloadAndLoadGIMMVFIModel",
+  "display_name": "(Down)Load GIMMVFI Model",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "GIMM-VFI",
+  "output_node": false
+ },
+ "GIMMVFI_interpolate": {
+  "input": {
+   "required": {
+    "gimmvfi_model": [
+     "GIMMVIF_MODEL"
+    ],
+    "images": [
+     "IMAGE"
+    ],
+    "ds_factor": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": 0.01,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "interpolation_factor": [
+     "INT",
+     {
+      "default": 8,
+      "min": 1,
+      "max": 100,
+      "step": 1
+     }
+    ],
+    "seed": [
+     "INT",
+     {
+      "default": 0,
+      "min": 0,
+      "max": 18446744073709551615,
+      "step": 1
+     }
+    ],
+    "output_flows": [
+     "BOOLEAN",
+     {
+      "default": false
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "gimmvfi_model",
+    "images",
+    "ds_factor",
+    "interpolation_factor",
+    "seed",
+    "output_flows"
+   ]
+  },
+  "output": [
+   "IMAGE",
+   "IMAGE"
+  ],
+  "output_is_list": [
+   false,
+   false
+  ],
+  "output_name": [
+   "images",
+   "flow_tensors"
+  ],
+  "name": "GIMMVFI_interpolate",
+  "display_name": "GIMM-VFI Interpolate",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "GIMM-VFI",
+  "output_node": false
+ },
+ "DownloadAndLoadSAM2Model": {
+  "input": {
+   "required": {
+    "model": [
+     [
+      "sam2_hiera_base_plus.safetensors",
+      "sam2_hiera_large.safetensors",
+      "sam2_hiera_small.safetensors",
+      "sam2_hiera_tiny.safetensors",
+      "sam2.1_hiera_base_plus.safetensors",
+      "sam2.1_hiera_large.safetensors",
+      "sam2.1_hiera_small.safetensors",
+      "sam2.1_hiera_tiny.safetensors"
+     ]
+    ],
+    "segmentor": [
+     [
+      "single_image",
+      "video",
+      "automaskgenerator"
+     ]
+    ],
+    "device": [
+     [
+      "cuda",
+      "cpu",
+      "mps"
+     ]
+    ],
+    "precision": [
+     [
+      "fp16",
+      "bf16",
+      "fp32"
+     ],
+     {
+      "default": "fp16"
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "segmentor",
+    "device",
+    "precision"
+   ]
+  },
+  "output": [
+   "SAM2MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "sam2_model"
+  ],
+  "name": "DownloadAndLoadSAM2Model",
+  "display_name": "(Down)Load SAM2Model",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "SAM2",
+  "output_node": false
+ },
+ "Sam2Segmentation": {
+  "input": {
+   "required": {
+    "sam2_model": [
+     "SAM2MODEL"
+    ],
+    "image": [
+     "IMAGE"
+    ],
+    "keep_model_loaded": [
+     "BOOLEAN",
+     {
+      "default": true
+     }
+    ]
+   },
+   "optional": {
+    "coordinates_positive": [
+     "STRING",
+     {
+      "forceInput": true
+     }
+    ],
+    "coordinates_negative": [
+     "STRING",
+     {
+      "forceInput": true
+     }
+    ],
+    "bboxes": [
+     "BBOX"
+    ],
+    "individual_objects": [
+     "BOOLEAN",
+     {
+      "default": false
+     }
+    ],
+    "mask": [
+     "MASK"
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "sam2_model",
+    "image",
+    "keep_model_loaded"
+   ],
+   "optional": [
+    "coordinates_positive",
+    "coordinates_negative",
+    "bboxes",
+    "individual_objects",
+    "mask"
+   ]
+  },
+  "output": [
+   "MASK"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "mask"
+  ],
+  "name": "Sam2Segmentation",
+  "display_name": "Sam2Segmentation",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "SAM2",
+  "output_node": false
+ },
+ "Sam2AutoSegmentation": {
+  "input": {
+   "required": {
+    "sam2_model": [
+     "SAM2MODEL"
+    ],
+    "image": [
+     "IMAGE"
+    ],
+    "points_per_side": [
+     "INT",
+     {
+      "default": 32,
+      "min": 1,
+      "max": 100,
+      "step": 1
+     }
+    ],
+    "points_per_batch": [
+     "INT",
+     {
+      "default": 64,
+      "min": 1,
+      "max": 100,
+      "step": 1
+     }
+    ],
+    "pred_iou_thresh": [
+     "FLOAT",
+     {
+      "default": 0.8,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "stability_score_thresh": [
+     "FLOAT",
+     {
+      "default": 0.95,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "stability_score_offset": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "mask_threshold": [
+     "FLOAT",
+     {
+      "default": 0.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "crop_n_layers": [
+     "INT",
+     {
+      "default": 0,
+      "min": 0,
+      "max": 100,
+      "step": 1
+     }
+    ],
+    "box_nms_thresh": [
+     "FLOAT",
+     {
+      "default": 0.7,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "crop_nms_thresh": [
+     "FLOAT",
+     {
+      "default": 0.7,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "crop_overlap_ratio": [
+     "FLOAT",
+     {
+      "default": 0.34133,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "crop_n_points_downscale_factor": [
+     "INT",
+     {
+      "default": 1,
+      "min": 1,
+      "max": 100,
+      "step": 1
+     }
+    ],
+    "min_mask_region_area": [
+     "FLOAT",
+     {
+      "default": 0.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "use_m2m": [
+     "BOOLEAN",
+     {
+      "default": false
+     }
+    ],
+    "keep_model_loaded": [
+     "BOOLEAN",
+     {
+      "default": true
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "sam2_model",
+    "image",
+    "points_per_side",
+    "points_per_batch",
+    "pred_iou_thresh",
+    "stability_score_thresh",
+    "stability_score_offset",
+    "mask_threshold",
+    "crop_n_layers",
+    "box_nms_thresh",
+    "crop_nms_thresh",
+    "crop_overlap_ratio",
+    "crop_n_points_downscale_factor",
+    "min_mask_region_area",
+    "use_m2m",
+    "keep_model_loaded"
+   ]
+  },
+  "output": [
+   "MASK",
+   "IMAGE",
+   "BBOX"
+  ],
+  "output_is_list": [
+   false,
+   false,
+   false
+  ],
+  "output_name": [
+   "mask",
+   "segmented_image",
+   "bbox"
+  ],
+  "name": "Sam2AutoSegmentation",
+  "display_name": "Sam2AutoSegmentation",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "SAM2",
+  "output_node": false
+ },
+ "UnetLoaderGGUF": {
+  "input": {
+   "required": {
+    "unet_name": [
+     []
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "unet_name"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "MODEL"
+  ],
+  "name": "UnetLoaderGGUF",
+  "display_name": "Unet Loader (GGUF)",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "bootleg",
+  "output_node": false,
+  "x_model_folders": {
+   "unet_name": "diffusion_models"
+  }
+ },
+ "CheckpointLoaderNF4": {
+  "input": {
+   "required": {
+    "ckpt_name": [
+     []
+    ]
+   },
+   "optional": {
+    "bnb_dtype": [
+     [
+      "nf4",
+      "fp4"
+     ],
+     {
+      "default": "nf4"
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "ckpt_name"
+   ],
+   "optional": [
+    "bnb_dtype"
+   ]
+  },
+  "output": [
+   "MODEL",
+   "CLIP",
+   "VAE"
+  ],
+  "output_is_list": [
+   false,
+   false,
+   false
+  ],
+  "output_name": [
+   "MODEL",
+   "CLIP",
+   "VAE"
+  ],
+  "name": "CheckpointLoaderNF4",
+  "display_name": "CheckpointLoaderNF4",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "loaders",
+  "output_node": false,
+  "x_model_folders": {
+   "ckpt_name": "checkpoints"
+  }
+ },
+ "NunchakuFluxDiTLoader": {
+  "input": {
+   "required": {
+    "model_path": [
+     []
+    ],
+    "cache_threshold": [
+     "FLOAT",
+     {
+      "default": 0.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.001
+     }
+    ],
+    "attention": [
+     [
+      "nunchaku-fp16",
+      "flash-attention2"
+     ]
+    ],
+    "cpu_offload": [
+     [
+      "auto",
+      "enable",
+      "disable"
+     ]
+    ],
+    "device_id": [
+     "INT",
+     {
+      "default": 0,
+      "min": 0,
+      "max": 64,
+      "step": 1
+     }
+    ],
+    "data_type": [
+     [
+      "bfloat16",
+      "float16"
+     ]
+    ]
+   },
+   "optional": {
+    "i2f_mode": [
+     [
+      "enabled",
+      "always"
+     ]
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model_path",
+    "cache_threshold",
+    "attention",
+    "cpu_offload",
+    "device_id",
+    "data_type"
+   ],
+   "optional": [
+    "i2f_mode"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "MODEL"
+  ],
+  "name": "NunchakuFluxDiTLoader",
+  "display_name": "Nunchaku FLUX DiT Loader",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "Nunchaku",
+  "output_node": false,
+  "x_model_folders": {
+   "model_path": "diffusion_models"
+  }
+ },
+ "NunchakuQwenImageDiTLoader": {
+  "input": {
+   "required": {
+    "model_name": [
+     []
+    ],
+    "cpu_offload": [
+     [
+      "auto",
+      "enable",
+      "disable"
+     ]
+    ],
+    "num_blocks_on_gpu": [
+     "INT",
+     {
+      "default": 1,
+      "min": 1,
+      "max": 60,
+      "step": 1
+     }
+    ],
+    "use_pin_memory": [
+     [
+      "enable",
+      "disable"
+     ]
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model_name",
+    "cpu_offload",
+    "num_blocks_on_gpu",
+    "use_pin_memory"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "MODEL"
+  ],
+  "name": "NunchakuQwenImageDiTLoader",
+  "display_name": "Nunchaku Qwen-Image DiT Loader",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "Nunchaku",
+  "output_node": false,
+  "x_model_folders": {
+   "model_name": "diffusion_models"
+  }
+ },
+ "NunchakuFluxLoraLoader": {
+  "input": {
+   "required": {
+    "model": [
+     "MODEL"
+    ],
+    "lora_name": [
+     []
+    ],
+    "lora_strength": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": -100.0,
+      "max": 100.0,
+      "step": 0.01
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "lora_name",
+    "lora_strength"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "MODEL"
+  ],
+  "name": "NunchakuFluxLoraLoader",
+  "display_name": "Nunchaku FLUX LoRA Loader",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "Nunchaku",
+  "output_node": false,
+  "x_model_folders": {
+   "lora_name": "loras"
+  }
+ },
+ "TensorRTLoader": {
+  "input": {
+   "required": {
+    "unet_name": [
+     []
+    ],
+    "model_type": [
+     [
+      "sdxl_base",
+      "sdxl_refiner",
+      "sd1.x",
+      "sd2.x-768v",
+      "svd",
+      "sd3",
+      "auraflow",
+      "flux_dev",
+      "flux_schnell"
+     ]
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "unet_name",
+    "model_type"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "MODEL"
+  ],
+  "name": "TensorRTLoader",
+  "display_name": "TensorRT Loader",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "TensorRT",
+  "output_node": false,
+  "x_model_folders": {
+   "unet_name": "tensorrt"
+  }
+ },
+ "AITemplateLoader": {
+  "input": {
+   "required": {
+    "model": [
+     "MODEL"
+    ],
+    "keep_loaded": [
+     [
+      "enable",
+      "disable"
+     ]
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "keep_loaded"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "MODEL"
+  ],
+  "name": "AITemplateLoader",
+  "display_name": "Load AITemplate",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "loaders",
+  "output_node": false
+ },
+ "TeaCache": {
+  "input": {
+   "required": {
+    "model": [
+     "MODEL"
+    ],
+    "model_type": [
+     [
+      "flux",
+      "flux-kontext",
+      "ltxv",
+      "lumina_2",
+      "hunyuan_video",
+      "hidream_i1_full",
+      "hidream_i1_dev",
+      "hidream_i1_fast",
+      "wan2.1_t2v_1.3B",
+      "wan2.1_t2v_14B",
+      "wan2.1_i2v_480p_14B",
+      "wan2.1_i2v_720p_14B",
+      "wan2.1_t2v_1.3B_ret_mode",
+      "wan2.1_t2v_14B_ret_mode",
+      "wan2.1_i2v_480p_14B_ret_mode",
+      "wan2.1_i2v_720p_14B_ret_mode"
+     ],
+     {
+      "default": "flux"
+     }
+    ],
+    "rel_l1_thresh": [
+     "FLOAT",
+     {
+      "default": 0.4,
+      "min": 0.0,
+      "max": 10.0,
+      "step": 0.01
+     }
+    ],
+    "max_skip_steps": [
+     "INT",
+     {
+      "default": 3,
+      "min": 1,
+      "max": 100,
+      "step": 1
+     }
+    ],
+    "start_percent": [
+     "FLOAT",
+     {
+      "default": 0.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "end_percent": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "cache_device": [
+     [
+      "cuda",
+      "cpu"
+     ],
+     {
+      "default": "cuda"
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "model_type",
+    "rel_l1_thresh",
+    "max_skip_steps",
+    "start_percent",
+    "end_percent",
+    "cache_device"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "model"
+  ],
+  "name": "TeaCache",
+  "display_name": "TeaCache",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "TeaCache",
+  "output_node": false
+ },
+ "TeaCacheForImgGen": {
+  "input": {
+   "required": {
+    "model": [
+     "MODEL"
+    ],
+    "model_type": [
+     [
+      "flux",
+      "flux-kontext",
+      "ltxv",
+      "lumina_2",
+      "hunyuan_video",
+      "hidream_i1_full",
+      "hidream_i1_dev",
+      "hidream_i1_fast",
+      "wan2.1_t2v_1.3B",
+      "wan2.1_t2v_14B",
+      "wan2.1_i2v_480p_14B",
+      "wan2.1_i2v_720p_14B",
+      "wan2.1_t2v_1.3B_ret_mode",
+      "wan2.1_t2v_14B_ret_mode",
+      "wan2.1_i2v_480p_14B_ret_mode",
+      "wan2.1_i2v_720p_14B_ret_mode"
+     ],
+     {
+      "default": "flux"
+     }
+    ],
+    "rel_l1_thresh": [
+     "FLOAT",
+     {
+      "default": 0.4,
+      "min": 0.0,
+      "max": 10.0,
+      "step": 0.01
+     }
+    ],
+    "max_skip_steps": [
+     "INT",
+     {
+      "default": 3,
+      "min": 1,
+      "max": 100,
+      "step": 1
+     }
+    ],
+    "start_percent": [
+     "FLOAT",
+     {
+      "default": 0.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "end_percent": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "cache_device": [
+     [
+      "cuda",
+      "cpu"
+     ],
+     {
+      "default": "cuda"
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "model_type",
+    "rel_l1_thresh",
+    "max_skip_steps",
+    "start_percent",
+    "end_percent",
+    "cache_device"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "model"
+  ],
+  "name": "TeaCacheForImgGen",
+  "display_name": "TeaCache For Img Gen",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "TeaCache",
+  "output_node": false
+ },
+ "TeaCacheForVidGen": {
+  "input": {
+   "required": {
+    "model": [
+     "MODEL"
+    ],
+    "model_type": [
+     [
+      "flux",
+      "flux-kontext",
+      "ltxv",
+      "lumina_2",
+      "hunyuan_video",
+      "hidream_i1_full",
+      "hidream_i1_dev",
+      "hidream_i1_fast",
+      "wan2.1_t2v_1.3B",
+      "wan2.1_t2v_14B",
+      "wan2.1_i2v_480p_14B",
+      "wan2.1_i2v_720p_14B",
+      "wan2.1_t2v_1.3B_ret_mode",
+      "wan2.1_t2v_14B_ret_mode",
+      "wan2.1_i2v_480p_14B_ret_mode",
+      "wan2.1_i2v_720p_14B_ret_mode"
+     ],
+     {
+      "default": "flux"
+     }
+    ],
+    "rel_l1_thresh": [
+     "FLOAT",
+     {
+      "default": 0.4,
+      "min": 0.0,
+      "max": 10.0,
+      "step": 0.01
+     }
+    ],
+    "max_skip_steps": [
+     "INT",
+     {
+      "default": 3,
+      "min": 1,
+      "max": 100,
+      "step": 1
+     }
+    ],
+    "start_percent": [
+     "FLOAT",
+     {
+      "default": 0.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "end_percent": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ],
+    "cache_device": [
+     [
+      "cuda",
+      "cpu"
+     ],
+     {
+      "default": "cuda"
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "model_type",
+    "rel_l1_thresh",
+    "max_skip_steps",
+    "start_percent",
+    "end_percent",
+    "cache_device"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "model"
+  ],
+  "name": "TeaCacheForVidGen",
+  "display_name": "TeaCache For Vid Gen",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "TeaCache",
+  "output_node": false
+ },
+ "OverrideCLIPDevice": {
+  "input": {
+   "required": {
+    "clip": [
+     "CLIP"
+    ],
+    "device": [
+     [
+      "cpu",
+      "cuda:0"
+     ]
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "clip",
+    "device"
+   ]
+  },
+  "output": [
+   "CLIP"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "CLIP"
+  ],
+  "name": "OverrideCLIPDevice",
+  "display_name": "Force/Set CLIP Device",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "other",
+  "output_node": false
+ },
+ "PixArtCheckpointLoader": {
+  "input": {
+   "required": {
+    "ckpt_name": [
+     []
+    ],
+    "model": [
+     [
+      "PixArtMS_XL_2",
+      "PixArt_XL_2",
+      "PixArtMS_Sigma_XL_2",
+      "PixArtMS_Sigma_XL_2_900M",
+      "PixArtMS_Sigma_XL_2_2K",
+      "PixArt_Sigma_XL_2_512",
+      "ControlPixArtHalf",
+      "ControlPixArtMSHalf"
+     ]
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "ckpt_name",
+    "model"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "model"
+  ],
+  "name": "PixArtCheckpointLoader",
+  "display_name": "PixArt Checkpoint Loader",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "ExtraModels/PixArt",
+  "output_node": false,
+  "x_model_folders": {
+   "ckpt_name": "checkpoints"
+  }
+ },
+ "SanaCheckpointLoader": {
+  "input": {
+   "required": {
+    "ckpt_name": [
+     []
+    ],
+    "model": [
+     [
+      "SanaMS_600M_P1_D28",
+      "SanaMS_1600M_P1_D20",
+      "SanaMS_1600M_P1_D20_2K",
+      "SanaMS_1600M_P1_D20_4K"
+     ]
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "ckpt_name",
+    "model"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "model"
+  ],
+  "name": "SanaCheckpointLoader",
+  "display_name": "Sana Checkpoint Loader",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "ExtraModels/Sana",
+  "output_node": false,
+  "x_model_folders": {
+   "ckpt_name": "checkpoints"
+  }
+ },
+ "GemmaLoader": {
+  "input": {
+   "required": {
+    "model_name": [
+     [
+      "Efficient-Large-Model/gemma-2-2b-it",
+      "unsloth/gemma-2-2b-it-bnb-4bit"
+     ]
+    ],
+    "device": [
+     [
+      "cpu",
+      "cuda"
+     ]
+    ],
+    "dtype": [
+     [
+      "default",
+      "auto (comfy)",
+      "FP32",
+      "FP16",
+      "BF16"
+     ]
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model_name",
+    "device",
+    "dtype"
+   ]
+  },
+  "output": [
+   "GEMMA"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "GEMMA"
+  ],
+  "name": "GemmaLoader",
+  "display_name": "Gemma Loader",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "ExtraModels/Sana",
+  "output_node": false
+ },
+ "SanaTextEncode": {
+  "input": {
+   "required": {
+    "text": [
+     "STRING",
+     {
+      "default": "",
+      "multiline": true
+     }
+    ],
+    "GEMMA": [
+     "GEMMA"
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "text",
+    "GEMMA"
+   ]
+  },
+  "output": [
+   "CONDITIONING"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "CONDITIONING"
+  ],
+  "name": "SanaTextEncode",
+  "display_name": "Sana Text Encode",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "ExtraModels/Sana",
+  "output_node": false
+ },
+ "DynamicThresholdingFull": {
+  "input": {
+   "required": {
+    "model": [
+     "MODEL"
+    ],
+    "mimic_scale": [
+     "FLOAT",
+     {
+      "default": 7.0,
+      "min": 0.0,
+      "max": 100.0,
+      "step": 0.5
+     }
+    ],
+    "threshold_percentile": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.001
+     }
+    ],
+    "mimic_mode": [
+     [
+      "Constant",
+      "Linear Down",
+      "Half Cosine Down",
+      "Cosine Down",
+      "Linear Up",
+      "Half Cosine Up",
+      "Cosine Up",
+      "Power Up",
+      "Power Down",
+      "Linear Repeating",
+      "Cosine Repeating"
+     ]
+    ],
+    "mimic_scale_min": [
+     "FLOAT",
+     {
+      "default": 0.0,
+      "min": 0.0,
+      "max": 100.0,
+      "step": 0.5
+     }
+    ],
+    "cfg_mode": [
+     [
+      "Constant",
+      "Linear Down",
+      "Half Cosine Down",
+      "Cosine Down",
+      "Linear Up",
+      "Half Cosine Up",
+      "Cosine Up",
+      "Power Up",
+      "Power Down",
+      "Linear Repeating",
+      "Cosine Repeating"
+     ]
+    ],
+    "cfg_scale_min": [
+     "FLOAT",
+     {
+      "default": 0.0,
+      "min": 0.0,
+      "max": 100.0,
+      "step": 0.5
+     }
+    ],
+    "sched_val": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": 0.0,
+      "max": 100.0,
+      "step": 0.01
+     }
+    ],
+    "separate_feature_channels": [
+     [
+      "enable",
+      "disable"
+     ]
+    ],
+    "scaling_startpoint": [
+     [
+      "MEAN",
+      "ZERO"
+     ]
+    ],
+    "variability_measure": [
+     [
+      "AD",
+      "STD"
+     ]
+    ],
+    "interpolate_phi": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "mimic_scale",
+    "threshold_percentile",
+    "mimic_mode",
+    "mimic_scale_min",
+    "cfg_mode",
+    "cfg_scale_min",
+    "sched_val",
+    "separate_feature_channels",
+    "scaling_startpoint",
+    "variability_measure",
+    "interpolate_phi"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "MODEL"
+  ],
+  "name": "DynamicThresholdingFull",
+  "display_name": "DynamicThresholdingFull",
+  "description": "",
+  "python_module": "custom_nodes",
+  "category": "advanced/mcmonkey",
+  "output_node": false
+ }
+}

@@ -1,0 +1,4 @@
+{
+  "1": { "class_type": "SwarmLoadAudioB64", "inputs": { "audio_base64": "$AUDIO_B64" } },
+  "2": { "class_type": "SaveAudioAdvanced", "inputs": { "audio": ["1", 0], "filename_prefix": "SwarmUI_1A2B_", "format": { "format": "flac" } } }
+}

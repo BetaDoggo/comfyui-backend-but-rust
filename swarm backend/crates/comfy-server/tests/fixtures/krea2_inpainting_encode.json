@@ -1,0 +1,199 @@
+{
+ "4": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "krea2/krea2_fp8_scaled.safetensors",
+   "weight_dtype": "fp8_e4m3fn"
+  }
+ },
+ "100": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_4b.safetensors",
+   "type": "krea2",
+   "device": "default"
+  }
+ },
+ "101": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "qwen_image_vae.safetensors"
+  }
+ },
+ "102": {
+  "class_type": "SwarmLoadImageB64",
+  "inputs": {
+   "image_base64": "$IMAGE_B64"
+  }
+ },
+ "103": {
+  "class_type": "ImageToMask",
+  "inputs": {
+   "image": [
+    "102",
+    0
+   ],
+   "channel": "red"
+  }
+ },
+ "104": {
+  "class_type": "DifferentialDiffusion",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ]
+  }
+ },
+ "15": {
+  "class_type": "SwarmLoadImageB64",
+  "inputs": {
+   "image_base64": "$IMAGE_B64"
+  }
+ },
+ "5": {
+  "class_type": "VAEEncodeForInpaint",
+  "inputs": {
+   "vae": [
+    "101",
+    0
+   ],
+   "pixels": [
+    "15",
+    0
+   ],
+   "mask": [
+    "103",
+    0
+   ],
+   "grow_mask_by": 6
+  }
+ },
+ "105": {
+  "class_type": "SetLatentNoiseMask",
+  "inputs": {
+   "samples": [
+    "5",
+    0
+   ],
+   "mask": [
+    "103",
+    0
+   ]
+  }
+ },
+ "6": {
+  "class_type": "SwarmTextEncodeAdvanced",
+  "inputs": {
+   "clip": [
+    "100",
+    0
+   ],
+   "lora_hooks": null,
+   "steps": 6,
+   "prompt": "a cat",
+   "width": 1024,
+   "height": 1024,
+   "target_width": 1024,
+   "target_height": 1024,
+   "guidance": -1.0,
+   "images": null,
+   "llama_template": "krea2"
+  }
+ },
+ "7": {
+  "class_type": "SwarmTextEncodeAdvanced",
+  "inputs": {
+   "clip": [
+    "100",
+    0
+   ],
+   "lora_hooks": null,
+   "steps": 6,
+   "prompt": "",
+   "width": 1024,
+   "height": 1024,
+   "target_width": 1024,
+   "target_height": 1024,
+   "guidance": -1.0,
+   "images": null,
+   "llama_template": "krea2"
+  }
+ },
+ "106": {
+  "class_type": "SwarmAttnTokenWeights",
+  "inputs": {
+   "model": [
+    "104",
+    0
+   ],
+   "conditioning": [
+    "6",
+    0
+   ]
+  }
+ },
+ "10": {
+  "class_type": "SwarmKSampler",
+  "inputs": {
+   "model": [
+    "106",
+    0
+   ],
+   "noise_seed": 2,
+   "steps": 6,
+   "cfg": 4.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "6",
+    0
+   ],
+   "negative": [
+    "7",
+    0
+   ],
+   "latent_image": [
+    "105",
+    0
+   ],
+   "start_at_step": 2,
+   "end_at_step": 10000,
+   "return_with_leftover_noise": "disable",
+   "add_noise": "enable",
+   "control_after_generate": "fixed",
+   "var_seed": 0,
+   "var_seed_strength": 0.0,
+   "sigma_min": -1.0,
+   "sigma_max": -1.0,
+   "rho": 7.0,
+   "previews": "default",
+   "tile_sample": false,
+   "tile_size": 1024,
+   "model_negative": null
+  }
+ },
+ "8": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "vae": [
+    "101",
+    0
+   ],
+   "samples": [
+    "10",
+    0
+   ]
+  }
+ },
+ "9": {
+  "class_type": "SwarmSaveImageWS",
+  "inputs": {
+   "images": [
+    "8",
+    0
+   ],
+   "bit_depth": "8bit"
+  }
+ }
+}

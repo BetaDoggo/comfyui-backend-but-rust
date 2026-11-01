@@ -1,0 +1,458 @@
+{
+ "4": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "krea2/krea2_fp8_scaled.safetensors",
+   "weight_dtype": "fp8_e4m3fn"
+  }
+ },
+ "100": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_4b.safetensors",
+   "type": "krea2",
+   "device": "default"
+  }
+ },
+ "101": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "qwen_image_vae.safetensors"
+  }
+ },
+ "5": {
+  "class_type": "EmptySD3LatentImage",
+  "inputs": {
+   "batch_size": 1,
+   "height": 1024,
+   "width": 1024
+  }
+ },
+ "6": {
+  "class_type": "SwarmTextEncodeAdvanced",
+  "inputs": {
+   "clip": [
+    "100",
+    0
+   ],
+   "lora_hooks": null,
+   "steps": 6,
+   "prompt": "a cat",
+   "width": 1024,
+   "height": 1024,
+   "target_width": 1024,
+   "target_height": 1024,
+   "guidance": -1.0,
+   "images": null,
+   "llama_template": "krea2"
+  }
+ },
+ "7": {
+  "class_type": "SwarmTextEncodeAdvanced",
+  "inputs": {
+   "clip": [
+    "100",
+    0
+   ],
+   "lora_hooks": null,
+   "steps": 6,
+   "prompt": "",
+   "width": 1024,
+   "height": 1024,
+   "target_width": 1024,
+   "target_height": 1024,
+   "guidance": -1.0,
+   "images": null,
+   "llama_template": "krea2"
+  }
+ },
+ "102": {
+  "class_type": "SwarmAttnTokenWeights",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "conditioning": [
+    "6",
+    0
+   ]
+  }
+ },
+ "10": {
+  "class_type": "SwarmKSampler",
+  "inputs": {
+   "model": [
+    "102",
+    0
+   ],
+   "noise_seed": 2,
+   "steps": 6,
+   "cfg": 4.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "6",
+    0
+   ],
+   "negative": [
+    "7",
+    0
+   ],
+   "latent_image": [
+    "5",
+    0
+   ],
+   "start_at_step": 0,
+   "end_at_step": 10000,
+   "return_with_leftover_noise": "disable",
+   "add_noise": "enable",
+   "control_after_generate": "fixed",
+   "var_seed": 0,
+   "var_seed_strength": 0.0,
+   "sigma_min": -1.0,
+   "sigma_max": -1.0,
+   "rho": 7.0,
+   "previews": "default",
+   "tile_sample": false,
+   "tile_size": 1024,
+   "model_negative": null
+  }
+ },
+ "8": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "vae": [
+    "101",
+    0
+   ],
+   "samples": [
+    "10",
+    0
+   ]
+  }
+ },
+ "103": {
+  "class_type": "SwarmClipSeg",
+  "inputs": {
+   "images": [
+    "8",
+    0
+   ],
+   "match_text": "face",
+   "threshold": 0.5
+  }
+ },
+ "104": {
+  "class_type": "SwarmMaskBlur",
+  "inputs": {
+   "mask": [
+    "103",
+    0
+   ],
+   "blur_radius": 4,
+   "sigma": 1
+  }
+ },
+ "105": {
+  "class_type": "GrowMask",
+  "inputs": {
+   "mask": [
+    "104",
+    0
+   ],
+   "expand": 8,
+   "tapered_corners": true
+  }
+ },
+ "106": {
+  "class_type": "MaskToImage",
+  "inputs": {
+   "mask": [
+    "105",
+    0
+   ]
+  }
+ },
+ "51000": {
+  "class_type": "SwarmSaveImageWS",
+  "inputs": {
+   "images": [
+    "106",
+    0
+   ],
+   "bit_depth": "8bit"
+  }
+ },
+ "107": {
+  "class_type": "SwarmMaskThreshold",
+  "inputs": {
+   "mask": [
+    "105",
+    0
+   ],
+   "min": 0.01,
+   "max": 1.0
+  }
+ },
+ "108": {
+  "class_type": "SwarmMaskBounds",
+  "inputs": {
+   "mask": [
+    "107",
+    0
+   ],
+   "grow": 16,
+   "aspect_x": 0,
+   "aspect_y": 0
+  }
+ },
+ "109": {
+  "class_type": "SwarmImageCrop",
+  "inputs": {
+   "image": [
+    "8",
+    0
+   ],
+   "x": [
+    "108",
+    0
+   ],
+   "y": [
+    "108",
+    1
+   ],
+   "width": [
+    "108",
+    2
+   ],
+   "height": [
+    "108",
+    3
+   ]
+  }
+ },
+ "110": {
+  "class_type": "CropMask",
+  "inputs": {
+   "mask": [
+    "107",
+    0
+   ],
+   "x": [
+    "108",
+    0
+   ],
+   "y": [
+    "108",
+    1
+   ],
+   "width": [
+    "108",
+    2
+   ],
+   "height": [
+    "108",
+    3
+   ]
+  }
+ },
+ "111": {
+  "class_type": "SwarmImageScaleForMP",
+  "inputs": {
+   "image": [
+    "109",
+    0
+   ],
+   "width": 1024,
+   "height": 1024,
+   "can_shrink": true
+  }
+ },
+ "112": {
+  "class_type": "VAEEncode",
+  "inputs": {
+   "vae": [
+    "101",
+    0
+   ],
+   "pixels": [
+    "111",
+    0
+   ]
+  }
+ },
+ "113": {
+  "class_type": "SetLatentNoiseMask",
+  "inputs": {
+   "samples": [
+    "112",
+    0
+   ],
+   "mask": [
+    "110",
+    0
+   ]
+  }
+ },
+ "114": {
+  "class_type": "DifferentialDiffusion",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ]
+  }
+ },
+ "115": {
+  "class_type": "SwarmTextEncodeAdvanced",
+  "inputs": {
+   "clip": [
+    "100",
+    0
+   ],
+   "lora_hooks": null,
+   "steps": 6,
+   "prompt": "a happy face",
+   "width": 1024,
+   "height": 1024,
+   "target_width": 1024,
+   "target_height": 1024,
+   "guidance": -1.0,
+   "images": null,
+   "llama_template": "krea2"
+  }
+ },
+ "116": {
+  "class_type": "SwarmAttnTokenWeights",
+  "inputs": {
+   "model": [
+    "114",
+    0
+   ],
+   "conditioning": [
+    "115",
+    0
+   ]
+  }
+ },
+ "117": {
+  "class_type": "SwarmKSampler",
+  "inputs": {
+   "model": [
+    "116",
+    0
+   ],
+   "noise_seed": 4,
+   "steps": 6,
+   "cfg": 4.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "115",
+    0
+   ],
+   "negative": [
+    "7",
+    0
+   ],
+   "latent_image": [
+    "113",
+    0
+   ],
+   "start_at_step": 2,
+   "end_at_step": 10000,
+   "return_with_leftover_noise": "disable",
+   "add_noise": "enable",
+   "control_after_generate": "fixed",
+   "var_seed": 0,
+   "var_seed_strength": 0.0,
+   "sigma_min": -1.0,
+   "sigma_max": -1.0,
+   "rho": 7.0,
+   "previews": "default",
+   "tile_sample": false,
+   "tile_size": 1024,
+   "model_negative": null
+  }
+ },
+ "118": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "vae": [
+    "101",
+    0
+   ],
+   "samples": [
+    "117",
+    0
+   ]
+  }
+ },
+ "119": {
+  "class_type": "ImageScale",
+  "inputs": {
+   "image": [
+    "118",
+    0
+   ],
+   "width": [
+    "108",
+    2
+   ],
+   "height": [
+    "108",
+    3
+   ],
+   "upscale_method": "lanczos",
+   "crop": "disabled"
+  }
+ },
+ "120": {
+  "class_type": "ThresholdMask",
+  "inputs": {
+   "mask": [
+    "110",
+    0
+   ],
+   "value": 0.001
+  }
+ },
+ "121": {
+  "class_type": "SwarmImageCompositeMaskedColorCorrecting",
+  "inputs": {
+   "destination": [
+    "8",
+    0
+   ],
+   "source": [
+    "119",
+    0
+   ],
+   "mask": [
+    "120",
+    0
+   ],
+   "x": [
+    "108",
+    0
+   ],
+   "y": [
+    "108",
+    1
+   ],
+   "resize_source": false,
+   "correction_method": "None"
+  }
+ },
+ "9": {
+  "class_type": "SwarmSaveImageWS",
+  "inputs": {
+   "images": [
+    "121",
+    0
+   ],
+   "bit_depth": "8bit"
+  }
+ }
+}

@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine-api", "crates/comfy-server", "crates/krea2-engine"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+swarm-engine-api = { path = "crates/engine-api" }
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# GIF/PNG encoding is very slow unoptimized; the video tests encode dozens of frames.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.gif]
+opt-level = 3
+[profile.dev.package.color_quant]
+opt-level = 3
+[profile.dev.package.weezl]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3

@@ -1,0 +1,264 @@
+{
+ "4": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "krea2/krea2_fp8_scaled.safetensors",
+   "weight_dtype": "fp8_e4m3fn"
+  }
+ },
+ "100": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_4b.safetensors",
+   "type": "krea2",
+   "device": "default"
+  }
+ },
+ "101": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "qwen_image_vae.safetensors"
+  }
+ },
+ "5": {
+  "class_type": "EmptySD3LatentImage",
+  "inputs": {
+   "batch_size": 1,
+   "height": 1024,
+   "width": 1024
+  }
+ },
+ "102": {
+  "class_type": "SwarmLoadImageB64",
+  "inputs": {
+   "image_base64": "$IMAGE_B64"
+  }
+ },
+ "103": {
+  "class_type": "ImageScale",
+  "inputs": {
+   "image": [
+    "102",
+    0
+   ],
+   "width": 384,
+   "height": 384,
+   "crop": "disabled",
+   "upscale_method": "lanczos"
+  }
+ },
+ "6": {
+  "class_type": "SwarmTextEncodeAdvanced",
+  "inputs": {
+   "clip": [
+    "100",
+    0
+   ],
+   "lora_hooks": null,
+   "steps": 6,
+   "prompt": "a cat",
+   "width": 1024,
+   "height": 1024,
+   "target_width": 1024,
+   "target_height": 1024,
+   "guidance": -1.0,
+   "images": [
+    "103",
+    0
+   ],
+   "llama_template": "krea2"
+  }
+ },
+ "104": {
+  "class_type": "CLIPVisionLoader",
+  "inputs": {
+   "clip_name": "sigclip_vision_patch14_384.safetensors"
+  }
+ },
+ "105": {
+  "class_type": "StyleModelLoader",
+  "inputs": {
+   "style_model_name": "redux_test.safetensors"
+  }
+ },
+ "106": {
+  "class_type": "CLIPVisionEncode",
+  "inputs": {
+   "clip_vision": [
+    "104",
+    0
+   ],
+   "image": [
+    "102",
+    0
+   ],
+   "crop": "none"
+  }
+ },
+ "107": {
+  "class_type": "StyleModelApply",
+  "inputs": {
+   "conditioning": [
+    "6",
+    0
+   ],
+   "clip_vision_output": [
+    "106",
+    0
+   ],
+   "style_model": [
+    "105",
+    0
+   ],
+   "strength_type": "multiply",
+   "strength": 0.8
+  }
+ },
+ "108": {
+  "class_type": "ConditioningAverage",
+  "inputs": {
+   "conditioning_to": [
+    "107",
+    0
+   ],
+   "conditioning_from": [
+    "6",
+    0
+   ],
+   "conditioning_to_strength": 0.7
+  }
+ },
+ "109": {
+  "class_type": "ConditioningSetTimestepRange",
+  "inputs": {
+   "conditioning": [
+    "6",
+    0
+   ],
+   "start": 0,
+   "end": 0.2
+  }
+ },
+ "110": {
+  "class_type": "ConditioningSetTimestepRange",
+  "inputs": {
+   "conditioning": [
+    "108",
+    0
+   ],
+   "start": 0.2,
+   "end": 1
+  }
+ },
+ "111": {
+  "class_type": "ConditioningCombine",
+  "inputs": {
+   "conditioning_1": [
+    "109",
+    0
+   ],
+   "conditioning_2": [
+    "110",
+    0
+   ]
+  }
+ },
+ "7": {
+  "class_type": "SwarmTextEncodeAdvanced",
+  "inputs": {
+   "clip": [
+    "100",
+    0
+   ],
+   "lora_hooks": null,
+   "steps": 6,
+   "prompt": "",
+   "width": 1024,
+   "height": 1024,
+   "target_width": 1024,
+   "target_height": 1024,
+   "guidance": -1.0,
+   "images": [
+    "103",
+    0
+   ],
+   "llama_template": "krea2"
+  }
+ },
+ "112": {
+  "class_type": "SwarmAttnTokenWeights",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "conditioning": [
+    "111",
+    0
+   ]
+  }
+ },
+ "10": {
+  "class_type": "SwarmKSampler",
+  "inputs": {
+   "model": [
+    "112",
+    0
+   ],
+   "noise_seed": 2,
+   "steps": 6,
+   "cfg": 4.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "111",
+    0
+   ],
+   "negative": [
+    "7",
+    0
+   ],
+   "latent_image": [
+    "5",
+    0
+   ],
+   "start_at_step": 0,
+   "end_at_step": 10000,
+   "return_with_leftover_noise": "disable",
+   "add_noise": "enable",
+   "control_after_generate": "fixed",
+   "var_seed": 0,
+   "var_seed_strength": 0.0,
+   "sigma_min": -1.0,
+   "sigma_max": -1.0,
+   "rho": 7.0,
+   "previews": "default",
+   "tile_sample": false,
+   "tile_size": 1024,
+   "model_negative": null
+  }
+ },
+ "8": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "vae": [
+    "101",
+    0
+   ],
+   "samples": [
+    "10",
+    0
+   ]
+  }
+ },
+ "9": {
+  "class_type": "SwarmSaveImageWS",
+  "inputs": {
+   "images": [
+    "8",
+    0
+   ],
+   "bit_depth": "8bit"
+  }
+ }
+}

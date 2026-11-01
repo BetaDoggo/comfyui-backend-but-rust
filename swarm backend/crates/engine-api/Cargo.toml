@@ -1,0 +1,11 @@
+[package]
+name = "swarm-engine-api"
+description = "Contract between the ComfyUI-compatible front server and a native Rust generation engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+anyhow.workspace = true
+serde.workspace = true

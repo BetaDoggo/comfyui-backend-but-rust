@@ -1,0 +1,13 @@
+{
+  "4": {"class_type": "UNETLoader", "inputs": {"unet_name": "moss_image_sft_int8.safetensors", "weight_dtype": "fp8_e4m3fn"}},
+  "100": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3.5_9b_int8_convrot.safetensors", "type": "moss_image", "device": "default"}},
+  "101": {"class_type": "VAELoader", "inputs": {"vae_name": "Flux/flux2-vae.safetensors"}},
+  "5": {"class_type": "EmptyFlux2LatentImage", "inputs": {"batch_size": 1, "height": 1024, "width": 1024}},
+  "102": {"class_type": "SwarmLoadImageB64", "inputs": {"image_base64": "$IMAGE_B64"}},
+  "103": {"class_type": "ImageScale", "inputs": {"image": ["102", 0], "width": 443, "height": 333, "crop": "disabled", "upscale_method": "lanczos"}},
+  "6": {"class_type": "SwarmTextEncodeAdvanced", "inputs": {"clip": ["100", 0], "lora_hooks": null, "steps": 12, "prompt": "a lighthouse in the style of the reference", "width": 1024, "height": 1024, "target_width": 1024, "target_height": 1024, "guidance": -1.0, "images": ["103", 0], "llama_template": "krea2"}},
+  "7": {"class_type": "SwarmTextEncodeAdvanced", "inputs": {"clip": ["100", 0], "lora_hooks": null, "steps": 12, "prompt": "", "width": 1024, "height": 1024, "target_width": 1024, "target_height": 1024, "guidance": -1.0, "images": ["103", 0], "llama_template": "krea2"}},
+  "10": {"class_type": "SwarmKSampler", "inputs": {"model": ["4", 0], "noise_seed": 11, "steps": 12, "cfg": 7.0, "sampler_name": "euler", "scheduler": "simple", "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0], "start_at_step": 0, "end_at_step": 10000, "return_with_leftover_noise": "disable", "add_noise": "enable", "control_after_generate": "fixed", "var_seed": 0, "var_seed_strength": 0.0, "sigma_min": -1.0, "sigma_max": -1.0, "rho": 7.0, "previews": "default", "tile_sample": false, "tile_size": 1024, "model_negative": null}},
+  "8": {"class_type": "VAEDecode", "inputs": {"vae": ["101", 0], "samples": ["10", 0]}},
+  "9": {"class_type": "SwarmSaveImageWS", "inputs": {"images": ["8", 0], "bit_depth": "8bit"}}
+}

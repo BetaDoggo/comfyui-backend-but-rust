@@ -1,0 +1,243 @@
+{
+  "4": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "krea2/krea2_fp8_scaled.safetensors",
+      "weight_dtype": "fp8_e4m3fn"
+    }
+  },
+  "100": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_4b.safetensors",
+      "type": "krea2",
+      "device": "default"
+    }
+  },
+  "101": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    }
+  },
+  "5": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "batch_size": 1,
+      "height": 256,
+      "width": 256
+    }
+  },
+  "6": {
+    "class_type": "SwarmTextEncodeAdvanced",
+    "inputs": {
+      "clip": [
+        "100",
+        0
+      ],
+      "lora_hooks": null,
+      "steps": 6,
+      "prompt": "a cat",
+      "width": 256,
+      "height": 256,
+      "target_width": 256,
+      "target_height": 256,
+      "guidance": -1.0,
+      "images": null,
+      "llama_template": "krea2"
+    }
+  },
+  "7": {
+    "class_type": "SwarmTextEncodeAdvanced",
+    "inputs": {
+      "clip": [
+        "100",
+        0
+      ],
+      "lora_hooks": null,
+      "steps": 6,
+      "prompt": "",
+      "width": 256,
+      "height": 256,
+      "target_width": 256,
+      "target_height": 256,
+      "guidance": -1.0,
+      "images": null,
+      "llama_template": "krea2"
+    }
+  },
+  "102": {
+    "class_type": "SwarmAttnTokenWeights",
+    "inputs": {
+      "model": [
+        "4",
+        0
+      ],
+      "conditioning": [
+        "6",
+        0
+      ]
+    }
+  },
+  "10": {
+    "class_type": "SwarmKSampler",
+    "inputs": {
+      "model": [
+        "102",
+        0
+      ],
+      "noise_seed": 2,
+      "steps": 6,
+      "cfg": 4.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "positive": [
+        "6",
+        0
+      ],
+      "negative": [
+        "7",
+        0
+      ],
+      "latent_image": [
+        "5",
+        0
+      ],
+      "start_at_step": 0,
+      "end_at_step": 10000,
+      "return_with_leftover_noise": "disable",
+      "add_noise": "enable",
+      "control_after_generate": "fixed",
+      "var_seed": 0,
+      "var_seed_strength": 0.0,
+      "sigma_min": -1.0,
+      "sigma_max": -1.0,
+      "rho": 7.0,
+      "previews": "default",
+      "tile_sample": false,
+      "tile_size": 1024,
+      "model_negative": null
+    }
+  },
+  "24": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "vae": [
+        "101",
+        0
+      ],
+      "samples": [
+        "10",
+        0
+      ]
+    }
+  },
+  "27": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": {
+      "model_name": "4x_test.safetensors"
+    }
+  },
+  "28": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": {
+      "upscale_model": [
+        "27",
+        0
+      ],
+      "image": [
+        "24",
+        0
+      ]
+    }
+  },
+  "26": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": [
+        "28",
+        0
+      ],
+      "width": 512,
+      "height": 512,
+      "upscale_method": "lanczos",
+      "crop": "disabled"
+    }
+  },
+  "25": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "vae": [
+        "101",
+        0
+      ],
+      "pixels": [
+        "26",
+        0
+      ]
+    }
+  },
+  "23": {
+    "class_type": "SwarmKSampler",
+    "inputs": {
+      "model": [
+        "102",
+        0
+      ],
+      "noise_seed": 3,
+      "steps": 6,
+      "cfg": 4.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "positive": [
+        "6",
+        0
+      ],
+      "negative": [
+        "7",
+        0
+      ],
+      "latent_image": [
+        "25",
+        0
+      ],
+      "start_at_step": 4,
+      "end_at_step": 10000,
+      "return_with_leftover_noise": "disable",
+      "add_noise": "enable",
+      "control_after_generate": "fixed",
+      "var_seed": 0,
+      "var_seed_strength": 0.0,
+      "sigma_min": -1.0,
+      "sigma_max": -1.0,
+      "rho": 7.0,
+      "previews": "default",
+      "tile_sample": true,
+      "tile_size": 1024,
+      "model_negative": null
+    }
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "vae": [
+        "101",
+        0
+      ],
+      "samples": [
+        "23",
+        0
+      ]
+    }
+  },
+  "9": {
+    "class_type": "SwarmSaveImageWS",
+    "inputs": {
+      "images": [
+        "8",
+        0
+      ],
+      "bit_depth": "8bit"
+    }
+  }
+}

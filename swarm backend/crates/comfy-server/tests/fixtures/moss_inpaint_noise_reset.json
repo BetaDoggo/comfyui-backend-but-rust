@@ -1,0 +1,255 @@
+{
+ "4": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "moss_image_sft_int8.safetensors",
+   "weight_dtype": "fp8_e4m3fn"
+  }
+ },
+ "100": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3.5_9b_int8_convrot.safetensors",
+   "type": "moss_image",
+   "device": "default"
+  }
+ },
+ "101": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "Flux/flux2-vae.safetensors"
+  }
+ },
+ "102": {
+  "class_type": "SwarmLoadImageB64",
+  "inputs": {
+   "image_base64": "$IMAGE_B64"
+  }
+ },
+ "103": {
+  "class_type": "ImageToMask",
+  "inputs": {
+   "image": [
+    "102",
+    0
+   ],
+   "channel": "red"
+  }
+ },
+ "15": {
+  "class_type": "SwarmLoadImageB64",
+  "inputs": {
+   "image_base64": "$IMAGE_B64"
+  }
+ },
+ "104": {
+  "class_type": "SwarmMaskThreshold",
+  "inputs": {
+   "mask": [
+    "103",
+    0
+   ],
+   "min": 0.5,
+   "max": 1.0
+  }
+ },
+ "105": {
+  "class_type": "SwarmImageNoise",
+  "inputs": {
+   "image": [
+    "15",
+    0
+   ],
+   "amount": 0.3,
+   "seed": 329,
+   "mask": [
+    "104",
+    0
+   ]
+  }
+ },
+ "5": {
+  "class_type": "VAEEncode",
+  "inputs": {
+   "vae": [
+    "101",
+    0
+   ],
+   "pixels": [
+    "105",
+    0
+   ]
+  }
+ },
+ "106": {
+  "class_type": "SetLatentNoiseMask",
+  "inputs": {
+   "samples": [
+    "5",
+    0
+   ],
+   "mask": [
+    "103",
+    0
+   ]
+  }
+ },
+ "107": {
+  "class_type": "EmptyFlux2LatentImage",
+  "inputs": {
+   "batch_size": 1,
+   "height": 1024,
+   "width": 1024
+  }
+ },
+ "108": {
+  "class_type": "SwarmLatentBlendMasked",
+  "inputs": {
+   "samples0": [
+    "106",
+    0
+   ],
+   "samples1": [
+    "107",
+    0
+   ],
+   "mask": [
+    "103",
+    0
+   ],
+   "blend_factor": 0.4
+  }
+ },
+ "6": {
+  "class_type": "SwarmTextEncodeAdvanced",
+  "inputs": {
+   "clip": [
+    "100",
+    0
+   ],
+   "lora_hooks": null,
+   "steps": 6,
+   "prompt": "a cat",
+   "width": 1024,
+   "height": 1024,
+   "target_width": 1024,
+   "target_height": 1024,
+   "guidance": -1.0,
+   "images": null,
+   "llama_template": "krea2"
+  }
+ },
+ "7": {
+  "class_type": "SwarmTextEncodeAdvanced",
+  "inputs": {
+   "clip": [
+    "100",
+    0
+   ],
+   "lora_hooks": null,
+   "steps": 6,
+   "prompt": "",
+   "width": 1024,
+   "height": 1024,
+   "target_width": 1024,
+   "target_height": 1024,
+   "guidance": -1.0,
+   "images": null,
+   "llama_template": "krea2"
+  }
+ },
+ "10": {
+  "class_type": "SwarmKSampler",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "noise_seed": 2,
+   "steps": 6,
+   "cfg": 4.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "6",
+    0
+   ],
+   "negative": [
+    "7",
+    0
+   ],
+   "latent_image": [
+    "108",
+    0
+   ],
+   "start_at_step": 2,
+   "end_at_step": 10000,
+   "return_with_leftover_noise": "disable",
+   "add_noise": "enable",
+   "control_after_generate": "fixed",
+   "var_seed": 0,
+   "var_seed_strength": 0.0,
+   "sigma_min": -1.0,
+   "sigma_max": -1.0,
+   "rho": 7.0,
+   "previews": "default",
+   "tile_sample": false,
+   "tile_size": 1024,
+   "model_negative": null
+  }
+ },
+ "8": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "vae": [
+    "101",
+    0
+   ],
+   "samples": [
+    "10",
+    0
+   ]
+  }
+ },
+ "109": {
+  "class_type": "ThresholdMask",
+  "inputs": {
+   "mask": [
+    "103",
+    0
+   ],
+   "value": 0.001
+  }
+ },
+ "110": {
+  "class_type": "SwarmImageCompositeMaskedColorCorrecting",
+  "inputs": {
+   "destination": [
+    "105",
+    0
+   ],
+   "source": [
+    "8",
+    0
+   ],
+   "mask": [
+    "109",
+    0
+   ],
+   "x": 0,
+   "y": 0,
+   "resize_source": false,
+   "correction_method": "None"
+  }
+ },
+ "9": {
+  "class_type": "SwarmSaveImageWS",
+  "inputs": {
+   "images": [
+    "110",
+    0
+   ],
+   "bit_depth": "8bit"
+  }
+ }
+}

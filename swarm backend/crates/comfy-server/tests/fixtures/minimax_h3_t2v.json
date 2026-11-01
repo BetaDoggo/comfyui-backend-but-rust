@@ -1,0 +1,15 @@
+{
+  "4": { "class_type": "UNETLoader", "inputs": { "unet_name": "minimax_h3_fp8.safetensors", "weight_dtype": "fp8_e4m3fn" } },
+  "100": { "class_type": "CLIPLoader", "inputs": { "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device": "default" } },
+  "101": { "class_type": "VAELoader", "inputs": { "vae_name": "minimax_h3_video_vae_int8.safetensors" } },
+  "102": { "class_type": "VAELoader", "inputs": { "vae_name": "minimax_h3_audio_vae.safetensors" } },
+  "103": { "class_type": "MiniMaxH3SigmaShift", "inputs": { "model": ["4", 0], "shift_video": 12.0, "shift_audio": 3 } },
+  "6": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["100", 0], "text": "a drummer playing on a rooftop at dusk, crowd cheering" } },
+  "7": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["100", 0], "text": "" } },
+  "5": { "class_type": "SwarmEmptyMiniMaxH3LatentAV", "inputs": { "length": 22, "height": 256, "width": 448 } },
+  "10": { "class_type": "SwarmKSampler", "inputs": { "model": ["103", 0], "noise_seed": 99, "steps": 8, "cfg": 5.0, "sampler_name": "res_multistep", "scheduler": "simple", "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0], "start_at_step": 0, "end_at_step": 10000, "return_with_leftover_noise": "disable", "add_noise": "enable", "var_seed": 0, "var_seed_strength": 0.0, "sigma_min": -1.0, "sigma_max": -1.0, "rho": 7.0, "previews": "animate", "tile_sample": false, "tile_size": 960, "model_negative": null } },
+  "104": { "class_type": "LTXVSeparateAVLatent", "inputs": { "av_latent": ["10", 0] } },
+  "8": { "class_type": "VAEDecodeTiled", "inputs": { "vae": ["101", 0], "samples": ["104", 0], "tile_size": 256, "overlap": 64, "temporal_size": 9999, "temporal_overlap": 8 } },
+  "105": { "class_type": "VAEDecodeAudio", "inputs": { "vae": ["102", 0], "samples": ["104", 1] } },
+  "9": { "class_type": "SwarmSaveAnimationWS", "inputs": { "images": ["8", 0], "fps": 24, "lossless": false, "quality": 95, "method": "default", "format": "h264-mp4", "audio": ["105", 0] } }
+}

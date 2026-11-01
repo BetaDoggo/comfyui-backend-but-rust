@@ -1,0 +1,6 @@
+{
+  "4": { "class_type": "UNETLoader", "inputs": { "unet_name": "krea2/krea2_fp8_scaled.safetensors", "weight_dtype": "fp8_e4m3fn" } },
+  "100": { "class_type": "CLIPLoader", "inputs": { "clip_name": "qwen3vl_4b.safetensors", "type": "krea2", "device": "default" } },
+  "101": { "class_type": "VAELoader", "inputs": { "vae_name": "qwen_image_vae.safetensors" } },
+  "102": { "class_type": "SwarmJustLoadTheModelPlease", "inputs": { "model": ["4", 0], "clip": ["100", 0], "vae": ["101", 0] } }
+}

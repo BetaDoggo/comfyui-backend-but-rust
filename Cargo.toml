@@ -2,6 +2,7 @@
 name = "krea2"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-only"
 description = "Rust + CUDA reimplementation of ComfyUI's Krea 2 (int8 W8A8) text-to-image pipeline"
 
 [lib]

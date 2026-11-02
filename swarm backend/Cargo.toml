@@ -5,7 +5,7 @@ members = ["crates/engine-api", "crates/comfy-server", "crates/krea2-engine"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [workspace.dependencies]
 swarm-engine-api = { path = "crates/engine-api" }

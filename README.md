@@ -56,7 +56,7 @@ backend. Keep a real ComfyUI backend next to it, because anything else is refuse
 
 More: [technical overview](docs/TECHNICAL_OVERVIEW.md), [status](docs/STATUS.md), [SwarmUI backend](swarm%20backend/README.md).
 
-This repository has no license yet. Files under `csrc/vendor/` are Apache-2.0, see `csrc/vendor/LICENSE.comfy-kitchen`.
+Licensed under the [GNU GPL v3](LICENSE), like ComfyUI, which this code was written from. Files under `csrc/vendor/` stay Apache-2.0, see `csrc/vendor/LICENSE.comfy-kitchen`.
 
 ## What this is
 

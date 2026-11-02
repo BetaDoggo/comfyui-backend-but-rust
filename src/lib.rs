@@ -1,4 +1,4 @@
-//! krea2: Rust + CUDA reimplementation of ComfyUI's Krea 2 (W8A8 int8) text-to-image pipeline.
+//! diffusion: Rust + CUDA reimplementation of ComfyUI's image generation, for int8 ConvRot checkpoints of Krea 2, Anima and MOSS Image.
 
 pub mod anima;
 pub mod cuda;

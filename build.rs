@@ -2,9 +2,9 @@
 //!
 //! Environment overrides:
 //!   CUDA_PATH            CUDA toolkit root (default: the toolkit nvcc reports)
-//!   KREA_CUTLASS_DIR     CUTLASS checkout (default: ref/comfy-kitchen/third_party/cutlass)
-//!   KREA_FLASH_ATTN_DIR  flash-attention checkout (default: ref/comfy-kitchen/third_party/flash-attention)
-//!   KREA_CUDA_ARCH       e.g. "120" (default 120)
+//!   CUTLASS_DIR     CUTLASS checkout (default: ref/comfy-kitchen/third_party/cutlass)
+//!   FLASH_ATTN_DIR  flash-attention checkout (default: ref/comfy-kitchen/third_party/flash-attention)
+//!   CUDA_ARCH       e.g. "120" (default 120)
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -41,10 +41,10 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc");
 
     let cuda = env_path("CUDA_PATH", PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0"));
-    let cutlass = env_path("KREA_CUTLASS_DIR", root.join("ref/comfy-kitchen/third_party/cutlass"));
-    let flash = env_path("KREA_FLASH_ATTN_DIR", root.join("ref/comfy-kitchen/third_party/flash-attention"));
-    let arch = std::env::var("KREA_CUDA_ARCH").unwrap_or_else(|_| "120".into());
-    println!("cargo:rerun-if-env-changed=KREA_CUDA_ARCH");
+    let cutlass = env_path("CUTLASS_DIR", root.join("ref/comfy-kitchen/third_party/cutlass"));
+    let flash = env_path("FLASH_ATTN_DIR", root.join("ref/comfy-kitchen/third_party/flash-attention"));
+    let arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "120".into());
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH");
     let flash_src = flash.join("csrc/flash_attn/src");
     assert!(cutlass.join("include/cutlass/cutlass.h").exists(), "CUTLASS not found at {}", cutlass.display());
     assert!(flash_src.join("flash.h").exists(), "flash-attention not found at {}", flash.display());
@@ -166,7 +166,7 @@ fn main() {
     }
 
     let lib_tool = cc::windows_registry::find_tool(TARGET, "lib.exe").expect("lib.exe not found");
-    let lib = out.join("krea_cuda.lib");
+    let lib = out.join("gpu_kernels.lib");
     let mut cmd = lib_tool.to_command();
     cmd.arg("/nologo").arg(format!("/OUT:{}", lib.display()));
     for o in &objs {
@@ -176,7 +176,7 @@ fn main() {
     assert!(st.success(), "lib.exe failed");
 
     println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=krea_cuda");
+    println!("cargo:rustc-link-lib=static=gpu_kernels");
     println!("cargo:rustc-link-search=native={}", cuda.join("lib/x64").display());
     println!("cargo:rustc-link-lib=static=cudart_static");
     println!("cargo:rustc-link-lib=dylib=cublasLt");

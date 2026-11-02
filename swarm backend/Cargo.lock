@@ -332,7 +332,7 @@ dependencies = [
  "clap",
  "futures-util",
  "image",
- "krea2-engine",
+ "native-engine",
  "reqwest",
  "serde",
  "serde_json",
@@ -504,6 +504,23 @@ checksum = "ab63b0e2bf4d5928aff72e83a7dace85d7bba5fe12dcc3c5a572d78caffd3f3c"
 dependencies = [
  "derive_builder_core",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "diffusion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "clap",
+ "fancy-regex",
+ "half",
+ "memmap2",
+ "png 0.17.16",
+ "serde_json",
+ "tiny_http",
+ "tokenizers",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -1021,34 +1038,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "krea2"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cc",
- "clap",
- "fancy-regex",
- "half",
- "memmap2",
- "png 0.17.16",
- "serde_json",
- "tiny_http",
- "tokenizers",
- "unicode-normalization",
-]
-
-[[package]]
-name = "krea2-engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "krea2",
- "serde_json",
- "swarm-engine-api",
- "tracing",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1234,6 +1223,17 @@ name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+
+[[package]]
+name = "native-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "diffusion",
+ "serde_json",
+ "swarm-engine-api",
+ "tracing",
+]
 
 [[package]]
 name = "nom"

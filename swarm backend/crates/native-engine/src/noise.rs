@@ -1,7 +1,7 @@
 //! `SwarmKSampler`'s initial noise (`swarm_fixed_noise`), which differs from plain ComfyUI: every
 //! batch image gets its own freshly seeded generator, and Variation Seed slerps per image.
 
-use krea2::sampling::torch_randn;
+use diffusion::sampling::torch_randn;
 use swarm_engine_api::VariationSeed;
 
 /// Noise of batch image `index`, `[channels, h, w]`.

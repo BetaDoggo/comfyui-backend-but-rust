@@ -1,4 +1,4 @@
-//! [`Engine`] implementation on the krea2 library: text-to-image for int8 ConvRot checkpoints of
+//! [`Engine`] implementation on the diffusion library: text-to-image for int8 ConvRot checkpoints of
 //! Krea 2, Anima and MOSS Image, with every ComfyUI sampler and scheduler, any CFG and LoRAs, plus
 //! Krea 2's prompt images and reference latents. Each file's architecture is read from its keys, so
 //! one backend serves all three.
@@ -13,11 +13,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use krea2::pipeline::{AnimaRequest, Cancelled, Generator, LoadOptions, MossRequest, Reference, Request, Sampling};
-use krea2::samplers::{self, ModelSampling, SigmaRange};
-use krea2::lora::{self, Lora};
-use krea2::tokenizer::token_weights;
-use krea2::vision::PromptImage;
+use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, LoadOptions, MossRequest, Reference, Request, Sampling};
+use diffusion::samplers::{self, ModelSampling, SigmaRange};
+use diffusion::lora::{self, Lora};
+use diffusion::tokenizer::token_weights;
+use diffusion::vision::PromptImage;
 use swarm_engine_api::prompt::PromptLeafKind;
 use swarm_engine_api::*;
 
@@ -42,11 +42,11 @@ enum Family {
 impl Family {
     /// (latent channels, pixels per latent)
     fn latent(self) -> (usize, usize) {
-        if self == Family::Moss { (krea2::moss::CH, 16) } else { (16, 8) }
+        if self == Family::Moss { (diffusion::moss::CH, 16) } else { (16, 8) }
     }
 }
 
-pub struct Krea2Options {
+pub struct NativeOptions {
     /// VRAM (MB) to leave untouched for the desktop and other applications.
     pub reserve_vram_mb: usize,
     /// Largest side (pixels, at 1:1) of a generation.
@@ -54,13 +54,13 @@ pub struct Krea2Options {
     pub threads: usize,
 }
 
-impl Default for Krea2Options {
+impl Default for NativeOptions {
     fn default() -> Self {
         Self { reserve_vram_mb: 512, max_side: 2048, threads: 6 }
     }
 }
 
-pub struct Krea2Engine {
+pub struct NativeEngine {
     gen: Mutex<Generator>,
 }
 
@@ -108,13 +108,13 @@ fn read_header(path: &Path) -> anyhow::Result<serde_json::Value> {
 /// The file's architecture. Refuses other models and formats before any weights are touched.
 fn check_dit(file: &ModelFile) -> EngineResult<Family> {
     let h = read_header(&file.path).map_err(|e| unsupported(format!("{}: not a readable safetensors file ({e})", file.name)))?;
-    if let Some(p) = krea2::anima::key_prefix(|k| h.get(k).is_some()) {
+    if let Some(p) = diffusion::anima::key_prefix(|k| h.get(k).is_some()) {
         if h.get(format!("{p}blocks.0.mlp.layer1.weight_scale")).is_none() {
             return Err(unsupported(format!("{}: this backend only runs int8 ConvRot Anima checkpoints", file.name)));
         }
         return Ok(Family::Anima);
     }
-    if krea2::moss::is_moss(|k| h.get(k).is_some()) {
+    if diffusion::moss::is_moss(|k| h.get(k).is_some()) {
         if h.get("layers.0.proj.qkv.weight_scale").is_none() {
             return Err(unsupported(format!("{}: this backend only runs int8 ConvRot MOSS Image checkpoints with fused q/k/v", file.name)));
         }
@@ -347,8 +347,8 @@ fn sampling(req: &SampleRequest, settings: &ModelSettings, (batch, lh, lw): (usi
     })
 }
 
-impl Krea2Engine {
-    pub fn new(o: &Krea2Options) -> anyhow::Result<Self> {
+impl NativeEngine {
+    pub fn new(o: &NativeOptions) -> anyhow::Result<Self> {
         let load = LoadOptions {
             dit: PathBuf::new(),
             te: PathBuf::new(),
@@ -428,7 +428,7 @@ impl Krea2Engine {
         gen.ensure_qwen35(&cond.text_encoder).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
-        let mut data = Vec::with_capacity(batch * krea2::moss::CH * lh * lw);
+        let mut data = Vec::with_capacity(batch * diffusion::moss::CH * lh * lw);
         for i in 0..batch {
             let r = MossRequest {
                 positive: positive[0].0.clone(),
@@ -437,7 +437,7 @@ impl Krea2Engine {
                 width: lw * 16,
                 height: lh * 16,
                 sampling: sampling(req, settings, shape, i)?,
-                noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, krea2::moss::CH, lh, lw),
+                noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, diffusion::moss::CH, lh, lw),
             };
             let (latent, stats) = gen
                 .sample_moss(&r, |step, steps| {
@@ -457,12 +457,12 @@ fn is_flux2_vae(file: &ModelFile) -> bool {
     read_header(&file.path).is_ok_and(|h| h.get("bn.running_mean").is_some())
 }
 
-impl Engine for Krea2Engine {
+impl Engine for NativeEngine {
     fn info(&self) -> EngineInfo {
         // Runs on server threads, possibly mid-generation: no generator lock here.
-        let (vram_free, vram_total) = krea2::cuda::mem_info().unwrap_or((0, 0));
+        let (vram_free, vram_total) = diffusion::cuda::mem_info().unwrap_or((0, 0));
         EngineInfo {
-            name: "krea2".into(),
+            name: "native".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             devices: vec![DeviceInfo { name: "cuda:0".into(), kind: "cuda".into(), index: 0, vram_total: vram_total as u64, vram_free: vram_free as u64 }],
             ram_total: 0,
@@ -524,7 +524,7 @@ impl Engine for Krea2Engine {
         };
         // SwarmUI sends the Krea 2 template for MOSS Image as well.
         let template = match &req.mode {
-            TextEncodeMode::Swarm(s) if s.llama_template.as_deref() == Some("krea2") => Some(krea2::te::TEMPLATE.to_string()),
+            TextEncodeMode::Swarm(s) if s.llama_template.as_deref() == Some("krea2") => Some(diffusion::te::TEMPLATE.to_string()),
             _ => None,
         };
         let images = match &req.mode {
@@ -539,7 +539,7 @@ impl Engine for Krea2Engine {
         if let EmptyLatentKind::Flux2 { width, height } = req.kind {
             let (b, h, w) = (req.batch_size as usize, height as usize / 16, width as usize / 16);
             return Ok(Latent::single(
-                LatentTensor { format: LatentFormat::Flux2, shape: vec![b, krea2::moss::CH, h, w], data: Opaque::none() },
+                LatentTensor { format: LatentFormat::Flux2, shape: vec![b, diffusion::moss::CH, h, w], data: Opaque::none() },
                 PixelInfo::image(width, height, req.batch_size),
             ));
         }
@@ -613,7 +613,7 @@ impl Engine for Krea2Engine {
                     !progress.interrupted()
                 })
                 .map_err(internal)?;
-            tracing::info!("krea2: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
+            tracing::info!("native: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
             data.extend_from_slice(&latent);
         }
         finish(data)
@@ -635,7 +635,7 @@ impl Engine for Krea2Engine {
         let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("decoding a latent this engine didn't sample"))?;
         let file = req.vae.source.as_ref().ok_or_else(|| unsupported("the pixel-space VAE"))?;
         let flux2 = is_flux2_vae(file);
-        if flux2 != (channels == krea2::moss::CH) {
+        if flux2 != (channels == diffusion::moss::CH) {
             return Err(unsupported(format!("this VAE on a {channels}-channel latent")));
         }
         let scale = if flux2 { 16 } else { 8 };
@@ -710,7 +710,7 @@ impl Engine for Krea2Engine {
             Ok(())
         };
         if let Err(e) = r {
-            tracing::warn!("krea2: freeing memory failed: {e:#}");
+            tracing::warn!("native: freeing memory failed: {e:#}");
         }
     }
 }

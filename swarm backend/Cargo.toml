@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/engine-api", "crates/comfy-server", "crates/krea2-engine"]
+members = ["crates/engine-api", "crates/comfy-server", "crates/native-engine"]
 
 [workspace.package]
 version = "0.1.0"

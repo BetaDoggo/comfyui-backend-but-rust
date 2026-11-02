@@ -75,7 +75,7 @@ bool init() {
 }  // namespace
 
 // 0 on success: *budget / *usage = this process's local (VRAM) budget and current usage, bytes.
-extern "C" int krea_wddm_budget(uint64_t* budget, uint64_t* usage) {
+extern "C" int gpu_wddm_budget(uint64_t* budget, uint64_t* usage) {
     if (!init()) return -1;
     MemoryBudgetQuery q{0, 0};
     MemoryBudget b{};

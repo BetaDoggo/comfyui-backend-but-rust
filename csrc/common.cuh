@@ -1,4 +1,4 @@
-// Shared device helpers for the krea2 CUDA backend.
+// Shared device helpers for the CUDA backend.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -9,7 +9,7 @@
 
 typedef __nv_bfloat16 bf16;
 
-#define KREA_API extern "C"
+#define GPU_API extern "C"
 
 // dtype codes shared with Rust (src/cuda.rs)
 enum DType { DT_F32 = 0, DT_F16 = 1, DT_BF16 = 2 };

@@ -1,4 +1,4 @@
-"""Compare a krea2 --dump file against tools/ref_dump.py output.
+"""Compare a diffusion --dump file against tools/ref_dump.py output.
 
 usage: python compare.py ref.safetensors rust.safetensors [--noise-check SEED]
 """

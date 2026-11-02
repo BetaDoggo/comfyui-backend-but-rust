@@ -39,9 +39,9 @@ import comfy.utils
 import comfy.sample
 import comfy.samplers
 
-DIT = os.path.join(os.environ["KREA2_MODELS"], r"Stable-diffusion\moss_image_sft_int8_convrot_attn.safetensors")
-TE = os.path.join(os.environ["KREA2_MODELS"], r"clip\qwen3.5_9b_int8_convrot.safetensors")
-VAE = os.path.join(os.environ["KREA2_MODELS"], r"VAE\flux2-vae.safetensors")
+DIT = os.path.join(os.environ["MODELS_ROOT"], r"Stable-diffusion\moss_image_sft_int8_convrot_attn.safetensors")
+TE = os.path.join(os.environ["MODELS_ROOT"], r"clip\qwen3.5_9b_int8_convrot.safetensors")
+VAE = os.path.join(os.environ["MODELS_ROOT"], r"VAE\flux2-vae.safetensors")
 KREA2_TEMPLATE = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
 
 os.makedirs(args.out, exist_ok=True)

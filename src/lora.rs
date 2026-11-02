@@ -281,10 +281,10 @@ fn add_patches(w: PM, rows: usize, per_row: usize, patches: &[Patch], files: &[S
                 let d = DevBuf::alloc_async(want * 2, st)?;
                 a.upload(0, &f.bf16_bytes(up)?, st)?;
                 b.upload(0, &f.bf16_bytes(down)?, st)?;
-                k!(krea_gemm(a.ptr(), ru as i64, b.ptr(), kd as i64, d.ptr(), kd as i64, null(), nu as i64, kd as i64, ru as i64, 0, bf, dt, 1.0, 0.0,
+                k!(gpu_gemm(a.ptr(), ru as i64, b.ptr(), kd as i64, d.ptr(), kd as i64, null(), nu as i64, kd as i64, ru as i64, 0, bf, dt, 1.0, 0.0,
                     s(st)))?;
                 let scale = p.strength as f64 * alpha.map_or(1.0, |v| v as f64 / rd as f64);
-                k!(krea_lora_add_bf16(dst, d.ptr(), scale as f32, want as i64, s(st)))?;
+                k!(gpu_lora_add_bf16(dst, d.ptr(), scale as f32, want as i64, s(st)))?;
             }
             Op::Diff(name) | Op::Set(name) => {
                 if f.info(name)?.numel() != want {
@@ -296,7 +296,7 @@ fn add_patches(w: PM, rows: usize, per_row: usize, patches: &[Patch], files: &[S
                 if matches!(p.op, Op::Set(_)) {
                     crate::cuda::memcpy_d2d(dst, d.ptr(), want * 2, st)?;
                 } else if p.strength != 0.0 {
-                    k!(krea_lora_add_bf16(dst, d.ptr(), p.strength, want as i64, s(st)))?;
+                    k!(gpu_lora_add_bf16(dst, d.ptr(), p.strength, want as i64, s(st)))?;
                 }
             }
         }
@@ -310,9 +310,9 @@ fn upload(bytes: &[u8], st: &Stream) -> Result<DevBuf> {
     Ok(d)
 }
 
-/// Parity tests (tools/lora_cmp.py): write a weight out if `$KREA_LORA_DUMP/<stem>.want` exists.
+/// Parity tests (tools/lora_cmp.py): write a weight out if `$LORA_DUMP/<stem>.want` exists.
 fn dump_baked(stem: &str, w: &DevBuf, q: &DevBuf, sc: &DevBuf, st: &Stream) -> Result<()> {
-    let Ok(dir) = std::env::var("KREA_LORA_DUMP") else {
+    let Ok(dir) = std::env::var("LORA_DUMP") else {
         return Ok(());
     };
     if Path::new(&dir).join(format!("{stem}.want")).exists() {
@@ -382,10 +382,10 @@ impl Model<'_> {
                 let sp = self.place(&scale_name)?;
                 let q = upload(self.st.bytes(&name)?, st)?;
                 let sc = upload(self.st.bytes(&self.file_name(&scale_name))?, st)?;
-                k!(krea_convrot_dequant_bf16(q.ptr(), sc.ptr(), w.ptr(), rows as i64, per_row as i32, s(st)))?;
+                k!(gpu_convrot_dequant_bf16(q.ptr(), sc.ptr(), w.ptr(), rows as i64, per_row as i32, s(st)))?;
                 add_patches(w.ptr(), rows, per_row, patches, files, tensor, st)?;
                 let seed = string_to_seed(&format!("diffusion_model.{stem}"));
-                k!(krea_convrot_requant_bf16(w.ptr(), q.ptr(), sc.ptr(), rows as i64, per_row as i32, seed, s(st)))?;
+                k!(gpu_convrot_requant_bf16(w.ptr(), q.ptr(), sc.ptr(), rows as i64, per_row as i32, seed, s(st)))?;
                 dump_baked(stem, &w, &q, &sc, st)?;
                 self.write(place, &q, st)?;
                 self.write(sp, &sc, st)

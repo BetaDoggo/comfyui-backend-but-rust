@@ -99,31 +99,31 @@ impl TextEncoder {
             let lay = &self.ws.layouts[i];
             let w = |key: &str| off(base, lay.off(key));
             let lin = |a: PM, wk: &str, n: usize, kk: usize, out: PM, beta: f32| -> Result<()> {
-                k!(krea_bf16_to_f32(w(wk), wf.ptr(), (n * kk) as i64, s(st)))?;
-                k!(krea_gemm(a, kk as i64, wf.ptr(), kk as i64, out, n as i64, null(), l as i64, n as i64, kk as i64, 1,
+                k!(gpu_bf16_to_f32(w(wk), wf.ptr(), (n * kk) as i64, s(st)))?;
+                k!(gpu_gemm(a, kk as i64, wf.ptr(), kk as i64, out, n as i64, null(), l as i64, n as i64, kk as i64, 1,
                     DT_F32, DT_F32, 1.0, beta, s(st)))
             };
-            k!(krea_prologue_rows(DT_F32, PRO_RMS, xp, d, null(), 0, 0, w("ln1"), EPS, null(), null(), h.ptr(), d, m,
+            k!(gpu_prologue_rows(DT_F32, PRO_RMS, xp, d, null(), 0, 0, w("ln1"), EPS, null(), null(), h.ptr(), d, m,
                 D as i32, s(st)))?;
             lin(h.ptr(), "wqkv", QKV, D, qkv.ptr(), 0.0)?;
             let q = qkv.ptr();
-            k!(krea_qk_norm_rope(DT_F32, HD as i32, q, QKV as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32, w("qn"),
+            k!(gpu_qk_norm_rope(DT_F32, HD as i32, q, QKV as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32, w("qn"),
                 w("kn"), EPS, rope_d.ptr(), 2, m, s(st)))?;
-            k!(krea_attn_small(DT_F32, q, QKV as i64, off(q, HQ * HD * 4), off(q, (HQ + HK) * HD * 4), QKV as i64,
+            k!(gpu_attn_small(DT_F32, q, QKV as i64, off(q, HQ * HD * 4), off(q, (HQ + HK) * HD * 4), QKV as i64,
                 HQ as i32, HK as i32, HD as i32, m, m, attn.ptr(), (HQ * HD) as i64, 1.0 / (HD as f32).sqrt(), 1, s(st)))?;
-            k!(krea_prologue_rows(DT_F32, PRO_PLAIN, attn.ptr(), (HQ * HD) as i64, null(), 0, 0, null(), 0.0, null(),
+            k!(gpu_prologue_rows(DT_F32, PRO_PLAIN, attn.ptr(), (HQ * HD) as i64, null(), 0, 0, null(), 0.0, null(),
                 null(), h.ptr(), (HQ * HD) as i64, m, (HQ * HD) as i32, s(st)))?;
             lin(h.ptr(), "wo", D, HQ * HD, xp, 1.0)?;
-            k!(krea_prologue_rows(DT_F32, PRO_RMS, xp, d, null(), 0, 0, w("ln2"), EPS, null(), null(), h.ptr(), d, m,
+            k!(gpu_prologue_rows(DT_F32, PRO_RMS, xp, d, null(), 0, 0, w("ln2"), EPS, null(), null(), h.ptr(), d, m,
                 D as i32, s(st)))?;
             lin(h.ptr(), "wgu", 2 * FF, D, gu.ptr(), 0.0)?;
-            k!(krea_prologue_rows(DT_F32, PRO_SWIGLU, gu.ptr(), (2 * FF) as i64, null(), 0, FF as i64, null(), 0.0, null(),
+            k!(gpu_prologue_rows(DT_F32, PRO_SWIGLU, gu.ptr(), (2 * FF) as i64, null(), 0, FF as i64, null(), 0.0, null(),
                 null(), h.ptr(), FF as i64, m, FF as i32, s(st)))?;
             lin(h.ptr(), "wd", D, FF, xp, 1.0)?;
             self.ws.release(i, st)?;
         }
         let out = DevBuf::alloc_async(l * D * 4, st)?;
-        k!(krea_prologue_rows(DT_F32, PRO_RMS, xp, d, null(), 0, 0, self.norm.ptr(), EPS, null(), null(), out.ptr(), d, m,
+        k!(gpu_prologue_rows(DT_F32, PRO_RMS, xp, d, null(), 0, 0, self.norm.ptr(), EPS, null(), null(), out.ptr(), d, m,
             D as i32, s(st)))?;
         Ok(out)
     }

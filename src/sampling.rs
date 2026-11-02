@@ -88,7 +88,7 @@ fn philox4x32(mut c: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
 
 /// torch.randn on a CUDA generator, for one tensor size. Each of `threads` GPU threads owns a Philox
 /// subsequence and draws 4 normals per iteration, laid out `threads` elements apart, so the result
-/// depends on the card's core count ([`crate::ffi::krea_randn_threads`]).
+/// depends on the card's core count ([`crate::ffi::gpu_randn_threads`]).
 pub struct CudaRandn {
     key: [u32; 2],
     numel: usize,

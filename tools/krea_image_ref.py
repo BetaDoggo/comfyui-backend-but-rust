@@ -42,7 +42,7 @@ import nodes
 import node_helpers
 from SwarmComfyCommon.SwarmText import SwarmTextEncodeAdvanced
 
-MODELS = os.environ["KREA2_MODELS"]
+MODELS = os.environ["MODELS_ROOT"]
 DIT = os.path.join(MODELS, r"Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors")
 TE = os.path.join(MODELS, r"clip\qwen3vl_4b.safetensors")
 VAE = os.path.join(MODELS, r"VAE\qwen_image_vae.safetensors")

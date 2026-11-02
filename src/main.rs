@@ -1,16 +1,16 @@
-//! krea2: Rust + CUDA reimplementation of ComfyUI's Krea 2 (W8A8 int8) text-to-image pipeline.
+//! diffusion: Rust + CUDA reimplementation of ComfyUI's image generation, for int8 ConvRot checkpoints of Krea 2, Anima and MOSS Image.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use krea2::samplers::ModelSampling;
-use krea2::{pipeline, serve, st};
+use diffusion::samplers::ModelSampling;
+use diffusion::{pipeline, serve, st};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Krea 2 (int8) text-to-image, ComfyUI-compatible")]
+#[command(version, about = "Int8 text-to-image for Krea 2, Anima and MOSS Image, ComfyUI-compatible")]
 struct Args {
     /// Text prompt
     #[arg(short, long, default_value = "a red fox sitting in a snowy forest, golden hour, photograph")]
@@ -34,9 +34,9 @@ struct Args {
     #[arg(short = 'n', long, default_value_t = 1)]
     count: usize,
     /// Output path; with several images, "_<i>" is inserted before the extension
-    #[arg(short, long, default_value = "krea2.png")]
+    #[arg(short, long, default_value = "output.png")]
     out: PathBuf,
-    /// Folder holding Stable-diffusion/, clip/ and VAE/ (default: $KREA2_MODELS, else ./models)
+    /// Folder holding Stable-diffusion/, clip/ and VAE/ (default: $MODELS_ROOT, else ./models)
     #[arg(long)]
     models: Option<PathBuf>,
     /// Diffusion model, instead of the default file in the models folder
@@ -120,7 +120,7 @@ struct Args {
 }
 
 /// RGB f32 [height, width, 3], 0 to 1.
-fn read_png(path: &Path) -> Result<krea2::vision::PromptImage> {
+fn read_png(path: &Path) -> Result<diffusion::vision::PromptImage> {
     let mut decoder = png::Decoder::new(std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?);
     decoder.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::ALPHA);
     let mut reader = decoder.read_info()?;
@@ -132,11 +132,11 @@ fn read_png(path: &Path) -> Result<krea2::vision::PromptImage> {
         let alpha = if channels % 2 == 0 { a } else { 1.0 };
         c.map(|v| v as f32 / 255.0 * alpha + 1.0 - alpha)
     }).collect();
-    Ok(krea2::vision::PromptImage { width: info.width as usize, height: info.height as usize, rgb })
+    Ok(diffusion::vision::PromptImage { width: info.width as usize, height: info.height as usize, rgb })
 }
 
 /// `path` or `path:strength`, as in `--lora`.
-fn parse_loras(args: &Args) -> Result<Vec<krea2::lora::Lora>> {
+fn parse_loras(args: &Args) -> Result<Vec<diffusion::lora::Lora>> {
     args.lora.iter().map(|l| {
         let (path, strength) = match l.rsplit_once(':').map(|(p, v)| (p, v.parse::<f32>())) {
             Some((p, Ok(v))) => (p, v),
@@ -145,7 +145,7 @@ fn parse_loras(args: &Args) -> Result<Vec<krea2::lora::Lora>> {
         if !std::path::Path::new(path).exists() {
             bail!("no LoRA at {path}");
         }
-        Ok(krea2::lora::Lora { path: PathBuf::from(path), strength })
+        Ok(diffusion::lora::Lora { path: PathBuf::from(path), strength })
     }).collect()
 }
 
@@ -166,7 +166,7 @@ impl Args {
     /// `path`, or `default` inside the models folder.
     fn model(&self, path: &Option<PathBuf>, default: &str) -> PathBuf {
         path.clone().unwrap_or_else(|| {
-            let root = self.models.clone().or_else(|| std::env::var_os("KREA2_MODELS").map(PathBuf::from));
+            let root = self.models.clone().or_else(|| std::env::var_os("MODELS_ROOT").map(PathBuf::from));
             root.unwrap_or_else(|| PathBuf::from("models")).join(default)
         })
     }
@@ -185,11 +185,11 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         let seed = args.seed + i as u64;
         let noise = match &args.ref_noise {
             Some(p) => st::SafeTensors::open(p)?.f32_vec("noise", false)?,
-            None => krea2::sampling::torch_randn(seed, n),
+            None => diffusion::sampling::torch_randn(seed, n),
         };
         let r = pipeline::AnimaRequest {
-            positive: krea2::tokenizer::token_weights(&args.prompt, 1.0),
-            negative: krea2::tokenizer::token_weights(&args.negative, 1.0),
+            positive: diffusion::tokenizer::token_weights(&args.prompt, 1.0),
+            negative: diffusion::tokenizer::token_weights(&args.negative, 1.0),
             width: args.width,
             height: args.height,
             sampling: args.sampling("er_sde", ModelSampling::Flow { shift }, seed, (args.width / 8, args.height / 8))?,
@@ -224,12 +224,12 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         let seed = args.seed + i as u64;
         let noise = match &args.ref_noise {
             Some(p) => st::SafeTensors::open(p)?.f32_vec("noise", false)?,
-            None => krea2::sampling::torch_randn(seed, n),
+            None => diffusion::sampling::torch_randn(seed, n),
         };
         let r = pipeline::MossRequest {
             positive: args.prompt.clone(),
             negative: args.negative.clone(),
-            template: args.swarm_template.then(|| krea2::te::TEMPLATE.to_string()),
+            template: args.swarm_template.then(|| diffusion::te::TEMPLATE.to_string()),
             width: args.width,
             height: args.height,
             sampling: args.sampling("euler", ModelSampling::Flow { shift }, seed, (args.width / 16, args.height / 16))?,

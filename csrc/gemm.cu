@@ -42,7 +42,7 @@ std::unordered_map<PlanKey, Plan, PlanKeyHash> g_plans;
 
 }  // namespace
 
-KREA_API int krea_blas_init(size_t workspace_bytes) {
+GPU_API int gpu_blas_init(size_t workspace_bytes) {
     std::lock_guard<std::mutex> lock(g_mu);
     if (g_lt) return 0;
     if (cublasLtCreate(&g_lt) != CUBLAS_STATUS_SUCCESS) return -1;
@@ -54,7 +54,7 @@ KREA_API int krea_blas_init(size_t workspace_bytes) {
 // Row-major D[M,N] = alpha * A[M,K] . op(B) (+ bias[N]) (+ beta * D)
 //   transb = 1: B is [N,K] (a Linear weight), transb = 0: B is [K,N].
 // A, B bf16 or f32 (in_dt, fp32 is computed without TF32); D bf16 or f32 (out_dt); bias in the output dtype.
-KREA_API int krea_gemm(const void* A, int64_t lda, const void* B, int64_t ldb, void* D, int64_t ldd, const void* bias,
+GPU_API int gpu_gemm(const void* A, int64_t lda, const void* B, int64_t ldb, void* D, int64_t ldd, const void* bias,
                        int64_t M, int64_t N, int64_t K, int transb, int in_dt, int out_dt, float alpha, float beta,
                        void* stream) {
     if (!g_lt) return -100;
@@ -119,7 +119,7 @@ extern "C" bool launch_cutlass_int8_dequant_residual(const void* A, const void* 
                                                      cudaStream_t stream);
 
 // D[M,N] = (A[M,K] . W[N,K]^T) * xs[m] * ws[n] + bias[n]
-KREA_API int krea_int8_gemm(const int8_t* A, const int8_t* W, const float* xs, const float* ws, const void* bias,
+GPU_API int gpu_int8_gemm(const int8_t* A, const int8_t* W, const float* xs, const float* ws, const void* bias,
                             void* D, int64_t M, int64_t N, int64_t K, int out_dt, void* stream) {
     if (!launch_cutlass_int8_dequant(A, W, xs, ws, bias, D, M, N, K, out_dt, (cudaStream_t)stream)) return -200;
     KCHECK();
@@ -127,7 +127,7 @@ KREA_API int krea_int8_gemm(const int8_t* A, const int8_t* W, const float* xs, c
 }
 
 // D[M,N] = resid[M,N] + rscale[n] * ((A . W^T) * xs[m] * ws[n] + bias[n])   (D may alias resid)
-KREA_API int krea_int8_gemm_residual(const int8_t* A, const int8_t* W, const float* xs, const float* ws,
+GPU_API int gpu_int8_gemm_residual(const int8_t* A, const int8_t* W, const float* xs, const float* ws,
                                      const void* bias, const void* rscale, const void* resid, void* D, int64_t M,
                                      int64_t N, int64_t K, int out_dt, void* stream) {
     if (!launch_cutlass_int8_dequant_residual(A, W, xs, ws, bias, rscale, resid, D, M, N, K, out_dt,
@@ -185,7 +185,7 @@ struct ConvFprop {
 }  // namespace
 
 // x [N,H,W,C], w [Cout,R,R,C], bias [Cout] (nullable), out [N,H,W,Cout]; C and Cout multiples of 8.
-KREA_API int krea_conv2d(const void* x, const void* w, const void* bias, void* out, int N, int H, int W, int C,
+GPU_API int gpu_conv2d(const void* x, const void* w, const void* bias, void* out, int N, int H, int W, int C,
                          int Cout, int R, void* stream) {
     if (C % 8 || Cout % 8) return -310;
     cudaStream_t st = (cudaStream_t)stream;

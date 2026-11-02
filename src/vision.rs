@@ -280,22 +280,22 @@ impl Vision {
         let x = xb.ptr();
         // y = x @ w^T + b, from a bf16 weight
         let lin = |a: PM, wq: PM, b: PM, rows: i64, out_w: usize, in_w: usize, out: PM| -> Result<()> {
-            k!(krea_bf16_to_f32(wq, wf.ptr(), (out_w * in_w) as i64, s(st)))?;
-            k!(krea_gemm(a, in_w as i64, wf.ptr(), in_w as i64, out, out_w as i64, b, rows, out_w as i64, in_w as i64, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))
+            k!(gpu_bf16_to_f32(wq, wf.ptr(), (out_w * in_w) as i64, s(st)))?;
+            k!(gpu_gemm(a, in_w as i64, wf.ptr(), in_w as i64, out, out_w as i64, b, rows, out_w as i64, in_w as i64, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))
         };
         let add = |dst: PM, v: PM, count: usize| -> Result<()> {
             let (p, c) = ([dst as crate::ffi::P, v as crate::ffi::P], [1.0f32, 1.0]);
-            k!(krea_lincomb(dst, count as i64, 2, p.as_ptr(), c.as_ptr(), s(st)))
+            k!(gpu_lincomb(dst, count as i64, 2, p.as_ptr(), c.as_ptr(), s(st)))
         };
         let zeros = self.zeros.ptr();
         let norm = |a: PM, w: PM, b: PM, width: usize, rows: usize, out: PM| -> Result<()> {
-            k!(krea_prologue_rows(DT_F32, PRO_LAYERNORM, a, width as i64, null(), 0, 0, w, EPS, zeros, b, out, width as i64, rows as i32, width as i32, s(st)))
+            k!(gpu_prologue_rows(DT_F32, PRO_LAYERNORM, a, width as i64, null(), 0, 0, w, EPS, zeros, b, out, width as i64, rows as i32, width as i32, s(st)))
         };
 
         let mut unit = 0;
         let base = self.ws.acquire(unit, st)?;
         let lay = &self.ws.layouts[unit];
-        k!(krea_gemm(px.ptr(), FRAME as i64, off(base, lay.off("w")), FRAME as i64, x, D as i64, off(base, lay.off("b")), nf, D as i64,
+        k!(gpu_gemm(px.ptr(), FRAME as i64, off(base, lay.off("w")), FRAME as i64, x, D as i64, off(base, lay.off("b")), nf, D as i64,
             FRAME as i64, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
         self.ws.release(unit, st)?;
         drop(px);
@@ -311,7 +311,7 @@ impl Vision {
             let w = |key: &str| off(base, lay.off(key));
             lin(x, w("w1"), w("b1"), tokens as i64, MERGED, MERGED, h.ptr())?;
             crate::cuda::memcpy_d2d(g.ptr(), h.ptr(), tokens * MERGED * 4, st)?;
-            k!(krea_gelu_f32(g.ptr(), (tokens * MERGED) as i64, 0, s(st)))?;
+            k!(gpu_gelu_f32(g.ptr(), (tokens * MERGED) as i64, 0, s(st)))?;
             lin(g.ptr(), w("w2"), w("b2"), tokens as i64, OUT, MERGED, out.ptr())
         };
         let h1 = DevBuf::alloc_async(tokens * MERGED * 4, st)?;
@@ -326,15 +326,15 @@ impl Vision {
             lin(normed.ptr(), w("qkv"), w("qkvb"), nf, 3 * D, D, qkv.ptr())?;
             let q = qkv.ptr();
             let (kp, vp) = (off(q, D * 4), off(q, 2 * D * 4));
-            k!(krea_rope_rows(q, (3 * D) as i64, rope.ptr(), n as i32, HEADS as i32, HD as i32, s(st)))?;
-            k!(krea_rope_rows(kp, (3 * D) as i64, rope.ptr(), n as i32, HEADS as i32, HD as i32, s(st)))?;
-            k!(krea_attn_small(DT_F32, q, (3 * D) as i64, kp, vp, (3 * D) as i64, HEADS as i32, HEADS as i32, HD as i32, n as i32, n as i32,
+            k!(gpu_rope_rows(q, (3 * D) as i64, rope.ptr(), n as i32, HEADS as i32, HD as i32, s(st)))?;
+            k!(gpu_rope_rows(kp, (3 * D) as i64, rope.ptr(), n as i32, HEADS as i32, HD as i32, s(st)))?;
+            k!(gpu_attn_small(DT_F32, q, (3 * D) as i64, kp, vp, (3 * D) as i64, HEADS as i32, HEADS as i32, HD as i32, n as i32, n as i32,
                 attn.ptr(), D as i64, 1.0 / (HD as f32).sqrt(), 0, s(st)))?;
             lin(attn.ptr(), w("proj"), w("projb"), nf, D, D, y.ptr())?;
             add(x, y.ptr(), n * D)?;
             norm(x, w("n2w"), w("n2b"), D, n, normed.ptr())?;
             lin(normed.ptr(), w("fc1"), w("fc1b"), nf, FF, D, ff.ptr())?;
-            k!(krea_gelu_f32(ff.ptr(), (n * FF) as i64, 1, s(st)))?;
+            k!(gpu_gelu_f32(ff.ptr(), (n * FF) as i64, 1, s(st)))?;
             lin(ff.ptr(), w("fc2"), w("fc2b"), nf, D, FF, y.ptr())?;
             add(x, y.ptr(), n * D)?;
             self.ws.release(unit, st)?;

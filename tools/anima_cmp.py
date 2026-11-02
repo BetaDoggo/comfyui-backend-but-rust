@@ -1,4 +1,4 @@
-"""Compare a krea2 --anima --dump file with tools/anima_ref.py output.
+"""Compare a diffusion --anima --dump file with tools/anima_ref.py output.
 
 usage: python anima_cmp.py <ref.safetensors> <ours.safetensors>
 """

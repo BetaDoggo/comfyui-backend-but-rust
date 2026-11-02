@@ -1,4 +1,4 @@
-"""Compare tools/krea_image_ref.py with a krea2 --dump. usage: python krea_image_cmp.py <ref_dir> <dump> <image.png>"""
+"""Compare tools/krea_image_ref.py with a diffusion --dump. usage: python krea_image_cmp.py <ref_dir> <dump> <image.png>"""
 import os
 import sys
 

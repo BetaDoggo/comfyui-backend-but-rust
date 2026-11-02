@@ -233,7 +233,7 @@ static int launch_quant(const QuantParams& p, int M, cudaStream_t st) {
     return 0;
 }
 
-KREA_API int krea_quant_rows(int dtype, int prologue, const void* x, int64_t x_stride, const void* g,
+GPU_API int gpu_quant_rows(int dtype, int prologue, const void* x, int64_t x_stride, const void* g,
                              int64_t g_stride, int64_t up_offset, const float* norm_w, float eps,
                              const void* mod_scale, const void* mod_shift, int8_t* q, float* scales,
                              int M, int K, int rotate, void* stream) {
@@ -260,7 +260,7 @@ KREA_API int krea_quant_rows(int dtype, int prologue, const void* x, int64_t x_s
 }
 
 // Same prologues + ConvRot rotation, fp32 output (weight-only int8 path: x_rot @ (q*s)^T).
-KREA_API int krea_rotate_rows_f32(int prologue, const float* x, int64_t x_stride, int64_t up_offset,
+GPU_API int gpu_rotate_rows_f32(int prologue, const float* x, int64_t x_stride, int64_t up_offset,
                                   const float* norm_w, float eps, float* out, int M, int K, void* stream) {
     if ((K % 256) != 0) return -1;
     QuantParams p{x, x_stride, nullptr, 0, up_offset, norm_w, eps, nullptr, nullptr, nullptr, nullptr, K, 1, out};
@@ -281,7 +281,7 @@ __global__ void dequant_i8_kernel(const int8_t* q, const float* s, float* out, i
     const float sc = s[i / K];
     *reinterpret_cast<float4*>(out + i) = make_float4(v.x * sc, v.y * sc, v.z * sc, v.w * sc);
 }
-KREA_API int krea_dequant_i8(const int8_t* q, const float* s, float* out, int64_t N, int64_t K, void* stream) {
+GPU_API int gpu_dequant_i8(const int8_t* q, const float* s, float* out, int64_t N, int64_t K, void* stream) {
     if (K % 4) return -1;
     const int64_t n4 = N * K / 4;
     dequant_i8_kernel<<<(unsigned)((n4 + 255) / 256), 256, 0, (cudaStream_t)stream>>>(q, s, out, N, K);
@@ -358,7 +358,7 @@ __global__ void prologue_rows_kernel(QuantParams p, T* out, int64_t out_stride) 
     }
 }
 
-KREA_API int krea_prologue_rows(int dtype, int prologue, const void* x, int64_t x_stride, const void* g,
+GPU_API int gpu_prologue_rows(int dtype, int prologue, const void* x, int64_t x_stride, const void* g,
                                 int64_t g_stride, int64_t up_offset, const float* norm_w, float eps,
                                 const void* mod_scale, const void* mod_shift, void* out, int64_t out_stride,
                                 int M, int K, void* stream) {
@@ -452,7 +452,7 @@ __global__ void qk_norm_rope_kernel(T* buf, int64_t row_stride, int q_off, int k
     for (int i = 0; i < EPL; ++i) stf(x, idx[i], v[i]);
 }
 
-KREA_API int krea_qk_norm_rope(int dtype, int head_dim, void* buf, int64_t row_stride, int q_off, int k_off, int hq,
+GPU_API int gpu_qk_norm_rope(int dtype, int head_dim, void* buf, int64_t row_stride, int q_off, int k_off, int hq,
                                int hk, const float* qw, const float* kw, float eps, const float* rope, int rope_mode,
                                int L, void* stream) {
     const int64_t warps = (int64_t)L * (hq + hk);
@@ -508,7 +508,7 @@ __global__ void attn_small_kernel(const T* q, int64_t q_stride, const T* kp, con
     stf(out, (int64_t)i * out_stride + h * d + e0, acc / sum);
 }
 
-KREA_API int krea_attn_small(int dtype, const void* q, int64_t q_stride, const void* k, const void* v,
+GPU_API int gpu_attn_small(int dtype, const void* q, int64_t q_stride, const void* k, const void* v,
                              int64_t kv_stride, int hq, int hk, int d, int lq, int lk, void* out, int64_t out_stride,
                              float scale, int causal, void* stream) {
     dim3 grid(lq, hq);
@@ -540,7 +540,7 @@ __global__ void embed_dequant_kernel(const int8_t* q, const float* s, float* out
     for (int k = threadIdx.x; k < K; k += blockDim.x) out[m * K + k] = rnd<bf16>(row[k]);
 }
 
-KREA_API int krea_embed_dequant(const int8_t* q, const float* s, float* out, int M, int K, int rotate, void* stream) {
+GPU_API int gpu_embed_dequant(const int8_t* q, const float* s, float* out, int M, int K, int rotate, void* stream) {
     if (!rotate) return -1;
     embed_dequant_kernel<<<M, 256, K * sizeof(float), (cudaStream_t)stream>>>(q, s, out, K);
     KCHECK();
@@ -554,7 +554,7 @@ __global__ void gelu_tanh_kernel(bf16* x, int64_t n) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = __float2bfloat16_rn(gelu_tanh_f(__bfloat162float(x[i])));
 }
-KREA_API int krea_gelu_tanh_bf16(void* x, int64_t n, void* stream) {
+GPU_API int gpu_gelu_tanh_bf16(void* x, int64_t n, void* stream) {
     gelu_tanh_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((bf16*)x, n);
     KCHECK();
     return 0;
@@ -571,7 +571,7 @@ __global__ void add_gated_kernel(bf16* x, int64_t x_stride, const bf16* y, int64
     bf16* px = x + (int64_t)r * x_stride + c;
     *px = __float2bfloat16_rn(__bfloat162float(*px) + v);
 }
-KREA_API int krea_add_gated_bf16(void* x, int64_t x_stride, const void* y, int64_t y_stride, const void* gate,
+GPU_API int gpu_add_gated_bf16(void* x, int64_t x_stride, const void* y, int64_t y_stride, const void* gate,
                                  int rows, int cols, void* stream) {
     const int64_t n = (int64_t)rows * cols;
     add_gated_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(
@@ -587,7 +587,7 @@ __global__ void add_vec_kernel(bf16* out, const bf16* a, const void* b, int b_is
     const float bv = b_is_f32 ? rnd<bf16>(((const float*)b)[i]) : __bfloat162float(((const bf16*)b)[i]);
     out[i] = __float2bfloat16_rn(__bfloat162float(a[i]) + bv);
 }
-KREA_API int krea_add_vec_bf16(void* out, const void* a, const void* b, int b_is_f32, int n, void* stream) {
+GPU_API int gpu_add_vec_bf16(void* out, const void* a, const void* b, int b_is_f32, int n, void* stream) {
     add_vec_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t)stream>>>((bf16*)out, (const bf16*)a, b, b_is_f32, n);
     KCHECK();
     return 0;
@@ -597,14 +597,14 @@ __global__ void f32_to_bf16_kernel(const float* in, bf16* out, int64_t n) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2bfloat16_rn(in[i]);
 }
-KREA_API int krea_f32_to_bf16(const float* in, void* out, int64_t n, void* stream) {
+GPU_API int gpu_f32_to_bf16(const float* in, void* out, int64_t n, void* stream) {
     f32_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(in, (bf16*)out, n);
     KCHECK();
     return 0;
 }
 
 // GPU threads torch.randn splits a large tensor across (multiProcessorCount * blocks per SM * 256).
-KREA_API int krea_randn_threads() {
+GPU_API int gpu_randn_threads() {
     cudaDeviceProp p{};
     if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) return -1;
     return p.multiProcessorCount * (p.maxThreadsPerMultiProcessor / 256) * 256;
@@ -614,7 +614,7 @@ __global__ void bf16_to_f32_kernel(const bf16* in, float* out, int64_t n) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __bfloat162float(in[i]);
 }
-KREA_API int krea_bf16_to_f32(const void* in, float* out, int64_t n, void* stream) {
+GPU_API int gpu_bf16_to_f32(const void* in, float* out, int64_t n, void* stream) {
     bf16_to_f32_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const bf16*)in, out, n);
     KCHECK();
     return 0;
@@ -647,7 +647,7 @@ __global__ void rope_rows_kernel(float* x, int64_t stride, const float* rope, in
         row[half + j] = b * c + a * s;
     }
 }
-KREA_API int krea_rope_rows(float* x, int64_t stride, const float* rope, int L, int H, int d, void* stream) {
+GPU_API int gpu_rope_rows(float* x, int64_t stride, const float* rope, int L, int H, int d, void* stream) {
     rope_rows_kernel<<<dim3(L, H), 32, 0, (cudaStream_t)stream>>>(x, stride, rope, H, d);
     KCHECK();
     return 0;
@@ -658,7 +658,7 @@ __global__ void gelu_f32_kernel(float* x, int64_t n, int approximate) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = approximate ? gelu_tanh_f(x[i]) : gelu_f(x[i]);
 }
-KREA_API int krea_gelu_f32(float* x, int64_t n, int approximate, void* stream) {
+GPU_API int gpu_gelu_f32(float* x, int64_t n, int approximate, void* stream) {
     gelu_f32_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(x, n, approximate);
     KCHECK();
     return 0;
@@ -674,14 +674,14 @@ __global__ void take_odd_kernel(const bf16* x, bf16* out, int H, int W, int C) {
     const int64_t src = (((2 * y + 1) * W) + 2 * xx + 1) * C;
     for (int c = 0; c < C; ++c) out[p * C + c] = x[src + c];
 }
-KREA_API int krea_take_odd(const void* x, void* out, int H, int W, int C, void* stream) {
+GPU_API int gpu_take_odd(const void* x, void* out, int H, int W, int C, void* stream) {
     const int64_t n = (int64_t)(H / 2) * (W / 2);
     take_odd_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const bf16*)x, (bf16*)out, H, W, C);
     KCHECK();
     return 0;
 }
 
-KREA_API int krea_lincomb(float* out, int64_t n, int nx, const float* const* x, const float* c, void* stream) {
+GPU_API int gpu_lincomb(float* out, int64_t n, int nx, const float* const* x, const float* c, void* stream) {
     if (nx < 1 || nx > 4) return -1;
     LincombArgs a{};
     for (int j = 0; j < nx; ++j) { a.x[j] = x[j]; a.c[j] = c[j]; }
@@ -699,7 +699,7 @@ __global__ void layer_project_kernel(const bf16* x, const bf16* w, bf16* out, in
     for (int n = 0; n < nl; ++n) acc += __bfloat162float(x[((int64_t)l * nl + n) * D + d]) * __bfloat162float(w[n]);
     out[i] = __float2bfloat16_rn(acc);
 }
-KREA_API int krea_layer_project(const void* x, const void* w, void* out, int L, int nl, int D, void* stream) {
+GPU_API int gpu_layer_project(const void* x, const void* w, void* out, int L, int nl, int D, void* stream) {
     const int64_t n = (int64_t)L * D;
     layer_project_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(
         (const bf16*)x, (const bf16*)w, (bf16*)out, L, nl, D);
@@ -722,7 +722,7 @@ __global__ void patchify_kernel(const float* lat, bf16* tok, int C, int H, int W
     const int f = (c * p + py) * p + px;
     tok[t * (C * p * p) + f] = __float2bfloat16_rn(lat[i]);
 }
-KREA_API int krea_patchify(const float* lat, void* tok, int C, int H, int W, int p, void* stream) {
+GPU_API int gpu_patchify(const float* lat, void* tok, int C, int H, int W, int p, void* stream) {
     const int64_t n = (int64_t)C * H * W;
     patchify_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(lat, (bf16*)tok, C, H, W, p);
     KCHECK();
@@ -747,7 +747,7 @@ __global__ void unpatch_euler_kernel(const bf16* tok, int64_t tok_stride, float*
     const float d = (x - den) / sigma;
     lat[i] = x + d * (sigma_next - sigma);
 }
-KREA_API int krea_unpatch_euler(const void* tok, int64_t tok_stride, float* lat, int C, int H, int W, int p,
+GPU_API int gpu_unpatch_euler(const void* tok, int64_t tok_stride, float* lat, int C, int H, int W, int p,
                                 float sigma, float sigma_next, float* denoised_out, void* stream) {
     const int64_t n = (int64_t)C * H * W;
     unpatch_euler_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(
@@ -770,7 +770,7 @@ __global__ void unpatch_denoised_kernel(const bf16* tok, int64_t tok_stride, con
     const int f = (py * p + px) * C + c;
     den[i] = lat[i] - __bfloat162float(tok[t * tok_stride + f]) * sigma;
 }
-KREA_API int krea_unpatch_denoised(const void* tok, int64_t tok_stride, const float* lat, float* den, int C, int H,
+GPU_API int gpu_unpatch_denoised(const void* tok, int64_t tok_stride, const float* lat, float* den, int C, int H,
                                    int W, int p, float sigma, void* stream) {
     const int64_t n = (int64_t)C * H * W;
     unpatch_denoised_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(
@@ -790,7 +790,7 @@ __global__ void vae_latent_in_kernel(const float* lat, const float* mean, const 
     const int c = (int)(i / HW), s = (int)(i % HW);
     out[(int64_t)s * C + c] = __float2bfloat16_rn(lat[i] * stdv[c] + mean[c]);
 }
-KREA_API int krea_vae_latent_in(const float* lat, const float* mean, const float* stdv, void* out, int C, int HW,
+GPU_API int gpu_vae_latent_in(const float* lat, const float* mean, const float* stdv, void* out, int C, int HW,
                                 void* stream) {
     const int64_t n = (int64_t)C * HW;
     vae_latent_in_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(lat, mean, stdv, (bf16*)out, C, HW);
@@ -829,7 +829,7 @@ __global__ void l2norm_silu_kernel(const bf16* x, bf16* out, const bf16* gamma, 
         }
     }
 }
-KREA_API int krea_l2norm_silu(const void* x, void* out, const void* gamma, int64_t P, int C, int silu, void* stream) {
+GPU_API int gpu_l2norm_silu(const void* x, void* out, const void* gamma, int64_t P, int C, int silu, void* stream) {
     const int threads = 256;
     const unsigned blocks = (unsigned)((P * 32 + threads - 1) / threads);
     cudaStream_t st = (cudaStream_t)stream;
@@ -855,7 +855,7 @@ __global__ void upsample2x_kernel(const bf16* x, bf16* out, int H, int W, int C)
     const int ox = (int)(p % (2 * W)), oy = (int)(p / (2 * W));
     out[i] = x[((int64_t)(oy >> 1) * W + (ox >> 1)) * C + c];
 }
-KREA_API int krea_upsample2x(const void* x, void* out, int H, int W, int C, void* stream) {
+GPU_API int gpu_upsample2x(const void* x, void* out, int H, int W, int C, void* stream) {
     const int64_t n = (int64_t)4 * H * W * C;
     upsample2x_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const bf16*)x, (bf16*)out, H, W, C);
     KCHECK();
@@ -877,7 +877,7 @@ __global__ void softmax_rows_kernel(const float* s, bf16* p, int n, float scale)
     const float inv = 1.f / sum;
     for (int j = threadIdx.x; j < n; j += blockDim.x) pr[j] = __float2bfloat16_rn(expf(sr[j] * scale - mx) * inv);
 }
-KREA_API int krea_softmax_rows(const float* s, void* p, int rows, int n, float scale, void* stream) {
+GPU_API int gpu_softmax_rows(const float* s, void* p, int rows, int n, float scale, void* stream) {
     softmax_rows_kernel<<<rows, 1024, 0, (cudaStream_t)stream>>>(s, (bf16*)p, n, scale);
     KCHECK();
     return 0;
@@ -894,7 +894,7 @@ __global__ void to_rgb8_kernel(const bf16* x, int cstride, uint8_t* out, int64_t
     v = fminf(fmaxf(255.f * v, 0.f), 255.f);
     out[i] = (uint8_t)v;
 }
-KREA_API int krea_to_rgb8(const void* x, int cstride, uint8_t* out, int64_t P, void* stream) {
+GPU_API int gpu_to_rgb8(const void* x, int cstride, uint8_t* out, int64_t P, void* stream) {
     to_rgb8_kernel<<<(unsigned)((P * 3 + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const bf16*)x, cstride, out, P);
     KCHECK();
     return 0;
@@ -910,7 +910,7 @@ __global__ void adaln_weight_kernel(const bf16* w, const bf16* sc, bf16* out, in
     const float a = rnd<bf16>(1.f + __bfloat162float(sc[i]));
     out[i] = __float2bfloat16_rn(rnd<bf16>(__bfloat162float(w[i]) * a) - 1.f);
 }
-KREA_API int krea_adaln_weight(const void* w, const void* sc, void* out, int n, void* stream) {
+GPU_API int gpu_adaln_weight(const void* w, const void* sc, void* out, int n, void* stream) {
     adaln_weight_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t)stream>>>((const bf16*)w, (const bf16*)sc, (bf16*)out, n);
     KCHECK();
     return 0;
@@ -933,7 +933,7 @@ __global__ void delta_conv_kernel(const float* x, const bf16* w, float* out, int
     }
     out[i] = silu_f(acc);
 }
-KREA_API int krea_delta_conv(const float* x, const void* w, float* out, int L, int C, void* stream) {
+GPU_API int gpu_delta_conv(const float* x, const void* w, float* out, int L, int C, void* stream) {
     const int64_t n = (int64_t)L * C;
     delta_conv_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(x, (const bf16*)w, out, L, C);
     KCHECK();
@@ -990,7 +990,7 @@ __global__ void delta_rule_kernel(const float* mix, const float* a, const float*
     }
 }
 // mix [L, q | k | v] is normalized in place. a, b [L, Hv]; dt, alog [Hv]; out [L, Hv, d].
-KREA_API int krea_delta_rule(float* mix, const float* a, const float* b, const float* dt, const float* alog, float* out,
+GPU_API int gpu_delta_rule(float* mix, const float* a, const float* b, const float* dt, const float* alog, float* out,
                              int L, int Hv, int Hk, int d, void* stream) {
     cudaStream_t st = (cudaStream_t)stream;
     const int64_t row = 2 * (int64_t)Hk * d + (int64_t)Hv * d;
@@ -1006,7 +1006,7 @@ __global__ void mul_silu_kernel(float* x, const float* z, int64_t n) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= silu_f(z[i]);
 }
-KREA_API int krea_mul_silu(float* x, const float* z, int64_t n, void* stream) {
+GPU_API int gpu_mul_silu(float* x, const float* z, int64_t n, void* stream) {
     mul_silu_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(x, z, n);
     KCHECK();
     return 0;
@@ -1030,7 +1030,7 @@ __global__ void partial_rope_kernel(float* x, int64_t stride, const float* w, fl
         v[i] = e * rstd * w[i];
     }
 }
-KREA_API int krea_partial_rope(float* x, int64_t stride, const float* w, float eps, const float* rope, int L, int H, int d,
+GPU_API int gpu_partial_rope(float* x, int64_t stride, const float* w, float eps, const float* rope, int L, int H, int d,
                                int pairs, void* stream) {
     partial_rope_kernel<<<L * H, d, 0, (cudaStream_t)stream>>>(x, stride, w, eps, rope, H, d, pairs);
     KCHECK();
@@ -1051,7 +1051,7 @@ __global__ void flux2_latent_in_kernel(const float* lat, const float* mean, cons
     const int oy = 2 * y + py, ox = 2 * xx + px;
     out[(((int64_t)oy * 2 * W + ox) * (C / 4)) + c] = __float2bfloat16_rn(v);
 }
-KREA_API int krea_flux2_latent_in(const float* lat, const float* mean, const float* stdv, void* out, int C, int H, int W,
+GPU_API int gpu_flux2_latent_in(const float* lat, const float* mean, const float* stdv, void* out, int C, int H, int W,
                                   void* stream) {
     const int64_t n = (int64_t)C * H * W;
     flux2_latent_in_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(lat, mean, stdv, (bf16*)out, C, H, W);
@@ -1090,7 +1090,7 @@ __global__ void group_apply_kernel(const bf16* x, bf16* out, const bf16* w, cons
 }
 
 // GroupNorm, then optional SiLU. x, out [P, C]; stats is 8 * groups bytes of scratch.
-KREA_API int krea_group_norm(const void* x, void* out, const void* w, const void* b, void* stats, int64_t P, int C, int groups,
+GPU_API int gpu_group_norm(const void* x, void* out, const void* w, const void* b, void* stats, int64_t P, int C, int groups,
                              float eps, int silu, void* stream) {
     cudaStream_t st = (cudaStream_t)stream;
     group_stats_kernel<<<groups, 1024, 0, st>>>((const bf16*)x, (float2*)stats, P, C, groups, eps);
@@ -1148,7 +1148,7 @@ __global__ void convrot_requant_kernel(const bf16* x, int8_t* q, float* scales, 
 static int convrot_threads(int K) { return K >= 6144 ? 1024 : 256; }
 
 // out = the weight in its original basis; q [N, K], s [N]
-KREA_API int krea_convrot_dequant_bf16(const void* q, const void* s, void* out, int64_t N, int K, void* stream) {
+GPU_API int gpu_convrot_dequant_bf16(const void* q, const void* s, void* out, int64_t N, int K, void* stream) {
     const int smem = K * sizeof(float);
     cudaFuncSetAttribute(convrot_dequant_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     convrot_dequant_kernel<<<(unsigned)N, convrot_threads(K), smem, (cudaStream_t)stream>>>((const int8_t*)q, (const float*)s, (bf16*)out, K);
@@ -1157,7 +1157,7 @@ KREA_API int krea_convrot_dequant_bf16(const void* q, const void* s, void* out, 
 }
 
 // x [N, K] in its original basis -> rotated q [N, K] and row scales s [N]
-KREA_API int krea_convrot_requant_bf16(const void* x, void* q, void* s, int64_t N, int K, uint64_t seed, void* stream) {
+GPU_API int gpu_convrot_requant_bf16(const void* x, void* q, void* s, int64_t N, int K, uint64_t seed, void* stream) {
     const int smem = (K + 33) * sizeof(float);
     cudaFuncSetAttribute(convrot_requant_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     convrot_requant_kernel<<<(unsigned)N, convrot_threads(K), smem, (cudaStream_t)stream>>>((const bf16*)x, (int8_t*)q, (float*)s, K, seed);
@@ -1171,7 +1171,7 @@ __global__ void lora_add_kernel(bf16* w, const bf16* d, float scale, int64_t n) 
 }
 
 // w += scale * d, every intermediate in bf16 as torch computes it
-KREA_API int krea_lora_add_bf16(void* w, const void* d, float scale, int64_t n, void* stream) {
+GPU_API int gpu_lora_add_bf16(void* w, const void* d, float scale, int64_t n, void* stream) {
     lora_add_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((bf16*)w, (const bf16*)d, scale, n);
     KCHECK();
     return 0;

@@ -152,7 +152,7 @@ impl TextEncoder {
         let s_d = DevBuf::alloc_async(sc.len(), st)?;
         s_d.upload(0, &sc, st)?;
         let text = DevBuf::alloc_async(l0 * D * 4, st)?;
-        k!(krea_embed_dequant(q_d.ptr(), s_d.ptr(), text.ptr(), l0 as i32, D as i32, 1, s(st)))?;
+        k!(gpu_embed_dequant(q_d.ptr(), s_d.ptr(), text.ptr(), l0 as i32, D as i32, 1, s(st)))?;
         let x = DevBuf::alloc_async(l * D * 4, st)?;
         let row = D * 4;
         let (mut from, mut to) = (0, 0);
@@ -204,31 +204,31 @@ impl TextEncoder {
             // ComfyUI runs text encoders with full_precision_mm: weights are dequantized and the
             // matmul is fp32. x @ ((q*s) H)^T == (x H) @ (q*s)^T, so rotate the activation instead.
             let lin = |xr: PM, wq: &str, sc: &str, n: usize, kk: usize, out: PM, beta: f32| -> Result<()> {
-                k!(krea_dequant_i8(w(wq), w(sc), wf.ptr(), n as i64, kk as i64, s(st)))?;
-                k!(krea_gemm(xr, kk as i64, wf.ptr(), kk as i64, out, n as i64,
+                k!(gpu_dequant_i8(w(wq), w(sc), wf.ptr(), n as i64, kk as i64, s(st)))?;
+                k!(gpu_gemm(xr, kk as i64, wf.ptr(), kk as i64, out, n as i64,
                     null(), l as i64, n as i64, kk as i64, 1, DT_F32, DT_F32, 1.0, beta, s(st)))
             };
             // attention
-            k!(krea_rotate_rows_f32(PRO_RMS, xp, D as i64, 0, w("ln1"), EPS, xr.ptr(), m, D as i32, s(st)))?;
+            k!(gpu_rotate_rows_f32(PRO_RMS, xp, D as i64, 0, w("ln1"), EPS, xr.ptr(), m, D as i32, s(st)))?;
             lin(xr.ptr(), "wqkv", "sqkv", QKV, D, qkv.ptr(), 0.0)?;
-            k!(krea_qk_norm_rope(DT_F32, HD as i32, qkv.ptr(), QKV as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32, w("qn"),
+            k!(gpu_qk_norm_rope(DT_F32, HD as i32, qkv.ptr(), QKV as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32, w("qn"),
                 w("kn"), EPS, rope_d.ptr(), 2, m, s(st)))?;
-            k!(krea_attn_small(DT_F32, qkv.ptr(), QKV as i64, off(qkv.ptr(), HQ * HD * 4),
+            k!(gpu_attn_small(DT_F32, qkv.ptr(), QKV as i64, off(qkv.ptr(), HQ * HD * 4),
                 off(qkv.ptr(), (HQ + HK) * HD * 4), QKV as i64, HQ as i32, HK as i32, HD as i32, m, m, attn.ptr(),
                 (HQ * HD) as i64, 1.0 / (HD as f32).sqrt(), 1, s(st)))?;
-            k!(krea_rotate_rows_f32(PRO_PLAIN, attn.ptr(), (HQ * HD) as i64, 0, null(), 0.0, xr.ptr(), m,
+            k!(gpu_rotate_rows_f32(PRO_PLAIN, attn.ptr(), (HQ * HD) as i64, 0, null(), 0.0, xr.ptr(), m,
                 (HQ * HD) as i32, s(st)))?;
             lin(xr.ptr(), "wo", "so", D, HQ * HD, xp, 1.0)?;
             // MLP
-            k!(krea_rotate_rows_f32(PRO_RMS, xp, D as i64, 0, w("ln2"), EPS, xr.ptr(), m, D as i32, s(st)))?;
+            k!(gpu_rotate_rows_f32(PRO_RMS, xp, D as i64, 0, w("ln2"), EPS, xr.ptr(), m, D as i32, s(st)))?;
             lin(xr.ptr(), "wgu", "sgu", 2 * FF, D, gu.ptr(), 0.0)?;
-            k!(krea_rotate_rows_f32(PRO_SWIGLU, gu.ptr(), (2 * FF) as i64, FF as i64, null(), 0.0, xr.ptr(), m,
+            k!(gpu_rotate_rows_f32(PRO_SWIGLU, gu.ptr(), (2 * FF) as i64, FF as i64, null(), 0.0, xr.ptr(), m,
                 FF as i32, s(st)))?;
             lin(xr.ptr(), "wd", "sd", D, FF, xp, 1.0)?;
             self.ws.release(i, st)?;
             if let Some(d) = deepstack.get(i) {
                 let (p, c) = ([xp as crate::ffi::P, d.ptr() as crate::ffi::P], [1.0f32, 1.0]);
-                k!(krea_lincomb(xp, (l * D) as i64, 2, p.as_ptr(), c.as_ptr(), s(st)))?;
+                k!(gpu_lincomb(xp, (l * D) as i64, 2, p.as_ptr(), c.as_ptr(), s(st)))?;
             }
         }
 
@@ -247,7 +247,7 @@ impl TextEncoder {
         let len = l - template_end;
         let row = TAPS.len() * D;
         let ctx = DevBuf::alloc_async(len * row * 2, st)?;
-        k!(krea_f32_to_bf16(off(taps.ptr(), template_end * row * 4), ctx.ptr(), (len * row) as i64, s(st)))?;
+        k!(gpu_f32_to_bf16(off(taps.ptr(), template_end * row * 4), ctx.ptr(), (len * row) as i64, s(st)))?;
         Ok(Cond { ctx, len, token_ids: ids })
     }
 }

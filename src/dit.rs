@@ -166,7 +166,7 @@ impl Dit {
         orow: usize, st: &Stream) -> Result<()> {
         let (bs, rs, hs) = ((sl * row) as i64, row as i64, HD as i64);
         let (obs, ors) = ((sl * orow) as i64, orow as i64);
-        k!(krea_flash_attn(q, kp, v, o, lse, b as i32, sl as i32, sl as i32, h as i32, hk as i32, bs, rs, hs, bs, rs,
+        k!(gpu_flash_attn(q, kp, v, o, lse, b as i32, sl as i32, sl as i32, h as i32, hk as i32, bs, rs, hs, bs, rs,
             hs, bs, rs, hs, obs, ors, hs, 1.0 / (HD as f32).sqrt(), self.attn_variant, s(st)))
     }
 
@@ -183,28 +183,28 @@ impl Dit {
         let gu = DevBuf::alloc_async(m * 2 * TXT_MLP * 2, st)?;
         let lse = DevBuf::alloc_async(m * TXT_H * 4, st)?;
         let (mi, d) = (m as i32, TXT_D as i64);
-        k!(krea_prologue_rows(DT_BF16, PRO_RMS, x, d, null(), 0, 0, w("pre"), EPS, null(), null(), h.ptr(), d, mi,
+        k!(gpu_prologue_rows(DT_BF16, PRO_RMS, x, d, null(), 0, 0, w("pre"), EPS, null(), null(), h.ptr(), d, mi,
             TXT_D as i32, s(st)))?;
-        k!(krea_gemm(h.ptr(), d, w("wqkvg"), d, qkvg.ptr(), TXT_QKVG as i64, null(), m as i64, TXT_QKVG as i64, d, 1,
+        k!(gpu_gemm(h.ptr(), d, w("wqkvg"), d, qkvg.ptr(), TXT_QKVG as i64, null(), m as i64, TXT_QKVG as i64, d, 1,
             DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
-        k!(krea_qk_norm_rope(DT_BF16, HD as i32, qkvg.ptr(), TXT_QKVG as i64, 0, TXT_D as i32, TXT_H as i32, TXT_H as i32,
+        k!(gpu_qk_norm_rope(DT_BF16, HD as i32, qkvg.ptr(), TXT_QKVG as i64, 0, TXT_D as i32, TXT_H as i32, TXT_H as i32,
             w("qn"), w("kn"), EPS, null(), 0, mi, s(st)))?;
         let q = qkvg.ptr();
         self.flash(q, off(q, TXT_D * 2), off(q, 2 * TXT_D * 2), attn.ptr(), lse.ptr(), nb, sl, TXT_H, TXT_H,
             TXT_QKVG, TXT_D, st)?;
-        k!(krea_prologue_rows(DT_BF16, PRO_GATE, attn.ptr(), d, off(q, 3 * TXT_D * 2), TXT_QKVG as i64, 0, null(),
+        k!(gpu_prologue_rows(DT_BF16, PRO_GATE, attn.ptr(), d, off(q, 3 * TXT_D * 2), TXT_QKVG as i64, 0, null(),
             0.0, null(), null(), h.ptr(), d, mi, TXT_D as i32, s(st)))?;
-        k!(krea_gemm(h.ptr(), d, w("wo"), d, y.ptr(), d, null(), m as i64, d, d, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
-        k!(krea_add_gated_bf16(x, d, y.ptr(), d, null(), mi, TXT_D as i32, s(st)))?;
-        k!(krea_prologue_rows(DT_BF16, PRO_RMS, x, d, null(), 0, 0, w("post"), EPS, null(), null(), h.ptr(), d, mi,
+        k!(gpu_gemm(h.ptr(), d, w("wo"), d, y.ptr(), d, null(), m as i64, d, d, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
+        k!(gpu_add_gated_bf16(x, d, y.ptr(), d, null(), mi, TXT_D as i32, s(st)))?;
+        k!(gpu_prologue_rows(DT_BF16, PRO_RMS, x, d, null(), 0, 0, w("post"), EPS, null(), null(), h.ptr(), d, mi,
             TXT_D as i32, s(st)))?;
-        k!(krea_gemm(h.ptr(), d, w("wgu"), d, gu.ptr(), (2 * TXT_MLP) as i64, null(), m as i64, (2 * TXT_MLP) as i64,
+        k!(gpu_gemm(h.ptr(), d, w("wgu"), d, gu.ptr(), (2 * TXT_MLP) as i64, null(), m as i64, (2 * TXT_MLP) as i64,
             d, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
-        k!(krea_prologue_rows(DT_BF16, PRO_SWIGLU, gu.ptr(), (2 * TXT_MLP) as i64, null(), 0, TXT_MLP as i64, null(),
+        k!(gpu_prologue_rows(DT_BF16, PRO_SWIGLU, gu.ptr(), (2 * TXT_MLP) as i64, null(), 0, TXT_MLP as i64, null(),
             0.0, null(), null(), h.ptr(), TXT_MLP as i64, mi, TXT_MLP as i32, s(st)))?;
-        k!(krea_gemm(h.ptr(), TXT_MLP as i64, w("wd"), TXT_MLP as i64, y.ptr(), d, null(), m as i64, d,
+        k!(gpu_gemm(h.ptr(), TXT_MLP as i64, w("wd"), TXT_MLP as i64, y.ptr(), d, null(), m as i64, d,
             TXT_MLP as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
-        k!(krea_add_gated_bf16(x, d, y.ptr(), d, null(), mi, TXT_D as i32, s(st)))?;
+        k!(gpu_add_gated_bf16(x, d, y.ptr(), d, null(), mi, TXT_D as i32, s(st)))?;
         self.txt.release(unit, st)
     }
 
@@ -218,7 +218,7 @@ impl Dit {
             self.txt_block(u, x.ptr(), lc, TXT_LAYERS, st)?;
         }
         let y = DevBuf::alloc_async(lc * TXT_D * 2, st)?;
-        k!(krea_layer_project(x.ptr(), self.g("proj"), y.ptr(), lc as i32, TXT_LAYERS as i32, TXT_D as i32, s(st)))?;
+        k!(gpu_layer_project(x.ptr(), self.g("proj"), y.ptr(), lc as i32, TXT_LAYERS as i32, TXT_D as i32, s(st)))?;
         for u in 2..4 {
             self.txt_block(u, y.ptr(), 1, lc, st)?;
         }
@@ -229,12 +229,12 @@ impl Dit {
         let a = DevBuf::alloc_async(lc * F * 2, st)?;
         let out = DevBuf::alloc_async(lc * F * 2, st)?;
         let d = TXT_D as i64;
-        k!(krea_prologue_rows(DT_BF16, PRO_RMS, y.ptr(), d, null(), 0, 0, w("norm"), EPS, null(), null(), h.ptr(), d,
+        k!(gpu_prologue_rows(DT_BF16, PRO_RMS, y.ptr(), d, null(), 0, 0, w("norm"), EPS, null(), null(), h.ptr(), d,
             lc as i32, TXT_D as i32, s(st)))?;
-        k!(krea_gemm(h.ptr(), d, w("w1"), d, a.ptr(), F as i64, w("b1"), lc as i64, F as i64, d, 1, DT_BF16, DT_BF16, 1.0, 0.0,
+        k!(gpu_gemm(h.ptr(), d, w("w1"), d, a.ptr(), F as i64, w("b1"), lc as i64, F as i64, d, 1, DT_BF16, DT_BF16, 1.0, 0.0,
             s(st)))?;
-        k!(krea_gelu_tanh_bf16(a.ptr(), (lc * F) as i64, s(st)))?;
-        k!(krea_gemm(a.ptr(), F as i64, w("w3"), F as i64, out.ptr(), F as i64, w("b3"), lc as i64, F as i64,
+        k!(gpu_gelu_tanh_bf16(a.ptr(), (lc * F) as i64, s(st)))?;
+        k!(gpu_gemm(a.ptr(), F as i64, w("w3"), F as i64, out.ptr(), F as i64, w("b3"), lc as i64, F as i64,
             F as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
         self.txt.release(4, st)?;
         Ok(out)
@@ -253,8 +253,8 @@ impl Dit {
             let d = DevBuf::alloc_async(padded.len() * 4, st)?;
             d.upload(0, &crate::st::f32_bytes(&padded), st)?;
             let tok = DevBuf::alloc_async(n * CH * PATCH * PATCH * 2, st)?;
-            k!(krea_patchify(d.ptr(), tok.ptr(), CH as i32, ph as i32, pw as i32, PATCH as i32, s(st)))?;
-            k!(krea_gemm(tok.ptr(), pd, self.g("first_w"), pd, off(tokens.ptr(), at * F * 2), F as i64, self.g("first_b"), n as i64, F as i64,
+            k!(gpu_patchify(d.ptr(), tok.ptr(), CH as i32, ph as i32, pw as i32, PATCH as i32, s(st)))?;
+            k!(gpu_gemm(tok.ptr(), pd, self.g("first_w"), pd, off(tokens.ptr(), at * F * 2), F as i64, self.g("first_b"), n as i64, F as i64,
                 pd, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
             at += n;
         }
@@ -314,14 +314,14 @@ impl Dit {
         let t = DevBuf::alloc_async(F * 2, st)?;
         let tg = DevBuf::alloc_async(F * 2, st)?;
         let tvec = DevBuf::alloc_async(MOD * 2, st)?;
-        k!(krea_gemm(emb.ptr(), TDIM as i64, self.g("t0_w"), TDIM as i64, t1.ptr(), fi, self.g("t0_b"), 1, fi,
+        k!(gpu_gemm(emb.ptr(), TDIM as i64, self.g("t0_w"), TDIM as i64, t1.ptr(), fi, self.g("t0_b"), 1, fi,
             TDIM as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
-        k!(krea_gelu_tanh_bf16(t1.ptr(), fi, s(st)))?;
-        k!(krea_gemm(t1.ptr(), fi, self.g("t2_w"), fi, t.ptr(), fi, self.g("t2_b"), 1, fi, fi, 1, DT_BF16, DT_BF16, 1.0, 0.0,
+        k!(gpu_gelu_tanh_bf16(t1.ptr(), fi, s(st)))?;
+        k!(gpu_gemm(t1.ptr(), fi, self.g("t2_w"), fi, t.ptr(), fi, self.g("t2_b"), 1, fi, fi, 1, DT_BF16, DT_BF16, 1.0, 0.0,
             s(st)))?;
         crate::cuda::memcpy_d2d(tg.ptr(), t.ptr(), F * 2, st)?;
-        k!(krea_gelu_tanh_bf16(tg.ptr(), fi, s(st)))?;
-        k!(krea_gemm(tg.ptr(), fi, self.g("tp_w"), fi, tvec.ptr(), MOD as i64, self.g("tp_b"), 1, MOD as i64, fi, 1,
+        k!(gpu_gelu_tanh_bf16(tg.ptr(), fi, s(st)))?;
+        k!(gpu_gemm(tg.ptr(), fi, self.g("tp_w"), fi, tvec.ptr(), MOD as i64, self.g("tp_b"), 1, MOD as i64, fi, 1,
             DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
         Ok((t, tvec))
     }
@@ -351,9 +351,9 @@ impl Dit {
         let x = DevBuf::alloc_async(l * F * 2, st)?;
         crate::cuda::memcpy_d2d(x.ptr(), ctx.ptr(), lt * F * 2, st)?;
         let tok = DevBuf::alloc_async(li * CH * PATCH * PATCH * 2, st)?;
-        k!(krea_patchify(latent.ptr(), tok.ptr(), CH as i32, h as i32, w as i32, PATCH as i32, s(st)))?;
+        k!(gpu_patchify(latent.ptr(), tok.ptr(), CH as i32, h as i32, w as i32, PATCH as i32, s(st)))?;
         let pd = (CH * PATCH * PATCH) as i64;
-        k!(krea_gemm(tok.ptr(), pd, self.g("first_w"), pd, off(x.ptr(), lt * F * 2), fi, self.g("first_b"),
+        k!(gpu_gemm(tok.ptr(), pd, self.g("first_w"), pd, off(x.ptr(), lt * F * 2), fi, self.g("first_b"),
             li as i64, fi, pd, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
         if let Some(r) = refs {
             crate::cuda::memcpy_d2d(off(x.ptr(), (lt + li) * F * 2), r.tokens.ptr(), nr * F * 2, st)?;
@@ -366,7 +366,7 @@ impl Dit {
         let gu = DevBuf::alloc_async(l * 2 * MLP * 2, st)?;
         let lse = DevBuf::alloc_async(HQ * l * 4, st)?;
         let int8_ws = if self.int8_attn {
-            let n = unsafe { crate::ffi::krea_int8_attn_workspace(1, HQ as i32, HK as i32, l as i32, l as i32) };
+            let n = unsafe { crate::ffi::gpu_int8_attn_workspace(1, HQ as i32, HK as i32, l as i32, l as i32) };
             Some(DevBuf::alloc_async(n as usize, st)?)
         } else {
             None
@@ -383,47 +383,47 @@ impl Dit {
             let base = self.blocks.acquire(b, st)?;
             let lay = &self.blocks.layouts[b];
             let wp = |key: &str| off(base, lay.off(key));
-            k!(krea_add_vec_bf16(modv.ptr(), tvec.ptr(), wp("mod"), 1, MOD as i32, s(st)))?;
+            k!(gpu_add_vec_bf16(modv.ptr(), tvec.ptr(), wp("mod"), 1, MOD as i32, s(st)))?;
             if let Some(t0) = &tvec0 {
-                k!(krea_add_vec_bf16(modv0.ptr(), t0.ptr(), wp("mod"), 1, MOD as i32, s(st)))?;
+                k!(gpu_add_vec_bf16(modv0.ptr(), t0.ptr(), wp("mod"), 1, MOD as i32, s(st)))?;
             }
             // attention
             for &(r0, rows, mv) in &groups {
-                k!(krea_quant_rows(DT_BF16, PRO_RMS, off(xp, r0 * F * 2), fi, null(), 0, 0, wp("pre"), EPS, mo(mv, 0), mo(mv, 1), off(a8.ptr(), r0 * F),
+                k!(gpu_quant_rows(DT_BF16, PRO_RMS, off(xp, r0 * F * 2), fi, null(), 0, 0, wp("pre"), EPS, mo(mv, 0), mo(mv, 1), off(a8.ptr(), r0 * F),
                     off(asc.ptr(), r0 * 4), rows as i32, F as i32, 1, s(st)))?;
             }
-            k!(krea_int8_gemm(a8.ptr(), wp("wqkvg"), asc.ptr(), wp("sqkvg"), null(), qkvg.ptr(), l as i64,
+            k!(gpu_int8_gemm(a8.ptr(), wp("wqkvg"), asc.ptr(), wp("sqkvg"), null(), qkvg.ptr(), l as i64,
                 QKVG as i64, fi, DT_BF16, s(st)))?;
-            k!(krea_qk_norm_rope(DT_BF16, HD as i32, qkvg.ptr(), QKVG as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32,
+            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, qkvg.ptr(), QKVG as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32,
                 wp("qn"), wp("kn"), EPS, rope.ptr(), 1, m, s(st)))?;
             let q = qkvg.ptr();
             let (kp, vp) = (off(q, HQ * HD * 2), off(q, (HQ + HK) * HD * 2));
             if let Some(ws) = &int8_ws {
                 let (bs, rs, hs) = ((l * QKVG) as i64, QKVG as i64, HD as i64);
-                k!(krea_int8_attn(q, kp, vp, attn.ptr(), ws.ptr(), 1, l as i32, l as i32, HQ as i32, HK as i32, bs, rs,
+                k!(gpu_int8_attn(q, kp, vp, attn.ptr(), ws.ptr(), 1, l as i32, l as i32, HQ as i32, HK as i32, bs, rs,
                     hs, bs, rs, hs, bs, rs, hs, (l * F) as i64, fi, hs, 1.0 / (HD as f32).sqrt(), s(st)))?;
             } else {
                 self.flash(q, kp, vp, attn.ptr(), lse.ptr(), 1, l, HQ, HK, QKVG, F, st)?;
             }
-            k!(krea_quant_rows(DT_BF16, PRO_GATE, attn.ptr(), fi, off(q, (HQ + 2 * HK) * HD * 2), QKVG as i64, 0,
+            k!(gpu_quant_rows(DT_BF16, PRO_GATE, attn.ptr(), fi, off(q, (HQ + 2 * HK) * HD * 2), QKVG as i64, 0,
                 null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m, F as i32, 1, s(st)))?;
             for &(r0, rows, mv) in &groups {
                 let xr = off(xp, r0 * F * 2);
-                k!(krea_int8_gemm_residual(off(a8.ptr(), r0 * F), wp("wo"), off(asc.ptr(), r0 * 4), wp("so"), null(), mo(mv, 2), xr, xr, rows as i64, fi,
+                k!(gpu_int8_gemm_residual(off(a8.ptr(), r0 * F), wp("wo"), off(asc.ptr(), r0 * 4), wp("so"), null(), mo(mv, 2), xr, xr, rows as i64, fi,
                     fi, DT_BF16, s(st)))?;
             }
             // MLP
             for &(r0, rows, mv) in &groups {
-                k!(krea_quant_rows(DT_BF16, PRO_RMS, off(xp, r0 * F * 2), fi, null(), 0, 0, wp("post"), EPS, mo(mv, 3), mo(mv, 4), off(a8.ptr(), r0 * F),
+                k!(gpu_quant_rows(DT_BF16, PRO_RMS, off(xp, r0 * F * 2), fi, null(), 0, 0, wp("post"), EPS, mo(mv, 3), mo(mv, 4), off(a8.ptr(), r0 * F),
                     off(asc.ptr(), r0 * 4), rows as i32, F as i32, 1, s(st)))?;
             }
-            k!(krea_int8_gemm(a8.ptr(), wp("wgu"), asc.ptr(), wp("sgu"), null(), gu.ptr(), l as i64, (2 * MLP) as i64,
+            k!(gpu_int8_gemm(a8.ptr(), wp("wgu"), asc.ptr(), wp("sgu"), null(), gu.ptr(), l as i64, (2 * MLP) as i64,
                 fi, DT_BF16, s(st)))?;
-            k!(krea_quant_rows(DT_BF16, PRO_SWIGLU, gu.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0,
+            k!(gpu_quant_rows(DT_BF16, PRO_SWIGLU, gu.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0,
                 null(), null(), a8.ptr(), asc.ptr(), m, MLP as i32, 1, s(st)))?;
             for &(r0, rows, mv) in &groups {
                 let xr = off(xp, r0 * F * 2);
-                k!(krea_int8_gemm_residual(off(a8.ptr(), r0 * MLP), wp("wd"), off(asc.ptr(), r0 * 4), wp("sd"), null(), mo(mv, 5), xr, xr, rows as i64, fi,
+                k!(gpu_int8_gemm_residual(off(a8.ptr(), r0 * MLP), wp("wd"), off(asc.ptr(), r0 * 4), wp("sd"), null(), mo(mv, 5), xr, xr, rows as i64, fi,
                     MLP as i64, DT_BF16, s(st)))?;
             }
             self.blocks.release(b, st)?;
@@ -434,17 +434,17 @@ impl Dit {
 
         // final layer on image tokens: (1 + scale) * norm(x) + shift -> linear
         let lm = DevBuf::alloc_async(2 * F * 2, st)?;
-        k!(krea_add_vec_bf16(lm.ptr(), t.ptr(), self.g("last_mod"), 0, F as i32, s(st)))?;
-        k!(krea_add_vec_bf16(off(lm.ptr(), F * 2), t.ptr(), off(self.g("last_mod"), F * 2), 0, F as i32, s(st)))?;
+        k!(gpu_add_vec_bf16(lm.ptr(), t.ptr(), self.g("last_mod"), 0, F as i32, s(st)))?;
+        k!(gpu_add_vec_bf16(off(lm.ptr(), F * 2), t.ptr(), off(self.g("last_mod"), F * 2), 0, F as i32, s(st)))?;
         let xi = off(xp, lt * F * 2);
-        k!(krea_prologue_rows(DT_BF16, PRO_RMS, xi, fi, null(), 0, 0, self.g("last_norm"), EPS, lm.ptr(),
+        k!(gpu_prologue_rows(DT_BF16, PRO_RMS, xi, fi, null(), 0, 0, self.g("last_norm"), EPS, lm.ptr(),
             off(lm.ptr(), F * 2), attn.ptr(), fi, li as i32, F as i32, s(st)))?;
-        k!(krea_gemm(attn.ptr(), fi, self.g("last_w"), fi, tok.ptr(), pd, self.g("last_b"), li as i64, pd, fi, 1,
+        k!(gpu_gemm(attn.ptr(), fi, self.g("last_w"), fi, tok.ptr(), pd, self.g("last_b"), li as i64, pd, fi, 1,
             DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
         if let Some(p) = probe.as_mut() {
             p("dit_out_tokens", &tok, li * pd as usize * 2);
         }
-        k!(krea_unpatch_euler(tok.ptr(), pd, latent.ptr(), CH as i32, h as i32, w as i32, PATCH as i32, sigma,
+        k!(gpu_unpatch_euler(tok.ptr(), pd, latent.ptr(), CH as i32, h as i32, w as i32, PATCH as i32, sigma,
             sigma_next, denoised.map_or(std::ptr::null_mut(), |d| d.ptr()), s(st)))?;
         let _ = PRO_PLAIN;
         Ok(())

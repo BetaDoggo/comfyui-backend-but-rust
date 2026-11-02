@@ -30,7 +30,7 @@ ap.add_argument("--capture", action="append", default=[])
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
 
-M = os.environ["KREA2_MODELS"]
+M = os.environ["MODELS_ROOT"]
 FAMILY = {
     "krea": dict(dit=M + r"\Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors", te=M + r"\clip\qwen3vl_4b.safetensors",
                  vae=M + r"\VAE\qwen_image_vae.safetensors", clip="KREA2", ch=16, down=8, steps=8, cfg=1.0, shift=1.15, sampler="euler",

@@ -13,12 +13,12 @@ name = "comfy-server"
 path = "src/main.rs"
 
 [features]
-# The real Krea 2 engine. Needs the CUDA toolkit and MSVC, so the default build stays mock-only.
-krea2 = ["dep:krea2-engine"]
+# The real engine. Needs the CUDA toolkit and MSVC, so the default build stays mock-only.
+native = ["dep:native-engine"]
 
 [dependencies]
 swarm-engine-api.workspace = true
-krea2-engine = { path = "../krea2-engine", optional = true }
+native-engine = { path = "../native-engine", optional = true }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

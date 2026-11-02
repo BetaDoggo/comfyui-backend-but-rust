@@ -1,13 +1,13 @@
 @echo off
 setlocal EnableDelayedExpansion
-rem Starts the krea2 SwarmUI backend. Pass extra comfy-server flags as arguments.
+rem Starts the native SwarmUI backend. Pass extra comfy-server flags as arguments.
 cd /D "%~dp0"
 
 set "PORT=8188"
-set "MODELS=%KREA2_MODELS%"
+set "MODELS=%MODELS_ROOT%"
 if not defined MODELS (
-    echo Set KREA2_MODELS to your models folder first, for example:
-    echo   set KREA2_MODELS=C:\SwarmUI\Models
+    echo Set MODELS_ROOT to your models folder first, for example:
+    echo   set MODELS_ROOT=C:\SwarmUI\Models
     goto failed
 )
 set "CUDA_BIN=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin"
@@ -17,14 +17,14 @@ rem A stray quote in PATH hides every later entry from cmd, including cargo, so 
 set "PATH=%CUDA_BIN%;!PATH:"=!"
 set ROOTS=--models-root "%MODELS%"
 
-rem cargo only rebuilds what changed, and the engine only exists in a --features krea2 build.
+rem cargo only rebuilds what changed, and the engine only exists in a --features native build.
 echo Building (the first build takes about 10 minutes)...
-cargo build --release -p comfy-server --features krea2
+cargo build --release -p comfy-server --features native
 if errorlevel 1 goto failed
 
 echo.
 echo ================================================================
-echo  krea2 backend
+echo  native backend
 echo.
 echo  Connect SwarmUI:
 echo    1. Server tab, Backends, add "ComfyUI API By URL"
@@ -40,12 +40,12 @@ echo  Press Ctrl+C to stop.
 echo ================================================================
 echo.
 
-"%SERVER%" --engine krea2 --port %PORT% %ROOTS% %*
+"%SERVER%" --engine native --port %PORT% %ROOTS% %*
 if errorlevel 1 goto failed
 goto :eof
 
 :failed
 echo.
-echo The krea2 backend stopped with an error (see above).
+echo The native backend stopped with an error (see above).
 pause
 exit /b 1

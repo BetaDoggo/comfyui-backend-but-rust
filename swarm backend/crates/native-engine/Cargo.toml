@@ -1,6 +1,6 @@
 [package]
-name = "krea2-engine"
-description = "swarm_engine_api::Engine backed by the krea2 Rust + CUDA Krea 2 (W8A8 int8) pipeline."
+name = "native-engine"
+description = "swarm_engine_api::Engine backed by the diffusion library's Rust + CUDA pipelines."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,4 +10,4 @@ swarm-engine-api.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 tracing = "0.1"
-krea2 = { path = "../../.." }
+diffusion = { path = "../../.." }

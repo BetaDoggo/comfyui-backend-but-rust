@@ -1,7 +1,7 @@
 import os
 import numpy as np, torch, comfy_kitchen as ck
 from safetensors import safe_open
-f = safe_open(os.path.join(os.environ["KREA2_MODELS"], r"clip\qwen3vl_4b.safetensors"), "pt")
+f = safe_open(os.path.join(os.environ["MODELS_ROOT"], r"clip\qwen3vl_4b.safetensors"), "pt")
 P = "model.language_model.layers.0."
 w = f.get_tensor(P+"self_attn.q_proj.weight").cuda(); ws = f.get_tensor(P+"self_attn.q_proj.weight_scale").cuda()
 ln = f.get_tensor(P+"input_layernorm.weight").cuda()

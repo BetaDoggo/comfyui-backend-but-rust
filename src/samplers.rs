@@ -427,7 +427,7 @@ fn seed_state(entropy: u64, spawn: Option<(u64, u32)>, n: usize) -> Vec<u32> {
 pub struct Batch {
     pub index: usize,
     pub size: usize,
-    /// [`crate::ffi::krea_randn_threads`]
+    /// [`crate::ffi::gpu_randn_threads`]
     pub threads: usize,
 }
 

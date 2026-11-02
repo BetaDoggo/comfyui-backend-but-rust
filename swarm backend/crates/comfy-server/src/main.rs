@@ -8,15 +8,15 @@ use swarm_engine_api::Engine;
 fn make_engine(cfg: &Config) -> anyhow::Result<Arc<dyn Engine>> {
     match cfg.engine.as_str() {
         "mock" => Ok(Arc::new(if cfg.mock_native_only { MockEngine::native_only(cfg.mock_step_ms) } else { MockEngine::new(cfg.mock_step_ms) })),
-        #[cfg(feature = "krea2")]
-        "krea2" => {
-            // Serves Krea 2 and Anima; the checkpoint picks which.
-            let options = krea2_engine::Krea2Options { reserve_vram_mb: cfg.krea2_reserve_vram, max_side: cfg.krea2_max_side, ..Default::default() };
-            Ok(Arc::new(krea2_engine::Krea2Engine::new(&options)?))
+        #[cfg(feature = "native")]
+        "native" => {
+            // Serves Krea 2, Anima and MOSS Image; the checkpoint picks which.
+            let options = native_engine::NativeOptions { reserve_vram_mb: cfg.reserve_vram, max_side: cfg.max_side, ..Default::default() };
+            Ok(Arc::new(native_engine::NativeEngine::new(&options)?))
         }
-        #[cfg(not(feature = "krea2"))]
-        "krea2" => anyhow::bail!("this build has no krea2 engine; rebuild with --features krea2"),
-        other => anyhow::bail!("unknown --engine {other} (mock | krea2)"),
+        #[cfg(not(feature = "native"))]
+        "native" => anyhow::bail!("this build has no native engine; rebuild with --features native"),
+        other => anyhow::bail!("unknown --engine {other} (mock | native)"),
     }
 }
 

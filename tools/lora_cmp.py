@@ -2,7 +2,7 @@
 
 usage: python lora_cmp.py <ref_dir> <ours_dir> [ours.png]
 
-ours_dir is $KREA_LORA_DUMP of a krea2 run: create an empty `<stem>.want` there for each module without `diffusion_model.`.
+ours_dir is $LORA_DUMP of a diffusion run: create an empty `<stem>.want` there for each module without `diffusion_model.`.
 """
 import os
 import sys

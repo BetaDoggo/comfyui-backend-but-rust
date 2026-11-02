@@ -165,22 +165,22 @@ impl Dit {
     /// here); with short ones it isn't, and the fused bias lands closest (measured on the first step).
     fn gemm(&self, a: PM, w: PM, bias: PM, out: PM, rows: usize, n: usize, kk: usize, ldd: usize, st: &Stream) -> Result<()> {
         if rows < 1024 {
-            return k!(krea_gemm(a, kk as i64, w, kk as i64, out, ldd as i64, bias, rows as i64, n as i64, kk as i64, 1, DT_BF16, DT_BF16, 1.0,
+            return k!(gpu_gemm(a, kk as i64, w, kk as i64, out, ldd as i64, bias, rows as i64, n as i64, kk as i64, 1, DT_BF16, DT_BF16, 1.0,
                 0.0, s(st)));
         }
-        k!(krea_gemm(a, kk as i64, w, kk as i64, out, ldd as i64, null(), rows as i64, n as i64, kk as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0,
+        k!(gpu_gemm(a, kk as i64, w, kk as i64, out, ldd as i64, null(), rows as i64, n as i64, kk as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0,
             s(st)))?;
         if bias.is_null() {
             return Ok(());
         }
-        k!(krea_add_gated_bf16(out, ldd as i64, bias, 0, null(), rows as i32, n as i32, s(st)))
+        k!(gpu_add_gated_bf16(out, ldd as i64, bias, 0, null(), rows as i32, n as i32, s(st)))
     }
 
     /// The text embedder depends on the prompt alone, so it runs once per prompt.
     pub fn encode_context(&self, cond: &DevBuf, len: usize, st: &Stream) -> Result<Context> {
         let (l, m, fi) = (len, len as i32, F as i64);
         let c16 = DevBuf::alloc_async(l * TXT * 2, st)?;
-        k!(krea_f32_to_bf16(cond.ptr(), c16.ptr(), (l * TXT) as i64, s(st)))?;
+        k!(gpu_f32_to_bf16(cond.ptr(), c16.ptr(), (l * TXT) as i64, s(st)))?;
         let x = DevBuf::alloc_async(l * F * 2, st)?;
         self.gemm(c16.ptr(), self.g("tp_w"), self.g("tp_b"), x.ptr(), l, F, TXT, F, st)?;
         let rope = rope_table(0, 0, l);
@@ -196,21 +196,21 @@ impl Dit {
         let xp = x.ptr();
         for i in 0..TXT_BLOCKS {
             let g = |x: &str| self.g(&format!("t{i}_{x}"));
-            k!(krea_prologue_rows(DT_BF16, PRO_RMS, xp, fi, null(), 0, 0, g("norm1"), EPS, null(), null(), h.ptr(), fi, m, F as i32, s(st)))?;
+            k!(gpu_prologue_rows(DT_BF16, PRO_RMS, xp, fi, null(), 0, 0, g("norm1"), EPS, null(), null(), h.ptr(), fi, m, F as i32, s(st)))?;
             self.gemm(h.ptr(), g("qkv_w"), g("qkv_b"), qkv.ptr(), l, QKV, F, QKV, st)?;
             let q = qkv.ptr();
-            k!(krea_qk_norm_rope(DT_BF16, HD as i32, q, QKV as i64, 0, F as i32, H as i32, H as i32, g("q_norm"), g("k_norm"), EPS,
+            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, q, QKV as i64, 0, F as i32, H as i32, H as i32, g("q_norm"), g("k_norm"), EPS,
                 rope_d.ptr(), 2, m, s(st)))?;
             self.attention(q, off(q, F * 2), off(q, 2 * F * 2), attn.ptr(), ws.ptr(), l, st)?;
             self.gemm(attn.ptr(), g("proj_w"), g("proj_b"), y.ptr(), l, F, F, F, st)?;
-            k!(krea_add_gated_bf16(xp, fi, y.ptr(), fi, null(), m, F as i32, s(st)))?;
-            k!(krea_prologue_rows(DT_BF16, PRO_RMS, xp, fi, null(), 0, 0, g("norm2"), EPS, null(), null(), h.ptr(), fi, m, F as i32, s(st)))?;
+            k!(gpu_add_gated_bf16(xp, fi, y.ptr(), fi, null(), m, F as i32, s(st)))?;
+            k!(gpu_prologue_rows(DT_BF16, PRO_RMS, xp, fi, null(), 0, 0, g("norm2"), EPS, null(), null(), h.ptr(), fi, m, F as i32, s(st)))?;
             self.gemm(h.ptr(), g("ffn_up_w"), g("ffn_up_b"), ug.ptr(), l, MLP, F, 2 * MLP, st)?;
             self.gemm(h.ptr(), g("ffn_gate_w"), g("ffn_gate_b"), off(ug.ptr(), MLP * 2), l, MLP, F, 2 * MLP, st)?;
-            k!(krea_prologue_rows(DT_BF16, PRO_SITU, ug.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0, null(), null(), a.ptr(),
+            k!(gpu_prologue_rows(DT_BF16, PRO_SITU, ug.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0, null(), null(), a.ptr(),
                 MLP as i64, m, MLP as i32, s(st)))?;
             self.gemm(a.ptr(), g("ffn_down_w"), g("ffn_down_b"), y.ptr(), l, F, MLP, F, st)?;
-            k!(krea_add_gated_bf16(xp, fi, y.ptr(), fi, null(), m, F as i32, s(st)))?;
+            k!(gpu_add_gated_bf16(xp, fi, y.ptr(), fi, null(), m, F as i32, s(st)))?;
         }
         Ok(Context { ctx: x, len })
     }
@@ -231,7 +231,7 @@ impl Dit {
         let t1 = DevBuf::alloc_async(F * 2, st)?;
         let vec = DevBuf::alloc_async(F * 2, st)?;
         self.gemm(emb.ptr(), self.g("t0_w"), self.g("t0_b"), t0.ptr(), 1, F, TDIM, F, st)?;
-        k!(krea_prologue_rows(DT_BF16, crate::ffi::PRO_SILU, t0.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), t1.ptr(), fi, 1, F as i32,
+        k!(gpu_prologue_rows(DT_BF16, crate::ffi::PRO_SILU, t0.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), t1.ptr(), fi, 1, F as i32,
             s(st)))?;
         self.gemm(t1.ptr(), self.g("t2_w"), self.g("t2_b"), vec.ptr(), 1, F, F, F, st)?;
         let shared = DevBuf::alloc(6 * F * 2)?;
@@ -239,7 +239,7 @@ impl Dit {
         let head = DevBuf::alloc(2 * F * 2)?;
         self.gemm(vec.ptr(), self.g("hm_w"), self.g("hm_b"), head.ptr(), 1, 2 * F, F, 2 * F, st)?;
         let scale = off(head.ptr(), F * 2);
-        k!(krea_adaln_weight(self.g("fn"), scale, scale, F as i32, s(st)))?;
+        k!(gpu_adaln_weight(self.g("fn"), scale, scale, F as i32, s(st)))?;
         let scales = DevBuf::alloc(self.blocks.len() * 2 * F * 2)?;
         Ok(Mods { shared, head, scales })
     }
@@ -247,7 +247,7 @@ impl Dit {
     /// flash attention only needs a softmax scratch; int8 attention quantizes q, k and v into it
     fn attn_workspace(&self, l: usize) -> usize {
         if self.int8_attn {
-            unsafe { crate::ffi::krea_int8_attn_workspace(1, H as i32, H as i32, l as i32, l as i32) as usize }
+            unsafe { crate::ffi::gpu_int8_attn_workspace(1, H as i32, H as i32, l as i32, l as i32) as usize }
         } else {
             H * l * 4
         }
@@ -257,9 +257,9 @@ impl Dit {
         let (hi, hs, sc) = (H as i32, HD as i64, 1.0 / (HD as f32).sqrt());
         let (bs, rs, ob, or) = ((l * QKV) as i64, QKV as i64, (l * F) as i64, F as i64);
         if self.int8_attn {
-            k!(krea_int8_attn(q, kp, vp, out, ws, 1, l as i32, l as i32, hi, hi, bs, rs, hs, bs, rs, hs, bs, rs, hs, ob, or, hs, sc, s(st)))
+            k!(gpu_int8_attn(q, kp, vp, out, ws, 1, l as i32, l as i32, hi, hi, bs, rs, hs, bs, rs, hs, bs, rs, hs, ob, or, hs, sc, s(st)))
         } else {
-            k!(krea_flash_attn(q, kp, vp, out, ws, 1, l as i32, l as i32, hi, hi, bs, rs, hs, bs, rs, hs, bs, rs, hs, ob, or, hs, sc,
+            k!(gpu_flash_attn(q, kp, vp, out, ws, 1, l as i32, l as i32, hi, hi, bs, rs, hs, bs, rs, hs, bs, rs, hs, ob, or, hs, sc,
                 self.attn_variant, s(st)))
         }
     }
@@ -285,7 +285,7 @@ impl Dit {
         // [image tokens ; text tokens]
         let x = DevBuf::alloc_async(l * F * 2, st)?;
         let tok = DevBuf::alloc_async(li * CH * 2, st)?;
-        k!(krea_patchify(latent.ptr(), tok.ptr(), CH as i32, h as i32, w as i32, 1, s(st)))?;
+        k!(gpu_patchify(latent.ptr(), tok.ptr(), CH as i32, h as i32, w as i32, 1, s(st)))?;
         self.gemm(tok.ptr(), self.g("vid_w"), self.g("vid_b"), x.ptr(), li, F, CH, F, st)?;
         crate::cuda::memcpy_d2d(off(x.ptr(), li * F * 2), c.ctx.ptr(), c.len * F * 2, st)?;
         if let Some(p) = probe.as_mut() {
@@ -307,25 +307,25 @@ impl Dit {
             let wp = |key: &str| off(base, lay.off(key));
             let scale = |j: usize| off(mods.scales.ptr(), (b * 2 + j) * F * 2);
             if !hit {
-                k!(krea_adaln_weight(wp("n1"), shared(1), scale(0), F as i32, s(st)))?;
-                k!(krea_adaln_weight(wp("n2"), shared(4), scale(1), F as i32, s(st)))?;
+                k!(gpu_adaln_weight(wp("n1"), shared(1), scale(0), F as i32, s(st)))?;
+                k!(gpu_adaln_weight(wp("n2"), shared(4), scale(1), F as i32, s(st)))?;
             }
-            k!(krea_quant_rows(DT_BF16, PRO_ADALN, xp, fi, null(), 0, 0, null(), EPS, scale(0), shared(0), a8.ptr(), asc.ptr(), m, F as i32, 1,
+            k!(gpu_quant_rows(DT_BF16, PRO_ADALN, xp, fi, null(), 0, 0, null(), EPS, scale(0), shared(0), a8.ptr(), asc.ptr(), m, F as i32, 1,
                 s(st)))?;
-            k!(krea_int8_gemm(a8.ptr(), wp("w_qkv"), asc.ptr(), wp("s_qkv"), null(), q, l as i64, QKV as i64, fi, DT_BF16, s(st)))?;
-            k!(krea_qk_norm_rope(DT_BF16, HD as i32, q, QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn"), wp("kn"), EPS, rope.ptr(), 2, m,
+            k!(gpu_int8_gemm(a8.ptr(), wp("w_qkv"), asc.ptr(), wp("s_qkv"), null(), q, l as i64, QKV as i64, fi, DT_BF16, s(st)))?;
+            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, q, QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn"), wp("kn"), EPS, rope.ptr(), 2, m,
                 s(st)))?;
             self.attention(q, off(q, F * 2), off(q, 2 * F * 2), attn.ptr(), ws.ptr(), l, st)?;
-            k!(krea_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m, F as i32, 1,
+            k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m, F as i32, 1,
                 s(st)))?;
-            k!(krea_int8_gemm_residual(a8.ptr(), wp("w_o"), asc.ptr(), wp("s_o"), null(), shared(2), xp, xp, l as i64, fi, fi, DT_BF16, s(st)))?;
+            k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_o"), asc.ptr(), wp("s_o"), null(), shared(2), xp, xp, l as i64, fi, fi, DT_BF16, s(st)))?;
 
-            k!(krea_quant_rows(DT_BF16, PRO_ADALN, xp, fi, null(), 0, 0, null(), EPS, scale(1), shared(3), a8.ptr(), asc.ptr(), m, F as i32, 1,
+            k!(gpu_quant_rows(DT_BF16, PRO_ADALN, xp, fi, null(), 0, 0, null(), EPS, scale(1), shared(3), a8.ptr(), asc.ptr(), m, F as i32, 1,
                 s(st)))?;
-            k!(krea_int8_gemm(a8.ptr(), wp("w_ug"), asc.ptr(), wp("s_ug"), null(), hid.ptr(), l as i64, (2 * MLP) as i64, fi, DT_BF16, s(st)))?;
-            k!(krea_quant_rows(DT_BF16, PRO_SITU, hid.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0, null(), null(), a8.ptr(),
+            k!(gpu_int8_gemm(a8.ptr(), wp("w_ug"), asc.ptr(), wp("s_ug"), null(), hid.ptr(), l as i64, (2 * MLP) as i64, fi, DT_BF16, s(st)))?;
+            k!(gpu_quant_rows(DT_BF16, PRO_SITU, hid.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0, null(), null(), a8.ptr(),
                 asc.ptr(), m, MLP as i32, 1, s(st)))?;
-            k!(krea_int8_gemm_residual(a8.ptr(), wp("w_d"), asc.ptr(), wp("s_d"), null(), shared(5), xp, xp, l as i64, fi, MLP as i64, DT_BF16,
+            k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_d"), asc.ptr(), wp("s_d"), null(), shared(5), xp, xp, l as i64, fi, MLP as i64, DT_BF16,
                 s(st)))?;
             self.blocks.release(b, st)?;
             if let Some(p) = probe.as_mut() {
@@ -334,13 +334,13 @@ impl Dit {
         }
 
         let head_scale = off(mods.head.ptr(), F * 2);
-        k!(krea_prologue_rows(DT_BF16, PRO_ADALN, xp, fi, null(), 0, 0, null(), EPS, head_scale, mods.head.ptr(), attn.ptr(), fi, li as i32,
+        k!(gpu_prologue_rows(DT_BF16, PRO_ADALN, xp, fi, null(), 0, 0, null(), EPS, head_scale, mods.head.ptr(), attn.ptr(), fi, li as i32,
             F as i32, s(st)))?;
         self.gemm(attn.ptr(), self.g("fl"), nil, tok.ptr(), li, CH, F, CH, st)?;
         if let Some(p) = probe.as_mut() {
             p("final_tokens", &tok, li * CH * 2);
         }
-        k!(krea_unpatch_denoised(tok.ptr(), CH as i64, latent.ptr(), den.ptr(), CH as i32, h as i32, w as i32, 1, sigma, s(st)))?;
+        k!(gpu_unpatch_denoised(tok.ptr(), CH as i64, latent.ptr(), den.ptr(), CH as i32, h as i32, w as i32, 1, sigma, s(st)))?;
         self.mods.insert(sigma.to_bits(), mods);
         Ok(())
     }

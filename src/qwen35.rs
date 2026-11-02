@@ -116,7 +116,7 @@ impl TextEncoder {
         let s_d = DevBuf::alloc_async(sc.len(), st)?;
         s_d.upload(0, &sc, st)?;
         let x = DevBuf::alloc_async(l * D * 4, st)?;
-        k!(krea_embed_dequant(q_d.ptr(), s_d.ptr(), x.ptr(), l as i32, D as i32, 1, s(st)))?;
+        k!(gpu_embed_dequant(q_d.ptr(), s_d.ptr(), x.ptr(), l as i32, D as i32, 1, s(st)))?;
 
         let mut rope = Vec::with_capacity(l * ROPE_PAIRS * 2);
         for pos in 0..l {
@@ -151,14 +151,14 @@ impl TextEncoder {
             let w = |key: &str| off(base, lay.off(key));
             // x @ ((q*s) H)^T == (x H) @ (q*s)^T, so the activation is rotated instead of the weight
             let lin = |a: PM, wq: &str, sq: &str, rows: usize, kk: usize, out: PM, beta: f32| -> Result<()> {
-                k!(krea_dequant_i8(w(wq), w(sq), wf.ptr(), rows as i64, kk as i64, s(st)))?;
-                k!(krea_gemm(a, kk as i64, wf.ptr(), kk as i64, out, rows as i64, null(), l as i64, rows as i64, kk as i64, 1, DT_F32, DT_F32,
+                k!(gpu_dequant_i8(w(wq), w(sq), wf.ptr(), rows as i64, kk as i64, s(st)))?;
+                k!(gpu_gemm(a, kk as i64, wf.ptr(), kk as i64, out, rows as i64, null(), l as i64, rows as i64, kk as i64, 1, DT_F32, DT_F32,
                     1.0, beta, s(st)))
             };
             let rotate = |a: PM, stride: usize, kk: usize| -> Result<()> {
-                k!(krea_rotate_rows_f32(PRO_PLAIN, a, stride as i64, 0, null(), 0.0, xr.ptr(), m, kk as i32, s(st)))
+                k!(gpu_rotate_rows_f32(PRO_PLAIN, a, stride as i64, 0, null(), 0.0, xr.ptr(), m, kk as i32, s(st)))
             };
-            k!(krea_prologue_rows(DT_F32, PRO_RMS, xp, d, null(), 0, 0, w("ln1"), EPS, null(), null(), n.ptr(), d, m, D as i32, s(st)))?;
+            k!(gpu_prologue_rows(DT_F32, PRO_RMS, xp, d, null(), 0, 0, w("ln1"), EPS, null(), null(), n.ptr(), d, m, D as i32, s(st)))?;
             if i == 0 {
                 if let Some(p) = probe.as_mut() {
                     p("te_norm0", &n, l * D * 4);
@@ -169,15 +169,15 @@ impl TextEncoder {
                 lin(xr.ptr(), "wqkv", "sqkv", CONV, D, proj.ptr(), 0.0)?;
                 lin(xr.ptr(), "wz", "sz", VAL, D, z.ptr(), 0.0)?;
                 for (key, out) in [("wa", &a), ("wb", &b)] {
-                    k!(krea_bf16_to_f32(w(key), aw.ptr(), (HV * D) as i64, s(st)))?;
-                    k!(krea_gemm(n.ptr(), d, aw.ptr(), d, out.ptr(), HV as i64, null(), l as i64, HV as i64, d, 1, DT_F32, DT_F32, 1.0, 0.0,
+                    k!(gpu_bf16_to_f32(w(key), aw.ptr(), (HV * D) as i64, s(st)))?;
+                    k!(gpu_gemm(n.ptr(), d, aw.ptr(), d, out.ptr(), HV as i64, null(), l as i64, HV as i64, d, 1, DT_F32, DT_F32, 1.0, 0.0,
                         s(st)))?;
                 }
-                k!(krea_delta_conv(proj.ptr(), w("conv"), mix.ptr(), m, CONV as i32, s(st)))?;
-                k!(krea_delta_rule(mix.ptr(), a.ptr(), b.ptr(), w("dt"), w("alog"), delta.ptr(), m, HV as i32, HK as i32, DV as i32, s(st)))?;
-                k!(krea_prologue_rows(DT_F32, PRO_RMS, delta.ptr(), DV as i64, null(), 0, 0, w("dn"), EPS, null(), null(), xr.ptr(), DV as i64,
+                k!(gpu_delta_conv(proj.ptr(), w("conv"), mix.ptr(), m, CONV as i32, s(st)))?;
+                k!(gpu_delta_rule(mix.ptr(), a.ptr(), b.ptr(), w("dt"), w("alog"), delta.ptr(), m, HV as i32, HK as i32, DV as i32, s(st)))?;
+                k!(gpu_prologue_rows(DT_F32, PRO_RMS, delta.ptr(), DV as i64, null(), 0, 0, w("dn"), EPS, null(), null(), xr.ptr(), DV as i64,
                     (l * HV) as i32, DV as i32, s(st)))?;
-                k!(krea_mul_silu(xr.ptr(), z.ptr(), (l * VAL) as i64, s(st)))?;
+                k!(gpu_mul_silu(xr.ptr(), z.ptr(), (l * VAL) as i64, s(st)))?;
                 crate::cuda::memcpy_d2d(delta.ptr(), xr.ptr(), l * VAL * 4, st)?;
                 rotate(delta.ptr(), VAL, VAL)?;
                 lin(xr.ptr(), "wo", "so", D, VAL, xp, 1.0)?;
@@ -188,12 +188,12 @@ impl TextEncoder {
                 let (qs, gs) = (mix.ptr(), delta.ptr());
                 memcpy_2d_d2d(qs, HD * 4, proj.ptr(), 2 * HD * 4, HD * 4, l * HA, st)?;
                 memcpy_2d_d2d(gs, HD * 4, off(proj.ptr(), HD * 4), 2 * HD * 4, HD * 4, l * HA, st)?;
-                k!(krea_partial_rope(qs, attn_row as i64, w("qn"), EPS, rope_d.ptr(), m, HA as i32, HD as i32, ROPE_PAIRS as i32, s(st)))?;
-                k!(krea_partial_rope(kv.ptr(), (2 * HKV * HD) as i64, w("kn"), EPS, rope_d.ptr(), m, HKV as i32, HD as i32, ROPE_PAIRS as i32,
+                k!(gpu_partial_rope(qs, attn_row as i64, w("qn"), EPS, rope_d.ptr(), m, HA as i32, HD as i32, ROPE_PAIRS as i32, s(st)))?;
+                k!(gpu_partial_rope(kv.ptr(), (2 * HKV * HD) as i64, w("kn"), EPS, rope_d.ptr(), m, HKV as i32, HD as i32, ROPE_PAIRS as i32,
                     s(st)))?;
-                k!(krea_attn_small(DT_F32, qs, attn_row as i64, kv.ptr(), off(kv.ptr(), HKV * HD * 4), (2 * HKV * HD) as i64, HA as i32,
+                k!(gpu_attn_small(DT_F32, qs, attn_row as i64, kv.ptr(), off(kv.ptr(), HKV * HD * 4), (2 * HKV * HD) as i64, HA as i32,
                     HKV as i32, HD as i32, m, m, proj.ptr(), attn_row as i64, 1.0 / (HD as f32).sqrt(), 1, s(st)))?;
-                k!(krea_prologue_rows(DT_F32, PRO_GATE, proj.ptr(), attn_row as i64, gs, attn_row as i64, 0, null(), 0.0, null(), null(),
+                k!(gpu_prologue_rows(DT_F32, PRO_GATE, proj.ptr(), attn_row as i64, gs, attn_row as i64, 0, null(), 0.0, null(), null(),
                     z.ptr(), attn_row as i64, m, attn_row as i32, s(st)))?;
                 rotate(z.ptr(), attn_row, attn_row)?;
                 lin(xr.ptr(), "wo", "so", D, attn_row, xp, 1.0)?;
@@ -203,9 +203,9 @@ impl TextEncoder {
                     p("te_attn0_x", &x, l * D * 4);
                 }
             }
-            k!(krea_rotate_rows_f32(PRO_RMS, xp, d, 0, w("ln2"), EPS, xr.ptr(), m, D as i32, s(st)))?;
+            k!(gpu_rotate_rows_f32(PRO_RMS, xp, d, 0, w("ln2"), EPS, xr.ptr(), m, D as i32, s(st)))?;
             lin(xr.ptr(), "wgu", "sgu", 2 * FF, D, gu.ptr(), 0.0)?;
-            k!(krea_rotate_rows_f32(PRO_SWIGLU, gu.ptr(), (2 * FF) as i64, FF as i64, null(), 0.0, xr.ptr(), m, FF as i32, s(st)))?;
+            k!(gpu_rotate_rows_f32(PRO_SWIGLU, gu.ptr(), (2 * FF) as i64, FF as i64, null(), 0.0, xr.ptr(), m, FF as i32, s(st)))?;
             lin(xr.ptr(), "wd", "sd", D, FF, xp, 1.0)?;
             self.ws.release(i, st)?;
             if let Some(p) = probe.as_mut() {
@@ -215,7 +215,7 @@ impl TextEncoder {
             }
         }
         let out = DevBuf::alloc_async(l * D * 4, st)?;
-        k!(krea_prologue_rows(DT_F32, PRO_RMS, xp, d, null(), 0, 0, self.norm.ptr(), EPS, null(), null(), out.ptr(), d, m, D as i32, s(st)))?;
+        k!(gpu_prologue_rows(DT_F32, PRO_RMS, xp, d, null(), 0, 0, self.norm.ptr(), EPS, null(), null(), out.ptr(), d, m, D as i32, s(st)))?;
         Ok(out)
     }
 }

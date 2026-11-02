@@ -114,7 +114,7 @@ fn nvml_device() -> Option<usize> {
 }
 
 extern "C" {
-    fn krea_wddm_budget(budget: *mut u64, usage: *mut u64) -> c_int;
+    fn gpu_wddm_budget(budget: *mut u64, usage: *mut u64) -> c_int;
 }
 
 /// VRAM this process can still use without the OS paging it out.
@@ -126,7 +126,7 @@ pub fn device_free() -> Result<usize> {
     let (cuda_free, _) = mem_info()?;
     let (mut budget, mut usage) = (0u64, 0u64);
     static LOGGED: std::sync::Once = std::sync::Once::new();
-    if unsafe { krea_wddm_budget(&mut budget, &mut usage) } == 0 && budget > 0 {
+    if unsafe { gpu_wddm_budget(&mut budget, &mut usage) } == 0 && budget > 0 {
         LOGGED.call_once(|| eprintln!("VRAM accounting: DXCore process budget ({} MB budget, {} MB in use)",
             budget >> 20, usage >> 20));
         return Ok(cuda_free.min(budget.saturating_sub(usage) as usize));

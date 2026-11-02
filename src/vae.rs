@@ -62,7 +62,7 @@ pub(crate) fn conv_krsc(st: &SafeTensors, name: &str, cout_pad: usize) -> Result
     Ok((out.iter().flat_map(|b| b.to_le_bytes()).collect(), cop, ci, r))
 }
 
-/// Like [`conv_krsc`] for a 3 channel input padded to 8, which `krea_conv2d` needs.
+/// Like [`conv_krsc`] for a 3 channel input padded to 8, which `gpu_conv2d` needs.
 fn conv_krsc_rgb(st: &SafeTensors, name: &str) -> Result<Vec<u8>> {
     let (w, cout, ci, r) = conv_krsc(st, name, 0)?;
     let mut out = vec![0u8; cout * r * r * RGB_PAD * 2];
@@ -83,7 +83,7 @@ pub(crate) fn bias_pad(st: &SafeTensors, name: &str, pad: usize) -> Result<Vec<u
 pub(crate) fn single_head_attention(x: &DevBuf, n: &DevBuf, p: usize, c: usize, w: [PM; 4], st: &Stream) -> Result<()> {
     let qkv = DevBuf::alloc_async(p * 3 * c * 2, st)?;
     let (ci, c3) = (c as i64, 3 * c as i64);
-    k!(krea_gemm(n.ptr(), ci, w[0], ci, qkv.ptr(), c3, w[1], p as i64, c3, ci, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
+    k!(gpu_gemm(n.ptr(), ci, w[0], ci, qkv.ptr(), c3, w[1], p as i64, c3, ci, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
     // query rows per chunk: keep the f32 scores + bf16 probabilities under ~256 MB
     let chunk = ((256 << 20) / (p * 6)).clamp(64, 4096).min(p);
     let sbuf = DevBuf::alloc_async(chunk * p * 4, st)?;
@@ -92,15 +92,15 @@ pub(crate) fn single_head_attention(x: &DevBuf, n: &DevBuf, p: usize, c: usize, 
     let (kp, vp) = (off(q, c * 2), off(q, 2 * c * 2));
     for r0 in (0..p).step_by(chunk) {
         let rows = chunk.min(p - r0);
-        k!(krea_gemm(off(q, r0 * 3 * c * 2), c3, kp, c3, sbuf.ptr(), p as i64, null(), rows as i64, p as i64, ci, 1, DT_BF16,
+        k!(gpu_gemm(off(q, r0 * 3 * c * 2), c3, kp, c3, sbuf.ptr(), p as i64, null(), rows as i64, p as i64, ci, 1, DT_BF16,
             crate::ffi::DT_F32, 1.0, 0.0, s(st)))?;
-        k!(krea_softmax_rows(sbuf.ptr(), pbuf.ptr(), rows as i32, p as i32, 1.0 / (c as f32).sqrt(), s(st)))?;
-        k!(krea_gemm(pbuf.ptr(), p as i64, vp, c3, off(n.ptr(), r0 * c * 2), ci, null(), rows as i64, ci, p as i64, 0, DT_BF16, DT_BF16, 1.0,
+        k!(gpu_softmax_rows(sbuf.ptr(), pbuf.ptr(), rows as i32, p as i32, 1.0 / (c as f32).sqrt(), s(st)))?;
+        k!(gpu_gemm(pbuf.ptr(), p as i64, vp, c3, off(n.ptr(), r0 * c * 2), ci, null(), rows as i64, ci, p as i64, 0, DT_BF16, DT_BF16, 1.0,
             0.0, s(st)))?;
     }
     let y = DevBuf::alloc_async(p * c * 2, st)?;
-    k!(krea_gemm(n.ptr(), ci, w[2], ci, y.ptr(), ci, w[3], p as i64, ci, ci, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
-    k!(krea_add_gated_bf16(x.ptr(), ci, y.ptr(), ci, null(), p as i32, c as i32, s(st)))
+    k!(gpu_gemm(n.ptr(), ci, w[2], ci, y.ptr(), ci, w[3], p as i64, ci, ci, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
+    k!(gpu_add_gated_bf16(x.ptr(), ci, y.ptr(), ci, null(), p as i32, c as i32, s(st)))
 }
 
 /// The ops of one stage of blocks, with their weights added to `lay`.
@@ -185,7 +185,7 @@ impl Vae {
 
     fn conv(&self, key: &str, x: PM, out: PM, h: usize, w: usize, cin: usize, cout: usize, r: usize, st: &Stream)
         -> Result<()> {
-        k!(krea_conv2d(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), out, 1, h as i32, w as i32,
+        k!(gpu_conv2d(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), out, 1, h as i32, w as i32,
             cin as i32, cout as i32, r as i32, s(st)))
     }
 
@@ -200,20 +200,20 @@ impl Vae {
         let alloc = |c: usize| DevBuf::alloc_async(h * w * c * 2, st);
         let p = (h * w) as i64;
         let t = alloc(cin)?;
-        k!(krea_l2norm_silu(x.ptr(), t.ptr(), self.w(&format!("{pre}.g0")), p, cin as i32, 1, s(st)))?;
+        k!(gpu_l2norm_silu(x.ptr(), t.ptr(), self.w(&format!("{pre}.g0")), p, cin as i32, 1, s(st)))?;
         let u = alloc(cout)?;
         self.conv(&format!("{pre}.c2"), t.ptr(), u.ptr(), h, w, cin, cout, 3, st)?;
         drop(t);
         let t2 = alloc(cout)?;
-        k!(krea_l2norm_silu(u.ptr(), t2.ptr(), self.w(&format!("{pre}.g3")), p, cout as i32, 1, s(st)))?;
+        k!(gpu_l2norm_silu(u.ptr(), t2.ptr(), self.w(&format!("{pre}.g3")), p, cout as i32, 1, s(st)))?;
         self.conv(&format!("{pre}.c6"), t2.ptr(), u.ptr(), h, w, cout, cout, 3, st)?;
         drop(t2);
         if shortcut {
             let sc = alloc(cout)?;
             self.conv(&format!("{pre}.sc"), x.ptr(), sc.ptr(), h, w, cin, cout, 1, st)?;
-            k!(krea_add_gated_bf16(u.ptr(), cout as i64, sc.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
+            k!(gpu_add_gated_bf16(u.ptr(), cout as i64, sc.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
         } else {
-            k!(krea_add_gated_bf16(u.ptr(), cout as i64, x.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
+            k!(gpu_add_gated_bf16(u.ptr(), cout as i64, x.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
         }
         Ok(u)
     }
@@ -250,7 +250,7 @@ impl Vae {
                     let full = alloc(*cd, hh, ww)?;
                     self.conv(&format!("{pre}.conv"), x.ptr(), full.ptr(), hh, ww, *cd, *cd, 3, st)?;
                     let y = alloc(*cd, hh / 2, ww / 2)?;
-                    k!(krea_take_odd(full.ptr(), y.ptr(), hh as i32, ww as i32, *cd as i32, s(st)))?;
+                    k!(gpu_take_odd(full.ptr(), y.ptr(), hh as i32, ww as i32, *cd as i32, s(st)))?;
                     x = y;
                     hh /= 2;
                     ww /= 2;
@@ -260,7 +260,7 @@ impl Vae {
         }
         let z2 = self.zdim * 2;
         let t = alloc(c, hh, ww)?;
-        k!(krea_l2norm_silu(x.ptr(), t.ptr(), self.w("encoder.head.g"), (hh * ww) as i64, c as i32, 1, s(st)))?;
+        k!(gpu_l2norm_silu(x.ptr(), t.ptr(), self.w("encoder.head.g"), (hh * ww) as i64, c as i32, 1, s(st)))?;
         let moments = alloc(z2, hh, ww)?;
         self.conv("encoder.head", t.ptr(), moments.ptr(), hh, ww, c, z2, 3, st)?;
         let q = alloc(z2, hh, ww)?;
@@ -282,7 +282,7 @@ impl Vae {
         let z = self.zdim;
         let alloc = |c: usize, hh: usize, ww: usize| DevBuf::alloc_async(hh * ww * c * 2, st);
         let zin = alloc(z, h, w)?;
-        k!(krea_vae_latent_in(latent.ptr(), self.w("mean"), self.w("std"), zin.ptr(), z as i32, (h * w) as i32, s(st)))?;
+        k!(gpu_vae_latent_in(latent.ptr(), self.w("mean"), self.w("std"), zin.ptr(), z as i32, (h * w) as i32, s(st)))?;
         let z2 = alloc(z, h, w)?;
         self.conv("conv2", zin.ptr(), z2.ptr(), h, w, z, z, 1, st)?;
         let c0 = self.c0;
@@ -303,7 +303,7 @@ impl Vae {
                 }
                 Op::Up { pre, cin } => {
                     let up = alloc(*cin, 2 * hh, 2 * ww)?;
-                    k!(krea_upsample2x(x.ptr(), up.ptr(), hh as i32, ww as i32, *cin as i32, s(st)))?;
+                    k!(gpu_upsample2x(x.ptr(), up.ptr(), hh as i32, ww as i32, *cin as i32, s(st)))?;
                     hh *= 2;
                     ww *= 2;
                     let co = cin / 2;
@@ -318,11 +318,11 @@ impl Vae {
         }
         let p = hh * ww;
         let t = alloc(c, hh, ww)?;
-        k!(krea_l2norm_silu(x.ptr(), t.ptr(), self.w("head.g"), p as i64, c as i32, 1, s(st)))?;
+        k!(gpu_l2norm_silu(x.ptr(), t.ptr(), self.w("head.g"), p as i64, c as i32, 1, s(st)))?;
         let o = alloc(OUT_PAD, hh, ww)?;
         self.conv("head", t.ptr(), o.ptr(), hh, ww, c, OUT_PAD, 3, st)?;
         let rgb = DevBuf::alloc_async(p * 3, st)?;
-        k!(krea_to_rgb8(o.ptr(), OUT_PAD as i32, rgb.ptr(), p as i64, s(st)))?;
+        k!(gpu_to_rgb8(o.ptr(), OUT_PAD as i32, rgb.ptr(), p as i64, s(st)))?;
         let mut out = vec![0u8; p * 3];
         rgb.download(0, &mut out, st)?;
         Ok(out)
@@ -331,7 +331,7 @@ impl Vae {
     /// Single-head spatial self-attention (in place on x [p, c]).
     fn attention(&self, pre: &str, x: &DevBuf, p: usize, c: usize, st: &Stream) -> Result<()> {
         let n = DevBuf::alloc_async(p * c * 2, st)?;
-        k!(krea_l2norm_silu(x.ptr(), n.ptr(), self.w(&format!("{pre}.g")), p as i64, c as i32, 0, s(st)))?;
+        k!(gpu_l2norm_silu(x.ptr(), n.ptr(), self.w(&format!("{pre}.g")), p as i64, c as i32, 0, s(st)))?;
         let w = |key: &str| self.w(&format!("{pre}.{key}"));
         single_head_attention(x, &n, p, c, [w("qkv.w"), w("qkv.b"), w("proj.w"), w("proj.b")], st)
     }

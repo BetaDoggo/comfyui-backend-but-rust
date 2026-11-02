@@ -13,7 +13,7 @@ int8 model families, text-to-image only.
 
 ## Quick start
 
-You need Windows x64, an NVIDIA GPU (the default build targets RTX 50-series, `sm_120`; set `KREA_CUDA_ARCH` for others),
+You need Windows x64, an NVIDIA GPU (the default build targets RTX 50-series, `sm_120`; set `CUDA_ARCH` for others),
 [Rust](https://rustup.rs), the CUDA 13 toolkit (`CUDA_PATH`) and MSVC Build Tools 2022.
 
 ```bash
@@ -27,7 +27,7 @@ about 6 minutes the first time:
 cargo build --release
 ```
 
-Put your models in one folder, keeping these subfolders, and point `KREA2_MODELS` at it (or pass `--models`, or `--dit`,
+Put your models in one folder, keeping these subfolders, and point `MODELS_ROOT` at it (or pass `--models`, or `--dit`,
 `--te` and `--vae` for any other file):
 
 | Model | `Stable-diffusion/` | `clip/` | `VAE/` |
@@ -39,19 +39,19 @@ Put your models in one folder, keeping these subfolders, and point `KREA2_MODELS
 Generate an image from the command line:
 
 ```bash
-target/release/krea2.exe -p "a red fox in a snowy forest" --seed 42 -o fox.png
+target/release/diffusion.exe -p "a red fox in a snowy forest" --seed 42 -o fox.png
 ```
 
 ```bash
-target/release/krea2.exe --anima -p "no humans, scenery, mountain lake at sunrise" -o lake.png
+target/release/diffusion.exe --anima -p "no humans, scenery, mountain lake at sunrise" -o lake.png
 ```
 
 ```bash
-target/release/krea2.exe --moss -p "a stone lighthouse on a sea cliff at dawn" --steps 20 --cfg 4 -o lighthouse.png
+target/release/diffusion.exe --moss -p "a stone lighthouse on a sea cliff at dawn" --steps 20 --cfg 4 -o lighthouse.png
 ```
 
-Add `--lora path/to/lora.safetensors:0.8` to any of them. To use it from SwarmUI, set `KREA2_MODELS`, run
-[`swarm backend/start-krea2.bat`](swarm%20backend/start-krea2.bat), and add `http://127.0.0.1:8188` as a "ComfyUI API By URL"
+Add `--lora path/to/lora.safetensors:0.8` to any of them. To use it from SwarmUI, set `MODELS_ROOT`, run
+[`swarm backend/start-backend.bat`](swarm%20backend/start-backend.bat), and add `http://127.0.0.1:8188` as a "ComfyUI API By URL"
 backend. Keep a real ComfyUI backend next to it, because anything else is refused or reaches a mock engine.
 
 More: [technical overview](docs/TECHNICAL_OVERVIEW.md), [status](docs/STATUS.md), [SwarmUI backend](swarm%20backend/README.md).
@@ -70,7 +70,7 @@ SwarmUI's features than that, but they only reach a mock engine so far. [`docs/S
 still to do, in priority order. Run it today beside a normal ComfyUI backend.
 
 * `swarm backend/` is the server: the ComfyUI protocol, the node graph, and the `Engine` interface. Start it with
-  [`start-krea2.bat`](swarm%20backend/start-krea2.bat) and see [its README](swarm%20backend/README.md).
+  [`start-backend.bat`](swarm%20backend/start-backend.bat) and see [its README](swarm%20backend/README.md).
 * The repository root is the real engine: the Krea 2, Anima and MOSS Image pipelines described below. They also run alone
   from the command line, and Krea 2 has a small web UI.
 * [`docs/TECHNICAL_OVERVIEW.md`](docs/TECHNICAL_OVERVIEW.md) explains what the project is built on and how the pieces fit.
@@ -80,7 +80,7 @@ still to do, in priority order. Run it today beside a normal ComfyUI backend.
 All three models take LoRAs, from SwarmUI or with `--lora path[:strength]` (repeatable, applied in order):
 
 ```bash
-target/release/krea2.exe --moss --lora moss-dmdv1.safetensors --steps 8 --cfg 1 -p "a stone lighthouse on a sea cliff at dawn, no people" -o lighthouse.png
+target/release/diffusion.exe --moss --lora moss-dmdv1.safetensors --steps 8 --cfg 1 -p "a stone lighthouse on a sea cliff at dawn, no people" -o lighthouse.png
 ```
 
 They are baked, as ComfyUI does for quantized weights: each patched int8 weight is dequantized to bf16, the patches are
@@ -116,7 +116,7 @@ All 45 ComfyUI samplers and all 9 ComfyUI schedulers run on all three models, pl
 and any CFG with a negative prompt, now including Krea 2:
 
 ```bash
-target/release/krea2.exe --anima --sampler dpmpp_2m_sde_gpu --scheduler karras --steps 12 --cfg 4 --negative "lowres" -p "no humans, scenery, mountain lake"
+target/release/diffusion.exe --anima --sampler dpmpp_2m_sde_gpu --scheduler karras --steps 12 --cfg 4 --negative "lowres" -p "no humans, scenery, mountain lake"
 ```
 
 They are ports of ComfyUI's code in f32 ([`src/samplers.rs`](src/samplers.rs)), running on the host between model evaluations.
@@ -154,7 +154,7 @@ Krea 2 takes images two ways, both as in ComfyUI, and SwarmUI's Prompt Images us
   with `index` or `index_timestep_zero`. These are for edit LoRAs; the base model mostly copies the reference.
 
 ```bash
-target/release/krea2.exe -p "no people, a stone lighthouse at sunset" --image ref_small.png --ref-image ref_full.png --ref-method index
+target/release/diffusion.exe -p "no people, a stone lighthouse at sunset" --image ref_small.png --ref-image ref_full.png --ref-method index
 ```
 
 The CLI reads PNGs at their own size. SwarmUI scales them first, to about 384x384 for the text encoder and to the generation's
@@ -188,12 +188,12 @@ published key layouts of that VAE load. Every sampler and scheduler works, at an
 Prompts are literal: like ComfyUI, this encoder has no `(word:1.2)` emphasis.
 
 ```bash
-target/release/krea2.exe --moss -p "a stone lighthouse on a sea cliff at dawn, no people" --steps 20 --cfg 4 --negative "blurry" -o lighthouse.png
+target/release/diffusion.exe --moss -p "a stone lighthouse on a sea cliff at dawn, no people" --steps 20 --cfg 4 --negative "blurry" -o lighthouse.png
 ```
 
 Measured at 1024x1024, 20 steps, CFG 4 (two model evaluations per step), after warm-up:
 
-| | ComfyUI | krea2 (`--attention flash`) | krea2 (default, `int8`) |
+| | ComfyUI | This engine (`--attention flash`) | This engine (default, `int8`) |
 |---|---|---|---|
 | Sampling | 12.0 s (601 ms/step) | 15.2 s (760 ms/step) | 11.0 to 11.5 s (550 to 573 ms/step) |
 | Text, one prompt | 437 ms | 248 ms | 248 ms |
@@ -220,12 +220,12 @@ place, as with Krea 2. Every sampler and scheduler works (see [Samplers](#sample
 negative prompts and `(word:1.2)` emphasis.
 
 ```bash
-target/release/krea2.exe --anima -p "no humans, scenery, mountain lake at sunrise" --seed 42 -o lake.png
+target/release/diffusion.exe --anima -p "no humans, scenery, mountain lake at sunrise" --seed 42 -o lake.png
 ```
 
 Measured at 1024x1024 with 8 steps, CFG 1 and `er_sde`, after warm-up:
 
-| | ComfyUI | krea2 (`--attention flash`) | krea2 (default, `int8`) |
+| | ComfyUI | This engine (`--attention flash`) | This engine (default, `int8`) |
 |---|---|---|---|
 | Sampling | 1.59 s (199 ms/step) | 1.31 s (164 ms/step) | 0.92 s (115 ms/step) |
 
@@ -258,13 +258,13 @@ cargo build --release
 ```
 
 ```bash
-target/release/krea2.exe -p "a red fox sitting in a snowy forest, golden hour, photograph" --seed 42 -o fox.png
+target/release/diffusion.exe -p "a red fox sitting in a snowy forest, golden hour, photograph" --seed 42 -o fox.png
 ```
 
 ### Web UI
 
 ```bash
-target/release/krea2.exe --serve 127.0.0.1:7860
+target/release/diffusion.exe --serve 127.0.0.1:7860
 ```
 
 Then open http://127.0.0.1:7860. Models load once and stay in memory; requests queue on the GPU.
@@ -293,7 +293,7 @@ Useful flags:
 
 1024×1024, 8 steps, warm page cache:
 
-| | ComfyUI (main.py, DynamicVRAM) | krea2 (`--attention flash`) | krea2 (default, `int8`) |
+| | ComfyUI (main.py, DynamicVRAM) | This engine (`--attention flash`) | This engine (default, `int8`) |
 | --- | --- | --- | --- |
 | per step | ~1.00 s | ~0.69–0.72 s | ~0.58–0.61 s |
 | per image (text + sample + VAE) | ~9.0 s | ~6.2 s | ~5.3 s |
@@ -356,6 +356,6 @@ tools/              ComfyUI reference dump / comparison / benchmark scripts
 ```
 
 The CUTLASS and flash-attention checkouts default to `ref/comfy-kitchen/third_party/*` (override with
-`KREA_CUTLASS_DIR` / `KREA_FLASH_ATTN_DIR`). Object files are cached by content hash.
+`CUTLASS_DIR` / `FLASH_ATTN_DIR`). Object files are cached by content hash.
 
 Not implemented: init images and inpainting, which need partial sampling.

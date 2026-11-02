@@ -23,7 +23,7 @@ extern "C" void launch_sage_attn_kernel(const void* q, const void* k, const void
 static int cta_k_for(int lk) { return lk > 1024 ? 128 : 64; }
 
 // Scratch bytes needed for b batches, h/hk heads, lengths lq/lk, head dim 128.
-extern "C" int64_t krea_int8_attn_workspace(int b, int h, int hk, int lq, int lk) {
+extern "C" int64_t gpu_int8_attn_workspace(int b, int h, int hk, int lq, int lk) {
     const int ck = cta_k_for(lk);
     const int64_t plk = (int64_t)(lk + ck - 1) / ck * ck;
     const int64_t d = 128;
@@ -40,7 +40,7 @@ extern "C" int64_t krea_int8_attn_workspace(int b, int h, int hk, int lq, int lk
 }
 
 // q/k/v: bf16 [b, seq, heads, 128] with element strides; o: bf16, same convention.
-extern "C" int krea_int8_attn(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk,
+extern "C" int gpu_int8_attn(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk,
                               int h, int hk, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs,
                               int64_t k_hs, int64_t v_bs, int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs,
                               int64_t o_hs, float scale, void* stream) {

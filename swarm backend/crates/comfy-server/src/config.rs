@@ -30,17 +30,17 @@ pub struct Config {
     #[arg(long, default_value = "ffmpeg")]
     pub ffmpeg: String,
 
-    /// Which engine runs generations: `mock`, or `krea2` (needs a build with `--features krea2`).
+    /// Which engine runs generations: `mock`, or `native` (needs a build with `--features native`).
     #[arg(long, default_value = "mock")]
     pub engine: String,
 
-    /// krea2 engine: VRAM (MB) to leave untouched for the desktop and other applications.
+    /// native engine: VRAM (MB) to leave untouched for the desktop and other applications.
     #[arg(long, default_value_t = 512)]
-    pub krea2_reserve_vram: usize,
+    pub reserve_vram: usize,
 
-    /// krea2 engine: largest side (pixels, at 1:1) of a generation.
+    /// native engine: largest side (pixels, at 1:1) of a generation.
     #[arg(long, default_value_t = 2048)]
-    pub krea2_max_side: usize,
+    pub max_side: usize,
 
     /// Mock engine only: artificial delay per sampling step, so progress/previews are visible.
     #[arg(long, default_value_t = 40)]
@@ -74,8 +74,8 @@ impl Config {
             temp_dir: root.join("temp"),
             ffmpeg: "ffmpeg".into(),
             engine: "mock".into(),
-            krea2_reserve_vram: 512,
-            krea2_max_side: 2048,
+            reserve_vram: 512,
+            max_side: 2048,
             mock_step_ms: 0,
             mock_native_only: false,
             max_history: 100,

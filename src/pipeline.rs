@@ -164,7 +164,7 @@ struct MossModel {
 /// is called twice per evaluation under CFG, always positive first.
 fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
     model: &mut dyn FnMut(&DevBuf, &DevBuf, f32, bool, usize) -> Result<()>, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<Vec<f32>> {
-    let threads = unsafe { ffi::krea_randn_threads() };
+    let threads = unsafe { ffi::gpu_randn_threads() };
     if threads <= 0 {
         bail!("could not read the GPU's core count");
     }
@@ -183,7 +183,7 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
         if negative {
             model(&x, &und, sigma, true, evals)?;
             let (p, c) = ([und.ptr() as ffi::P, den.ptr() as ffi::P], [1.0 - cfg, cfg]);
-            ffi::k!(krea_lincomb(den.ptr(), n as i64, 2, p.as_ptr(), c.as_ptr(), ffi::s(st)))?;
+            ffi::k!(gpu_lincomb(den.ptr(), n as i64, 2, p.as_ptr(), c.as_ptr(), ffi::s(st)))?;
         }
         let read = |b: &DevBuf| -> Result<Vec<f32>> {
             let mut bytes = vec![0u8; n * 4];
@@ -256,7 +256,7 @@ fn rebalance(st: &Stream, blocks: &mut offload::WeightSet, dst: &st::SafeTensors
     let owned = blocks.vram_bytes();
     let avail = (free + owned).saturating_sub(need + reserve);
     let mut p = offload::plan(&blocks.layouts, avail, slots);
-    if std::env::var_os("KREA_DEBUG_VRAM").is_some() {
+    if std::env::var_os("DEBUG_VRAM").is_some() {
         let (cf, _) = cuda::mem_info()?;
         eprintln!("rebalance: free {} MB (cuda {} MB), owned {} MB, need {} MB, avail {} MB -> {} resident",
             free / MB, cf / MB, owned / MB, need / MB, avail / MB, p.resident);
@@ -306,7 +306,7 @@ impl Generator {
     /// Start the GPU runtime with no models loaded; the `ensure_*` methods load them.
     pub fn new(o: &LoadOptions) -> Result<Self> {
         cuda::init(0)?;
-        ffi::ok(unsafe { ffi::krea_blas_init(64 * MB) }, "cublasLt init")?;
+        ffi::ok(unsafe { ffi::gpu_blas_init(64 * MB) }, "cublasLt init")?;
         let st0 = Stream::new()?;
         let (_, total) = cuda::mem_info()?;
         eprintln!("GPU memory: {} MB free (device-wide) / {} MB total", cuda::device_free()? / MB, total / MB);

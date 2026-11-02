@@ -328,6 +328,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "diffusion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "clap",
+ "fancy-regex",
+ "half",
+ "memmap2",
+ "png",
+ "serde_json",
+ "tiny_http",
+ "tokenizers",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -443,23 +460,6 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "krea2"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cc",
- "clap",
- "fancy-regex",
- "half",
- "memmap2",
- "png",
- "serde_json",
- "tiny_http",
- "tokenizers",
- "unicode-normalization",
-]
 
 [[package]]
 name = "libc"

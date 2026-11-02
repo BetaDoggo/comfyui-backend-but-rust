@@ -1,7 +1,7 @@
 //! Every sampler and scheduler against ComfyUI's own code, recorded by `tools/sampler_ref.py`.
 
-use krea2::samplers::{self, Batch, Eval, ModelSampling, Uncond};
-use krea2::sampling::torch_randn;
+use diffusion::samplers::{self, Batch, Eval, ModelSampling, Uncond};
+use diffusion::sampling::torch_randn;
 use serde_json::Value;
 
 /// Worst relative error allowed in a final latent: f32 rounding, not a different algorithm.

@@ -6,7 +6,7 @@
 
 using namespace FLASH_NAMESPACE;
 
-namespace krea_fa {
+namespace gpu_fa {
 
 template <typename Traits, bool EvenMN>
 void launch_variant(Flash_fwd_params& params, cudaStream_t stream) {
@@ -35,12 +35,12 @@ using TraitsB = Flash_fwd_kernel_traits<128, 128, 32, 4, false, false, cutlass::
 
 int round_up(int x, int m) { return (x + m - 1) / m * m; }
 
-}  // namespace krea_fa
-using namespace krea_fa;
+}  // namespace gpu_fa
+using namespace gpu_fa;
 
 // q/k/v/o: bf16, layout [b, seq, heads, 128] with arbitrary batch/row/head strides (elements).
 // lse: float scratch [b, h, seqlen_q]. variant 0: 128x64 tiles, 1: 128x32 tiles.
-KREA_API int krea_flash_attn(const void* q, const void* k, const void* v, void* o, float* lse, int b, int sq, int sk,
+GPU_API int gpu_flash_attn(const void* q, const void* k, const void* v, void* o, float* lse, int b, int sq, int sk,
                              int h, int hk, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs,
                              int64_t k_hs, int64_t v_bs, int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs,
                              int64_t o_hs, float scale, int variant, void* stream) {

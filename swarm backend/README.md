@@ -1,7 +1,7 @@
 # swarm backend (Rust)
 
 A ComfyUI-API-compatible server that SwarmUI can use as a normal **"ComfyUI API By URL"** backend,
-fronting a native Rust generation engine. It ships with two engines: **krea2**, which really generates Krea 2
+fronting a native Rust generation engine. It ships with two engines: **native**, which really generates Krea 2
 Turbo, Anima and MOSS Image text-to-image with the Rust + CUDA pipelines in the parent repository, and the **mock engine**,
 which returns placeholder images/video/audio of the correct shapes for every other model family.
 
@@ -9,7 +9,7 @@ which returns placeholder images/video/audio of the correct shapes for every oth
 crates/
   engine-api/     the contract: Engine trait + typed request structs (no web deps)
   comfy-server/   HTTP + websocket server that speaks ComfyUI's protocol, validates and runs graphs
-  krea2-engine/   the real engine: Krea 2, Anima and MOSS Image int8 text-to-image (optional, `--features krea2`)
+  native-engine/   the real engine: Krea 2, Anima and MOSS Image int8 text-to-image (optional, `--features native`)
 docs/
   INPUT_MAPPING.md   what SwarmUI sends for Krea 2 / Anima / MiniMax H3 / MOSS Image / Qwen Image 2.1, and what the engine receives
   COMPATIBILITY.md   every Swarm parameter probed live, and the node classes served through the generic custom_node route
@@ -35,23 +35,23 @@ and video inputs. PNG/JPEG/GIF/WAV are handled natively.
 
 ## Run Krea 2 for real
 
-The krea2 engine needs the parent repository's build requirements (CUDA 13, MSVC Build Tools, CUTLASS and
+The native engine needs the parent repository's build requirements (CUDA 13, MSVC Build Tools, CUTLASS and
 flash-attention checkouts). The first build takes about 10 minutes, so it's behind a feature and the default
 build stays mock-only.
 
 ```bash
-cargo run --release -p comfy-server --features krea2 -- --engine krea2 --models-root "C:/path/to/SwarmUI/Models"
+cargo run --release -p comfy-server --features native -- --engine native --models-root "C:/path/to/SwarmUI/Models"
 ```
 
-On Windows, [`start-krea2.bat`](start-krea2.bat) does this for the folder in `KREA2_MODELS`, and prints what to enter
+On Windows, [`start-backend.bat`](start-backend.bat) does this for the folder in `MODELS_ROOT`, and prints what to enter
 in SwarmUI. Extra arguments go to the server, so `--models-root` can add a second folder.
 
-Extra flags: `--krea2-reserve-vram 512` (MB left for the desktop and other apps) and `--krea2-max-side 2048`.
+Extra flags: `--reserve-vram 512` (MB left for the desktop and other apps) and `--max-side 2048`.
 
 In SwarmUI, select the W8A8 checkpoint and set **CFG Scale 1** and **Steps 8**. These work: size up to
-`--krea2-max-side` squared in pixels (multiples of 16), seed, Variation Seed, Batch Size, Sigma Shift, cancelling,
+`--max-side` squared in pixels (multiples of 16), seed, Variation Seed, Batch Size, Sigma Shift, cancelling,
 Model Attention Backend (`int8`, or `flash` for ComfyUI's numerics), Free VRAM. The server accepts the model from
-`Stable-Diffusion/` as well as `diffusion_models/`, and a generation is pixel-identical to the `krea2` CLI for the
+`Stable-Diffusion/` as well as `diffusion_models/`, and a generation is pixel-identical to the `diffusion` CLI for the
 same seed. There are no live previews.
 
 Every sampler and scheduler works on all three families, at any CFG with a negative prompt, along with Sampler Sigma Min,
@@ -64,7 +64,7 @@ Everything else is refused with an error in SwarmUI rather than silently ignored
 init images and refiners, ControlNet, regions, VAE tiling, Seamless Tileable, and
 non-W8A8 Krea 2 files.
 
-**Anima** runs from the same `--engine krea2` server. The checkpoint's keys pick the family, and one family is
+**Anima** runs from the same `--engine native` server. The checkpoint's keys pick the family, and one family is
 loaded at a time, so switching took 4 s to Anima and 9 s to Krea 2 with the files cached. Select an int8 ConvRot Anima checkpoint with
 Steps 8 and CFG Scale 1 for turbo models. These work: any CFG with a negative
 prompt, `(word:1.2)` and `<weight>`, seed, Variation Seed, Batch Size, Sigma Shift, Model Attention Backend, cancelling and
@@ -86,7 +86,7 @@ encoder keys are refused with an error. See the [README](../README.md#loras).
 **Alongside ComfyUI.** Add this server next to SwarmUI's normal ComfyUI backend. In a live test with both running,
 SwarmUI sent every Krea 2 job here and Anima to ComfyUI, keeping each model on the backend that had it loaded.
 Nothing guarantees where the first Krea 2 job goes when both are idle. Set **Exact Backend ID** in a preset to pin
-Krea 2 to this backend. The two share the GPU: krea2 re-plans DiT residency from live free VRAM for each request.
+Krea 2 to this backend. The two share the GPU: the native engine re-plans DiT residency from live free VRAM for each request.
 
 ## Connect SwarmUI
 
@@ -102,7 +102,7 @@ running them fails validation. See [COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
 ## Plugging in the real engine
 
-[`crates/krea2-engine`](crates/krea2-engine/src/lib.rs) is a worked example. Implement
+[`crates/native-engine`](crates/native-engine/src/lib.rs) is a worked example. Implement
 [`swarm_engine_api::Engine`](crates/engine-api/src/engine.rs). It has 11 required methods. The
 optional feature operations (audio, latent ops, segmentation, upscaling, CLIP Vision, custom sampling, the generic
 `custom_node` hook, warmup, free-memory) default to "unsupported" or a no-op. Then add it to `make_engine` in

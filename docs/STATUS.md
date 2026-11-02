@@ -15,7 +15,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | Server | Swarm backend connection | Connects as "ComfyUI API By URL". Swarm reads the model list and features and generates. |
 | P0 | Server | Runs beside a real ComfyUI backend | Live test: Krea 2 stayed here and Anima went to ComfyUI. First job isn't pinned without Exact Backend ID. |
 | P0 | Server | Model folder scanning | Uses Swarm's and ComfyUI's folder names, including Stable-diffusion, clip and VAE. |
-| P0 | Server | Start script | start-krea2.bat builds, starts the server and prints the connection steps. |
+| P0 | Server | Start script | start-backend.bat builds, starts the server and prints the connection steps. |
 | P0 | Engine core | Low-memory block streaming | Packed blocks in pinned RAM, streamed through VRAM slots on a copy stream. |
 | P0 | Engine core | Cancelling and Free VRAM | Interrupt stops at the next step. Free VRAM unloads models, and they reload on next use. |
 | P0 | Engine core | Sampler: er_sde | Anima and MOSS Image, generated through SwarmUI. Noise follows torch's CUDA Philox layout on this GPU. Other GPUs untested. |
@@ -47,7 +47,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 
 | Priority | Area | Item | Notes |
 |---|---|---|---|
-| P0 | Engine core | Route each model to its engine | One backend now serves Krea 2, Anima and MOSS Image, picked from the checkpoint's keys. Still inside krea2-engine; other families need a real router. |
+| P0 | Engine core | Route each model to its engine | One backend now serves Krea 2, Anima and MOSS Image, picked from the checkpoint's keys. Still inside native-engine; other families need a real router. |
 | P0 | Engine core | Dynamic VRAM offloading | Live residency works and adapted to ComfyUI's memory. Open: 16 to 11 drop at 1024, one 867 ms/step run after ComfyUI. |
 | P1 | Krea 2 | Model Attention Backend | int8 and flash, per request. flash not yet run through the server. |
 
@@ -92,9 +92,9 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 
 | Priority | Area | Item | Notes |
 |---|---|---|---|
-| P0 | Engine core | Move krea2 behind a shared engine crate | Share the CUDA runtime, kernels, offloading and sampler between model families instead of hard-coding Krea 2. |
+| P0 | Engine core | Move Krea 2 behind a shared engine crate | Share the CUDA runtime, kernels, offloading and sampler between model families instead of hard-coding Krea 2. |
 | P0 | Engine core | Latent operations | Add, multiply, blend, batch, repeat and upscale. Needed by init images, refiners and regions. |
-| P1 | Engine core | Live previews | Latent-to-RGB preview during sampling. Swarm shows none for krea2 today. |
+| P1 | Engine core | Live previews | Latent-to-RGB preview during sampling. Swarm shows none for the native engine today. |
 | P1 | Engine core | Hardware beyond this card | Everything targets sm_120 on Windows. Other GPUs and Linux are untested. |
 | P1 | Krea 2 | Prompt weights | <weight> through SwarmAttnTokenWeights, inside attention. |
 | P1 | Krea 2 | <break>, <alternate> and <fromto> | Per-chunk and per-step conditioning. |

@@ -102,12 +102,12 @@ impl Vae {
     }
 
     fn conv(&self, key: &str, x: PM, out: PM, h: usize, w: usize, cin: usize, cout: usize, r: usize, st: &Stream) -> Result<()> {
-        k!(krea_conv2d(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), out, 1, h as i32, w as i32, cin as i32, cout as i32,
+        k!(gpu_conv2d(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), out, 1, h as i32, w as i32, cin as i32, cout as i32,
             r as i32, s(st)))
     }
 
     fn norm(&self, key: &str, x: PM, out: PM, stats: PM, p: usize, c: usize, silu: bool, st: &Stream) -> Result<()> {
-        k!(krea_group_norm(x, out, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), stats, p as i64, c as i32, GROUPS as i32, EPS,
+        k!(gpu_group_norm(x, out, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), stats, p as i64, c as i32, GROUPS as i32, EPS,
             silu as i32, s(st)))
     }
 
@@ -136,7 +136,7 @@ impl Vae {
         } else {
             x
         };
-        k!(krea_add_gated_bf16(u.ptr(), cout as i64, residual.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
+        k!(gpu_add_gated_bf16(u.ptr(), cout as i64, residual.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
         Ok(u)
     }
 
@@ -147,7 +147,7 @@ impl Vae {
         let stats = DevBuf::alloc_async(GROUPS * 8, st)?;
         let sp = stats.ptr();
         let z = alloc(Z, hh, ww)?;
-        k!(krea_flux2_latent_in(latent.ptr(), self.w("mean"), self.w("std"), z.ptr(), CH as i32, h as i32, w as i32, s(st)))?;
+        k!(gpu_flux2_latent_in(latent.ptr(), self.w("mean"), self.w("std"), z.ptr(), CH as i32, h as i32, w as i32, s(st)))?;
         let z2 = alloc(Z, hh, ww)?;
         self.conv("pq", z.ptr(), z2.ptr(), hh, ww, Z, Z, 1, st)?;
         let mut c = self.block_in;
@@ -173,7 +173,7 @@ impl Vae {
             }
             if i != 0 {
                 let up = alloc(c, 2 * hh, 2 * ww)?;
-                k!(krea_upsample2x(x.ptr(), up.ptr(), hh as i32, ww as i32, c as i32, s(st)))?;
+                k!(gpu_upsample2x(x.ptr(), up.ptr(), hh as i32, ww as i32, c as i32, s(st)))?;
                 hh *= 2;
                 ww *= 2;
                 let y = alloc(c, hh, ww)?;
@@ -187,7 +187,7 @@ impl Vae {
         let o = alloc(OUT_PAD, hh, ww)?;
         self.conv("out", t.ptr(), o.ptr(), hh, ww, c, OUT_PAD, 3, st)?;
         let rgb = DevBuf::alloc_async(p * 3, st)?;
-        k!(krea_to_rgb8(o.ptr(), OUT_PAD as i32, rgb.ptr(), p as i64, s(st)))?;
+        k!(gpu_to_rgb8(o.ptr(), OUT_PAD as i32, rgb.ptr(), p as i64, s(st)))?;
         let mut out = vec![0u8; p * 3];
         rgb.download(0, &mut out, st)?;
         Ok(out)

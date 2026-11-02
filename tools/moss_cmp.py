@@ -1,4 +1,4 @@
-"""Compare a krea2 --moss --dump file with tools/moss_ref.py output.
+"""Compare a diffusion --moss --dump file with tools/moss_ref.py output.
 
 usage: python moss_cmp.py <ref.safetensors> <ours.safetensors>
 """

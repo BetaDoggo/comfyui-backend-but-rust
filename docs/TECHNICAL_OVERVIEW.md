@@ -7,7 +7,7 @@ ComfyUI is the reference for behaviour, not a runtime dependency: its API, model
 project reproduces. The int8 GEMM and attention kernels come from comfy-kitchen, the library ComfyUI uses for them.
 
 Only Windows x64 and NVIDIA GPUs are supported. `build.rs` targets `x86_64-pc-windows-msvc`, and kernels compile for
-`sm_120` by default (`KREA_CUDA_ARCH` changes that).
+`sm_120` by default (`CUDA_ARCH` changes that).
 
 ## How the pieces fit
 
@@ -18,19 +18,19 @@ SwarmUI (unchanged, "ComfyUI API By URL" backend)
 comfy-server            axum + tokio: routes, node graph validation, execution, queue
    |  swarm_engine_api::Engine trait
    +--> mock engine     placeholder outputs for model families with no real engine yet
-   +--> krea2-engine    picks the model family, refuses what it cannot honour
+   +--> native-engine    picks the model family, refuses what it cannot honour
            |  Rust library calls
            v
-krea2 library           loader, offloading, tokenizers, models, samplers (Rust)
+diffusion library         loader, offloading, tokenizers, models, samplers (Rust)
            |  C ABI (src/ffi.rs)
            v
-krea_cuda.lib           kernels built by nvcc from csrc/
+gpu_kernels.lib           kernels built by nvcc from csrc/
            |
            v
 CUDA runtime, cuBLASLt, GPU
 ```
 
-The real engine sits behind a Cargo feature (`--features krea2`). A default build of the server needs no CUDA toolkit and
+The real engine sits behind a Cargo feature (`--features native`). A default build of the server needs no CUDA toolkit and
 serves only the mock engine.
 
 ## What it is built on
@@ -66,7 +66,7 @@ There is no Rust binding to a tensor library. CUDA, NVML and the kernels are cal
 
 `csrc/compat/` holds small stand-ins for the PyTorch headers that FlashAttention-2 includes, so it builds without
 libtorch. CUTLASS and FlashAttention-2 are not in this repository. The build finds them in
-`ref/comfy-kitchen/third_party/` (gitignored) or through `KREA_CUTLASS_DIR` and `KREA_FLASH_ATTN_DIR`.
+`ref/comfy-kitchen/third_party/` (gitignored) or through `CUTLASS_DIR` and `FLASH_ATTN_DIR`.
 
 ### Our own kernels
 

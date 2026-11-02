@@ -1,6 +1,6 @@
 //! [`Engine`] implementation on the krea2 library: text-to-image for int8 ConvRot checkpoints of
-//! Krea 2 (turbo: CFG 1, `euler` / `simple`) and Anima (`er_sde` or `euler`, `simple`, any CFG).
-//! Each file's architecture is read from its keys, so one backend serves both.
+//! Krea 2 (turbo: CFG 1, `euler` / `simple`), Anima and MOSS Image (`er_sde` or `euler`, `simple`, any
+//! CFG). Each file's architecture is read from its keys, so one backend serves all three.
 //!
 //! Text encoding is deferred to `sample`, so the negative prompt SwarmUI always sends costs nothing
 //! at CFG 1. Everything the pipeline can't do is refused with [`EngineError::Unsupported`], which
@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use krea2::pipeline::{AnimaRequest, AnimaSampler, Cancelled, Generator, LoadOptions, Request};
+use krea2::pipeline::{AnimaRequest, Cancelled, FlowSampler, Generator, LoadOptions, MossRequest, Request};
 use krea2::tokenizer::token_weights;
 use swarm_engine_api::prompt::PromptLeafKind;
 use swarm_engine_api::*;
@@ -22,14 +22,24 @@ const ATTENTION: [&str; 2] = ["int8", "flash"];
 /// ComfyUI's `sampling_settings`, used when SwarmUI sends no Sigma Shift.
 const KREA2_SHIFT: f64 = 1.15;
 const ANIMA_SHIFT: f64 = 3.0;
+const MOSS_SHIFT: f64 = 5.0;
 /// [`TextEncoderHandle::encoder_type`] of Anima's Qwen3 0.6B; SwarmUI's own type is the generic
 /// `stable_diffusion`.
 const ANIMA_ENCODER: &str = "anima";
+const MOSS_ENCODER: &str = "moss_image";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
     Krea2,
     Anima,
+    Moss,
+}
+
+impl Family {
+    /// (latent channels, pixels per latent)
+    fn latent(self) -> (usize, usize) {
+        if self == Family::Moss { (krea2::moss::CH, 16) } else { (16, 8) }
+    }
 }
 
 pub struct Krea2Options {
@@ -54,11 +64,13 @@ pub struct Krea2Engine {
 /// really needed: at CFG 1 the negative is never read.
 struct DeferredCond {
     text_encoder: PathBuf,
-    /// (text, weight) segments; Krea 2 has exactly one, of weight 1.
+    /// (text, weight) segments; Krea 2 and MOSS Image have exactly one, of weight 1.
     prompt: Result<Vec<(String, f32)>, String>,
+    /// MOSS Image: the chat template, None for ComfyUI's own.
+    template: Option<String>,
 }
 
-/// Sampled latents, `[B, 16, H/8, W/8]`.
+/// Sampled latents, `[B, 16, H/8, W/8]`, or `[B, 128, H/16, W/16]` for MOSS Image.
 struct HostLatent {
     data: Vec<f32>,
 }
@@ -94,9 +106,15 @@ fn check_dit(file: &ModelFile) -> EngineResult<Family> {
         }
         return Ok(Family::Anima);
     }
+    if krea2::moss::is_moss(|k| h.get(k).is_some()) {
+        if h.get("layers.0.proj.qkv.weight_scale").is_none() {
+            return Err(unsupported(format!("{}: this backend only runs int8 ConvRot MOSS Image checkpoints with fused q/k/v", file.name)));
+        }
+        return Ok(Family::Moss);
+    }
     // The keys SwarmUI's `isKrea2` tests.
     if ["txtfusion.projector.weight", "blocks.0.attn.gate.weight", "blocks.0.mod.lin"].iter().any(|k| h.get(k).is_none()) {
-        return Err(unsupported(format!("{}: this backend only runs Krea 2 and Anima models", file.name)));
+        return Err(unsupported(format!("{}: this backend only runs Krea 2, Anima and MOSS Image models", file.name)));
     }
     if h.get("blocks.0.attn.gate.weight_scale").is_none() {
         return Err(unsupported(format!("{}: this backend only runs W8A8 (ConvRot int8) Krea 2 checkpoints", file.name)));
@@ -121,7 +139,7 @@ fn prompt_segments(p: &ParsedPrompt, steps: u32, family: Family) -> Result<Vec<(
     let mut text = String::new();
     let mut segments = Vec::new();
     for leaf in &chunks[0] {
-        if family == Family::Krea2 && leaf.weight != 1.0 {
+        if family != Family::Anima && leaf.weight != 1.0 {
             return Err("prompt weights (<weight>)".into());
         }
         match &leaf.kind {
@@ -132,7 +150,7 @@ fn prompt_segments(p: &ParsedPrompt, steps: u32, family: Family) -> Result<Vec<(
             PromptLeafKind::Break => unreachable!("chunks() splits on breaks"),
         }
     }
-    if family == Family::Krea2 {
+    if family != Family::Anima {
         segments.push((text, 1.0));
     }
     Ok(segments)
@@ -143,8 +161,8 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<(String
         return Err("LoRAs and CLIP Stop At Layer".into());
     }
     match &req.mode {
-        // Qwen3-VL tokenizes with weights disabled, Anima's T5 tokens take ComfyUI's emphasis.
-        TextEncodeMode::Plain { text } if family == Family::Krea2 => Ok(vec![(text.clone(), 1.0)]),
+        // Qwen tokenizers run with weights disabled, Anima's T5 tokens take ComfyUI's emphasis.
+        TextEncodeMode::Plain { text } if family != Family::Anima => Ok(vec![(text.clone(), 1.0)]),
         TextEncodeMode::Plain { text } => Ok(token_weights(text, 1.0)),
         TextEncodeMode::Swarm(s) => {
             if s.images.is_some() {
@@ -168,7 +186,7 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<(String
 }
 
 /// The one plain prompt of a conditioning: anything regional or image-based is refused.
-fn single_prompt(c: &Conditioning) -> EngineResult<(&Path, &[(String, f32)])> {
+fn single_prompt(c: &Conditioning) -> EngineResult<(&DeferredCond, &[(String, f32)])> {
     let [e] = c.entries.as_slice() else {
         return Err(unsupported("regional prompts (more than one conditioning entry)"));
     };
@@ -189,7 +207,7 @@ fn single_prompt(c: &Conditioning) -> EngineResult<(&Path, &[(String, f32)])> {
     }
     let cond = e.embedding.downcast_ref::<DeferredCond>().ok_or_else(|| unsupported("conditioning from another text encoder"))?;
     let segments = cond.prompt.as_deref().map_err(|e| unsupported(e.clone()))?;
-    Ok((&cond.text_encoder, segments))
+    Ok((cond, segments))
 }
 
 /// `ModelSamplingFlux`: `max_shift` applies at 2560 latent patches, `base_shift` at 256.
@@ -204,14 +222,18 @@ struct ModelSettings {
 }
 
 fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
-    let shift = if family == Family::Anima { ANIMA_SHIFT } else { KREA2_SHIFT };
+    let shift = match family {
+        Family::Krea2 => KREA2_SHIFT,
+        Family::Anima => ANIMA_SHIFT,
+        Family::Moss => MOSS_SHIFT,
+    };
     let mut s = ModelSettings { shift, int8_attention: true };
     for p in &model.patches {
         match p {
             ModelPatch::SamplingFlux { max_shift, base_shift, width, height } if family == Family::Krea2 => {
                 s.shift = flux_shift(*max_shift, *base_shift, *width, *height)
             }
-            ModelPatch::SamplingAuraFlow { shift, sampling } if family == Family::Anima && sampling == "flow" => s.shift = *shift,
+            ModelPatch::SamplingAuraFlow { shift, sampling } if family != Family::Krea2 && sampling == "flow" => s.shift = *shift,
             ModelPatch::AttentionBackend { backend } => {
                 s.int8_attention = match backend.as_str() {
                     "int8" => true,
@@ -290,6 +312,7 @@ impl Krea2Engine {
         let (family, name) = match check_dit(file)? {
             Family::Krea2 => (self.gen().ensure_dit(&file.path), "krea-2"),
             Family::Anima => (self.gen().ensure_anima(&file.path), "anima"),
+            Family::Moss => (self.gen().ensure_moss(&file.path), "moss-image"),
         };
         family.map_err(internal)?;
         Ok(ModelHandle::new(Some(file.clone()), Some(name.into()), Opaque::none()))
@@ -299,10 +322,11 @@ impl Krea2Engine {
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
-        let (text_encoder, positive) = single_prompt(&req.positive)?;
+        let (cond, positive) = single_prompt(&req.positive)?;
+        let text_encoder = &cond.text_encoder;
         let guided = (req.cfg - 1.0).abs() > 1e-6;
         let negative = if guided { single_prompt(&req.negative)?.1 } else { &[] };
-        let sampler = if req.sampler == "er_sde" { AnimaSampler::ErSde } else { AnimaSampler::Euler };
+        let sampler = flow_sampler(req);
         let steps = req.steps as usize;
         let mut gen = self.gen();
         gen.ensure_anima(&file.path).map_err(internal)?;
@@ -322,7 +346,7 @@ impl Krea2Engine {
                 height: lh * 8,
                 steps,
                 shift,
-                noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, lh, lw),
+                noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, 16, lh, lw),
             };
             let (latent, stats) = gen
                 .sample_anima(&r, |step, _| {
@@ -335,6 +359,56 @@ impl Krea2Engine {
         }
         Ok(data)
     }
+
+    fn sample_moss(&self, req: &SampleRequest, shape: (usize, usize, usize), int8_attention: bool, shift: f64, progress: &mut dyn ProgressSink)
+        -> EngineResult<Vec<f32>> {
+        let (batch, lh, lw) = shape;
+        let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
+        let (cond, positive) = single_prompt(&req.positive)?;
+        let guided = (req.cfg - 1.0).abs() > 1e-6;
+        let negative = if guided { single_prompt(&req.negative)?.1[0].0.clone() } else { String::new() };
+        let steps = req.steps as usize;
+        let mut gen = self.gen();
+        gen.ensure_moss(&file.path).map_err(internal)?;
+        gen.ensure_qwen35(&cond.text_encoder).map_err(internal)?;
+        gen.set_int8_attention(int8_attention);
+        let mut data = Vec::with_capacity(batch * krea2::moss::CH * lh * lw);
+        for i in 0..batch {
+            let r = MossRequest {
+                positive: positive[0].0.clone(),
+                negative: negative.clone(),
+                template: cond.template.clone(),
+                cfg: req.cfg,
+                sampler: flow_sampler(req),
+                seed: req.noise_seed,
+                batch_index: i,
+                batch_size: batch,
+                width: lw * 16,
+                height: lh * 16,
+                steps,
+                shift,
+                noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, krea2::moss::CH, lh, lw),
+            };
+            let (latent, stats) = gen
+                .sample_moss(&r, |step, _| {
+                    progress.progress((i * steps + step) as u32, (batch * steps) as u32);
+                    !progress.interrupted()
+                }, None)
+                .map_err(internal)?;
+            tracing::info!("moss: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
+            data.extend_from_slice(&latent);
+        }
+        Ok(data)
+    }
+}
+
+fn flow_sampler(req: &SampleRequest) -> FlowSampler {
+    if req.sampler == "er_sde" { FlowSampler::ErSde } else { FlowSampler::Euler }
+}
+
+/// True for the Flux 2 VAE, which MOSS Image uses.
+fn is_flux2_vae(file: &ModelFile) -> bool {
+    read_header(&file.path).is_ok_and(|h| h.get("bn.running_mean").is_some())
 }
 
 impl Engine for Krea2Engine {
@@ -378,26 +452,47 @@ impl Engine for Krea2Engine {
                 self.gen().ensure_qwen3(&file.path).map_err(internal)?;
                 ANIMA_ENCODER
             }
-            t => return Err(unsupported(format!("text encoder type {t} (this backend only runs Krea 2 and Anima)"))),
+            MOSS_ENCODER => {
+                self.gen().ensure_qwen35(&file.path).map_err(internal)?;
+                MOSS_ENCODER
+            }
+            t => return Err(unsupported(format!("text encoder type {t} (this backend only runs Krea 2, Anima and MOSS Image)"))),
         };
         Ok(TextEncoderHandle { sources: req.files.clone(), encoder_type: encoder_type.into(), device: req.device.clone(), engine: Opaque::none(), patches: vec![] })
     }
 
     fn load_vae(&self, req: &LoadVae) -> EngineResult<VaeHandle> {
-        self.gen().ensure_vae(&req.file.path).map_err(internal)?;
+        let mut gen = self.gen();
+        if is_flux2_vae(&req.file) { gen.ensure_flux2_vae(&req.file.path) } else { gen.ensure_vae(&req.file.path) }.map_err(internal)?;
         Ok(VaeHandle::new(Some(req.file.clone()), Opaque::none()))
     }
 
     fn encode_text(&self, req: &TextEncodeRequest) -> EngineResult<Conditioning> {
         let [file] = req.text_encoder.sources.as_slice() else {
-            return Err(unsupported("this text encoder (Krea 2 needs one Qwen3-VL file, Anima one Qwen3 file)"));
+            return Err(unsupported("this text encoder (Krea 2 needs one Qwen3-VL file, Anima one Qwen3 file, MOSS Image one Qwen3.5 file)"));
         };
-        let family = if req.text_encoder.encoder_type == ANIMA_ENCODER { Family::Anima } else { Family::Krea2 };
-        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family) };
+        let family = match req.text_encoder.encoder_type.as_str() {
+            ANIMA_ENCODER => Family::Anima,
+            MOSS_ENCODER => Family::Moss,
+            _ => Family::Krea2,
+        };
+        // SwarmUI sends the Krea 2 template for MOSS Image as well.
+        let template = match &req.mode {
+            TextEncodeMode::Swarm(s) if s.llama_template.as_deref() == Some("krea2") => Some(krea2::te::TEMPLATE.to_string()),
+            _ => None,
+        };
+        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), template };
         Ok(Conditioning::single(Opaque::new(cond), CondMeta::default()))
     }
 
     fn empty_latent(&self, req: &EmptyLatentRequest) -> EngineResult<Latent> {
+        if let EmptyLatentKind::Flux2 { width, height } = req.kind {
+            let (b, h, w) = (req.batch_size as usize, height as usize / 16, width as usize / 16);
+            return Ok(Latent::single(
+                LatentTensor { format: LatentFormat::Flux2, shape: vec![b, krea2::moss::CH, h, w], data: Opaque::none() },
+                PixelInfo::image(width, height, req.batch_size),
+            ));
+        }
         let EmptyLatentKind::Image16Ch { width, height } = req.kind else {
             return Err(unsupported(format!("latent {:?}", req.kind)));
         };
@@ -416,12 +511,15 @@ impl Engine for Krea2Engine {
         let LatentSamples::Single(tensor) = &req.latent.samples else {
             return Err(unsupported("audio/video latents"));
         };
-        let &[batch, 16, lh, lw] = tensor.shape.as_slice() else {
+        let &[batch, channels, lh, lw] = tensor.shape.as_slice() else {
             return Err(unsupported(format!("latent shape {:?}", tensor.shape)));
         };
+        if channels != family.latent().0 {
+            return Err(unsupported(format!("latent shape {:?} for this model", tensor.shape)));
+        }
         let finish = |data| {
             Ok(req.latent.with_samples(LatentSamples::Single(LatentTensor {
-                format: LatentFormat::Image16Ch,
+                format: tensor.format.clone(),
                 shape: tensor.shape.clone(),
                 data: Opaque::new(HostLatent { data }),
             })))
@@ -429,8 +527,11 @@ impl Engine for Krea2Engine {
         if family == Family::Anima {
             return finish(self.sample_anima(req, (batch, lh, lw), settings.int8_attention, settings.shift, progress)?);
         }
-        let (text_encoder, prompt) = single_prompt(&req.positive)?;
-        let prompt = &prompt[0].0;
+        if family == Family::Moss {
+            return finish(self.sample_moss(req, (batch, lh, lw), settings.int8_attention, settings.shift, progress)?);
+        }
+        let (cond, prompt) = single_prompt(&req.positive)?;
+        let (text_encoder, prompt) = (&cond.text_encoder, &prompt[0].0);
         let (width, height) = (lw * 8, lh * 8);
         let steps = req.steps as usize;
 
@@ -441,7 +542,7 @@ impl Engine for Krea2Engine {
 
         let mut data = Vec::with_capacity(batch * 16 * lh * lw);
         for i in 0..batch {
-            let image = noise::swarm_noise(req.noise_seed, req.variation, i as u64, lh, lw);
+            let image = noise::swarm_noise(req.noise_seed, req.variation, i as u64, 16, lh, lw);
             let r = Request { prompt: prompt.to_string(), seed: req.noise_seed, width, height, steps, shift: settings.shift, noise: Some(image) };
             let (latent, stats) = gen
                 .sample_latent(&r, |step, _| {
@@ -465,21 +566,27 @@ impl Engine for Krea2Engine {
         let LatentSamples::Single(t) = &req.latent.samples else {
             return Err(unsupported("audio/video latents"));
         };
-        let &[batch, 16, lh, lw] = t.shape.as_slice() else {
+        let &[batch, channels, lh, lw] = t.shape.as_slice() else {
             return Err(unsupported(format!("latent shape {:?}", t.shape)));
         };
         let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("decoding a latent this engine didn't sample"))?;
         let file = req.vae.source.as_ref().ok_or_else(|| unsupported("the pixel-space VAE"))?;
-        let (width, height) = (lw * 8, lh * 8);
+        let flux2 = is_flux2_vae(file);
+        if flux2 != (channels == krea2::moss::CH) {
+            return Err(unsupported(format!("this VAE on a {channels}-channel latent")));
+        }
+        let scale = if flux2 { 16 } else { 8 };
+        let (width, height) = (lw * scale, lh * scale);
 
         let mut gen = self.gen();
-        gen.ensure_vae(&file.path).map_err(internal)?;
+        if flux2 { gen.ensure_flux2_vae(&file.path) } else { gen.ensure_vae(&file.path) }.map_err(internal)?;
         let mut rgb = Vec::with_capacity(batch * height * width * 3);
-        for (i, image) in latent.data.chunks_exact(16 * lh * lw).enumerate() {
+        for (i, image) in latent.data.chunks_exact(channels * lh * lw).enumerate() {
             if progress.interrupted() {
                 return Err(EngineError::Interrupted);
             }
-            rgb.extend_from_slice(&gen.decode_latent(image, width, height).map_err(internal)?);
+            let pixels = if flux2 { gen.decode_moss(image, width, height) } else { gen.decode_latent(image, width, height) };
+            rgb.extend_from_slice(&pixels.map_err(internal)?);
             progress.progress(i as u32 + 1, batch as u32);
         }
         Ok(ImageBatch::from_u8(batch as u32, height as u32, width as u32, 3, rgb))
@@ -499,14 +606,15 @@ impl Engine for Krea2Engine {
         }
         let mut gen = self.gen();
         if let [f] = req.text_encoder.sources.as_slice() {
-            if req.text_encoder.encoder_type == ANIMA_ENCODER {
-                gen.ensure_qwen3(&f.path).map_err(internal)?;
-            } else {
-                gen.ensure_te(&f.path).map_err(internal)?;
+            match req.text_encoder.encoder_type.as_str() {
+                ANIMA_ENCODER => gen.ensure_qwen3(&f.path),
+                MOSS_ENCODER => gen.ensure_qwen35(&f.path),
+                _ => gen.ensure_te(&f.path),
             }
+            .map_err(internal)?;
         }
         if let Some(f) = &req.vae.source {
-            gen.ensure_vae(&f.path).map_err(internal)?;
+            if is_flux2_vae(f) { gen.ensure_flux2_vae(&f.path) } else { gen.ensure_vae(&f.path) }.map_err(internal)?;
         }
         Ok(())
     }
@@ -551,6 +659,13 @@ mod tests {
         assert!((weight("pine") - 1.3).abs() < 1e-6);
         assert!((weight("sky") - 1.2).abs() < 1e-6);
         assert_eq!(weight("lake"), 1.0);
+    }
+
+    #[test]
+    fn moss_prompts_are_one_literal_segment() {
+        let p = ParsedPrompt::parse("a (red:1.2) lake");
+        assert_eq!(prompt_segments(&p, 8, Family::Moss).unwrap(), [("a (red:1.2) lake".to_string(), 1.0)]);
+        assert!(prompt_segments(&ParsedPrompt::parse("a <weight[1.3]:lake>"), 8, Family::Moss).is_err());
     }
 
     #[test]

@@ -18,6 +18,8 @@ pub const PRO_SWIGLU: i32 = 3;
 pub const PRO_LAYERNORM: i32 = 4;
 pub const PRO_SILU: i32 = 5;
 pub const PRO_GELU: i32 = 6;
+pub const PRO_ADALN: i32 = 7;
+pub const PRO_SITU: i32 = 8;
 
 extern "C" {
     pub fn krea_blas_init(workspace: usize) -> i32;
@@ -65,6 +67,13 @@ extern "C" {
     pub fn krea_upsample2x(x: P, out: PM, h: i32, w: i32, c: i32, s: PM) -> i32;
     pub fn krea_softmax_rows(s_: P, p: PM, rows: i32, n: i32, scale: f32, s: PM) -> i32;
     pub fn krea_to_rgb8(x: P, cstride: i32, out: PM, p: i64, s: PM) -> i32;
+    pub fn krea_adaln_weight(w: P, sc: P, out: PM, n: i32, s: PM) -> i32;
+    pub fn krea_delta_conv(x: P, w: P, out: PM, l: i32, c: i32, s: PM) -> i32;
+    pub fn krea_delta_rule(mix: PM, a: P, b: P, dt: P, alog: P, out: PM, l: i32, hv: i32, hk: i32, d: i32, s: PM) -> i32;
+    pub fn krea_mul_silu(x: PM, z: P, n: i64, s: PM) -> i32;
+    pub fn krea_partial_rope(x: PM, stride: i64, w: P, eps: f32, rope: P, l: i32, h: i32, d: i32, pairs: i32, s: PM) -> i32;
+    pub fn krea_flux2_latent_in(lat: P, mean: P, std: P, out: PM, c: i32, h: i32, w: i32, s: PM) -> i32;
+    pub fn krea_group_norm(x: P, out: PM, w: P, b: P, stats: PM, p: i64, c: i32, groups: i32, eps: f32, silu: i32, s: PM) -> i32;
 }
 
 /// Turn a launcher return code into an error naming the call.

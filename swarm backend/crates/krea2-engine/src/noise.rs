@@ -4,25 +4,23 @@
 use krea2::sampling::torch_randn;
 use swarm_engine_api::VariationSeed;
 
-const CHANNELS: usize = 16;
-
-/// Noise of batch image `index`, `[16, h, w]`.
-pub fn swarm_noise(seed: u64, variation: Option<VariationSeed>, index: u64, h: usize, w: usize) -> Vec<f32> {
-    let n = CHANNELS * h * w;
+/// Noise of batch image `index`, `[channels, h, w]`.
+pub fn swarm_noise(seed: u64, variation: Option<VariationSeed>, index: u64, channels: usize, h: usize, w: usize) -> Vec<f32> {
+    let n = channels * h * w;
     match variation {
         None => torch_randn(seed.wrapping_add(index), n),
-        Some(v) => slerp(v.strength as f32, &torch_randn(seed, n), &torch_randn(v.seed.wrapping_add(index), n), h, w),
+        Some(v) => slerp(v.strength as f32, &torch_randn(seed, n), &torch_randn(v.seed.wrapping_add(index), n), channels, h, w),
     }
 }
 
 /// `SwarmKSampler.slerp` on `[C, H, W]`: spherical interpolation of each column (`dim=1`).
-fn slerp(val: f32, low: &[f32], high: &[f32], h: usize, w: usize) -> Vec<f32> {
+fn slerp(val: f32, low: &[f32], high: &[f32], channels: usize, h: usize, w: usize) -> Vec<f32> {
     let at = |c: usize, y: usize, x: usize| (c * h + y) * w + x;
-    let columns = CHANNELS * w;
+    let columns = channels * w;
     let mut dots = vec![0f32; columns];
     let mut low_norms = vec![0f32; columns];
     let mut high_norms = vec![0f32; columns];
-    for c in 0..CHANNELS {
+    for c in 0..channels {
         for x in 0..w {
             let j = c * w + x;
             for y in 0..h {
@@ -40,7 +38,7 @@ fn slerp(val: f32, low: &[f32], high: &[f32], h: usize, w: usize) -> Vec<f32> {
         return low.iter().zip(high).map(|(l, r)| l * val + r * (1.0 - val)).collect();
     }
     let mut out = vec![0f32; low.len()];
-    for c in 0..CHANNELS {
+    for c in 0..channels {
         for x in 0..w {
             let omega = dots[c * w + x].acos();
             let so = omega.sin();
@@ -59,14 +57,14 @@ mod tests {
 
     #[test]
     fn batch_images_use_consecutive_seeds() {
-        assert_eq!(swarm_noise(10, None, 3, 8, 8), torch_randn(13, 16 * 8 * 8));
+        assert_eq!(swarm_noise(10, None, 3, 16, 8, 8), torch_randn(13, 16 * 8 * 8));
     }
 
     #[test]
     fn slerp_endpoints_are_the_inputs() {
         let (a, b) = (torch_randn(1, 16 * 8 * 8), torch_randn(2, 16 * 8 * 8));
         let close = |x: &[f32], y: &[f32]| x.iter().zip(y).all(|(p, q)| (p - q).abs() < 1e-3);
-        assert!(close(&slerp(0.0, &a, &b, 8, 8), &a));
-        assert!(close(&slerp(1.0, &a, &b, 8, 8), &b));
+        assert!(close(&slerp(0.0, &a, &b, 16, 8, 8), &a));
+        assert!(close(&slerp(1.0, &a, &b, 16, 8, 8), &b));
     }
 }

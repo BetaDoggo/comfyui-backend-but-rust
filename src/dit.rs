@@ -236,7 +236,7 @@ impl Dit {
     }
 
     /// Timestep embedding (flux style, time_factor 1000), rounded to bf16.
-    fn timestep_embedding(sigma: f32) -> Vec<f32> {
+    pub fn timestep_embedding(sigma: f32) -> Vec<f32> {
         let half = TDIM / 2;
         let t = 1000.0f32 * sigma;
         let neg_log = -(10000f64.ln()) as f32;

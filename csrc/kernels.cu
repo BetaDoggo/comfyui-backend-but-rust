@@ -1,4 +1,4 @@
-// Custom kernels for the Krea 2 and Anima pipelines (DiTs, Qwen text encoders, Wan VAE decoder).
+// Custom kernels for the Krea 2, Anima and MOSS Image pipelines (DiTs, Qwen text encoders, VAE decoders).
 //
 // Where ComfyUI materializes an intermediate tensor in the activation dtype (bf16 for the DiT),
 // the kernels round to that dtype at the same point (rnd<T>) so results track ComfyUI closely.
@@ -8,14 +8,15 @@
 // Row prologue -> optional ConvRot rotation -> per-row int8 quantization.
 // Produces the A operand (+ per-row scales) of the fused int8 GEMM.
 // ---------------------------------------------------------------------------------------------
-enum { PRO_PLAIN = 0, PRO_RMS = 1, PRO_GATE = 2, PRO_SWIGLU = 3, PRO_LAYERNORM = 4, PRO_SILU = 5, PRO_GELU = 6 };
+enum { PRO_PLAIN = 0, PRO_RMS = 1, PRO_GATE = 2, PRO_SWIGLU = 3, PRO_LAYERNORM = 4, PRO_SILU = 5, PRO_GELU = 6, PRO_ADALN = 7,
+       PRO_SITU = 8 };
 
 struct QuantParams {
     const void* x;       // PLAIN/RMS: input row; GATE: attention output; SWIGLU: [gate | up] row
     int64_t x_stride;    // elements between rows of x
     const void* g;       // GATE: gate logits
     int64_t g_stride;
-    int64_t up_offset;   // SWIGLU: column of `up` inside the x row
+    int64_t up_offset;   // SWIGLU: column of `up` inside the x row; SITU: of `gate`
     const float* norm_w; // RMS weight (zero-centered offset already applied); null = 1
     float eps;
     const void* mod_scale;  // RMS/LAYERNORM modulation (T): v = (1 + scale) * v + shift; null = none
@@ -84,9 +85,15 @@ __global__ void __launch_bounds__(1024) quant_rows_kernel(QuantParams p) {
             load8(x + p.up_offset + c, u);
 #pragma unroll
             for (int j = 0; j < 8; ++j) v[gi][j] = rnd<T>(rnd<T>(silu_f(a[j])) * u[j]);
+        } else if (PRO == PRO_SITU) {
+            float a[8], u[8];
+            load8(x + c, a);
+            load8(x + p.up_offset + c, u);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) v[gi][j] = situ_f(a[j], u[j]);
         } else {
             load8(x + c, v[gi]);
-            if (PRO == PRO_RMS) {
+            if (PRO == PRO_RMS || PRO == PRO_ADALN) {
 #pragma unroll
                 for (int j = 0; j < 8; ++j) ss += v[gi][j] * v[gi][j];
             } else if (PRO == PRO_LAYERNORM) {
@@ -114,7 +121,7 @@ __global__ void __launch_bounds__(1024) quant_rows_kernel(QuantParams p) {
             }
         }
     }
-    if (PRO == PRO_RMS || PRO == PRO_LAYERNORM) {
+    if (PRO == PRO_RMS || PRO == PRO_LAYERNORM || PRO == PRO_ADALN) {
         ss = block_sum(ss, red);
         const float rstd = rsqrtf(ss / (float)K + p.eps);
         const T* ms = (const T*)p.mod_scale;
@@ -132,6 +139,10 @@ __global__ void __launch_bounds__(1024) quant_rows_kernel(QuantParams p) {
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 float n = v[gi][j] * rstd;
+                if (PRO == PRO_ADALN) {  // one rounding, like the fused rms_adaln
+                    v[gi][j] = rnd<T>(n * (1.f + msv[j]) + shv[j]);
+                    continue;
+                }
                 if (p.norm_w) n *= p.norm_w[c + j];
                 n = rnd<T>(n);
                 if (ms) {
@@ -238,6 +249,8 @@ KREA_API int krea_quant_rows(int dtype, int prologue, const void* x, int64_t x_s
         case PRO_LAYERNORM: return launch_quant<T, PRO_LAYERNORM>(p, M, st); \
         case PRO_SILU: return launch_quant<T, PRO_SILU>(p, M, st);     \
         case PRO_GELU: return launch_quant<T, PRO_GELU>(p, M, st);     \
+        case PRO_ADALN: return launch_quant<T, PRO_ADALN>(p, M, st);   \
+        case PRO_SITU: return launch_quant<T, PRO_SITU>(p, M, st);     \
         default: return -3;                                            \
     }
     if (dtype == DT_BF16) { QDISPATCH(bf16) }
@@ -286,7 +299,7 @@ __global__ void prologue_rows_kernel(QuantParams p, T* out, int64_t out_stride) 
     const int64_t m = blockIdx.x;
     const T* x = (const T*)p.x + m * p.x_stride;
     T* o = out + m * out_stride;
-    if (PRO == PRO_RMS || PRO == PRO_LAYERNORM) {
+    if (PRO == PRO_RMS || PRO == PRO_LAYERNORM || PRO == PRO_ADALN) {
         float mean = 0.f;
         if (PRO == PRO_LAYERNORM) {
             for (int k = threadIdx.x; k < K; k += blockDim.x) mean += ldf(x, k);
@@ -303,6 +316,10 @@ __global__ void prologue_rows_kernel(QuantParams p, T* out, int64_t out_stride) 
         const T* sh = (const T*)p.mod_shift;
         for (int k = threadIdx.x; k < K; k += blockDim.x) {
             float n = (ldf(x, k) - mean) * rstd;
+            if (PRO == PRO_ADALN) {
+                stf(o, k, n * (1.f + ldf(ms, k)) + ldf(sh, k));
+                continue;
+            }
             if (p.norm_w) n *= p.norm_w[k];
             n = rnd<T>(n);
             if (ms) {
@@ -327,6 +344,15 @@ __global__ void prologue_rows_kernel(QuantParams p, T* out, int64_t out_stride) 
         for (int k = threadIdx.x; k < K; k += blockDim.x) stf(o, k, silu_f(ldf(x, k)));
     } else if (PRO == PRO_GELU) {
         for (int k = threadIdx.x; k < K; k += blockDim.x) stf(o, k, gelu_f(ldf(x, k)));
+    } else if (PRO == PRO_SITU) {
+        // the eager op chain: every intermediate tensor is rounded
+        for (int k = threadIdx.x; k < K; k += blockDim.x) {
+            const float hidden = ldf(x, k), gate = ldf(x, p.up_offset + k);
+            const float capped = rnd<T>(4.f * rnd<T>(stable_tanh(rnd<T>(gate / 4.f))));
+            const float g = rnd<T>(capped * rnd<T>(sigmoid_f(gate)));
+            const float h = rnd<T>(25.f * rnd<T>(stable_tanh(rnd<T>(hidden / 25.f))));
+            stf(o, k, g * h);
+        }
     } else {
         for (int k = threadIdx.x; k < K; k += blockDim.x) stf(o, k, ldf(x, k));
     }
@@ -348,6 +374,8 @@ KREA_API int krea_prologue_rows(int dtype, int prologue, const void* x, int64_t 
         case PRO_LAYERNORM: prologue_rows_kernel<T, PRO_LAYERNORM><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break; \
         case PRO_SILU: prologue_rows_kernel<T, PRO_SILU><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break;     \
         case PRO_GELU: prologue_rows_kernel<T, PRO_GELU><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break;     \
+        case PRO_ADALN: prologue_rows_kernel<T, PRO_ADALN><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break;   \
+        case PRO_SITU: prologue_rows_kernel<T, PRO_SITU><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break;     \
         default: return -3;                                                                                \
     }
     if (dtype == DT_BF16) { PDISPATCH(bf16) }
@@ -820,6 +848,207 @@ __global__ void to_rgb8_kernel(const bf16* x, int cstride, uint8_t* out, int64_t
 }
 KREA_API int krea_to_rgb8(const void* x, int cstride, uint8_t* out, int64_t P, void* stream) {
     to_rgb8_kernel<<<(unsigned)((P * 3 + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const bf16*)x, cstride, out, P);
+    KCHECK();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOSS Image
+// ---------------------------------------------------------------------------------------------
+// weight * (1 + scale) - 1: the norm weight folded into the scale of a fused rms_adaln.
+__global__ void adaln_weight_kernel(const bf16* w, const bf16* sc, bf16* out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float a = rnd<bf16>(1.f + __bfloat162float(sc[i]));
+    out[i] = __float2bfloat16_rn(rnd<bf16>(__bfloat162float(w[i]) * a) - 1.f);
+}
+KREA_API int krea_adaln_weight(const void* w, const void* sc, void* out, int n, void* stream) {
+    adaln_weight_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t)stream>>>((const bf16*)w, (const bf16*)sc, (bf16*)out, n);
+    KCHECK();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Qwen3.5 GatedDeltaNet (fp32)
+// ---------------------------------------------------------------------------------------------
+// silu(conv1d(x)): causal depthwise FIR. x, out [L, C]; w [C, 4]
+__global__ void delta_conv_kernel(const float* x, const bf16* w, float* out, int L, int C) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)L * C) return;
+    const int t = (int)(i / C), c = (int)(i % C);
+    const bf16* wc = w + (int64_t)c * 4;
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int s = t + k - 3;
+        if (s >= 0) acc += __bfloat162float(wc[k]) * x[(int64_t)s * C + c];
+    }
+    out[i] = silu_f(acc);
+}
+KREA_API int krea_delta_conv(const float* x, const void* w, float* out, int L, int C, void* stream) {
+    const int64_t n = (int64_t)L * C;
+    delta_conv_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(x, (const bf16*)w, out, L, C);
+    KCHECK();
+    return 0;
+}
+
+// L2-normalizes the d-wide heads of q and k in place (query | key halves of a [L, 2*H*d] row).
+__global__ void delta_normalize_kernel(float* x, int64_t stride, int H, int d) {
+    __shared__ float red[33];
+    const int64_t r = blockIdx.x;
+    const int t = (int)(r / (2 * H)), h = (int)(r % (2 * H));
+    float* v = x + (int64_t)t * stride + (int64_t)h * d;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) ss += v[i] * v[i];
+    ss = block_sum(ss, red);
+    const float n = fmaxf(sqrtf(ss), 1e-12f);
+    for (int i = threadIdx.x; i < d; i += blockDim.x) v[i] /= n;
+}
+
+// The delta rule as the plain recursion its chunked form computes: one block per value head, one
+// thread per state column, state in shared memory.
+__global__ void delta_rule_kernel(const float* mix, const float* a, const float* b, const float* dt, const float* alog,
+                                  float* out, int L, int Hv, int Hk, int d, float scale) {
+    extern __shared__ float sm[];  // state [d][d] | k | q
+    float* kq = sm + d * d;
+    const int h = blockIdx.x, c = threadIdx.x;
+    const int hk = h / (Hv / Hk);
+    const int64_t kdim = (int64_t)Hk * d, row = 2 * kdim + (int64_t)Hv * d;
+    for (int k = 0; k < d; ++k) sm[k * d + c] = 0.f;
+    const float decay = -expf(alog[h]);
+    for (int s = 0; s < L; ++s) {
+        const float* m = mix + (int64_t)s * row;
+        kq[c] = m[kdim + (int64_t)hk * d + c];
+        kq[d + c] = m[(int64_t)hk * d + c] * scale;
+        __syncthreads();
+        const float aa = a[(int64_t)s * Hv + h] + dt[h];
+        const float g = expf(decay * (aa > 20.f ? aa : log1pf(expf(aa))));
+        const float beta = sigmoid_f(b[(int64_t)s * Hv + h]);
+        float kvm = 0.f;
+        for (int k = 0; k < d; ++k) {
+            const float sv = sm[k * d + c] * g;
+            sm[k * d + c] = sv;
+            kvm = fmaf(kq[k], sv, kvm);
+        }
+        const float delta = (m[2 * kdim + (int64_t)h * d + c] - kvm) * beta;
+        float o = 0.f;
+        for (int k = 0; k < d; ++k) {
+            const float sv = fmaf(kq[k], delta, sm[k * d + c]);
+            sm[k * d + c] = sv;
+            o = fmaf(kq[d + k], sv, o);
+        }
+        out[((int64_t)s * Hv + h) * d + c] = o;
+        __syncthreads();
+    }
+}
+// mix [L, q | k | v] is normalized in place. a, b [L, Hv]; dt, alog [Hv]; out [L, Hv, d].
+KREA_API int krea_delta_rule(float* mix, const float* a, const float* b, const float* dt, const float* alog, float* out,
+                             int L, int Hv, int Hk, int d, void* stream) {
+    cudaStream_t st = (cudaStream_t)stream;
+    const int64_t row = 2 * (int64_t)Hk * d + (int64_t)Hv * d;
+    delta_normalize_kernel<<<L * 2 * Hk, d, 0, st>>>(mix, row, Hk, d);
+    const size_t smem = (size_t)(d * d + 2 * d) * sizeof(float);
+    if (smem > 48 * 1024) cudaFuncSetAttribute(delta_rule_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    delta_rule_kernel<<<Hv, d, smem, st>>>(mix, a, b, dt, alog, out, L, Hv, Hk, d, 1.f / sqrtf((float)d));
+    KCHECK();
+    return 0;
+}
+
+__global__ void mul_silu_kernel(float* x, const float* z, int64_t n) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= silu_f(z[i]);
+}
+KREA_API int krea_mul_silu(float* x, const float* z, int64_t n, void* stream) {
+    mul_silu_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(x, z, n);
+    KCHECK();
+    return 0;
+}
+
+// RMSNorm of d-wide heads, then split-half RoPE on their first 2*pairs dims. x [L, H, d] with rows
+// `stride` elements apart, w [d], rope [L][pairs][(cos, sin)].
+__global__ void partial_rope_kernel(float* x, int64_t stride, const float* w, float eps, const float* rope, int H, int d,
+                                    int pairs) {
+    __shared__ float red[33];
+    const int t = blockIdx.x / H, h = blockIdx.x % H, i = threadIdx.x;
+    float* v = x + (int64_t)t * stride + (int64_t)h * d;
+    const float e = v[i];
+    const float rstd = rsqrtf(block_sum(e * e, red) / (float)d + eps);
+    if (i < pairs) {
+        const float* r = rope + ((int64_t)t * pairs + i) * 2;
+        const float a = e * rstd * w[i], b = v[i + pairs] * rstd * w[i + pairs];
+        v[i] = a * r[0] - b * r[1];
+        v[i + pairs] = b * r[0] + a * r[1];
+    } else if (i >= 2 * pairs) {
+        v[i] = e * rstd * w[i];
+    }
+}
+KREA_API int krea_partial_rope(float* x, int64_t stride, const float* w, float eps, const float* rope, int L, int H, int d,
+                               int pairs, void* stream) {
+    partial_rope_kernel<<<L * H, d, 0, (cudaStream_t)stream>>>(x, stride, w, eps, rope, H, d, pairs);
+    KCHECK();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Flux 2 VAE decoder helpers (NHWC bf16)
+// ---------------------------------------------------------------------------------------------
+// latent float [64*2, H, W] -> z * s + m, unpacked to NHWC bf16 [2H, 2W, C/4]
+__global__ void flux2_latent_in_kernel(const float* lat, const float* mean, const float* stdv, bf16* out, int C, int H, int W) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)C * H * W) return;
+    const int cc = (int)(i / ((int64_t)H * W));
+    const int y = (int)((i / W) % H), xx = (int)(i % W);
+    const float v = rnd<bf16>(rnd<bf16>(rnd<bf16>(lat[i]) * stdv[cc]) + mean[cc]);
+    const int c = cc / 4, py = (cc >> 1) & 1, px = cc & 1;
+    const int oy = 2 * y + py, ox = 2 * xx + px;
+    out[(((int64_t)oy * 2 * W + ox) * (C / 4)) + c] = __float2bfloat16_rn(v);
+}
+KREA_API int krea_flux2_latent_in(const float* lat, const float* mean, const float* stdv, void* out, int C, int H, int W,
+                                  void* stream) {
+    const int64_t n = (int64_t)C * H * W;
+    flux2_latent_in_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(lat, mean, stdv, (bf16*)out, C, H, W);
+    KCHECK();
+    return 0;
+}
+
+// GroupNorm statistics of x [P, C]: stats[g] = (mean, 1 / sqrt(var + eps))
+__global__ void group_stats_kernel(const bf16* x, float2* stats, int64_t P, int C, int groups, float eps) {
+    __shared__ float red[33];
+    const int g = blockIdx.x, per = C / groups;
+    float sum = 0.f, ss = 0.f;
+    for (int64_t p = threadIdx.x; p < P; p += blockDim.x) {
+        const bf16* r = x + p * C + g * per;
+#pragma unroll 4
+        for (int c = 0; c < per; ++c) {
+            const float v = __bfloat162float(r[c]);
+            sum += v;
+            ss += v * v;
+        }
+    }
+    const float nv = 1.f / ((float)P * per);
+    const float mean = block_sum(sum, red) * nv;
+    const float var = block_sum(ss, red) * nv - mean * mean;
+    if (threadIdx.x == 0) stats[g] = make_float2(mean, rsqrtf(fmaxf(var, 0.f) + eps));
+}
+
+__global__ void group_apply_kernel(const bf16* x, bf16* out, const bf16* w, const bf16* b, const float2* stats, int64_t n, int C,
+                                   int per, int silu) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int c = (int)(i % C);
+    const float2 st = stats[c / per];
+    const float y = (__bfloat162float(x[i]) - st.x) * st.y * __bfloat162float(w[c]) + __bfloat162float(b[c]);
+    out[i] = __float2bfloat16_rn(silu ? silu_f(y) : y);
+}
+
+// GroupNorm, then optional SiLU. x, out [P, C]; stats is 8 * groups bytes of scratch.
+KREA_API int krea_group_norm(const void* x, void* out, const void* w, const void* b, void* stats, int64_t P, int C, int groups,
+                             float eps, int silu, void* stream) {
+    cudaStream_t st = (cudaStream_t)stream;
+    group_stats_kernel<<<groups, 1024, 0, st>>>((const bf16*)x, (float2*)stats, P, C, groups, eps);
+    const int64_t n = P * C;
+    group_apply_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>((const bf16*)x, (bf16*)out, (const bf16*)w, (const bf16*)b,
+                                                                     (const float2*)stats, n, C, C / groups, silu);
     KCHECK();
     return 0;
 }

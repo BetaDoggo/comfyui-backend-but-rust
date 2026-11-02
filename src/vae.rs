@@ -5,7 +5,7 @@
 //! and the temporal upsampling convs are skipped (as in ComfyUI).
 
 use crate::cuda::{DevBuf, Stream};
-use crate::ffi::{k, null, off, s, PM};
+use crate::ffi::{k, null, off, s, DT_BF16, PM};
 use crate::offload::Layout;
 use crate::st::{f32_bytes, SafeTensors};
 use anyhow::{bail, Result};
@@ -33,7 +33,7 @@ pub struct Vae {
 }
 
 /// Conv weight [Cout, Cin, (T,) R, R] -> KRSC bf16 (last temporal slice), Cout zero-padded to `cout_pad`.
-fn conv_krsc(st: &SafeTensors, name: &str, cout_pad: usize) -> Result<(Vec<u8>, usize, usize, usize)> {
+pub(crate) fn conv_krsc(st: &SafeTensors, name: &str, cout_pad: usize) -> Result<(Vec<u8>, usize, usize, usize)> {
     let info = st.info(name)?.clone();
     let v = st.f32_vec(name, false)?;
     let (co, ci) = (info.shape[0], info.shape[1]);
@@ -57,10 +57,35 @@ fn conv_krsc(st: &SafeTensors, name: &str, cout_pad: usize) -> Result<(Vec<u8>, 
     Ok((out.iter().flat_map(|b| b.to_le_bytes()).collect(), cop, ci, r))
 }
 
-fn bias_pad(st: &SafeTensors, name: &str, pad: usize) -> Result<Vec<u8>> {
+pub(crate) fn bias_pad(st: &SafeTensors, name: &str, pad: usize) -> Result<Vec<u8>> {
     let mut v = st.f32_vec(name, false)?;
     v.resize(pad.max(v.len()), 0.0);
     Ok(v.iter().flat_map(|x| bf16::from_f32(*x).to_le_bytes()).collect())
+}
+
+/// Single-head spatial self-attention, added to x [p, c] in place. `n` holds the normalized x and is
+/// overwritten. `w` is the weight and bias of [q | k | v], then of the output projection.
+pub(crate) fn single_head_attention(x: &DevBuf, n: &DevBuf, p: usize, c: usize, w: [PM; 4], st: &Stream) -> Result<()> {
+    let qkv = DevBuf::alloc_async(p * 3 * c * 2, st)?;
+    let (ci, c3) = (c as i64, 3 * c as i64);
+    k!(krea_gemm(n.ptr(), ci, w[0], ci, qkv.ptr(), c3, w[1], p as i64, c3, ci, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
+    // query rows per chunk: keep the f32 scores + bf16 probabilities under ~256 MB
+    let chunk = ((256 << 20) / (p * 6)).clamp(64, 4096).min(p);
+    let sbuf = DevBuf::alloc_async(chunk * p * 4, st)?;
+    let pbuf = DevBuf::alloc_async(chunk * p * 2, st)?;
+    let q = qkv.ptr();
+    let (kp, vp) = (off(q, c * 2), off(q, 2 * c * 2));
+    for r0 in (0..p).step_by(chunk) {
+        let rows = chunk.min(p - r0);
+        k!(krea_gemm(off(q, r0 * 3 * c * 2), c3, kp, c3, sbuf.ptr(), p as i64, null(), rows as i64, p as i64, ci, 1, DT_BF16,
+            crate::ffi::DT_F32, 1.0, 0.0, s(st)))?;
+        k!(krea_softmax_rows(sbuf.ptr(), pbuf.ptr(), rows as i32, p as i32, 1.0 / (c as f32).sqrt(), s(st)))?;
+        k!(krea_gemm(pbuf.ptr(), p as i64, vp, c3, off(n.ptr(), r0 * c * 2), ci, null(), rows as i64, ci, p as i64, 0, DT_BF16, DT_BF16, 1.0,
+            0.0, s(st)))?;
+    }
+    let y = DevBuf::alloc_async(p * c * 2, st)?;
+    k!(krea_gemm(n.ptr(), ci, w[2], ci, y.ptr(), ci, w[3], p as i64, ci, ci, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
+    k!(krea_add_gated_bf16(x.ptr(), ci, y.ptr(), ci, null(), p as i32, c as i32, s(st)))
 }
 
 impl Vae {
@@ -211,28 +236,8 @@ impl Vae {
     fn attention(&self, pre: &str, x: &DevBuf, p: usize, c: usize, st: &Stream) -> Result<()> {
         let n = DevBuf::alloc_async(p * c * 2, st)?;
         k!(krea_l2norm_silu(x.ptr(), n.ptr(), self.w(&format!("{pre}.g")), p as i64, c as i32, 0, s(st)))?;
-        let qkv = DevBuf::alloc_async(p * 3 * c * 2, st)?;
-        let (ci, c3) = (c as i64, 3 * c as i64);
-        k!(krea_gemm(n.ptr(), ci, self.w(&format!("{pre}.qkv.w")), ci, qkv.ptr(), c3, self.w(&format!("{pre}.qkv.b")),
-            p as i64, c3, ci, 1, crate::ffi::DT_BF16, crate::ffi::DT_BF16, 1.0, 0.0, s(st)))?;
-        // query rows per chunk: keep the f32 scores + bf16 probabilities under ~256 MB
-        let chunk = ((256 << 20) / (p * 6)).clamp(64, 4096).min(p);
-        let sbuf = DevBuf::alloc_async(chunk * p * 4, st)?;
-        let pbuf = DevBuf::alloc_async(chunk * p * 2, st)?;
-        let q = qkv.ptr();
-        let (kp, vp) = (off(q, c * 2), off(q, 2 * c * 2));
-        for r0 in (0..p).step_by(chunk) {
-            let rows = chunk.min(p - r0);
-            k!(krea_gemm(off(q, r0 * 3 * c * 2), c3, kp, c3, sbuf.ptr(), p as i64, null(), rows as i64, p as i64, ci,
-                1, crate::ffi::DT_BF16, crate::ffi::DT_F32, 1.0, 0.0, s(st)))?;
-            k!(krea_softmax_rows(sbuf.ptr(), pbuf.ptr(), rows as i32, p as i32, 1.0 / (c as f32).sqrt(), s(st)))?;
-            k!(krea_gemm(pbuf.ptr(), p as i64, vp, c3, off(n.ptr(), r0 * c * 2), ci, null(), rows as i64, ci, p as i64,
-                0, crate::ffi::DT_BF16, crate::ffi::DT_BF16, 1.0, 0.0, s(st)))?;
-        }
-        let y = DevBuf::alloc_async(p * c * 2, st)?;
-        k!(krea_gemm(n.ptr(), ci, self.w(&format!("{pre}.proj.w")), ci, y.ptr(), ci, self.w(&format!("{pre}.proj.b")),
-            p as i64, ci, ci, 1, crate::ffi::DT_BF16, crate::ffi::DT_BF16, 1.0, 0.0, s(st)))?;
-        k!(krea_add_gated_bf16(x.ptr(), ci, y.ptr(), ci, null(), p as i32, c as i32, s(st)))
+        let w = |key: &str| self.w(&format!("{pre}.{key}"));
+        single_head_attention(x, &n, p, c, [w("qkv.w"), w("qkv.b"), w("proj.w"), w("proj.b")], st)
     }
 }
 

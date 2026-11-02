@@ -2,14 +2,14 @@
 
 A ComfyUI-API-compatible server that SwarmUI can use as a normal **"ComfyUI API By URL"** backend,
 fronting a native Rust generation engine. It ships with two engines: **krea2**, which really generates Krea 2
-Turbo and Anima text-to-image with the Rust + CUDA pipelines in the parent repository, and the **mock engine**,
+Turbo, Anima and MOSS Image text-to-image with the Rust + CUDA pipelines in the parent repository, and the **mock engine**,
 which returns placeholder images/video/audio of the correct shapes for every other model family.
 
 ```
 crates/
   engine-api/     the contract: Engine trait + typed request structs (no web deps)
   comfy-server/   HTTP + websocket server that speaks ComfyUI's protocol, validates and runs graphs
-  krea2-engine/   the real engine: Krea 2 and Anima int8 text-to-image (optional, `--features krea2`)
+  krea2-engine/   the real engine: Krea 2, Anima and MOSS Image int8 text-to-image (optional, `--features krea2`)
 docs/
   INPUT_MAPPING.md   what SwarmUI sends for Krea 2 / Anima / MiniMax H3 / MOSS Image / Qwen Image 2.1, and what the engine receives
   COMPATIBILITY.md   every Swarm parameter probed live, and the node classes served through the generic custom_node route
@@ -65,6 +65,12 @@ Steps 8 and CFG Scale 1 for turbo models. These work: `er_sde` and `euler` with 
 prompt, `(word:1.2)` and `<weight>`, seed, Variation Seed, Batch Size, Sigma Shift, Model Attention Backend, cancelling and
 Free VRAM. Other samplers and schedulers, LoRAs, LLLite ControlNets, `<break>`, `<alternate>`, `<fromto>`, init images and
 VAE tiling are refused with an error.
+
+**MOSS Image** runs from the same server. Select an int8 ConvRot MOSS Image checkpoint; SwarmUI adds
+`qwen3.5_9b_int8_convrot.safetensors` and the Flux 2 VAE itself. Tested through SwarmUI at 1024x1024 and 832x1216: `euler` and `er_sde` with
+`simple`, CFG 1 and CFG 4 with a negative prompt, seed, Batch Size and Sigma Shift. Other samplers and schedulers, LoRAs, Prompt Images, `<weight>`,
+`<break>`, `<alternate>`, `<fromto>` and init images are refused with an error. A 20-step CFG 4 image took 11.5 s through SwarmUI,
+and switching from Krea 2 or Anima took about 3 s extra.
 
 **Alongside ComfyUI.** Add this server next to SwarmUI's normal ComfyUI backend. In a live test with both running,
 SwarmUI sent every Krea 2 job here and Anima to ComfyUI, keeping each model on the backend that had it loaded.

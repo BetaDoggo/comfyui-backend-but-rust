@@ -3,17 +3,49 @@
 A Rust and CUDA backend that speaks ComfyUI's API and replaces the ComfyUI features SwarmUI uses most, so
 SwarmUI can generate without Python or ComfyUI. The goal is speed first: Krea 2 Turbo takes about 4.65 s per
 1024x1024 image here, against about 9 s in ComfyUI on the same machine, and Anima Turbo samples 8 steps in
-0.92 s against 1.59 s.
+0.92 s against 1.59 s. MOSS Image gains least, about 5 to 8% per step, because ComfyUI already runs it on the same kernels.
 
-**Status:** two model families really generate, text-to-image only: Krea 2 Turbo and Anima. The server accepts far more of
+**Status:** three model families really generate, text-to-image only: Krea 2 Turbo, Anima and MOSS Image. The server accepts far more of
 SwarmUI's features than that, but they only reach a mock engine so far. The
 [project board](https://claude.ai/artifact/ARcm3yAXPwmZ5ZUHHhdNX9) lists everything that works and everything
 still to do, in priority order. Run it today beside a normal ComfyUI backend.
 
 * `swarm backend/` is the server: the ComfyUI protocol, the node graph, and the `Engine` interface. Start it with
   [`start-krea2.bat`](swarm%20backend/start-krea2.bat) and see [its README](swarm%20backend/README.md).
-* The repository root is the real engine: the Krea 2 and Anima pipelines described below. They also run alone
+* The repository root is the real engine: the Krea 2, Anima and MOSS Image pipelines described below. They also run alone
   from the command line, and Krea 2 has a small web UI.
+
+## MOSS Image engine
+
+Runs int8 ConvRot MOSS Image checkpoints with fused q/k/v, the Qwen3.5 9B text encoder and the Flux 2 VAE. Both
+published key layouts of that VAE load. `euler` (SwarmUI's default) and `er_sde` work with the `simple` scheduler, at any CFG.
+Prompts are literal: like ComfyUI, this encoder has no `(word:1.2)` emphasis.
+
+```bash
+target/release/krea2.exe --moss -p "a stone lighthouse on a sea cliff at dawn, no people" --steps 20 --cfg 4 --negative "blurry" -o lighthouse.png
+```
+
+Measured at 1024x1024, 20 steps, CFG 4 (two model evaluations per step), after warm-up:
+
+| | ComfyUI | krea2 (`--attention flash`) | krea2 (default, `int8`) |
+|---|---|---|---|
+| Sampling | 12.0 s (601 ms/step) | 15.2 s (760 ms/step) | 11.0 to 11.5 s (550 to 573 ms/step) |
+| Text, one prompt | 437 ms | 248 ms | 248 ms |
+| VAE decode | 530 to 780 ms | 268 ms | 268 ms |
+
+Where the time goes in one evaluation (about 275 ms): the int8 GEMMs take 173 ms and attention 58 ms. Those are the
+same kernels ComfyUI uses, so sampling gains little. The text encoder is streamed from pinned RAM here and timed with
+ComfyUI's held in VRAM.
+
+The prompt's text embedder runs once, and the modulation is cached per sigma across images.
+
+The output is not pixel-identical to ComfyUI. Token ids match, Qwen3.5 hidden states match to 3e-6 (the GatedDeltaNet
+layers run as the plain delta-rule recursion on the GPU), and the image embedder matches exactly. The text embedder
+differs by 0.5%, because torch's bf16 GEMM isn't exact at those sizes. The same seed gives the same picture at about
+34 dB PSNR with int8 attention and 33 dB with flash.
+
+`--swarm-template` encodes with the Krea 2 template, which SwarmUI sends for this model. Test prompts here must not
+generate people.
 
 ## Anima engine
 

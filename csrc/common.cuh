@@ -70,6 +70,15 @@ __device__ __forceinline__ float block_max(float v, float* red) {
 
 __device__ __forceinline__ float silu_f(float x) { return x / (1.f + expf(-x)); }
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.f / (1.f + expf(-x)); }
+// tanh that stays accurate near zero, as comfy-kitchen's quantizer computes it
+__device__ __forceinline__ float stable_tanh(float x) {
+    const float t = expm1f(-2.f * fabsf(x));
+    return copysignf(-t / (t + 2.f), x);
+}
+// MOSS Image's soft-capped gated activation in one float expression
+__device__ __forceinline__ float situ_f(float hidden, float gate) {
+    return 4.f * stable_tanh(gate / 4.f) / (1.f + expf(-gate)) * (25.f * stable_tanh(hidden / 25.f));
+}
 __device__ __forceinline__ float gelu_f(float x) { return 0.5f * x * (1.f + erff(x * 0.70710678118654752f)); }
 __device__ __forceinline__ float gelu_tanh_f(float x) {
     const float k0 = 0.7978845608028654f, k1 = 0.044715f;

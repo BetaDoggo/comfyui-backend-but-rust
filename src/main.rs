@@ -80,24 +80,33 @@ struct Args {
     /// Run Anima instead of Krea 2 (--dit and --te then default to the Anima files, --shift to 3)
     #[arg(long)]
     anima: bool,
-    /// Anima: negative prompt (used when --cfg isn't 1)
+    /// Run MOSS Image instead of Krea 2 (--dit, --te and --vae then default to the MOSS files, --shift to 5)
+    #[arg(long)]
+    moss: bool,
+    /// MOSS Image: encode with the Krea 2 template, as SwarmUI does
+    #[arg(long)]
+    swarm_template: bool,
+    /// Anima, MOSS Image: negative prompt (used when --cfg isn't 1)
     #[arg(long, default_value = "")]
     negative: String,
-    /// Anima: CFG scale
+    /// Anima, MOSS Image: CFG scale
     #[arg(long, default_value_t = 1.0)]
     cfg: f64,
-    /// Anima: sampler (er_sde | euler)
-    #[arg(long, default_value = "er_sde")]
-    sampler: String,
+    /// Anima, MOSS Image: sampler (er_sde | euler), default er_sde for Anima, euler for MOSS Image
+    #[arg(long)]
+    sampler: Option<String>,
 }
 
 const ANIMA_DIT: &str = r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\animaInt8Mxfp8_turboV11Int8.safetensors";
 const ANIMA_TE: &str = r"G:\stable-diffusion-webui-forge\models\clip\qwen_3_600m.safetensors";
+const MOSS_DIT: &str = r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\moss_image_sft_int8_convrot_attn.safetensors";
+const MOSS_TE: &str = r"G:\stable-diffusion-webui-forge\models\clip\qwen3.5_9b_int8_convrot.safetensors";
+const MOSS_VAE: &str = r"G:\stable-diffusion-webui-forge\models\VAE\flux2-vae.safetensors";
 
 fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
-    let sampler = match args.sampler.as_str() {
-        "er_sde" => pipeline::AnimaSampler::ErSde,
-        "euler" => pipeline::AnimaSampler::Euler,
+    let sampler = match args.sampler.as_deref().unwrap_or("er_sde") {
+        "er_sde" => pipeline::FlowSampler::ErSde,
+        "euler" => pipeline::FlowSampler::Euler,
         s => bail!("unknown --sampler {s} (er_sde | euler)"),
     };
     let default_dit = PathBuf::from(r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors");
@@ -134,6 +143,60 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         let (latent, _) = gen.sample_anima(&r, |_, _| true, args.dump.as_ref().map(|_| &mut dump))?;
         let rgb = gen.decode_latent(&latent, args.width, args.height)?;
         eprintln!("image done in {:.2}s", t0.elapsed().as_secs_f64());
+        let path = out_path(&args.out, i, args.count);
+        std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("[{i}] saved {} (seed {seed})", path.display());
+        if let Some(d) = &args.dump {
+            write_safetensors(d, &dump)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
+    let sampler = match args.sampler.as_deref().unwrap_or("euler") {
+        "euler" => pipeline::FlowSampler::Euler,
+        "er_sde" => pipeline::FlowSampler::ErSde,
+        s => bail!("unknown --sampler {s} (euler | er_sde)"),
+    };
+    let default_dit = PathBuf::from(r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors");
+    let dit = if args.dit == default_dit { PathBuf::from(MOSS_DIT) } else { args.dit.clone() };
+    let te = if args.te.ends_with("qwen3vl_4b.safetensors") { PathBuf::from(MOSS_TE) } else { args.te.clone() };
+    let vae = if args.vae.ends_with("qwen_image_vae.safetensors") { PathBuf::from(MOSS_VAE) } else { args.vae.clone() };
+    let shift = if args.shift == 1.15 { 5.0 } else { args.shift };
+    let mut gen = pipeline::Generator::new(&load)?;
+    gen.ensure_moss(&dit)?;
+    gen.ensure_qwen35(&te)?;
+    gen.ensure_flux2_vae(&vae)?;
+    let n = 128 * (args.height / 16) * (args.width / 16);
+    for i in 0..args.count {
+        let seed = args.seed + i as u64;
+        let noise = match &args.ref_noise {
+            Some(p) => st::SafeTensors::open(p)?.f32_vec("noise", false)?,
+            None => krea2::sampling::torch_randn(seed, n),
+        };
+        let r = pipeline::MossRequest {
+            positive: args.prompt.clone(),
+            negative: args.negative.clone(),
+            template: args.swarm_template.then(|| krea2::te::TEMPLATE.to_string()),
+            cfg: args.cfg,
+            sampler,
+            seed,
+            batch_index: 0,
+            batch_size: 1,
+            width: args.width,
+            height: args.height,
+            steps: args.steps,
+            shift,
+            noise,
+        };
+        let mut dump = pipeline::Dump::new();
+        let t0 = Instant::now();
+        let (latent, _) = gen.sample_moss(&r, |_, _| true, args.dump.as_ref().map(|_| &mut dump))?;
+        let t1 = Instant::now();
+        let rgb = gen.decode_moss(&latent, args.width, args.height)?;
+        eprintln!("VAE decode {:.0} ms, image done in {:.2}s", t1.elapsed().as_secs_f64() * 1e3, t0.elapsed().as_secs_f64());
         let path = out_path(&args.out, i, args.count);
         std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
             .with_context(|| format!("writing {}", path.display()))?;
@@ -204,6 +267,9 @@ fn main() -> Result<()> {
     };
     if args.anima {
         return run_anima(&args, load);
+    }
+    if args.moss {
+        return run_moss(&args, load);
     }
     if let Some(addr) = &args.serve {
         return serve::run(load, serve::ServeOptions {

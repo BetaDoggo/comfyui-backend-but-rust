@@ -8,6 +8,9 @@ use unicode_normalization::UnicodeNormalization;
 const VOCAB: &str = include_str!("../assets/qwen25_tokenizer/vocab.json");
 const MERGES: &str = include_str!("../assets/qwen25_tokenizer/merges.txt");
 const CONFIG: &str = include_str!("../assets/qwen25_tokenizer/tokenizer_config.json");
+const VOCAB35: &str = include_str!("../assets/qwen35_tokenizer/vocab.json");
+const MERGES35: &str = include_str!("../assets/qwen35_tokenizer/merges.txt");
+const CONFIG35: &str = include_str!("../assets/qwen35_tokenizer/tokenizer_config.json");
 const PRETOKENIZE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 pub struct Tokenizer {
@@ -38,14 +41,23 @@ fn bytes_to_unicode() -> [char; 256] {
 
 impl Tokenizer {
     pub fn new() -> Result<Self> {
-        let vocab: HashMap<String, u32> = serde_json::from_str(VOCAB)?;
+        Self::build(VOCAB, MERGES, CONFIG)
+    }
+
+    /// The tokenizer of Qwen3.5 text encoders.
+    pub fn qwen35() -> Result<Self> {
+        Self::build(VOCAB35, MERGES35, CONFIG35)
+    }
+
+    fn build(vocab: &str, merges: &str, config: &str) -> Result<Self> {
+        let vocab: HashMap<String, u32> = serde_json::from_str(vocab)?;
         let mut ranks = HashMap::new();
-        for (i, line) in MERGES.lines().skip(1).enumerate() {
+        for (i, line) in merges.lines().skip(1).enumerate() {
             if let Some((a, b)) = line.split_once(' ') {
                 ranks.insert((a.to_string(), b.to_string()), i as u32);
             }
         }
-        let cfg: serde_json::Value = serde_json::from_str(CONFIG)?;
+        let cfg: serde_json::Value = serde_json::from_str(config)?;
         let mut special = Vec::new();
         for (id, t) in cfg["added_tokens_decoder"].as_object().ok_or_else(|| anyhow!("tokenizer config"))? {
             special.push((t["content"].as_str().unwrap().to_string(), id.parse::<u32>()?));

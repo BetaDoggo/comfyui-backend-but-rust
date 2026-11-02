@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value as Json};
 use swarm_engine_api::Engine;
@@ -24,6 +24,12 @@ use crate::ws::Hub;
 
 fn panic_message(p: &Box<dyn std::any::Any + Send>) -> String {
     p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into())
+}
+
+/// How long the engine waits for work before it gives VRAM back; IDLE_RELEASE_SECS, 0 to never.
+fn idle_after() -> Option<Duration> {
+    let secs = std::env::var("IDLE_RELEASE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    (secs > 0).then_some(Duration::from_secs(secs))
 }
 
 fn now_ms() -> u64 {
@@ -68,15 +74,20 @@ impl Executor {
 
     /// The worker loop. Runs forever on a dedicated thread.
     pub fn run_forever(&self) {
+        let mut wait = None;
         loop {
-            match self.queue.next_work() {
-                Work::Free(FreeRequest { unload_models, free_memory }) => {
+            match self.queue.next_work(wait) {
+                None => {
+                    self.engine.idle();
+                    wait = None;
+                }
+                Some(Work::Free(FreeRequest { unload_models, free_memory })) => {
                     if unload_models {
                         self.cache.lock().unwrap().clear();
                     }
                     self.engine.free_memory(unload_models, free_memory);
                 }
-                Work::Prompt(item) => {
+                Some(Work::Prompt(item)) => {
                     let entry = self.run_prompt(&item);
                     // Like ComfyUI's `task_done` then `executing None`: history must exist before
                     // the client sees the end marker, since SwarmUI fetches `/history` right away.
@@ -85,6 +96,7 @@ impl Executor {
                     self.queue.finish(entry);
                     self.hub.send_json("executing", json!({ "node": null, "prompt_id": pid }), sid.as_deref());
                     self.broadcast_status();
+                    wait = idle_after();
                 }
             }
         }

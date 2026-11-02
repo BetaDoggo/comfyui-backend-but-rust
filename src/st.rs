@@ -6,6 +6,11 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn VirtualUnlock(addr: *const std::ffi::c_void, size: usize) -> i32;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dt {
     F32,
@@ -88,6 +93,16 @@ impl SafeTensors {
     pub fn bytes(&self, name: &str) -> Result<&[u8]> {
         let i = self.info(name)?;
         Ok(&self.mmap[i.start..i.start + i.len])
+    }
+
+    /// Take a tensor's pages out of this process. They stay in the file cache, so a later read costs
+    /// a soft fault per page rather than a disk read: not for tensors read again on every step.
+    pub fn evict(&self, name: &str) {
+        if let Ok(i) = self.info(name) {
+            let (start, end) = (i.start & !4095, (i.start + i.len).next_multiple_of(4096).min(self.mmap.len()));
+            // on pages that aren't locked this reports failure and does what we want, as documented
+            unsafe { VirtualUnlock(self.mmap[start..end].as_ptr().cast(), end - start) };
+        }
     }
 
     /// Tensor as f32 values, first rounded through bf16 when `via_bf16` (ComfyUI keeps the

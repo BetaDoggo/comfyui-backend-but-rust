@@ -235,7 +235,7 @@ The first video decode reads 2.4 GB from the file, about 23 s on this drive.
 Baking the LoRA adds about 11 s when it changes, and text encoding from a cold disk takes about 140 s on both engines, as the drive reads at about 100 MB/s.
 ComfyUI's text encoding took 151 s cold. Runs longer than 22 frames and sizes above 512x512 haven't been tested.
 
-Offloading is the lazy kind in [`src/offload.rs`](src/offload.rs): nothing is read at load, reader threads fill four pinned staging buffers ahead of compute, and file pages stay evictable.
+Offloading is the lazy kind in [`src/offload.rs`](src/offload.rs): nothing is read at load, reader threads fill up to four pinned staging buffers ahead of compute, taken only when a unit needs one and returned when the set parks. Pages read once leave the process right after, which took a H3 run's peak working set from 52 GB to 32 GB.
 Weights stay in packed 6-bit form in VRAM and decode to int8 before each GEMM, which leaves room for 30 of the 50 blocks at 512x512. Streamed blocks are spread evenly among the resident ones, so each copy overlaps compute instead of queueing behind the last; at 5 frames that took a step from 0.33 s to 0.24 s, and copies no longer hold it up.
 Splitting weights to keep them in L2 gained 2 to 3%, so it isn't used: the int8 GEMM already runs close to what this GPU can do.
 LoRA-baked blocks keep a pinned host copy, about 15 GB, and go straight to VRAM: this machine copies 18 GB/s in RAM but 28 GB/s from pinned memory to VRAM, so a pass through staging cost about 200 ms a step.

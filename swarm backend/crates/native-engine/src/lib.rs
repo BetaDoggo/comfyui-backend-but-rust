@@ -861,6 +861,12 @@ impl Engine for NativeEngine {
         Ok(())
     }
 
+    fn idle(&self) {
+        if let Err(e) = self.gen().idle() {
+            tracing::warn!("native: releasing VRAM failed: {e:#}");
+        }
+    }
+
     fn free_memory(&self, unload_models: bool, free_memory: bool) {
         let mut gen = self.gen();
         let r = if unload_models {

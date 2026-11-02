@@ -18,8 +18,8 @@ use crate::st::{f32_bytes, Dt, SafeTensors};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::time::Instant;
 
 pub const ALIGN: usize = 256;
@@ -142,6 +142,17 @@ impl Layout {
         Ok(v)
     }
 
+    /// Take this unit's tensors out of the process, once they are held elsewhere.
+    pub fn evict(&self, st: &SafeTensors) {
+        for e in &self.entries {
+            match &e.src {
+                Src::Raw(names) | Src::Bf16(names) => names.iter().for_each(|n| st.evict(n)),
+                Src::F32(n, _) => st.evict(n),
+                Src::Bytes(_) => {}
+            }
+        }
+    }
+
     pub fn pack(&self, st: &SafeTensors, dst: &mut [u8]) -> Result<()> {
         for e in &self.entries {
             let d = &mut dst[e.off..e.off + e.len];
@@ -217,6 +228,57 @@ const STAGING: usize = 4;
 
 type Staged = (usize, u64, Result<PinnedBuf>);
 
+/// Leave to fill a staging buffer, with the buffer if one is free and what it must wait for.
+type Ticket = (Option<PinnedBuf>, Option<Event>);
+
+/// The staging buffers of a lazy set. They are taken from the driver only when a unit has to pass
+/// through one, so a set that is idle, or holds its images, keeps none.
+struct Staging {
+    tickets: Mutex<Vec<Ticket>>,
+    ready: Condvar,
+    generation: AtomicU64,
+}
+
+impl Staging {
+    fn new() -> Self {
+        Staging { tickets: Mutex::new((0..STAGING).map(|_| (None, None)).collect()), ready: Condvar::new(), generation: AtomicU64::new(0) }
+    }
+
+    fn current(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) == generation
+    }
+
+    /// The next ticket, or None once `generation` is over.
+    fn take(&self, generation: u64) -> Option<Ticket> {
+        let mut q = self.tickets.lock().unwrap();
+        loop {
+            if !self.current(generation) {
+                return None;
+            }
+            if !q.is_empty() {
+                return Some(q.remove(0));
+            }
+            q = self.ready.wait(q).unwrap();
+        }
+    }
+
+    fn put(&self, t: Ticket) {
+        self.tickets.lock().unwrap().push(t);
+        self.ready.notify_one();
+    }
+
+    fn start(&self, generation: u64) {
+        let _q = self.tickets.lock().unwrap();
+        self.generation.store(generation, Ordering::SeqCst);
+        self.ready.notify_all();
+    }
+
+    /// Give the waiting buffers back. Their copies must be finished.
+    fn empty(&self) {
+        self.tickets.lock().unwrap().iter_mut().for_each(|t| *t = (None, None));
+    }
+}
+
 /// A unit held in RAM, pinned unless there is no room for that.
 enum Image {
     Pinned(PinnedBuf),
@@ -243,12 +305,18 @@ struct Lazy {
     keep: Arc<AtomicBool>,
     want: mpsc::Sender<(usize, u64)>,
     done: mpsc::Receiver<Staged>,
-    free: mpsc::Sender<(PinnedBuf, Option<Event>)>,
+    staging: Arc<Staging>,
     staged: HashMap<usize, PinnedBuf>,
     asked: HashSet<usize>,
     /// Resident units whose VRAM holds their data.
     filled: Vec<bool>,
     generation: u64,
+}
+
+impl Drop for Lazy {
+    fn drop(&mut self) {
+        self.staging.start(u64::MAX);
+    }
 }
 
 pub struct WeightSet {
@@ -331,12 +399,14 @@ impl WeightSet {
                         let buf = free_rx.lock().unwrap().recv();
                         let Ok(mut buf) = buf else { break };
                         let r = layouts[i].pack(st, &mut buf.as_mut_slice()[..layouts[i].size]).map(|_| buf);
+                        layouts[i].evict(st);
                         if done_tx.send((i, r)).is_err() {
                             break;
                         }
                     } else {
                         let r = PinnedBuf::alloc(layouts[i].size)
                             .and_then(|mut b| layouts[i].pack(st, b.as_mut_slice()).map(|_| b));
+                        layouts[i].evict(st);
                         match r {
                             Ok(b) => host_out.lock().unwrap()[i] = Some(b),
                             Err(e) => *err.lock().unwrap() = Some(e),
@@ -400,22 +470,23 @@ impl WeightSet {
         }
         let (want, want_rx) = mpsc::channel::<(usize, u64)>();
         let (done_tx, done) = mpsc::channel::<Staged>();
-        let (free, free_rx) = mpsc::channel::<(PinnedBuf, Option<Event>)>();
-        for _ in 0..STAGING {
-            free.send((PinnedBuf::alloc(max_size)?, None))?;
-        }
+        let staging = Arc::new(Staging::new());
         let images: Arc<Vec<RwLock<Option<Image>>>> = Arc::new((0..n).map(|_| RwLock::new(None)).collect());
-        let (want_rx, free_rx) = (Arc::new(Mutex::new(want_rx)), Arc::new(Mutex::new(free_rx)));
+        let want_rx = Arc::new(Mutex::new(want_rx));
         let keep = Arc::new(AtomicBool::new(false));
         for _ in 0..threads.clamp(1, 3) {
-            let (want_rx, free_rx, done_tx, st, layouts, images, keep) = (want_rx.clone(), free_rx.clone(), done_tx.clone(), st.clone(), layouts.clone(), images.clone(), keep.clone());
+            let (want_rx, staging, done_tx, st, layouts, images, keep) = (want_rx.clone(), staging.clone(), done_tx.clone(), st.clone(), layouts.clone(), images.clone(), keep.clone());
             std::thread::spawn(move || loop {
                 let Ok((unit, generation)) = want_rx.lock().unwrap().recv() else { break };
-                let Ok((mut buf, event)) = free_rx.lock().unwrap().recv() else { break };
-                let r = (|| -> Result<()> {
+                let Some((buf, event)) = staging.take(generation) else { continue };
+                let r = (|| -> Result<PinnedBuf> {
                     if let Some(e) = event {
                         e.sync()?;
                     }
+                    let mut buf = match buf {
+                        Some(b) => b,
+                        None => PinnedBuf::alloc(max_size)?,
+                    };
                     let size = layouts[unit].size;
                     let mut held = images[unit].write().unwrap();
                     match &mut *held {
@@ -426,19 +497,27 @@ impl WeightSet {
                                 let mut img = Image::new(size);
                                 img.bytes()[..size].copy_from_slice(&buf.as_mut_slice()[..size]);
                                 *held = Some(img);
+                                layouts[unit].evict(&st);
                             }
                         }
                     }
-                    Ok(())
+                    Ok(buf)
                 })();
-                if done_tx.send((unit, generation, r.map(|_| buf))).is_err() {
+                // nobody waits for a stale unit, and a parked set wants its memory back
+                if r.is_err() || !staging.current(generation) {
+                    staging.put((None, None));
+                    if r.is_ok() {
+                        continue;
+                    }
+                }
+                if done_tx.send((unit, generation, r)).is_err() {
                     break;
                 }
             });
         }
         let total: usize = layouts.iter().map(|l| l.size).sum();
         eprintln!("[{name}] {n} units, {:.2} GB: {} resident, {} streamed via {} slots, read on use", total as f64 / 1e9, plan.resident, streamed.len(), slots.len());
-        let lazy = Lazy { st, images, keep, want, done, free, staged: HashMap::new(), asked: HashSet::new(), filled: vec![false; n], generation: 0 };
+        let lazy = Lazy { st, images, keep, want, done, staging, staged: HashMap::new(), asked: HashSet::new(), filled: vec![false; n], generation: 0 };
         Ok(WeightSet { name: name.to_string(), layouts, stores, rewritten: vec![false; n], streamed, slot_of: HashMap::new(), next_rank: 0, rr: 0, slots, copy: Stream::new()?, lazy: Some(lazy), copied_bytes: 0 })
     }
 
@@ -469,7 +548,30 @@ impl WeightSet {
             l.filled.iter_mut().for_each(|f| *f = false);
         }
         eprintln!("[{}] {} units in VRAM, {} streamed via {} slots", self.name, self.resident(), self.streamed.len(), self.slots.len());
-        self.restart_ring()
+        self.restart_ring()?;
+        if let (true, Some(l)) = (self.stores.iter().all(|s| s.dev.is_none()) && self.slots.is_empty(), &self.lazy) {
+            while let Ok((_, _, r)) = l.done.try_recv() {
+                if r.is_ok() {
+                    l.staging.put((None, None));
+                }
+            }
+            l.staging.empty();
+        }
+        Ok(())
+    }
+
+    /// Take a set that will not run for a while out of the process.
+    pub fn evict(&self) {
+        if let Some(l) = &self.lazy {
+            self.layouts.iter().for_each(|u| u.evict(&l.st));
+        }
+    }
+
+    /// As [`Self::evict`], for the units held in host memory since a LoRA rewrote them.
+    pub fn evict_rewritten(&self) {
+        if let Some(l) = &self.lazy {
+            self.layouts.iter().zip(&self.rewritten).filter(|(_, r)| **r).for_each(|(u, _)| u.evict(&l.st));
+        }
     }
 
     /// Keep what is read in host memory, so a lazy set that returns needs no second trip to the file.
@@ -535,7 +637,7 @@ impl WeightSet {
             if generation == l.generation {
                 l.staged.insert(u, buf);
             } else {
-                l.free.send((buf, None))?;
+                l.staging.put((Some(buf), None));
             }
         }
         let buf = l.staged.remove(&unit).unwrap();
@@ -543,7 +645,7 @@ impl WeightSet {
         memcpy_h2d(dst, buf.ptr(), size, &self.copy)?;
         let done = Event::new()?;
         done.record(&self.copy)?;
-        l.free.send((buf, Some(Event::new_like(&done, &self.copy)?)))?;
+        l.staging.put((Some(buf), Some(Event::new_like(&done, &self.copy)?)));
         self.copied_bytes += size;
         Ok(done)
     }
@@ -622,9 +724,10 @@ impl WeightSet {
     pub fn restart_ring(&mut self) -> Result<()> {
         if let Some(l) = &mut self.lazy {
             l.generation += 1;
+            l.staging.start(l.generation);
             l.asked.clear();
             for (_, buf) in l.staged.drain() {
-                l.free.send((buf, None))?;
+                l.staging.put((Some(buf), None));
             }
         }
         self.slot_of.clear();

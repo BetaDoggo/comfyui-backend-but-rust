@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value as Json};
 
@@ -104,19 +105,30 @@ impl PromptQueue {
     }
 
     /// Blocks until there is something to do.
-    pub fn next_work(&self) -> Work {
+    /// The next work, waiting up to `wait` for it (for ever without one).
+    pub fn next_work(&self, wait: Option<Duration>) -> Option<Work> {
+        let deadline = wait.map(|w| Instant::now() + w);
         let mut g = self.inner.lock().unwrap();
         loop {
             if let Some(f) = g.free.take() {
-                return Work::Free(f);
+                return Some(Work::Free(f));
             }
             if !g.pending.is_empty() {
                 let item = g.pending.remove(0);
                 g.running = Some(item.clone());
                 self.interrupt.store(false, Ordering::SeqCst);
-                return Work::Prompt(item);
+                return Some(Work::Prompt(item));
             }
-            g = self.cv.wait(g).unwrap();
+            g = match deadline {
+                Some(d) => {
+                    let left = d.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return None;
+                    }
+                    self.cv.wait_timeout(g, left).unwrap().0
+                }
+                None => self.cv.wait(g).unwrap(),
+            };
         }
     }
 

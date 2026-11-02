@@ -193,7 +193,7 @@ pub fn n_blocks(st: &SafeTensors) -> usize {
 
 /// Rough activation footprint of one evaluation (bytes) for `l` tokens.
 pub fn step_activation_bytes(l: usize) -> usize {
-    l * (F * 2 + QKV * 2 + INNER * 2 + 2 * FFN * 2 + FFN + 8) + 2 * l * 2 * INNER + 4 * 28672 * F / 3 + (128 << 20)
+    l * (F * 2 + INNER * 2 + 2 * FFN * 2 + FFN + 1024) + 4 * 28672 * F / 3 + (128 << 20)
 }
 
 pub struct Dit {
@@ -290,6 +290,7 @@ impl Dit {
         k!(gpu_prologue_rows(DT_BF16, PRO_RMS, xp, fi, null(), 0, 0, self.g("rn"), 1e-5, null(), null(), out.ptr(), fi, m, F as i32, s(st)))?;
         st.sync()?;
         self.refiner.replan(Plan { resident: 0, slots: 0 })?;
+        self.refiner.evict();
         Ok(out)
     }
 
@@ -309,7 +310,7 @@ impl Dit {
         std::array::from_fn(|j| self.table[i * 8 + j] + w * (self.table[(i + 1) * 8 + j] - self.table[i * 8 + j]))
     }
 
-    fn attn_workspace(&self, l: usize) -> usize {
+    pub fn attn_workspace(&self, l: usize) -> usize {
         if self.int8_attn {
             unsafe { crate::ffi::gpu_int8_attn_workspace(1, H as i32, H as i32, l as i32, l as i32) as usize }
         } else {
@@ -382,7 +383,9 @@ impl Dit {
 
         // tokens
         let x = DevBuf::alloc_async(l * F * 2, st)?;
-        let fbuf = DevBuf::alloc_async(l * F * 4, st)?;
+        // qkv, the gate-up rows and the f32 rows at either end are never live together
+        let hid = DevBuf::alloc_async(l * 2 * FFN * 2, st)?;
+        let (qkv, fbuf) = (&hid, &hid);
         let up = DevBuf::alloc_async((rows.len() + arows.len()) * 4, st)?;
         up.upload(0, &f32_bytes(&rows), st)?;
         up.upload(rows.len() * 4, &f32_bytes(&arows), st)?;
@@ -395,9 +398,7 @@ impl Dit {
 
         let a8 = DevBuf::alloc_async(l * FFN, st)?;
         let asc = DevBuf::alloc_async(l * 4, st)?;
-        let qkv = DevBuf::alloc_async(l * QKV * 2, st)?;
         let attn = DevBuf::alloc_async(l * INNER * 2, st)?;
-        let hid = DevBuf::alloc_async(l * 2 * FFN * 2, st)?;
         let wdec = DevBuf::alloc_async(2 * FFN * F, st)?;
         let ws = DevBuf::alloc_async(self.attn_workspace(l), st)?;
         let modf = DevBuf::alloc_async(2 * MODS * 4, st)?;
@@ -442,7 +443,7 @@ impl Dit {
             if b == 0 {
                 if let Some(p) = probe.as_mut() {
                     p("b0.out_proj.in", &attn, l * INNER * 2);
-                    p("b0.q", &qkv, l * QKV * 2);
+                    p("b0.q", qkv, l * QKV * 2);
                 }
             }
             k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), INNER as i64, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), l as i32, INNER as i32, 1, s(st)))?;
@@ -485,7 +486,7 @@ impl Dit {
         k!(gpu_gemm(cd.ptr(), 8, self.g("fa_w"), 8, fm.ptr(), (2 * F) as i64, self.g("fa_b"), 2, (2 * F) as i64, 8, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
         let fb = DevBuf::alloc_async(2 * 2 * F * 2, st)?;
         k!(gpu_f32_to_bf16(fm.ptr(), fb.ptr(), (4 * F) as i64, s(st)))?;
-        let h16 = DevBuf::alloc_async(l * F * 2, st)?;
+        let h16 = &attn;
         for (row, first, n) in [(0usize, al, vr), (1, text, ar)] {
             let (shift, scale) = (off(fb.ptr(), row * 2 * F * 2), off(fb.ptr(), (row * 2 + 1) * F * 2));
             k!(gpu_adaln_weight(self.g("fn"), scale, folded.ptr(), F as i32, s(st)))?;

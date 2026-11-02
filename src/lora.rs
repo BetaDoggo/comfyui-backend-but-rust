@@ -708,6 +708,7 @@ pub fn apply(arch: Arch, st: &SafeTensors, prefix: &str, mut stores: Vec<Store>,
     for store in &mut m.stores {
         if let Store::Set(w) = store {
             w.restart_ring()?;
+            w.evict_rewritten();
         }
     }
     state.stack = loras.to_vec();

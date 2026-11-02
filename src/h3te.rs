@@ -125,6 +125,7 @@ impl TextEncoder {
         }
         st.sync()?;
         self.ws.replan(Plan { resident: 0, slots: 0 })?;
+        self.ws.evict();
         Ok(x)
     }
 }

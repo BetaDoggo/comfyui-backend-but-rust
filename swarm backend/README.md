@@ -129,6 +129,11 @@ sends, the generic route versus native nodes, the engine-side work, and tests.
 through `custom_node`. Each generic-route node class is tagged with what native support would take: server-only
 work, a new patch/metadata field, a new `Engine` operation, or a new model architecture.
 
+## Idle memory
+
+After 5 minutes with no work the engine moves diffusion blocks to RAM, so other applications get the VRAM.
+The next generation takes them back. `IDLE_RELEASE_SECS` changes the wait, and 0 turns this off.
+
 ## Test
 
 ```bash

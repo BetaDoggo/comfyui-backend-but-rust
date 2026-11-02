@@ -644,7 +644,7 @@ impl Generator {
         st.sync()?;
         cuda::trim_pool()?;
         let tokens = text.max(neg.map_or(0, |n| n.1)) + 2 * r.shape.audio_t + r.shape.t * (r.shape.h / 2) * (r.shape.w / 2);
-        let budget = (cuda::device_free()? + m.dit.blocks_vram()).saturating_sub(self.reserve + (1 << 29) + h3::step_activation_bytes(tokens));
+        let budget = (cuda::device_free()? + m.dit.blocks_vram()).saturating_sub(self.reserve + (1 << 29) + h3::step_activation_bytes(tokens) + m.dit.attn_workspace(tokens));
         m.dit.reserve(budget, self.slots)?;
         let rope = m.dit.rope(text, &r.shape, st)?;
         let rope_neg = neg.map(|(_, l)| m.dit.rope(l, &r.shape, st)).transpose()?;
@@ -1060,6 +1060,27 @@ impl Generator {
         self.h3_audio = None;
         self.flux2 = None;
         self.vae = None;
+        cuda::trim_pool()
+    }
+
+    /// Nothing is running: other applications get the VRAM, and the next generation takes its blocks
+    /// back from RAM. Models keep their place, LoRAs and prompts. Forced residency is left alone.
+    pub fn idle(&mut self) -> Result<()> {
+        self.st.sync()?;
+        if self.dynamic {
+            if let Some(m) = &mut self.dit {
+                m.dit.blocks.set_resident(0, 1, &m.st)?;
+            }
+            if let Some(m) = &mut self.anima {
+                m.dit.blocks.set_resident(0, 1, &m.st)?;
+            }
+            if let Some(m) = &mut self.moss {
+                m.dit.blocks.set_resident(0, 1, &m.st)?;
+            }
+            if let Some(m) = &mut self.h3 {
+                m.dit.park()?;
+            }
+        }
         cuda::trim_pool()
     }
 

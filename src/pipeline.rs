@@ -1,7 +1,7 @@
 //! Loaded models + one text-to-image generation, shared by the CLI and the web server.
 
 use crate::cuda::{self, DevBuf, Event, Stream};
-use crate::{anima, dit, ffi, flux2vae, moss, offload, qwen3, qwen35, sampling, st, te, tokenizer, vae};
+use crate::{anima, dit, ffi, flux2vae, lora, moss, offload, qwen3, qwen35, sampling, st, te, tokenizer, vae};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -65,6 +65,7 @@ struct DitModel {
     path: PathBuf,
     dit: dit::Dit,
     st: st::SafeTensors,
+    lora: lora::State,
 }
 
 /// Samplers shared by the flow models with a separate velocity prediction (not Krea 2's fused Euler).
@@ -97,6 +98,7 @@ struct AnimaModel {
     path: PathBuf,
     dit: anima::Dit,
     st: st::SafeTensors,
+    lora: lora::State,
 }
 
 pub struct MossRequest {
@@ -121,6 +123,7 @@ struct MossModel {
     path: PathBuf,
     dit: moss::Dit,
     st: st::SafeTensors,
+    lora: lora::State,
 }
 
 /// x and the sampler's state between steps of a flow model.
@@ -364,7 +367,7 @@ impl Generator {
         dit.attn_variant = self.attn_variant;
         dit.int8_attn = self.int8_attn;
         eprintln!("DiT ready in {:.1}s (activation reserve {} MB)", t0.elapsed().as_secs_f64(), act / MB);
-        self.dit = Some(DitModel { path: path.to_path_buf(), dit, st: dst });
+        self.dit = Some(DitModel { path: path.to_path_buf(), dit, st: dst, lora: lora::State::default() });
         Ok(())
     }
 
@@ -411,7 +414,7 @@ impl Generator {
         dit.attn_variant = self.attn_variant;
         dit.int8_attn = self.int8_attn;
         eprintln!("Anima ready in {:.1}s", t0.elapsed().as_secs_f64());
-        self.anima = Some(AnimaModel { path: path.to_path_buf(), dit, st: dst });
+        self.anima = Some(AnimaModel { path: path.to_path_buf(), dit, st: dst, lora: lora::State::default() });
         Ok(())
     }
 
@@ -454,7 +457,7 @@ impl Generator {
         dit.attn_variant = self.attn_variant;
         dit.int8_attn = self.int8_attn;
         eprintln!("MOSS Image ready in {:.1}s", t0.elapsed().as_secs_f64());
-        self.moss = Some(MossModel { path: path.to_path_buf(), dit, st: dst });
+        self.moss = Some(MossModel { path: path.to_path_buf(), dit, st: dst, lora: lora::State::default() });
         Ok(())
     }
 
@@ -785,6 +788,31 @@ impl Generator {
             dm.insert("samples".into(), ("F32".into(), vec![dit::CH, lh, lw], b.clone()));
         }
         Ok((b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(), stats))
+    }
+
+    /// Bake `loras` into the loaded diffusion model, in place of any others. Prompts encoded through
+    /// the old weights are dropped: their contexts come out of the diffusion model.
+    pub fn set_loras(&mut self, loras: &[lora::Lora]) -> Result<()> {
+        let st = &self.st;
+        if let Some(m) = &mut self.dit {
+            if lora::apply(lora::Arch::Krea2, &m.st, "", m.dit.stores(), &mut m.lora, loras, st)? {
+                self.cached = None;
+            }
+        } else if let Some(m) = &mut self.anima {
+            let prefix = m.dit.prefix();
+            if lora::apply(lora::Arch::Anima, &m.st, &prefix, m.dit.stores(), &mut m.lora, loras, st)? {
+                m.dit.clear_mods();
+                self.contexts.clear();
+            }
+        } else if let Some(m) = &mut self.moss {
+            if lora::apply(lora::Arch::Moss, &m.st, "", m.dit.stores(), &mut m.lora, loras, st)? {
+                m.dit.clear_mods();
+                self.moss_contexts.clear();
+            }
+        } else if !loras.is_empty() {
+            bail!("no diffusion model loaded");
+        }
+        Ok(())
     }
 
     /// Choose the DiT attention: INT8 (fastest) or bf16 FlashAttention. Takes effect on the next step.

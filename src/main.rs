@@ -95,6 +95,23 @@ struct Args {
     /// Anima, MOSS Image: sampler (er_sde | euler), default er_sde for Anima, euler for MOSS Image
     #[arg(long)]
     sampler: Option<String>,
+    /// LoRA file, `path` or `path:strength`, in order (repeatable)
+    #[arg(long)]
+    lora: Vec<String>,
+}
+
+/// `path` or `path:strength`, as in `--lora`.
+fn parse_loras(args: &Args) -> Result<Vec<krea2::lora::Lora>> {
+    args.lora.iter().map(|l| {
+        let (path, strength) = match l.rsplit_once(':').map(|(p, v)| (p, v.parse::<f32>())) {
+            Some((p, Ok(v))) => (p, v),
+            _ => (l.as_str(), 1.0),
+        };
+        if !std::path::Path::new(path).exists() {
+            bail!("no LoRA at {path}");
+        }
+        Ok(krea2::lora::Lora { path: PathBuf::from(path), strength })
+    }).collect()
 }
 
 const ANIMA_DIT: &str = r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\animaInt8Mxfp8_turboV11Int8.safetensors";
@@ -117,6 +134,7 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     gen.ensure_vae(&args.vae)?;
     gen.ensure_anima(&dit)?;
     gen.ensure_qwen3(&te)?;
+    gen.set_loras(&parse_loras(args)?)?;
     let n = 16 * (args.height / 8) * (args.width / 8);
     for i in 0..args.count {
         let seed = args.seed + i as u64;
@@ -169,6 +187,7 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     gen.ensure_moss(&dit)?;
     gen.ensure_qwen35(&te)?;
     gen.ensure_flux2_vae(&vae)?;
+    gen.set_loras(&parse_loras(args)?)?;
     let n = 128 * (args.height / 16) * (args.width / 16);
     for i in 0..args.count {
         let seed = args.seed + i as u64;
@@ -284,6 +303,7 @@ fn main() -> Result<()> {
 
     let t_start = Instant::now();
     let mut gen = pipeline::Generator::load(&load)?;
+    gen.set_loras(&parse_loras(&args)?)?;
     let prompts: Vec<String> = match &args.prompt_file {
         Some(p) => std::fs::read_to_string(p)
             .with_context(|| format!("reading {}", p.display()))?

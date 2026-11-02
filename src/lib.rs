@@ -5,6 +5,7 @@ pub mod cuda;
 pub mod dit;
 pub mod ffi;
 pub mod flux2vae;
+pub mod lora;
 pub mod moss;
 pub mod offload;
 pub mod pipeline;

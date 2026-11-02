@@ -5,7 +5,7 @@ SwarmUI can generate without Python or ComfyUI. The goal is speed first: Krea 2 
 1024x1024 image here, against about 9 s in ComfyUI on the same machine, and Anima Turbo samples 8 steps in
 0.92 s against 1.59 s. MOSS Image gains least, about 5 to 8% per step, because ComfyUI already runs it on the same kernels.
 
-**Status:** three model families really generate, text-to-image only: Krea 2 Turbo, Anima and MOSS Image. The server accepts far more of
+**Status:** three model families really generate, text-to-image only, with LoRAs: Krea 2 Turbo, Anima and MOSS Image. The server accepts far more of
 SwarmUI's features than that, but they only reach a mock engine so far. The
 [project board](https://claude.ai/artifact/ARcm3yAXPwmZ5ZUHHhdNX9) lists everything that works and everything
 still to do, in priority order. Run it today beside a normal ComfyUI backend.
@@ -14,6 +14,41 @@ still to do, in priority order. Run it today beside a normal ComfyUI backend.
   [`start-krea2.bat`](swarm%20backend/start-krea2.bat) and see [its README](swarm%20backend/README.md).
 * The repository root is the real engine: the Krea 2, Anima and MOSS Image pipelines described below. They also run alone
   from the command line, and Krea 2 has a small web UI.
+* [`docs/TECHNICAL_OVERVIEW.md`](docs/TECHNICAL_OVERVIEW.md) explains what the project is built on and how the pieces fit.
+
+## LoRAs
+
+All three models take LoRAs, from SwarmUI or with `--lora path[:strength]` (repeatable, applied in order):
+
+```bash
+target/release/krea2.exe --moss --lora moss-dmdv1.safetensors --steps 8 --cfg 1 -p "a stone lighthouse on a sea cliff at dawn, no people" -o lighthouse.png
+```
+
+They are baked, as ComfyUI does for quantized weights: each patched int8 weight is dequantized to bf16, the patches are
+added in bf16, and it is requantized with new row scales and stochastic rounding seeded by the module's name. Sampling
+then runs the same int8 kernels, so a LoRA costs no time per step. Only tensors whose patches changed are rewritten, and
+removing a LoRA puts the file's bytes back. Prompts are encoded again after a change, because their contexts come out of
+the diffusion model.
+
+Compared with ComfyUI under DynamicVRAM, which SwarmUI's `main.py` uses, on the same LoRAs at 1024x1024:
+
+| | Krea 2 (2 LoRAs, 12 GB model) | Anima (Turbo LoRA) | MOSS Image (DMD LoRA) |
+|---|---|---|---|
+| Bake, files cached | 2.7 to 3.5 s | 0.4 to 0.7 s | 1.2 to 1.7 s |
+| ComfyUI's first run minus a later run (includes loading the model) | about 27 s | about 2.4 s | about 12 s |
+| Sampling with the LoRA | 615 ms/step | 128 ms/step | 289 ms/step |
+| ComfyUI, later runs | 1102 ms/step | 223 ms/step | 309 ms/step |
+| Baked weights | identical | identical | identical |
+| Image PSNR with LoRA / same settings without | 31.6 dB / not measured | 21.2 / 25.6 dB | 22.3 / 40.3 dB |
+
+"Identical" means every value of the bf16 weight, the row scales and the int8 weight. That was checked on three Krea 2
+modules, four Anima modules, and all 168 MOSS Image weights by fingerprint. What still differs is what already differed
+without a LoRA. MOSS Image's error in one model step is the same either way (3.2% and 2.8%), and the DMD LoRA's short
+path magnifies it, as Turbo trajectories do on Krea 2. Check this with `tools/lora_ref.py` and `tools/lora_cmp.py`.
+
+Like ComfyUI, keys that match nothing in the model are logged and ignored, so a LoRA for another model changes nothing.
+Plain LoRA, `diff` and `set` patches work. These are refused with an error: LoHa, LoKr, GLoRA, OFT, DoRA, LoCon mid
+weights, reshaped patches, MOSS Image control LoRAs, LoRA hooks, and LoRAs with text encoder keys.
 
 ## MOSS Image engine
 
@@ -184,7 +219,7 @@ csrc/gemm.cu        cuBLASLt bf16/fp32 GEMM, CUTLASS conv2d, int8 GEMM wrappers
 csrc/attn.cu        FlashAttention-2 forward wrapper (only the needed variants instantiated)
 csrc/attn_int8.cu   optional INT8 attention wrapper
 csrc/vendor/        comfy-kitchen CUTLASS int8 GEMM + Sage INT8 attention (Apache-2.0)
-src/                Rust: loader, offload engine, tokenizer, text encoder, DiT, VAE, CLI
+src/                Rust: loader, offload engine, tokenizer, text encoder, DiT, VAE, LoRA baking, CLI
 tools/              ComfyUI reference dump / comparison / benchmark scripts
 ```
 
@@ -194,4 +229,4 @@ flash-attention checkouts (default `ref/comfy-kitchen/third_party/*`, override w
 The first build takes ~6 minutes (CUTLASS int8 GEMM); object files are cached by content hash.
 
 Not implemented: CFG > 1 / negative prompts (the turbo workflow uses CFG 1), image inputs to the
-text encoder, reference latents (edit mode), and LoRAs.
+text encoder and reference latents (edit mode).

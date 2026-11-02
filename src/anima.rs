@@ -3,7 +3,7 @@
 
 use crate::cuda::{DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_BF16, PM, PRO_GELU, PRO_LAYERNORM, PRO_PLAIN, PRO_RMS, PRO_SILU};
-use crate::offload::{plan, Layout, WeightSet};
+use crate::offload::{plan, Layout, Store, WeightSet};
 use crate::st::SafeTensors;
 use anyhow::{bail, Result};
 use half::bf16;
@@ -215,6 +215,21 @@ impl Dit {
 
     fn g(&self, key: &str) -> PM {
         self.globals.at(self.gl.off(key))
+    }
+
+    /// Everywhere this model keeps weights.
+    pub fn stores(&mut self) -> Vec<Store<'_>> {
+        vec![Store::Set(&mut self.blocks), Store::Buf(&self.globals, &self.gl)]
+    }
+
+    /// The file's key prefix.
+    pub fn prefix(&self) -> String {
+        self.prefix.clone()
+    }
+
+    /// Forget what was derived from the weights.
+    pub fn clear_mods(&mut self) {
+        self.mods.clear();
     }
 
     /// LLM adapter: Qwen3 hidden states (f32 [lq, 1024]) + T5 ids -> bf16 [ids, 1024].

@@ -73,6 +73,9 @@ extern "C" {
     pub fn krea_mul_silu(x: PM, z: P, n: i64, s: PM) -> i32;
     pub fn krea_partial_rope(x: PM, stride: i64, w: P, eps: f32, rope: P, l: i32, h: i32, d: i32, pairs: i32, s: PM) -> i32;
     pub fn krea_flux2_latent_in(lat: P, mean: P, std: P, out: PM, c: i32, h: i32, w: i32, s: PM) -> i32;
+    pub fn krea_convrot_dequant_bf16(q: P, s_: P, out: PM, n: i64, k: i32, s: PM) -> i32;
+    pub fn krea_convrot_requant_bf16(x: P, q: PM, s_: PM, n: i64, k: i32, seed: u64, s: PM) -> i32;
+    pub fn krea_lora_add_bf16(w: PM, d: P, scale: f32, n: i64, s: PM) -> i32;
     pub fn krea_group_norm(x: P, out: PM, w: P, b: P, stats: PM, p: i64, c: i32, groups: i32, eps: f32, silu: i32, s: PM) -> i32;
 }
 

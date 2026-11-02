@@ -1,6 +1,6 @@
 //! [`Engine`] implementation on the krea2 library: text-to-image for int8 ConvRot checkpoints of
 //! Krea 2 (turbo: CFG 1, `euler` / `simple`), Anima and MOSS Image (`er_sde` or `euler`, `simple`, any
-//! CFG). Each file's architecture is read from its keys, so one backend serves all three.
+//! CFG), with LoRAs. Each file's architecture is read from its keys, so one backend serves all three.
 //!
 //! Text encoding is deferred to `sample`, so the negative prompt SwarmUI always sends costs nothing
 //! at CFG 1. Everything the pipeline can't do is refused with [`EngineError::Unsupported`], which
@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use krea2::pipeline::{AnimaRequest, Cancelled, FlowSampler, Generator, LoadOptions, MossRequest, Request};
+use krea2::lora::{self, Lora};
 use krea2::tokenizer::token_weights;
 use swarm_engine_api::prompt::PromptLeafKind;
 use swarm_engine_api::*;
@@ -81,9 +82,11 @@ fn unsupported(what: impl Into<String>) -> EngineError {
 
 fn internal(e: anyhow::Error) -> EngineError {
     if e.is::<Cancelled>() {
-        EngineError::Interrupted
-    } else {
-        EngineError::Internal(e)
+        return EngineError::Interrupted;
+    }
+    match e.chain().find_map(|c| c.downcast_ref::<lora::Unsupported>()) {
+        Some(u) => unsupported(u.0.clone()),
+        None => EngineError::Internal(e),
     }
 }
 
@@ -157,8 +160,18 @@ fn prompt_segments(p: &ParsedPrompt, steps: u32, family: Family) -> Result<Vec<(
 }
 
 fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<(String, f32)>, String> {
-    if !req.text_encoder.patches.is_empty() {
-        return Err("LoRAs and CLIP Stop At Layer".into());
+    for p in &req.text_encoder.patches {
+        match p {
+            TextEncoderPatch::Lora { file, .. } => {
+                let h = read_header(&file.path).map_err(|e| format!("{}: not a readable safetensors file ({e})", file.name))?;
+                let keys = h.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default();
+                if lora::has_text_encoder_keys(keys) {
+                    return Err(format!("{}: LoRAs that patch the text encoder", file.name));
+                }
+            }
+            TextEncoderPatch::Hooks { .. } => return Err("LoRA hooks".into()),
+            TextEncoderPatch::StopAtLayer { .. } => return Err("CLIP Stop At Layer".into()),
+        }
     }
     match &req.mode {
         // Qwen tokenizers run with weights disabled, Anima's T5 tokens take ComfyUI's emphasis.
@@ -219,6 +232,7 @@ fn flux_shift(max_shift: f64, base_shift: f64, width: u32, height: u32) -> f64 {
 struct ModelSettings {
     shift: f64,
     int8_attention: bool,
+    loras: Vec<Lora>,
 }
 
 fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
@@ -227,7 +241,7 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::Anima => ANIMA_SHIFT,
         Family::Moss => MOSS_SHIFT,
     };
-    let mut s = ModelSettings { shift, int8_attention: true };
+    let mut s = ModelSettings { shift, int8_attention: true, loras: Vec::new() };
     for p in &model.patches {
         match p {
             ModelPatch::SamplingFlux { max_shift, base_shift, width, height } if family == Family::Krea2 => {
@@ -243,7 +257,7 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
             }
             // Weighted prompts are refused in encode_text; with none this patch has no effect.
             ModelPatch::AttnTokenWeights { .. } | ModelPatch::Compile { .. } => {}
-            ModelPatch::Lora { .. } => return Err(unsupported("LoRAs")),
+            ModelPatch::Lora { file, strength } => s.loras.push(Lora { path: file.path.clone(), strength: *strength }),
             other => {
                 let name = format!("{other:?}");
                 return Err(unsupported(format!("model option {}", name.split([' ', '{', '(']).next().unwrap_or("?"))));
@@ -318,7 +332,7 @@ impl Krea2Engine {
         Ok(ModelHandle::new(Some(file.clone()), Some(name.into()), Opaque::none()))
     }
 
-    fn sample_anima(&self, req: &SampleRequest, shape: (usize, usize, usize), int8_attention: bool, shift: f64, progress: &mut dyn ProgressSink)
+    fn sample_anima(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, progress: &mut dyn ProgressSink)
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
@@ -331,7 +345,8 @@ impl Krea2Engine {
         let mut gen = self.gen();
         gen.ensure_anima(&file.path).map_err(internal)?;
         gen.ensure_qwen3(text_encoder).map_err(internal)?;
-        gen.set_int8_attention(int8_attention);
+        gen.set_int8_attention(settings.int8_attention);
+        gen.set_loras(&settings.loras).map_err(internal)?;
         let mut data = Vec::with_capacity(batch * 16 * lh * lw);
         for i in 0..batch {
             let r = AnimaRequest {
@@ -345,7 +360,7 @@ impl Krea2Engine {
                 width: lw * 8,
                 height: lh * 8,
                 steps,
-                shift,
+                shift: settings.shift,
                 noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, 16, lh, lw),
             };
             let (latent, stats) = gen
@@ -360,7 +375,7 @@ impl Krea2Engine {
         Ok(data)
     }
 
-    fn sample_moss(&self, req: &SampleRequest, shape: (usize, usize, usize), int8_attention: bool, shift: f64, progress: &mut dyn ProgressSink)
+    fn sample_moss(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, progress: &mut dyn ProgressSink)
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
@@ -371,7 +386,8 @@ impl Krea2Engine {
         let mut gen = self.gen();
         gen.ensure_moss(&file.path).map_err(internal)?;
         gen.ensure_qwen35(&cond.text_encoder).map_err(internal)?;
-        gen.set_int8_attention(int8_attention);
+        gen.set_int8_attention(settings.int8_attention);
+        gen.set_loras(&settings.loras).map_err(internal)?;
         let mut data = Vec::with_capacity(batch * krea2::moss::CH * lh * lw);
         for i in 0..batch {
             let r = MossRequest {
@@ -386,7 +402,7 @@ impl Krea2Engine {
                 width: lw * 16,
                 height: lh * 16,
                 steps,
-                shift,
+                shift: settings.shift,
                 noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, krea2::moss::CH, lh, lw),
             };
             let (latent, stats) = gen
@@ -525,10 +541,10 @@ impl Engine for Krea2Engine {
             })))
         };
         if family == Family::Anima {
-            return finish(self.sample_anima(req, (batch, lh, lw), settings.int8_attention, settings.shift, progress)?);
+            return finish(self.sample_anima(req, (batch, lh, lw), &settings, progress)?);
         }
         if family == Family::Moss {
-            return finish(self.sample_moss(req, (batch, lh, lw), settings.int8_attention, settings.shift, progress)?);
+            return finish(self.sample_moss(req, (batch, lh, lw), &settings, progress)?);
         }
         let (cond, prompt) = single_prompt(&req.positive)?;
         let (text_encoder, prompt) = (&cond.text_encoder, &prompt[0].0);
@@ -539,6 +555,7 @@ impl Engine for Krea2Engine {
         gen.ensure_dit(&file.path).map_err(internal)?;
         gen.ensure_te(text_encoder).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
+        gen.set_loras(&settings.loras).map_err(internal)?;
 
         let mut data = Vec::with_capacity(batch * 16 * lh * lw);
         for i in 0..batch {

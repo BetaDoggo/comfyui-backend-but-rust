@@ -55,7 +55,7 @@ Model Attention Backend (`int8`, or `flash` for ComfyUI's numerics), Free VRAM. 
 same seed. There are no live previews.
 
 Everything else is refused with an error in SwarmUI rather than silently ignored: CFG other than 1 and negative
-prompts, samplers other than `euler` / `simple`, `<weight>` and other per-step or per-chunk prompt syntax, LoRAs,
+prompts, samplers other than `euler` / `simple`, `<weight>` and other per-step or per-chunk prompt syntax,
 Prompt Images, init images and refiners (no VAE encoder), ControlNet, regions, VAE tiling, Seamless Tileable, and
 non-W8A8 Krea 2 files.
 
@@ -63,14 +63,20 @@ non-W8A8 Krea 2 files.
 loaded at a time, so switching took 4 s to Anima and 9 s to Krea 2 with the files cached. Select an int8 ConvRot Anima checkpoint with
 Steps 8 and CFG Scale 1 for turbo models. These work: `er_sde` and `euler` with `simple`, any CFG with a negative
 prompt, `(word:1.2)` and `<weight>`, seed, Variation Seed, Batch Size, Sigma Shift, Model Attention Backend, cancelling and
-Free VRAM. Other samplers and schedulers, LoRAs, LLLite ControlNets, `<break>`, `<alternate>`, `<fromto>`, init images and
+Free VRAM. Other samplers and schedulers, LLLite ControlNets, `<break>`, `<alternate>`, `<fromto>`, init images and
 VAE tiling are refused with an error.
 
 **MOSS Image** runs from the same server. Select an int8 ConvRot MOSS Image checkpoint; SwarmUI adds
 `qwen3.5_9b_int8_convrot.safetensors` and the Flux 2 VAE itself. Tested through SwarmUI at 1024x1024 and 832x1216: `euler` and `er_sde` with
-`simple`, CFG 1 and CFG 4 with a negative prompt, seed, Batch Size and Sigma Shift. Other samplers and schedulers, LoRAs, Prompt Images, `<weight>`,
+`simple`, CFG 1 and CFG 4 with a negative prompt, seed, Batch Size and Sigma Shift. Other samplers and schedulers, Prompt Images, `<weight>`,
 `<break>`, `<alternate>`, `<fromto>` and init images are refused with an error. A 20-step CFG 4 image took 11.5 s through SwarmUI,
 and switching from Krea 2 or Anima took about 3 s extra.
+
+**LoRAs** work on all three, from the LoRA parameter or `<lora:name:weight>`, stacked, at any strength. The first image
+after a change bakes them into the weights (about 3 s on Krea 2, 1 s on the others, with the files cached), and sampling
+stays as fast as without. Tested through SwarmUI: repeats, strength changes, stacks, removal (the base image comes back
+pixel-identical), and baked blocks moving to RAM and back. LoHa, LoKr, GLoRA, OFT, DoRA, LoRA hooks and LoRAs with text
+encoder keys are refused with an error. See the [README](../README.md#loras).
 
 **Alongside ComfyUI.** Add this server next to SwarmUI's normal ComfyUI backend. In a live test with both running,
 SwarmUI sent every Krea 2 job here and Anima to ComfyUI, keeping each model on the backend that had it loaded.

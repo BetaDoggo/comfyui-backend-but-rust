@@ -4,7 +4,7 @@
 use crate::cuda::{DevBuf, Stream};
 use crate::dit::Dit as KreaDit;
 use crate::ffi::{k, null, off, s, DT_BF16, PM, PRO_ADALN, PRO_PLAIN, PRO_RMS, PRO_SITU};
-use crate::offload::{plan, Layout, WeightSet};
+use crate::offload::{plan, Layout, Store, WeightSet};
 use crate::st::SafeTensors;
 use anyhow::Result;
 use half::bf16;
@@ -149,6 +149,16 @@ impl Dit {
 
     fn g(&self, key: &str) -> PM {
         self.globals.at(self.gl.off(key))
+    }
+
+    /// Everywhere this model keeps weights.
+    pub fn stores(&mut self) -> Vec<Store<'_>> {
+        vec![Store::Set(&mut self.blocks), Store::Buf(&self.globals, &self.gl)]
+    }
+
+    /// Forget what was derived from the weights.
+    pub fn clear_mods(&mut self) {
+        self.mods.clear();
     }
 
     /// bf16 linear. With image-sized inputs torch's result is the rounded product plus the bias (exact

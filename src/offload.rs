@@ -7,7 +7,7 @@
 //! are issued as soon as a slot is released, so PCIe transfers overlap the compute of earlier
 //! blocks and the compute stream only waits on an event when a copy is genuinely late.
 
-use crate::cuda::{memcpy_h2d, DevBuf, Event, PinnedBuf, Stream};
+use crate::cuda::{memcpy_d2d, memcpy_h2d, DevBuf, Event, PinnedBuf, Stream};
 use crate::st::{f32_bytes, Dt, SafeTensors};
 use anyhow::{bail, Result};
 use std::collections::HashMap;
@@ -35,6 +35,23 @@ struct Entry {
     src: Src,
     off: usize,
     len: usize,
+}
+
+/// How a tensor is held in a unit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Stored {
+    Raw,
+    Bf16,
+    /// bf16-rounded value + this
+    F32(f32),
+}
+
+/// Where a tensor sits in its unit.
+#[derive(Clone, Copy, Debug)]
+pub struct Placed {
+    pub off: usize,
+    pub len: usize,
+    pub kind: Stored,
 }
 
 /// Device layout of one unit.
@@ -90,6 +107,29 @@ impl Layout {
         *self.offsets.get(key).unwrap_or_else(|| panic!("layout key {key}"))
     }
 
+    /// Every tensor of this unit that comes from the file, with its place.
+    pub fn tensors(&self, st: &SafeTensors) -> Result<Vec<(String, Placed)>> {
+        let mut v = Vec::new();
+        for e in &self.entries {
+            let (names, dt, kind) = match &e.src {
+                Src::Raw(n) => (n.clone(), None, Stored::Raw),
+                Src::Bf16(n) => (n.clone(), Some(Dt::BF16), Stored::Bf16),
+                Src::F32(n, add) => (vec![n.clone()], Some(Dt::F32), Stored::F32(*add)),
+                Src::Bytes(_) => continue,
+            };
+            let mut off = e.off;
+            for n in names {
+                let len = match dt {
+                    Some(dt) => st.packed_len(&n, dt)?,
+                    None => st.info(&n)?.len,
+                };
+                v.push((n, Placed { off, len, kind }));
+                off += len;
+            }
+        }
+        Ok(v)
+    }
+
     pub fn pack(&self, st: &SafeTensors, dst: &mut [u8]) -> Result<()> {
         for e in &self.entries {
             let d = &mut dst[e.off..e.off + e.len];
@@ -124,7 +164,7 @@ impl Layout {
 /// A unit lives in VRAM (`dev`), in page-locked RAM (`host`), or both. Units that started out
 /// resident get their host copy packed lazily the first time they are demoted.
 #[derive(Default)]
-struct Store {
+struct Copies {
     dev: Option<DevBuf>,
     host: Option<PinnedBuf>,
 }
@@ -137,10 +177,35 @@ struct Slot {
     released: bool,
 }
 
+/// Where a model's weights live, to rewrite them in place.
+pub enum Store<'a> {
+    Set(&'a mut WeightSet),
+    Buf(&'a DevBuf, &'a Layout),
+}
+
+impl Store<'_> {
+    pub fn layouts(&self) -> &[Layout] {
+        match self {
+            Store::Set(w) => &w.layouts,
+            Store::Buf(_, l) => std::slice::from_ref(*l),
+        }
+    }
+
+    /// Copy `len` bytes of `src` over `unit` at `off`. Issued on `st`.
+    pub fn write(&mut self, unit: usize, off: usize, src: &DevBuf, len: usize, st: &Stream) -> Result<()> {
+        match self {
+            Store::Set(w) => w.write(unit, off, src, len, st),
+            Store::Buf(b, _) => memcpy_d2d(b.at(off), src.ptr(), len, st),
+        }
+    }
+}
+
 pub struct WeightSet {
     pub name: String,
     pub layouts: Vec<Layout>,
-    stores: Vec<Store>,
+    stores: Vec<Copies>,
+    /// Units rewritten since loading: the file no longer holds their contents.
+    rewritten: Vec<bool>,
     streamed: Vec<usize>,           // unit ids streamed, in execution order
     slot_of: HashMap<usize, usize>, // unit -> slot currently holding it
     next_rank: usize,               // next index of `streamed` to copy
@@ -243,7 +308,7 @@ impl WeightSet {
             return Err(e);
         }
         let mut host = host_out.into_inner().unwrap();
-        let stores: Vec<Store> = (0..n).map(|i| Store { dev: dev[i].take(), host: host[i].take() }).collect();
+        let stores: Vec<Copies> = (0..n).map(|i| Copies { dev: dev[i].take(), host: host[i].take() }).collect();
 
         let streamed: Vec<usize> = (plan.resident..n).collect();
         let mut slots = Vec::new();
@@ -260,7 +325,7 @@ impl WeightSet {
             slots.len(), t0.elapsed().as_secs_f64()
         );
         let mut ws = WeightSet {
-            name: name.to_string(), layouts, stores, streamed, slot_of: HashMap::new(), next_rank: 0, rr: 0, slots,
+            name: name.to_string(), layouts, stores, rewritten: vec![false; n], streamed, slot_of: HashMap::new(), next_rank: 0, rr: 0, slots,
             copy,
             copied_bytes: 0,
         };
@@ -300,7 +365,11 @@ impl WeightSet {
             if self.stores[i].dev.is_some() {
                 if self.stores[i].host.is_none() {
                     let mut b = PinnedBuf::alloc(self.layouts[i].size)?;
-                    self.layouts[i].pack(st, b.as_mut_slice())?;
+                    if self.rewritten[i] {
+                        self.stores[i].dev.as_ref().unwrap().download(0, b.as_mut_slice(), &self.copy)?;
+                    } else {
+                        self.layouts[i].pack(st, b.as_mut_slice())?;
+                    }
                     self.stores[i].host = Some(b);
                 }
                 self.stores[i].dev = None;
@@ -325,8 +394,17 @@ impl WeightSet {
         while self.slots.len() < want_slots {
             self.slots.push(Slot { buf: DevBuf::alloc(max_size)?, unit: None, ready: Event::new()?, free: Event::new()?, released: true });
         }
-        // restart the ring
         self.streamed = (r..n).collect();
+        self.restart_ring()?;
+        if before != r {
+            eprintln!("[{}] residency {before} -> {r} units in VRAM ({} streamed via {} slots) in {:.0} ms",
+                self.name, n - r, self.slots.len(), t0.elapsed().as_secs_f64() * 1e3);
+        }
+        Ok(())
+    }
+
+    /// Forget what the ring holds. Compute and copy streams must be idle.
+    pub fn restart_ring(&mut self) -> Result<()> {
         self.slot_of.clear();
         for s in &mut self.slots {
             s.unit = None;
@@ -334,10 +412,23 @@ impl WeightSet {
         }
         self.rr = 0;
         self.next_rank = 0;
-        self.prefetch_initial()?;
-        if before != r {
-            eprintln!("[{}] residency {before} -> {r} units in VRAM ({} streamed via {} slots) in {:.0} ms",
-                self.name, n - r, self.slots.len(), t0.elapsed().as_secs_f64() * 1e3);
+        self.prefetch_initial()
+    }
+
+    /// Wait for the copies in flight, so units can be rewritten.
+    pub fn quiesce(&self) -> Result<()> {
+        self.copy.sync()
+    }
+
+    /// Copy `len` bytes of `src` over every copy of `unit`. Call [`Self::restart_ring`] when done.
+    fn write(&mut self, unit: usize, off: usize, src: &DevBuf, len: usize, st: &Stream) -> Result<()> {
+        self.rewritten[unit] = true;
+        let store = &mut self.stores[unit];
+        if let Some(d) = &store.dev {
+            memcpy_d2d(d.at(off), src.ptr(), len, st)?;
+        }
+        if let Some(h) = &mut store.host {
+            src.download(0, &mut h.as_mut_slice()[off..off + len], st)?;
         }
         Ok(())
     }

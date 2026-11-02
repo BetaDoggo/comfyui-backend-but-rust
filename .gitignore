@@ -3,3 +3,7 @@ ref/
 refout/
 *.png
 __pycache__/
+prof/
+outputs/
+*.log
+*.safetensors

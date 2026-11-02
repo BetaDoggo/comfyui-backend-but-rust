@@ -43,8 +43,8 @@ build stays mock-only.
 cargo run --release -p comfy-server --features krea2 -- --engine krea2 --models-root "C:/path/to/SwarmUI/Models"
 ```
 
-On Windows, [`start-krea2.bat`](start-krea2.bat) does this with the model folders set at its top, and prints what
-to enter in SwarmUI.
+On Windows, [`start-krea2.bat`](start-krea2.bat) does this for the folder in `KREA2_MODELS`, and prints what to enter
+in SwarmUI. Extra arguments go to the server, so `--models-root` can add a second folder.
 
 Extra flags: `--krea2-reserve-vram 512` (MB left for the desktop and other apps) and `--krea2-max-side 2048`.
 

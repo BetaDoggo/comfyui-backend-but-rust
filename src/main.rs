@@ -35,12 +35,18 @@ struct Args {
     /// Output path; with several images, "_<i>" is inserted before the extension
     #[arg(short, long, default_value = "krea2.png")]
     out: PathBuf,
-    #[arg(long, default_value = r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors")]
-    dit: PathBuf,
-    #[arg(long, default_value = r"G:\stable-diffusion-webui-forge\models\clip\qwen3vl_4b.safetensors")]
-    te: PathBuf,
-    #[arg(long, default_value = r"G:\stable-diffusion-webui-forge\models\VAE\qwen_image_vae.safetensors")]
-    vae: PathBuf,
+    /// Folder holding Stable-diffusion/, clip/ and VAE/ (default: $KREA2_MODELS, else ./models)
+    #[arg(long)]
+    models: Option<PathBuf>,
+    /// Diffusion model, instead of the default file in the models folder
+    #[arg(long)]
+    dit: Option<PathBuf>,
+    /// Text encoder, instead of the default file in the models folder
+    #[arg(long)]
+    te: Option<PathBuf>,
+    /// VAE, instead of the default file in the models folder
+    #[arg(long)]
+    vae: Option<PathBuf>,
     /// VRAM (MB) to leave untouched for the desktop / other apps
     #[arg(long, default_value_t = 512)]
     reserve_vram: usize,
@@ -114,11 +120,24 @@ fn parse_loras(args: &Args) -> Result<Vec<krea2::lora::Lora>> {
     }).collect()
 }
 
-const ANIMA_DIT: &str = r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\animaInt8Mxfp8_turboV11Int8.safetensors";
-const ANIMA_TE: &str = r"G:\stable-diffusion-webui-forge\models\clip\qwen_3_600m.safetensors";
-const MOSS_DIT: &str = r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\moss_image_sft_int8_convrot_attn.safetensors";
-const MOSS_TE: &str = r"G:\stable-diffusion-webui-forge\models\clip\qwen3.5_9b_int8_convrot.safetensors";
-const MOSS_VAE: &str = r"G:\stable-diffusion-webui-forge\models\VAE\flux2-vae.safetensors";
+const KREA_DIT: &str = "Stable-diffusion/kroma-v0.3.1-turbo-opd-W8A8.safetensors";
+const KREA_TE: &str = "clip/qwen3vl_4b.safetensors";
+const QWEN_VAE: &str = "VAE/qwen_image_vae.safetensors";
+const ANIMA_DIT: &str = "Stable-diffusion/animaInt8Mxfp8_turboV11Int8.safetensors";
+const ANIMA_TE: &str = "clip/qwen_3_600m.safetensors";
+const MOSS_DIT: &str = "Stable-diffusion/moss_image_sft_int8_convrot_attn.safetensors";
+const MOSS_TE: &str = "clip/qwen3.5_9b_int8_convrot.safetensors";
+const MOSS_VAE: &str = "VAE/flux2-vae.safetensors";
+
+impl Args {
+    /// `path`, or `default` inside the models folder.
+    fn model(&self, path: &Option<PathBuf>, default: &str) -> PathBuf {
+        path.clone().unwrap_or_else(|| {
+            let root = self.models.clone().or_else(|| std::env::var_os("KREA2_MODELS").map(PathBuf::from));
+            root.unwrap_or_else(|| PathBuf::from("models")).join(default)
+        })
+    }
+}
 
 fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     let sampler = match args.sampler.as_deref().unwrap_or("er_sde") {
@@ -126,12 +145,10 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         "euler" => pipeline::FlowSampler::Euler,
         s => bail!("unknown --sampler {s} (er_sde | euler)"),
     };
-    let default_dit = PathBuf::from(r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors");
-    let dit = if args.dit == default_dit { PathBuf::from(ANIMA_DIT) } else { args.dit.clone() };
-    let te = if args.te.ends_with("qwen3vl_4b.safetensors") { PathBuf::from(ANIMA_TE) } else { args.te.clone() };
+    let (dit, te) = (args.model(&args.dit, ANIMA_DIT), args.model(&args.te, ANIMA_TE));
     let shift = if args.shift == 1.15 { 3.0 } else { args.shift };
     let mut gen = pipeline::Generator::new(&load)?;
-    gen.ensure_vae(&args.vae)?;
+    gen.ensure_vae(&args.model(&args.vae, QWEN_VAE))?;
     gen.ensure_anima(&dit)?;
     gen.ensure_qwen3(&te)?;
     gen.set_loras(&parse_loras(args)?)?;
@@ -178,10 +195,7 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         "er_sde" => pipeline::FlowSampler::ErSde,
         s => bail!("unknown --sampler {s} (euler | er_sde)"),
     };
-    let default_dit = PathBuf::from(r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors");
-    let dit = if args.dit == default_dit { PathBuf::from(MOSS_DIT) } else { args.dit.clone() };
-    let te = if args.te.ends_with("qwen3vl_4b.safetensors") { PathBuf::from(MOSS_TE) } else { args.te.clone() };
-    let vae = if args.vae.ends_with("qwen_image_vae.safetensors") { PathBuf::from(MOSS_VAE) } else { args.vae.clone() };
+    let (dit, te, vae) = (args.model(&args.dit, MOSS_DIT), args.model(&args.te, MOSS_TE), args.model(&args.vae, MOSS_VAE));
     let shift = if args.shift == 1.15 { 5.0 } else { args.shift };
     let mut gen = pipeline::Generator::new(&load)?;
     gen.ensure_moss(&dit)?;
@@ -266,9 +280,9 @@ fn main() -> Result<()> {
         a => bail!("unknown --attention {a} (flash | int8)"),
     };
     let load = pipeline::LoadOptions {
-        dit: args.dit.clone(),
-        te: args.te.clone(),
-        vae: args.vae.clone(),
+        dit: args.model(&args.dit, KREA_DIT),
+        te: args.model(&args.te, KREA_TE),
+        vae: args.model(&args.vae, QWEN_VAE),
         max_width: args.width,
         max_height: args.height,
         // the web UI accepts any size up to --max-side squared; residency is re-planned per request

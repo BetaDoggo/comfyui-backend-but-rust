@@ -32,9 +32,9 @@ import comfy.sample
 import comfy.samplers
 import nodes
 
-DIT = r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors"
-TE = r"G:\stable-diffusion-webui-forge\models\clip\qwen3vl_4b.safetensors"
-VAE = r"G:\stable-diffusion-webui-forge\models\VAE\qwen_image_vae.safetensors"
+DIT = os.path.join(os.environ["KREA2_MODELS"], r"Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors")
+TE = os.path.join(os.environ["KREA2_MODELS"], r"clip\qwen3vl_4b.safetensors")
+VAE = os.path.join(os.environ["KREA2_MODELS"], r"VAE\qwen_image_vae.safetensors")
 
 os.makedirs(args.out, exist_ok=True)
 dump = {}

@@ -4,15 +4,18 @@ rem Starts the krea2 SwarmUI backend. Pass extra comfy-server flags as arguments
 cd /D "%~dp0"
 
 set "PORT=8188"
-set "MODELS=G:\stable-diffusion-webui-forge\models"
-set "EXTRA_MODELS=R:\models"
+set "MODELS=%KREA2_MODELS%"
+if not defined MODELS (
+    echo Set KREA2_MODELS to your models folder first, for example:
+    echo   set KREA2_MODELS=C:\SwarmUI\Models
+    goto failed
+)
 set "CUDA_BIN=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin"
 set "SERVER=target\release\comfy-server.exe"
 
 rem A stray quote in PATH hides every later entry from cmd, including cargo, so drop quotes here.
 set "PATH=%CUDA_BIN%;!PATH:"=!"
-set "ROOTS=--models-root "%MODELS%""
-if exist "%EXTRA_MODELS%\" set ROOTS=%ROOTS% --models-root "%EXTRA_MODELS%"
+set ROOTS=--models-root "%MODELS%"
 
 rem cargo only rebuilds what changed, and the engine only exists in a --features krea2 build.
 echo Building (the first build takes about 10 minutes)...
@@ -33,7 +36,6 @@ echo  With ComfyUI as well, set Exact Backend ID to this backend's
 echo  number in a preset to keep Krea 2 here.
 echo.
 echo  Models: %MODELS%
-if exist "%EXTRA_MODELS%\" echo          %EXTRA_MODELS%
 echo  Press Ctrl+C to stop.
 echo ================================================================
 echo.

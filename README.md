@@ -1,4 +1,64 @@
-# Native ComfyUI replacement for SwarmUI
+# ComfyUI backend, but Rust
+
+> [!CAUTION]
+> # VIBECODED WIP. DO NOT USE THIS.
+>
+> **Unless you hate yourself, use ComfyUI.** This entire project was vibecoded by an AI. It is a work in progress that
+> runs on one person's machine, has no stability guarantees, and hasn't been reviewed by anyone who could tell you
+> whether it's a good idea. It drives your GPU through hand-written CUDA kernels. Expect crashes, refused features,
+> and images that differ from ComfyUI's. Nobody will support you.
+
+A Rust and CUDA backend that speaks ComfyUI's API, so SwarmUI can generate without Python or ComfyUI. It only runs three
+int8 model families, text-to-image only.
+
+## Quick start
+
+You need Windows x64, an NVIDIA GPU (the default build targets RTX 50-series, `sm_120`; set `KREA_CUDA_ARCH` for others),
+[Rust](https://rustup.rs), the CUDA 13 toolkit (`CUDA_PATH`) and MSVC Build Tools 2022.
+
+```bash
+git clone --recursive https://github.com/Comfy-Org/comfy-kitchen ref/comfy-kitchen
+```
+
+Run that inside this repository: the build takes CUTLASS and FlashAttention-2 from that checkout. Then build, which takes
+about 6 minutes the first time:
+
+```bash
+cargo build --release
+```
+
+Put your models in one folder, keeping these subfolders, and point `KREA2_MODELS` at it (or pass `--models`, or `--dit`,
+`--te` and `--vae` for any other file):
+
+| Model | `Stable-diffusion/` | `clip/` | `VAE/` |
+|---|---|---|---|
+| Krea 2 Turbo | `kroma-v0.3.1-turbo-opd-W8A8.safetensors` | `qwen3vl_4b.safetensors` | `qwen_image_vae.safetensors` |
+| Anima | `animaInt8Mxfp8_turboV11Int8.safetensors` | `qwen_3_600m.safetensors` | `qwen_image_vae.safetensors` |
+| MOSS Image | `moss_image_sft_int8_convrot_attn.safetensors` | `qwen3.5_9b_int8_convrot.safetensors` | `flux2-vae.safetensors` |
+
+Generate an image from the command line:
+
+```bash
+target/release/krea2.exe -p "a red fox in a snowy forest" --seed 42 -o fox.png
+```
+
+```bash
+target/release/krea2.exe --anima -p "no humans, scenery, mountain lake at sunrise" -o lake.png
+```
+
+```bash
+target/release/krea2.exe --moss -p "a stone lighthouse on a sea cliff at dawn" --steps 20 --cfg 4 -o lighthouse.png
+```
+
+Add `--lora path/to/lora.safetensors:0.8` to any of them. To use it from SwarmUI, set `KREA2_MODELS`, run
+[`swarm backend/start-krea2.bat`](swarm%20backend/start-krea2.bat), and add `http://127.0.0.1:8188` as a "ComfyUI API By URL"
+backend. Keep a real ComfyUI backend next to it, because anything else is refused or reaches a mock engine.
+
+More: [technical overview](docs/TECHNICAL_OVERVIEW.md), [status](docs/STATUS.md), [SwarmUI backend](swarm%20backend/README.md).
+
+This repository has no license yet. Files under `csrc/vendor/` are Apache-2.0, see `csrc/vendor/LICENSE.comfy-kitchen`.
+
+## What this is
 
 A Rust and CUDA backend that speaks ComfyUI's API and replaces the ComfyUI features SwarmUI uses most, so
 SwarmUI can generate without Python or ComfyUI. The goal is speed first: Krea 2 Turbo takes about 4.65 s per
@@ -6,8 +66,7 @@ SwarmUI can generate without Python or ComfyUI. The goal is speed first: Krea 2 
 0.92 s against 1.59 s. MOSS Image gains least, about 5 to 8% per step, because ComfyUI already runs it on the same kernels.
 
 **Status:** three model families really generate, text-to-image only, with LoRAs: Krea 2 Turbo, Anima and MOSS Image. The server accepts far more of
-SwarmUI's features than that, but they only reach a mock engine so far. The
-[project board](https://claude.ai/artifact/ARcm3yAXPwmZ5ZUHHhdNX9) lists everything that works and everything
+SwarmUI's features than that, but they only reach a mock engine so far. [`docs/STATUS.md`](docs/STATUS.md) lists everything that works and everything
 still to do, in priority order. Run it today beside a normal ComfyUI backend.
 
 * `swarm backend/` is the server: the ComfyUI protocol, the node graph, and the `Engine` interface. Start it with
@@ -144,8 +203,7 @@ size. Planning VRAM for 2048² keeps fewer DiT blocks resident (9 instead of 16 
 which costs ~3% at 1024²; a 2048² image takes ~26 s. JSON API: `POST /api/generate`
 `{prompt, seed?, width?, height?, steps?}` → `{id}`, `GET /api/job/<id>`, `GET /api/image/<id>.png`.
 
-Model paths default to the files under `G:\stable-diffusion-webui-forge\models`; override them with
-`--dit`, `--te` and `--vae`. Useful flags:
+Useful flags:
 
 | flag | meaning |
 | --- | --- |
@@ -223,10 +281,8 @@ src/                Rust: loader, offload engine, tokenizer, text encoder, DiT, 
 tools/              ComfyUI reference dump / comparison / benchmark scripts
 ```
 
-Build requirements: CUDA 13 (`CUDA_PATH`), MSVC Build Tools 2022, and the CUTLASS and
-flash-attention checkouts (default `ref/comfy-kitchen/third_party/*`, override with
-`KREA_CUTLASS_DIR` / `KREA_FLASH_ATTN_DIR`). The default target is `sm_120` (`KREA_CUDA_ARCH`).
-The first build takes ~6 minutes (CUTLASS int8 GEMM); object files are cached by content hash.
+The CUTLASS and flash-attention checkouts default to `ref/comfy-kitchen/third_party/*` (override with
+`KREA_CUTLASS_DIR` / `KREA_FLASH_ATTN_DIR`). Object files are cached by content hash.
 
 Not implemented: CFG > 1 / negative prompts (the turbo workflow uses CFG 1), image inputs to the
 text encoder and reference latents (edit mode).

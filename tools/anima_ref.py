@@ -37,9 +37,9 @@ import comfy.utils
 import comfy.sample
 import comfy.samplers
 
-DIT = r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\animaInt8Mxfp8_turboV11Int8.safetensors"
-TE = r"G:\stable-diffusion-webui-forge\models\clip\qwen_3_600m.safetensors"
-VAE = r"G:\stable-diffusion-webui-forge\models\VAE\qwen_image_vae.safetensors"
+DIT = os.path.join(os.environ["KREA2_MODELS"], r"Stable-diffusion\animaInt8Mxfp8_turboV11Int8.safetensors")
+TE = os.path.join(os.environ["KREA2_MODELS"], r"clip\qwen_3_600m.safetensors")
+VAE = os.path.join(os.environ["KREA2_MODELS"], r"VAE\qwen_image_vae.safetensors")
 
 os.makedirs(args.out, exist_ok=True)
 dump = {}

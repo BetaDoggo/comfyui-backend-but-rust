@@ -226,9 +226,9 @@ Warm files, 512x512, 4 steps, turbo LoRA, on this machine:
 | Stage | ComfyUI, 5 frames | Here, 5 frames | Here, 22 frames |
 |---|---|---|---|
 | Text encoding | 13.1 s | 2.2 s | 2.3 s |
-| Per step, warm | 1.59 s | 0.32 s | 0.53 s |
+| Per step, warm | 1.59 s | 0.24 s | 0.53 s |
 
-Through real SwarmUI with everything warm, a repeat generation took 2.8 s at 5 frames and 3.7 s at 22, because the bake, the encoded prompt and both decoders are kept.
+Through real SwarmUI with everything warm, a repeat generation took 2.6 s at 5 frames and 3.8 s at 22, because the bake, the encoded prompt and both decoders are kept.
 That covers sampling, video decode and audio decode. ComfyUI took 28.3 s for video decode and 3.6 s for audio decode alone.
 The first video decode reads 2.4 GB from the file, about 23 s on this drive.
 
@@ -236,7 +236,8 @@ Baking the LoRA adds about 11 s when it changes, and text encoding from a cold d
 ComfyUI's text encoding took 151 s cold. Runs longer than 22 frames and sizes above 512x512 haven't been tested.
 
 Offloading is the lazy kind in [`src/offload.rs`](src/offload.rs): nothing is read at load, reader threads fill four pinned staging buffers ahead of compute, and file pages stay evictable.
-Weights stay in packed 6-bit form in VRAM and decode to int8 before each GEMM, which leaves room for 30 of the 50 blocks at 512x512.
+Weights stay in packed 6-bit form in VRAM and decode to int8 before each GEMM, which leaves room for 30 of the 50 blocks at 512x512. Streamed blocks are spread evenly among the resident ones, so each copy overlaps compute instead of queueing behind the last; at 5 frames that took a step from 0.33 s to 0.24 s, and copies no longer hold it up.
+Splitting weights to keep them in L2 gained 2 to 3%, so it isn't used: the int8 GEMM already runs close to what this GPU can do.
 LoRA-baked blocks keep a pinned host copy, about 15 GB, and go straight to VRAM: this machine copies 18 GB/s in RAM but 28 GB/s from pinned memory to VRAM, so a pass through staging cost about 200 ms a step.
 If pinning fails they fall back to pageable memory and staging. The blocks leave VRAM before the video decode and come back for the next clip, re-planned for its size.
 The text encoder and refiner only hold VRAM while they run. The video decoder holds 2.4 GB of pinned RAM between clips, and takes no VRAM while sampling.

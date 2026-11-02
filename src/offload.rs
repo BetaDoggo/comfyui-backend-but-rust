@@ -454,14 +454,17 @@ impl WeightSet {
             s.dev = None;
         }
         self.slots.clear();
-        for i in 0..p.resident.min(n) {
+        // streamed units spread between resident ones, so each copy overlaps compute
+        let out = n - p.resident.min(n);
+        let streamed: Vec<usize> = (0..n).filter(|i| (i + 1) * out / n > i * out / n).collect();
+        for i in (0..n).filter(|i| !streamed.contains(i)) {
             self.stores[i].dev = Some(DevBuf::alloc(self.layouts[i].size)?);
         }
         let max_size = self.layouts.iter().map(|l| l.size).max().unwrap_or(0);
         for _ in 0..p.slots {
             self.slots.push(Slot { buf: DevBuf::alloc(max_size)?, unit: None, ready: Event::new()?, free: Event::new()?, released: true });
         }
-        self.streamed = (p.resident.min(n)..n).collect();
+        self.streamed = streamed;
         if let Some(l) = &mut self.lazy {
             l.filled.iter_mut().for_each(|f| *f = false);
         }
@@ -493,9 +496,14 @@ impl WeightSet {
     /// Ask the readers for the units after `unit`, as far as the staging buffers go.
     fn read_ahead(&mut self, unit: usize) -> Result<()> {
         let n = self.len();
-        for j in 0..n.min(STAGING - 1) {
+        let mut ahead = 0;
+        for j in 0..n {
             let v = (unit + j) % n;
+            if ahead == STAGING - 1 {
+                break;
+            }
             if self.needs_data(v) && self.pinned(v).is_none() {
+                ahead += 1;
                 let l = self.lazy.as_mut().unwrap();
                 if l.asked.insert(v) {
                     l.want.send((v, l.generation))?;
@@ -544,9 +552,9 @@ impl WeightSet {
         self.layouts.len()
     }
 
-    /// Number of leading units currently held in VRAM.
+    /// Number of units held in VRAM.
     pub fn resident(&self) -> usize {
-        self.stores.iter().take_while(|s| s.dev.is_some()).count()
+        self.stores.iter().filter(|s| s.dev.is_some()).count()
     }
 
     /// VRAM held by this set (resident units + streaming slots).

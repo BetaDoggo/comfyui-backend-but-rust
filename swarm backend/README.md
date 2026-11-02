@@ -57,8 +57,11 @@ same seed. There are no live previews.
 Every sampler and scheduler works on all three families, at any CFG with a negative prompt, along with Sampler Sigma Min,
 Sigma Max and Rho. Only the `ltxv-image` scheduler is refused. See the [README](../README.md#samplers).
 
+Krea 2 takes Prompt Images, and Enable Reference Latents with `index` and `index_timestep_zero`; see the
+[README](../README.md#krea-2-reference-images).
+
 Everything else is refused with an error in SwarmUI rather than silently ignored: `<weight>` and other per-step or per-chunk prompt syntax,
-Prompt Images, init images and refiners (no VAE encoder), ControlNet, regions, VAE tiling, Seamless Tileable, and
+init images and refiners, ControlNet, regions, VAE tiling, Seamless Tileable, and
 non-W8A8 Krea 2 files.
 
 **Anima** runs from the same `--engine krea2` server. The checkpoint's keys pick the family, and one family is

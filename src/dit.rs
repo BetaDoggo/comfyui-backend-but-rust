@@ -35,6 +35,29 @@ pub struct Dit {
     pub int8_attn: bool,
 }
 
+/// Reference images as DiT tokens, added after the image's.
+pub struct References {
+    /// bf16 [tokens, F]
+    tokens: DevBuf,
+    pub count: usize,
+    /// ComfyUI's `index_timestep_zero`: these tokens are modulated as if at timestep 0.
+    timestep_zero: bool,
+}
+
+/// `pad_to_patch_size` of [16, h, w]: an odd side wraps around.
+fn pad_circular(latent: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) {
+    let (ph, pw) = (h + h % PATCH, w + w % PATCH);
+    let mut out = Vec::with_capacity(CH * ph * pw);
+    for c in 0..CH {
+        for y in 0..ph {
+            for x in 0..pw {
+                out.push(latent[(c * h + y % h) * w + x % w]);
+            }
+        }
+    }
+    (out, ph, pw)
+}
+
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| bf16::from_f32(*x).to_le_bytes()).collect()
 }
@@ -217,8 +240,30 @@ impl Dit {
         Ok(out)
     }
 
-    /// RoPE table [l][64][(cos, sin)] for lt text tokens (position 0) followed by an ht x wt grid.
-    pub fn rope_table(lt: usize, ht: usize, wt: usize) -> Vec<f32> {
+    /// Run reference latents ([16, h, w] f32, model scale) through the input layer.
+    pub fn references(&self, latents: &[(Vec<f32>, usize, usize)], timestep_zero: bool, st: &Stream) -> Result<References> {
+        let token_grid = |h: usize, w: usize| h.div_ceil(PATCH) * w.div_ceil(PATCH);
+        let count = latents.iter().map(|(_, h, w)| token_grid(*h, *w)).sum();
+        let tokens = DevBuf::alloc_async(count * F * 2, st)?;
+        let pd = (CH * PATCH * PATCH) as i64;
+        let mut at = 0;
+        for (latent, h, w) in latents {
+            let (padded, ph, pw) = pad_circular(latent, *h, *w);
+            let n = token_grid(*h, *w);
+            let d = DevBuf::alloc_async(padded.len() * 4, st)?;
+            d.upload(0, &crate::st::f32_bytes(&padded), st)?;
+            let tok = DevBuf::alloc_async(n * CH * PATCH * PATCH * 2, st)?;
+            k!(krea_patchify(d.ptr(), tok.ptr(), CH as i32, ph as i32, pw as i32, PATCH as i32, s(st)))?;
+            k!(krea_gemm(tok.ptr(), pd, self.g("first_w"), pd, off(tokens.ptr(), at * F * 2), F as i64, self.g("first_b"), n as i64, F as i64,
+                pd, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
+            at += n;
+        }
+        Ok(References { tokens, count, timestep_zero })
+    }
+
+    /// RoPE table [l][64][(cos, sin)] for lt text tokens (position 0) followed by an ht x wt grid, then
+    /// by one grid per reference latent (rows, columns), numbered from 1 on the first axis.
+    pub fn rope_table(lt: usize, ht: usize, wt: usize, refs: &[(usize, usize)]) -> Vec<f32> {
         let axes = [HD - 12 * (HD / 16), 6 * (HD / 16), 6 * (HD / 16)]; // 32, 48, 48
         let mut omegas: Vec<(usize, f64)> = Vec::new(); // (axis, omega) per pair
         for (a, &dim) in axes.iter().enumerate() {
@@ -227,14 +272,19 @@ impl Dit {
                 omegas.push((a, 1.0 / THETA.powf(scale)));
             }
         }
-        let l = lt + ht * wt;
+        let l = lt + ht * wt + refs.iter().map(|(h, w)| h * w).sum::<usize>();
         let mut t = Vec::with_capacity(l * 128);
-        for r in 0..l {
-            let pos = if r < lt { [0.0, 0.0, 0.0] } else { [0.0, ((r - lt) / wt) as f64, ((r - lt) % wt) as f64] };
+        let mut push = |pos: [f64; 3]| {
             for &(a, om) in &omegas {
                 let ang = pos[a] * om;
                 t.push(ang.cos() as f32);
                 t.push(ang.sin() as f32);
+            }
+        };
+        (0..lt).for_each(|_| push([0.0; 3]));
+        for (index, &(h, w)) in std::iter::once(&(ht, wt)).chain(refs).enumerate() {
+            for r in 0..h * w {
+                push([index as f64, (r / w) as f64, (r % w) as f64]);
             }
         }
         t
@@ -255,21 +305,9 @@ impl Dit {
         e
     }
 
-    /// One model evaluation + Euler update of `latent` (f32 [16, H, W]) from sigma to sigma_next.
-    #[allow(clippy::too_many_arguments)]
-    pub fn step(&mut self, latent: &DevBuf, h: usize, w: usize, ctx: &DevBuf, lt: usize, rope: &DevBuf, sigma: f32,
-        sigma_next: f32, st: &Stream, denoised: Option<&DevBuf>, probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>)
-        -> Result<()> {
-        if h % PATCH != 0 || w % PATCH != 0 {
-            bail!("latent size must be even");
-        }
-        let (ht, wt) = (h / PATCH, w / PATCH);
-        let li = ht * wt;
-        let l = lt + li;
+    /// (t, tvec) of the timestep MLPs: t = tmlp(emb), tvec = tproj(gelu(t)).
+    fn timestep(&self, sigma: f32, st: &Stream) -> Result<(DevBuf, DevBuf)> {
         let fi = F as i64;
-        let mut probe = probe;
-
-        // timestep MLPs: t = tmlp(emb), tvec = tproj(gelu(t))
         let emb = DevBuf::alloc_async(TDIM * 2, st)?;
         emb.upload(0, &bf16_bytes(&Self::timestep_embedding(sigma)), st)?;
         let t1 = DevBuf::alloc_async(F * 2, st)?;
@@ -285,6 +323,29 @@ impl Dit {
         k!(krea_gelu_tanh_bf16(tg.ptr(), fi, s(st)))?;
         k!(krea_gemm(tg.ptr(), fi, self.g("tp_w"), fi, tvec.ptr(), MOD as i64, self.g("tp_b"), 1, MOD as i64, fi, 1,
             DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
+        Ok((t, tvec))
+    }
+
+    /// One model evaluation + Euler update of `latent` (f32 [16, H, W]) from sigma to sigma_next.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step(&mut self, latent: &DevBuf, h: usize, w: usize, ctx: &DevBuf, lt: usize, refs: Option<&References>, rope: &DevBuf, sigma: f32,
+        sigma_next: f32, st: &Stream, denoised: Option<&DevBuf>, probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>)
+        -> Result<()> {
+        if h % PATCH != 0 || w % PATCH != 0 {
+            bail!("latent size must be even");
+        }
+        let (ht, wt) = (h / PATCH, w / PATCH);
+        let li = ht * wt;
+        let nr = refs.map_or(0, |r| r.count);
+        let l = lt + li + nr;
+        let fi = F as i64;
+        let mut probe = probe;
+
+        let (t, tvec) = self.timestep(sigma, st)?;
+        let tvec0 = match refs {
+            Some(r) if r.timestep_zero => Some(self.timestep(0.0, st)?.1),
+            _ => None,
+        };
 
         // combined sequence x = [context ; first(patchify(latent))]
         let x = DevBuf::alloc_async(l * F * 2, st)?;
@@ -294,6 +355,9 @@ impl Dit {
         let pd = (CH * PATCH * PATCH) as i64;
         k!(krea_gemm(tok.ptr(), pd, self.g("first_w"), pd, off(x.ptr(), lt * F * 2), fi, self.g("first_b"),
             li as i64, fi, pd, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
+        if let Some(r) = refs {
+            crate::cuda::memcpy_d2d(off(x.ptr(), (lt + li) * F * 2), r.tokens.ptr(), nr * F * 2, st)?;
+        }
 
         let a8 = DevBuf::alloc_async(l * MLP, st)?;
         let asc = DevBuf::alloc_async(l * 4, st)?;
@@ -308,17 +372,26 @@ impl Dit {
             None
         };
         let modv = DevBuf::alloc_async(MOD * 2, st)?;
+        let modv0 = DevBuf::alloc_async(MOD * 2, st)?;
         let (m, xp) = (l as i32, x.ptr());
-        let mo = |i: usize| off(modv.ptr(), i * F * 2);
+        // (first row, rows, modulation): one group, or the references apart at timestep 0
+        let split = lt + li;
+        let groups: Vec<(usize, usize, &DevBuf)> = if tvec0.is_some() { vec![(0, split, &modv), (split, nr, &modv0)] } else { vec![(0, l, &modv)] };
+        let mo = |b: &DevBuf, i: usize| off(b.ptr(), i * F * 2);
 
         for b in 0..self.blocks.len() {
             let base = self.blocks.acquire(b, st)?;
             let lay = &self.blocks.layouts[b];
             let wp = |key: &str| off(base, lay.off(key));
             k!(krea_add_vec_bf16(modv.ptr(), tvec.ptr(), wp("mod"), 1, MOD as i32, s(st)))?;
+            if let Some(t0) = &tvec0 {
+                k!(krea_add_vec_bf16(modv0.ptr(), t0.ptr(), wp("mod"), 1, MOD as i32, s(st)))?;
+            }
             // attention
-            k!(krea_quant_rows(DT_BF16, PRO_RMS, xp, fi, null(), 0, 0, wp("pre"), EPS, mo(0), mo(1), a8.ptr(),
-                asc.ptr(), m, F as i32, 1, s(st)))?;
+            for &(r0, rows, mv) in &groups {
+                k!(krea_quant_rows(DT_BF16, PRO_RMS, off(xp, r0 * F * 2), fi, null(), 0, 0, wp("pre"), EPS, mo(mv, 0), mo(mv, 1), off(a8.ptr(), r0 * F),
+                    off(asc.ptr(), r0 * 4), rows as i32, F as i32, 1, s(st)))?;
+            }
             k!(krea_int8_gemm(a8.ptr(), wp("wqkvg"), asc.ptr(), wp("sqkvg"), null(), qkvg.ptr(), l as i64,
                 QKVG as i64, fi, DT_BF16, s(st)))?;
             k!(krea_qk_norm_rope(DT_BF16, HD as i32, qkvg.ptr(), QKVG as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32,
@@ -334,17 +407,25 @@ impl Dit {
             }
             k!(krea_quant_rows(DT_BF16, PRO_GATE, attn.ptr(), fi, off(q, (HQ + 2 * HK) * HD * 2), QKVG as i64, 0,
                 null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m, F as i32, 1, s(st)))?;
-            k!(krea_int8_gemm_residual(a8.ptr(), wp("wo"), asc.ptr(), wp("so"), null(), mo(2), xp, xp, l as i64, fi,
-                fi, DT_BF16, s(st)))?;
+            for &(r0, rows, mv) in &groups {
+                let xr = off(xp, r0 * F * 2);
+                k!(krea_int8_gemm_residual(off(a8.ptr(), r0 * F), wp("wo"), off(asc.ptr(), r0 * 4), wp("so"), null(), mo(mv, 2), xr, xr, rows as i64, fi,
+                    fi, DT_BF16, s(st)))?;
+            }
             // MLP
-            k!(krea_quant_rows(DT_BF16, PRO_RMS, xp, fi, null(), 0, 0, wp("post"), EPS, mo(3), mo(4), a8.ptr(),
-                asc.ptr(), m, F as i32, 1, s(st)))?;
+            for &(r0, rows, mv) in &groups {
+                k!(krea_quant_rows(DT_BF16, PRO_RMS, off(xp, r0 * F * 2), fi, null(), 0, 0, wp("post"), EPS, mo(mv, 3), mo(mv, 4), off(a8.ptr(), r0 * F),
+                    off(asc.ptr(), r0 * 4), rows as i32, F as i32, 1, s(st)))?;
+            }
             k!(krea_int8_gemm(a8.ptr(), wp("wgu"), asc.ptr(), wp("sgu"), null(), gu.ptr(), l as i64, (2 * MLP) as i64,
                 fi, DT_BF16, s(st)))?;
             k!(krea_quant_rows(DT_BF16, PRO_SWIGLU, gu.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0,
                 null(), null(), a8.ptr(), asc.ptr(), m, MLP as i32, 1, s(st)))?;
-            k!(krea_int8_gemm_residual(a8.ptr(), wp("wd"), asc.ptr(), wp("sd"), null(), mo(5), xp, xp, l as i64, fi,
-                MLP as i64, DT_BF16, s(st)))?;
+            for &(r0, rows, mv) in &groups {
+                let xr = off(xp, r0 * F * 2);
+                k!(krea_int8_gemm_residual(off(a8.ptr(), r0 * MLP), wp("wd"), off(asc.ptr(), r0 * 4), wp("sd"), null(), mo(mv, 5), xr, xr, rows as i64, fi,
+                    MLP as i64, DT_BF16, s(st)))?;
+            }
             self.blocks.release(b, st)?;
             if let Some(p) = probe.as_mut() {
                 p(&format!("block{b}"), &x, l * F * 2);
@@ -367,5 +448,28 @@ impl Dit {
             sigma_next, denoised.map_or(std::ptr::null_mut(), |d| d.ptr()), s(st)))?;
         let _ = PRO_PLAIN;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reference_grids_are_numbered_from_one() {
+        let t = Dit::rope_table(1, 1, 1, &[(1, 2)]);
+        assert_eq!(t.len(), 4 * 128);
+        // pair 1 of the first axis: position 0 for the image, 1 for the reference
+        let omega = 1.0f64 / 1000f64.powf(2.0 / 32.0);
+        assert_eq!(t[128 + 2], 1.0);
+        assert!((t[128 * 2 + 2] - omega.cos() as f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn odd_sides_wrap_around() {
+        let latent: Vec<f32> = (0..CH * 3 * 2).map(|i| i as f32).collect();
+        let (out, h, w) = pad_circular(&latent, 3, 2);
+        assert_eq!((h, w), (4, 2));
+        assert_eq!(out[6..8], latent[0..2]);
     }
 }

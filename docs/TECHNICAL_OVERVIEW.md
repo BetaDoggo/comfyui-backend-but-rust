@@ -112,6 +112,10 @@ evaluations, baked LoRA weights and final images with this engine. They need Pyt
 Samplers and schedulers ([`src/samplers.rs`](../src/samplers.rs)) are checked against ComfyUI's own code on a mock model by
 `tools/sampler_ref.py` and `tests/samplers_match_comfy.rs`, which needs no checkpoint.
 
+Krea 2's image paths are checked against ComfyUI by `tools/krea_image_ref.py`, run with SwarmUI's own Python, and
+`tools/krea_image_cmp.py`. Unlike the older tools it uses SwarmUI's ComfyUI copy and its text node, since the vision tower
+isn't in `ref/ComfyUI`'s version and the node decides the tokens.
+
 Noise is reimplemented in [`src/sampling.rs`](../src/sampling.rs): `mt19937` for torch's CPU generator and Philox for its
 CUDA generator, so seeds give the same noise as ComfyUI. Images are close but not identical, because rounding differs
 at some steps. The README gives the measured PSNR for each model.

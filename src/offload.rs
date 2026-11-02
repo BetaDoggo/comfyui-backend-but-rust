@@ -103,6 +103,12 @@ impl Layout {
         self.push(key, Src::Bytes(b), len);
     }
 
+    /// Bytes of one entry.
+    pub fn size_of(&self, key: &str) -> usize {
+        let off = self.off(key);
+        self.entries.iter().find(|e| e.off == off).map_or(0, |e| e.len)
+    }
+
     pub fn off(&self, key: &str) -> usize {
         *self.offsets.get(key).unwrap_or_else(|| panic!("layout key {key}"))
     }

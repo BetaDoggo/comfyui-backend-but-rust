@@ -71,6 +71,9 @@ extern "C" {
     pub fn krea_delta_conv(x: P, w: P, out: PM, l: i32, c: i32, s: PM) -> i32;
     pub fn krea_delta_rule(mix: PM, a: P, b: P, dt: P, alog: P, out: PM, l: i32, hv: i32, hk: i32, d: i32, s: PM) -> i32;
     pub fn krea_mul_silu(x: PM, z: P, n: i64, s: PM) -> i32;
+    pub fn krea_rope_rows(x: PM, stride: i64, rope: P, l: i32, h: i32, d: i32, s: PM) -> i32;
+    pub fn krea_gelu_f32(x: PM, n: i64, approximate: i32, s: PM) -> i32;
+    pub fn krea_take_odd(x: P, out: PM, h: i32, w: i32, c: i32, s: PM) -> i32;
     pub fn krea_partial_rope(x: PM, stride: i64, w: P, eps: f32, rope: P, l: i32, h: i32, d: i32, pairs: i32, s: PM) -> i32;
     pub fn krea_flux2_latent_in(lat: P, mean: P, std: P, out: PM, c: i32, h: i32, w: i32, s: PM) -> i32;
     pub fn krea_convrot_dequant_bf16(q: P, s_: P, out: PM, n: i64, k: i32, s: PM) -> i32;

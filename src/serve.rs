@@ -119,7 +119,7 @@ pub fn run(load: LoadOptions, opts: ServeOptions) -> Result<()> {
                     j.state = "running";
                     let ms = ModelSampling::Flux { shift };
                     let sampling = Sampling::new("euler", "simple", ms, j.steps, 1.0, j.seed, (j.width / 8, j.height / 8)).unwrap();
-                    Request { prompt: j.prompt.clone(), negative: String::new(), seed: j.seed, width: j.width, height: j.height, sampling, noise: None }
+                    Request { prompt: j.prompt.clone(), negative: String::new(), seed: j.seed, width: j.width, height: j.height, sampling, noise: None, images: Vec::new(), negative_images: Vec::new(), references: Vec::new(), timestep_zero: false }
                 };
                 let st2 = state.clone();
                 let result = gen

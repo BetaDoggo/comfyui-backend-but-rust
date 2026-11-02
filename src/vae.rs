@@ -1,4 +1,4 @@
-//! Wan 2.1 VAE decoder (qwen_image_vae) for single images, NHWC bf16.
+//! Wan 2.1 VAE (qwen_image_vae) for single images, NHWC bf16.
 //!
 //! With one latent frame and no temporal cache, every CausalConv3d sees two zero frames of
 //! padding before the current one, so it equals a 2D conv with the kernel's last temporal slice,
@@ -17,17 +17,22 @@ const LATENT_MEAN: [f32; 16] = [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.96
 const LATENT_STD: [f32; 16] = [2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526,
     2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160];
 const OUT_PAD: usize = 8;
+const RGB_PAD: usize = 8;
 
 enum Op {
     Res { pre: String, cin: usize, cout: usize, shortcut: bool },
     Attn { pre: String, c: usize },
     Up { pre: String, cin: usize },
+    /// Zero padding on the right and bottom, then a stride 2 conv.
+    Down { pre: String, c: usize },
 }
 
 pub struct Vae {
     buf: DevBuf,
     lay: Layout,
     ops: Vec<Op>,
+    /// Empty when the file has no encoder.
+    encoder: Vec<Op>,
     zdim: usize,
     c0: usize,
 }
@@ -55,6 +60,16 @@ pub(crate) fn conv_krsc(st: &SafeTensors, name: &str, cout_pad: usize) -> Result
         }
     }
     Ok((out.iter().flat_map(|b| b.to_le_bytes()).collect(), cop, ci, r))
+}
+
+/// Like [`conv_krsc`] for a 3 channel input padded to 8, which `krea_conv2d` needs.
+fn conv_krsc_rgb(st: &SafeTensors, name: &str) -> Result<Vec<u8>> {
+    let (w, cout, ci, r) = conv_krsc(st, name, 0)?;
+    let mut out = vec![0u8; cout * r * r * RGB_PAD * 2];
+    for (i, px) in w.chunks_exact(ci * 2).enumerate() {
+        out[i * RGB_PAD * 2..][..ci * 2].copy_from_slice(px);
+    }
+    Ok(out)
 }
 
 pub(crate) fn bias_pad(st: &SafeTensors, name: &str, pad: usize) -> Result<Vec<u8>> {
@@ -88,6 +103,41 @@ pub(crate) fn single_head_attention(x: &DevBuf, n: &DevBuf, p: usize, c: usize, 
     k!(krea_add_gated_bf16(x.ptr(), ci, y.ptr(), ci, null(), p as i32, c as i32, s(st)))
 }
 
+/// The ops of one stage of blocks, with their weights added to `lay`.
+fn stage(st: &SafeTensors, lay: &mut Layout, blocks: &[String], conv: &dyn Fn(&mut Layout, &str, &str, usize) -> Result<usize>) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    for p in blocks {
+        let p = p.clone();
+        if st.has(&format!("{p}.residual.2.weight")) {
+            let cin = st.info(&format!("{p}.residual.2.weight"))?.shape[1];
+            let cout = st.info(&format!("{p}.residual.2.weight"))?.shape[0];
+            lay.bf16(st, &format!("{p}.g0"), &[format!("{p}.residual.0.gamma")])?;
+            lay.bf16(st, &format!("{p}.g3"), &[format!("{p}.residual.3.gamma")])?;
+            conv(lay, &format!("{p}.c2"), &format!("{p}.residual.2"), 0)?;
+            conv(lay, &format!("{p}.c6"), &format!("{p}.residual.6"), 0)?;
+            let shortcut = st.has(&format!("{p}.shortcut.weight"));
+            if shortcut {
+                conv(lay, &format!("{p}.sc"), &format!("{p}.shortcut"), 0)?;
+            }
+            ops.push(Op::Res { pre: p, cin, cout, shortcut });
+        } else if st.has(&format!("{p}.to_qkv.weight")) {
+            let c = st.info(&format!("{p}.proj.weight"))?.shape[0];
+            lay.bf16(st, &format!("{p}.g"), &[format!("{p}.norm.gamma")])?;
+            lay.bf16(st, &format!("{p}.qkv.w"), &[format!("{p}.to_qkv.weight")])?;
+            lay.bf16(st, &format!("{p}.qkv.b"), &[format!("{p}.to_qkv.bias")])?;
+            lay.bf16(st, &format!("{p}.proj.w"), &[format!("{p}.proj.weight")])?;
+            lay.bf16(st, &format!("{p}.proj.b"), &[format!("{p}.proj.bias")])?;
+            ops.push(Op::Attn { pre: p, c });
+        } else {
+            let cin = st.info(&format!("{p}.resample.1.weight"))?.shape[1];
+            let cout = st.info(&format!("{p}.resample.1.weight"))?.shape[0];
+            conv(lay, &format!("{p}.conv"), &format!("{p}.resample.1"), 0)?;
+            ops.push(if cout == cin { Op::Down { pre: p, c: cin } } else { Op::Up { pre: p, cin } });
+        }
+    }
+    Ok(ops)
+}
+
 impl Vae {
     pub fn load(path: &Path, s0: &Stream) -> Result<Self> {
         let st = SafeTensors::open(path)?;
@@ -102,37 +152,20 @@ impl Vae {
         let c0 = st.info("decoder.conv1.weight")?.shape[0];
         conv(&mut lay, "conv2", "conv2", 0)?;
         conv(&mut lay, "conv1", "decoder.conv1", 0)?;
-        let mut ops = Vec::new();
         let mut blocks: Vec<String> = (0..3).map(|i| format!("decoder.middle.{i}")).collect();
-        blocks.extend((0..).map(|i| format!("decoder.upsamples.{i}")).take_while(|p| {
-            st.has(&format!("{p}.residual.2.weight")) || st.has(&format!("{p}.resample.1.weight"))
-        }));
-        for p in blocks {
-            if st.has(&format!("{p}.residual.2.weight")) {
-                let cin = st.info(&format!("{p}.residual.2.weight"))?.shape[1];
-                let cout = st.info(&format!("{p}.residual.2.weight"))?.shape[0];
-                lay.bf16(&st, &format!("{p}.g0"), &[format!("{p}.residual.0.gamma")])?;
-                lay.bf16(&st, &format!("{p}.g3"), &[format!("{p}.residual.3.gamma")])?;
-                conv(&mut lay, &format!("{p}.c2"), &format!("{p}.residual.2"), 0)?;
-                conv(&mut lay, &format!("{p}.c6"), &format!("{p}.residual.6"), 0)?;
-                let shortcut = st.has(&format!("{p}.shortcut.weight"));
-                if shortcut {
-                    conv(&mut lay, &format!("{p}.sc"), &format!("{p}.shortcut"), 0)?;
-                }
-                ops.push(Op::Res { pre: p, cin, cout, shortcut });
-            } else if st.has(&format!("{p}.to_qkv.weight")) {
-                let c = st.info(&format!("{p}.proj.weight"))?.shape[0];
-                lay.bf16(&st, &format!("{p}.g"), &[format!("{p}.norm.gamma")])?;
-                lay.bf16(&st, &format!("{p}.qkv.w"), &[format!("{p}.to_qkv.weight")])?;
-                lay.bf16(&st, &format!("{p}.qkv.b"), &[format!("{p}.to_qkv.bias")])?;
-                lay.bf16(&st, &format!("{p}.proj.w"), &[format!("{p}.proj.weight")])?;
-                lay.bf16(&st, &format!("{p}.proj.b"), &[format!("{p}.proj.bias")])?;
-                ops.push(Op::Attn { pre: p, c });
-            } else {
-                let cin = st.info(&format!("{p}.resample.1.weight"))?.shape[1];
-                conv(&mut lay, &format!("{p}.up"), &format!("{p}.resample.1"), 0)?;
-                ops.push(Op::Up { pre: p, cin });
-            }
+        let in_stage = |p: &String| st.has(&format!("{p}.residual.2.weight")) || st.has(&format!("{p}.resample.1.weight"));
+        blocks.extend((0..).map(|i| format!("decoder.upsamples.{i}")).take_while(in_stage));
+        let ops = stage(&st, &mut lay, &blocks, &conv)?;
+        let mut encoder = Vec::new();
+        if st.has("encoder.conv1.weight") {
+            lay.bytes("encoder.conv1.w", conv_krsc_rgb(&st, "encoder.conv1.weight")?);
+            lay.bytes("encoder.conv1.b", bias_pad(&st, "encoder.conv1.bias", 0)?);
+            let mut blocks: Vec<String> = (0..).map(|i| format!("encoder.downsamples.{i}")).take_while(in_stage).collect();
+            blocks.extend((0..3).map(|i| format!("encoder.middle.{i}")));
+            encoder = stage(&st, &mut lay, &blocks, &conv)?;
+            lay.bf16(&st, "encoder.head.g", &["encoder.head.0.gamma".to_string()])?;
+            conv(&mut lay, "encoder.head", "encoder.head.2", 0)?;
+            conv(&mut lay, "quant", "conv1", 0)?;
         }
         lay.bf16(&st, "head.g", &["decoder.head.0.gamma".to_string()])?;
         conv(&mut lay, "head", "decoder.head.2", OUT_PAD)?;
@@ -143,7 +176,7 @@ impl Vae {
         let buf = DevBuf::alloc(lay.size)?;
         buf.upload(0, &host, s0)?;
         s0.sync()?;
-        Ok(Vae { buf, lay, ops, zdim, c0 })
+        Ok(Vae { buf, lay, ops, encoder, zdim, c0 })
     }
 
     fn w(&self, key: &str) -> PM {
@@ -161,6 +194,87 @@ impl Vae {
         let full = h * 8 * w * 8;
         // x + h + residual temp at full res (96ch), upsample buffer (192ch at full res), attention chunk
         full * 96 * 2 * 3 + full * 192 * 2 + (512 << 20)
+    }
+
+    fn res(&self, pre: &str, x: &DevBuf, h: usize, w: usize, cin: usize, cout: usize, shortcut: bool, st: &Stream) -> Result<DevBuf> {
+        let alloc = |c: usize| DevBuf::alloc_async(h * w * c * 2, st);
+        let p = (h * w) as i64;
+        let t = alloc(cin)?;
+        k!(krea_l2norm_silu(x.ptr(), t.ptr(), self.w(&format!("{pre}.g0")), p, cin as i32, 1, s(st)))?;
+        let u = alloc(cout)?;
+        self.conv(&format!("{pre}.c2"), t.ptr(), u.ptr(), h, w, cin, cout, 3, st)?;
+        drop(t);
+        let t2 = alloc(cout)?;
+        k!(krea_l2norm_silu(u.ptr(), t2.ptr(), self.w(&format!("{pre}.g3")), p, cout as i32, 1, s(st)))?;
+        self.conv(&format!("{pre}.c6"), t2.ptr(), u.ptr(), h, w, cout, cout, 3, st)?;
+        drop(t2);
+        if shortcut {
+            let sc = alloc(cout)?;
+            self.conv(&format!("{pre}.sc"), x.ptr(), sc.ptr(), h, w, cin, cout, 1, st)?;
+            k!(krea_add_gated_bf16(u.ptr(), cout as i64, sc.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
+        } else {
+            k!(krea_add_gated_bf16(u.ptr(), cout as i64, x.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
+        }
+        Ok(u)
+    }
+
+    /// RGB f32 [h, w, 3] (0 to 1, both sides multiples of 8) -> model latent f32 [16, h/8, w/8]:
+    /// the encoder's mean, after ComfyUI's `process_latent_in`.
+    pub fn encode(&self, rgb: &[f32], h: usize, w: usize, st: &Stream) -> Result<Vec<f32>> {
+        if self.encoder.is_empty() {
+            bail!("this VAE file has no encoder");
+        }
+        let alloc = |c: usize, hh: usize, ww: usize| DevBuf::alloc_async(hh * ww * c * 2, st);
+        let mut px = vec![bf16::ZERO; h * w * RGB_PAD];
+        for (o, v) in px.chunks_exact_mut(RGB_PAD).zip(rgb.chunks_exact(3)) {
+            for c in 0..3 {
+                o[c] = bf16::from_f32(v[c] * 2.0 - 1.0);
+            }
+        }
+        let input = alloc(RGB_PAD, h, w)?;
+        input.upload(0, &px.iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>(), st)?;
+        let c0 = self.lay.size_of("encoder.conv1.b") / 2;
+        let mut x = alloc(c0, h, w)?;
+        self.conv("encoder.conv1", input.ptr(), x.ptr(), h, w, RGB_PAD, c0, 3, st)?;
+        drop(input);
+        let (mut hh, mut ww, mut c) = (h, w, c0);
+        for op in &self.encoder {
+            match op {
+                Op::Res { pre, cin, cout, shortcut } => {
+                    x = self.res(pre, &x, hh, ww, *cin, *cout, *shortcut, st)?;
+                    c = *cout;
+                }
+                Op::Attn { pre, c: ca } => self.attention(pre, &x, hh * ww, *ca, st)?,
+                Op::Down { pre, c: cd } => {
+                    // a stride 1 conv pads the same zeros, and holds the stride 2 samples at odd positions
+                    let full = alloc(*cd, hh, ww)?;
+                    self.conv(&format!("{pre}.conv"), x.ptr(), full.ptr(), hh, ww, *cd, *cd, 3, st)?;
+                    let y = alloc(*cd, hh / 2, ww / 2)?;
+                    k!(krea_take_odd(full.ptr(), y.ptr(), hh as i32, ww as i32, *cd as i32, s(st)))?;
+                    x = y;
+                    hh /= 2;
+                    ww /= 2;
+                }
+                Op::Up { .. } => bail!("upsampling in the encoder"),
+            }
+        }
+        let z2 = self.zdim * 2;
+        let t = alloc(c, hh, ww)?;
+        k!(krea_l2norm_silu(x.ptr(), t.ptr(), self.w("encoder.head.g"), (hh * ww) as i64, c as i32, 1, s(st)))?;
+        let moments = alloc(z2, hh, ww)?;
+        self.conv("encoder.head", t.ptr(), moments.ptr(), hh, ww, c, z2, 3, st)?;
+        let q = alloc(z2, hh, ww)?;
+        self.conv("quant", moments.ptr(), q.ptr(), hh, ww, z2, z2, 1, st)?;
+        let mut bytes = vec![0u8; hh * ww * z2 * 2];
+        q.download(0, &mut bytes, st)?;
+        let value = |i: usize| bf16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]).to_f32();
+        let mut out = Vec::with_capacity(self.zdim * hh * ww);
+        for ch in 0..self.zdim {
+            for p in 0..hh * ww {
+                out.push((value(p * z2 + ch) - LATENT_MEAN[ch]) / LATENT_STD[ch]);
+            }
+        }
+        Ok(out)
     }
 
     /// latent f32 [16, h, w] -> RGB8 [8h, 8w, 3]
@@ -181,26 +295,7 @@ impl Vae {
             match op {
                 Op::Res { pre, cin, cout, shortcut } => {
                     debug_assert_eq!(*cin, c);
-                    let p = (hh * ww) as i64;
-                    let t = alloc(*cin, hh, ww)?;
-                    k!(krea_l2norm_silu(x.ptr(), t.ptr(), self.w(&format!("{pre}.g0")), p, *cin as i32, 1, s(st)))?;
-                    let u = alloc(*cout, hh, ww)?;
-                    self.conv(&format!("{pre}.c2"), t.ptr(), u.ptr(), hh, ww, *cin, *cout, 3, st)?;
-                    drop(t);
-                    let t2 = alloc(*cout, hh, ww)?;
-                    k!(krea_l2norm_silu(u.ptr(), t2.ptr(), self.w(&format!("{pre}.g3")), p, *cout as i32, 1, s(st)))?;
-                    self.conv(&format!("{pre}.c6"), t2.ptr(), u.ptr(), hh, ww, *cout, *cout, 3, st)?;
-                    drop(t2);
-                    if *shortcut {
-                        let sc = alloc(*cout, hh, ww)?;
-                        self.conv(&format!("{pre}.sc"), x.ptr(), sc.ptr(), hh, ww, *cin, *cout, 1, st)?;
-                        k!(krea_add_gated_bf16(u.ptr(), *cout as i64, sc.ptr(), *cout as i64, null(), p as i32,
-                            *cout as i32, s(st)))?;
-                    } else {
-                        k!(krea_add_gated_bf16(u.ptr(), *cout as i64, x.ptr(), *cout as i64, null(), p as i32,
-                            *cout as i32, s(st)))?;
-                    }
-                    x = u;
+                    x = self.res(pre, &x, hh, ww, *cin, *cout, *shortcut, st)?;
                     c = *cout;
                 }
                 Op::Attn { pre, c: ca } => {
@@ -214,10 +309,11 @@ impl Vae {
                     let co = cin / 2;
                     let y = alloc(co, hh, ww)?;
                     drop(x);
-                    self.conv(&format!("{pre}.up"), up.ptr(), y.ptr(), hh, ww, *cin, co, 3, st)?;
+                    self.conv(&format!("{pre}.conv"), up.ptr(), y.ptr(), hh, ww, *cin, co, 3, st)?;
                     x = y;
                     c = co;
                 }
+                Op::Down { .. } => bail!("downsampling in the decoder"),
             }
         }
         let p = hh * ww;

@@ -144,6 +144,43 @@ Differences to know about:
   the `_gpu` ones. An 8-step Anima image at 1024x1024 took 2.4 s with `dpmpp_2m_sde` and 2.0 s with its `_gpu` variant, against
   1.3 s with `euler`.
 
+## Krea 2 reference images
+
+Krea 2 takes images two ways, both as in ComfyUI, and SwarmUI's Prompt Images use them:
+
+* **Through the text encoder**, the default. Each image goes through Qwen3-VL's vision tower ([`src/vision.rs`](src/vision.rs)) and
+  its tokens follow the prompt as `Picture N:`, on the negative prompt too.
+* **As reference latents**, with SwarmUI's Enable Reference Latents. The image is also VAE encoded and joins the DiT's tokens,
+  with `index` or `index_timestep_zero`. These are for edit LoRAs; the base model mostly copies the reference.
+
+```bash
+target/release/krea2.exe -p "no people, a stone lighthouse at sunset" --image ref_small.png --ref-image ref_full.png --ref-method index
+```
+
+The CLI reads PNGs at their own size. SwarmUI scales them first, to about 384x384 for the text encoder and to the generation's
+size for the latent.
+
+Compared with ComfyUI's own code and SwarmUI's own text node (`tools/krea_image_ref.py`, `tools/krea_image_cmp.py`), at 768x768 with 8 steps:
+
+| Case | ComfyUI | This engine | Image against ComfyUI |
+|---|---|---|---|
+| Two prompt images, flash attention | 694 ms/evaluation | 430 ms | 40.8 dB |
+| One prompt image and an `index` reference | 1040 ms/step | 787 ms flash, 651 ms int8 | 24.7 dB |
+| The same with `index_timestep_zero`, CFG 2 | 1660 ms/step | 1183 ms flash, 1011 ms int8 | 24.9 dB |
+
+Reference latents are sensitive to rounding: the same picture appears, but int8 and flash attention here differ from each other
+by 27 dB and 19 dB on those two cases, so a gap of that size is expected from rounding. Passing ComfyUI's exact latent to this
+engine changed nothing. The model's first output is within about 1% in every case, the vision tokens within 0.25%, and the VAE encoder's latent within 0.6%.
+
+A prompt image at about 384x384 costs 130 ms in the vision tower and a VAE encode about 50 ms. The vision tower's attention
+grows with the square of its tokens: a 1024x1024 image, SwarmUI's Large Text Encoded Image, took 3.9 s.
+
+Differences to know about:
+
+* `input_image_N` in a prompt stays plain text. SwarmUI's code means to replace it, but ComfyUI's tokens keep the text, so these do as well.
+* No edit LoRA for Krea 2 is installed here, so reference latents have only run on the base model.
+* The other reference methods (`offset`, `uxo/uno` and so on) are refused, and so are references on the negative prompt, which SwarmUI doesn't send.
+
 ## MOSS Image engine
 
 Runs int8 ConvRot MOSS Image checkpoints with fused q/k/v, the Qwen3.5 9B text encoder and the Flux 2 VAE. Both
@@ -245,6 +282,7 @@ Useful flags:
 | `--width/--height` | multiples of 16 (default 1024×1024) |
 | `--steps`, `--shift`, `--seed` | sampler settings; the seed gives the **same noise as ComfyUI's KSampler** |
 | `--sampler`, `--scheduler`, `--cfg`, `--negative` | any ComfyUI sampler and scheduler, on any model |
+| `--image`, `--ref-image`, `--ref-method` | Krea 2 reference images, see [Krea 2 reference images](#krea-2-reference-images) |
 | `--prompt-file f.txt`, `-n N` | many prompts / seeds with the models loaded once |
 | `--attention flash` | bf16 FlashAttention-2 like ComfyUI's default (closest numerics, ~15% slower per step); the default is `int8`, comfy-kitchen's SageAttention-style INT8 attention |
 | `--reserve-vram MB` | VRAM left untouched for the desktop (default 512) |
@@ -320,5 +358,4 @@ tools/              ComfyUI reference dump / comparison / benchmark scripts
 The CUTLASS and flash-attention checkouts default to `ref/comfy-kitchen/third_party/*` (override with
 `KREA_CUTLASS_DIR` / `KREA_FLASH_ATTN_DIR`). Object files are cached by content hash.
 
-Not implemented: image inputs to the
-text encoder and reference latents (edit mode).
+Not implemented: init images and inpainting, which need partial sampling.

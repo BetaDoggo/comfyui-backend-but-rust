@@ -108,6 +108,31 @@ struct Args {
     /// LoRA file, `path` or `path:strength`, in order (repeatable)
     #[arg(long)]
     lora: Vec<String>,
+    /// Krea 2: PNG for the text encoder, at its own size; SwarmUI scales these to about 384x384 (repeatable)
+    #[arg(long)]
+    image: Vec<PathBuf>,
+    /// Krea 2: PNG for a reference latent, for edit LoRAs (repeatable)
+    #[arg(long)]
+    ref_image: Vec<PathBuf>,
+    /// Krea 2: how reference latents are used, "index" or "index_timestep_zero"
+    #[arg(long, default_value = "index")]
+    ref_method: String,
+}
+
+/// RGB f32 [height, width, 3], 0 to 1.
+fn read_png(path: &Path) -> Result<krea2::vision::PromptImage> {
+    let mut decoder = png::Decoder::new(std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?);
+    decoder.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::ALPHA);
+    let mut reader = decoder.read_info()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf)?;
+    let channels = info.color_type.samples();
+    let rgb = buf[..info.buffer_size()].chunks_exact(channels).flat_map(|px| {
+        let (c, a) = (if channels >= 3 { [px[0], px[1], px[2]] } else { [px[0]; 3] }, px[channels - 1] as f32 / 255.0);
+        let alpha = if channels % 2 == 0 { a } else { 1.0 };
+        c.map(|v| v as f32 / 255.0 * alpha + 1.0 - alpha)
+    }).collect();
+    Ok(krea2::vision::PromptImage { width: info.width as usize, height: info.height as usize, rgb })
 }
 
 /// `path` or `path:strength`, as in `--lora`.
@@ -322,6 +347,16 @@ fn main() -> Result<()> {
         Some(p) => Some(st::SafeTensors::open(p)?.f32_vec("noise", false)?),
         None => None,
     };
+    let timestep_zero = match args.ref_method.as_str() {
+        "index" => false,
+        "index_timestep_zero" => true,
+        m => bail!("unknown --ref-method {m} (index | index_timestep_zero)"),
+    };
+    let images = args.image.iter().map(|p| read_png(p)).collect::<Result<Vec<_>>>()?;
+    let references = args.ref_image.iter().map(|p| {
+        let i = read_png(p)?;
+        gen.encode_image(&i.rgb, i.width, i.height)
+    }).collect::<Result<Vec<_>>>()?;
     for (img_i, (prompt, seed_off)) in jobs.into_iter().enumerate() {
         let req = pipeline::Request {
             prompt,
@@ -331,8 +366,15 @@ fn main() -> Result<()> {
             height: args.height,
             sampling: args.sampling("euler", ModelSampling::Flux { shift: args.shift }, args.seed + seed_off, (args.width / 8, args.height / 8))?,
             noise: ref_noise.clone(),
+            images: images.clone(),
+            negative_images: images.clone(),
+            references: references.clone(),
+            timestep_zero,
         };
         let mut dump = pipeline::Dump::new();
+        if let Some(r) = references.first() {
+            dump.insert("ref0".into(), ("F32".into(), vec![16, r.height, r.width], st::f32_bytes(&r.latent).to_vec()));
+        }
         let (rgb, _) = gen.generate(&req, |_, _| true, args.dump.as_ref().map(|_| &mut dump))?;
         let path = out_path(&args.out, img_i, n_jobs);
         std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)

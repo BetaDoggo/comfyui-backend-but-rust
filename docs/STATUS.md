@@ -37,6 +37,11 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Engine core | Samplers: dpmpp_2m, dpmpp_2m_sde, uni_pc, ddim | All 45 ComfyUI samplers: within 8e-6 of ComfyUI's own code on a mock model. Real images on all three models, through the server API and CLI, not the SwarmUI page. dpm_adaptive picks steps per image, not per batch. |
 | P1 | Engine core | Schedulers: normal, karras, sgm_uniform, beta | All 9 ComfyUI schedulers plus turbo, align_your_steps, flux2 and ideogram4. Within 2e-6 of ComfyUI on 1105 schedules. ltxv-image is refused. |
 | P2 | Engine core | Sigma overrides | Sigma Min, Sigma Max and Rho for karras and exponential, as SwarmKSampler does. Run once through the server API. |
+| P0 | Engine core | CFG and negative prompts | All three models, tested through SwarmUI. |
+| P0 | Krea 2 | CFG above 1 and negative prompts | Tested through SwarmUI at CFG 2 with prompt images and references. Compared with ComfyUI only with a reference latent, at 24.9 dB. |
+| P0 | Image workflows | VAE encoder | Qwen Image VAE encoder, 0.6% from ComfyUI, about 50 ms at 768. Used by Krea 2 reference latents. The Flux 2 VAE has no encoder yet; init images still need partial sampling. |
+| P2 | Krea 2 | Prompt Images | Vision tower and DeepStack, up to several images, on both prompts. Tokens match SwarmUI's text node, 40.8 dB from ComfyUI, tested through SwarmUI. A 1024 image costs 3.9 s against 130 ms at 384. |
+| P2 | Krea 2 | Reference latents | index and index_timestep_zero, tested through SwarmUI. 1% from ComfyUI on the first evaluation; images 25 dB, about what int8 and flash differ by here (27 and 19 dB). No Krea 2 edit LoRA installed, so base model only. |
 
 ## Doing
 
@@ -45,8 +50,6 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | Engine core | Route each model to its engine | One backend now serves Krea 2, Anima and MOSS Image, picked from the checkpoint's keys. Still inside krea2-engine; other families need a real router. |
 | P0 | Engine core | Dynamic VRAM offloading | Live residency works and adapted to ComfyUI's memory. Open: 16 to 11 drop at 1024, one 867 ms/step run after ComfyUI. |
 | P1 | Krea 2 | Model Attention Backend | int8 and flash, per request. flash not yet run through the server. |
-| P0 | Engine core | CFG and negative prompts | Anima and MOSS Image work. Krea 2 works from the CLI and isn't tested through SwarmUI yet. |
-| P0 | Krea 2 | CFG above 1 and negative prompts | Works from the CLI, with real images at CFG 2. Not yet tested through SwarmUI or compared with ComfyUI. |
 
 ## Plumbing
 
@@ -91,7 +94,6 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 |---|---|---|---|
 | P0 | Engine core | Move krea2 behind a shared engine crate | Share the CUDA runtime, kernels, offloading and sampler between model families instead of hard-coding Krea 2. |
 | P0 | Engine core | Latent operations | Add, multiply, blend, batch, repeat and upscale. Needed by init images, refiners and regions. |
-| P0 | Image workflows | VAE encoder | Nothing can encode an image yet. Blocks init images, refiners, inpainting and references. |
 | P1 | Engine core | Live previews | Latent-to-RGB preview during sampling. Swarm shows none for krea2 today. |
 | P1 | Engine core | Hardware beyond this card | Everything targets sm_120 on Windows. Other GPUs and Linux are untested. |
 | P1 | Krea 2 | Prompt weights | <weight> through SwarmAttnTokenWeights, inside attention. |
@@ -108,8 +110,6 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | MOSS Image | Other MOSS Image checkpoint formats | bf16 and unfused q/k/v files are refused. Only fused int8 ConvRot runs. |
 | P2 | Server | ComfyUI node editor page | SwarmUI's Comfy Workflow tab won't render. Generation doesn't need it. |
 | P2 | Engine core | Tiled sampling | Swarm's Tile Sample and refiner tiling. |
-| P2 | Krea 2 | Prompt Images | Needs the Qwen3-VL vision tower. |
-| P2 | Krea 2 | Reference latents | Edit mode, needs the VAE encoder too. |
 | P2 | MiniMax H3 | MiniMax H3 video and audio engine | Installed. Largest of the five: joint video and audio latents, tiled video VAE. |
 | P2 | Other models | Flux and Flux 2 | Very common in Swarm. T5 and CLIP encoders, GGUF and NF4 formats. |
 | P2 | Anima | Anima LLLite ControlNet | Needs the patch hooks inside the blocks. |

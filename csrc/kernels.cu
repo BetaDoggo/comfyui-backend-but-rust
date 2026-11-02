@@ -633,6 +633,54 @@ __global__ void lincomb_kernel(LincombArgs a, int nx, float* out, int64_t n) {
     for (int j = 0; j < nx; ++j) v += a.c[j] * a.x[j][i];
     out[i] = v;
 }
+// RoPE on f32 rows of H heads of d elements, the first half of each head paired with the second half.
+// rope: [L][d/2][(cos, sin)], for vision attention, which has no q/k norm.
+__global__ void rope_rows_kernel(float* x, int64_t stride, const float* rope, int H, int d) {
+    const int64_t l = blockIdx.x;
+    const int h = blockIdx.y;
+    float* row = x + l * stride + (int64_t)h * d;
+    const float* r = rope + l * d;
+    const int half = d / 2;
+    for (int j = threadIdx.x; j < half; j += blockDim.x) {
+        const float a = row[j], b = row[half + j], c = r[2 * j], s = r[2 * j + 1];
+        row[j] = a * c - b * s;
+        row[half + j] = b * c + a * s;
+    }
+}
+KREA_API int krea_rope_rows(float* x, int64_t stride, const float* rope, int L, int H, int d, void* stream) {
+    rope_rows_kernel<<<dim3(L, H), 32, 0, (cudaStream_t)stream>>>(x, stride, rope, H, d);
+    KCHECK();
+    return 0;
+}
+
+// x = gelu(x) on f32, with torch's tanh approximation or the exact erf form.
+__global__ void gelu_f32_kernel(float* x, int64_t n, int approximate) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = approximate ? gelu_tanh_f(x[i]) : gelu_f(x[i]);
+}
+KREA_API int krea_gelu_f32(float* x, int64_t n, int approximate, void* stream) {
+    gelu_f32_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(x, n, approximate);
+    KCHECK();
+    return 0;
+}
+
+// The samples of a stride 2 conv from its stride 1 output: x [H, W, C] -> out [H/2, W/2, C], taking
+// odd rows and columns, whose windows start on even positions.
+__global__ void take_odd_kernel(const bf16* x, bf16* out, int H, int W, int C) {
+    const int64_t p = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t ow = W / 2;
+    if (p >= (H / 2) * ow) return;
+    const int64_t y = p / ow, xx = p % ow;
+    const int64_t src = (((2 * y + 1) * W) + 2 * xx + 1) * C;
+    for (int c = 0; c < C; ++c) out[p * C + c] = x[src + c];
+}
+KREA_API int krea_take_odd(const void* x, void* out, int H, int W, int C, void* stream) {
+    const int64_t n = (int64_t)(H / 2) * (W / 2);
+    take_odd_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const bf16*)x, (bf16*)out, H, W, C);
+    KCHECK();
+    return 0;
+}
+
 KREA_API int krea_lincomb(float* out, int64_t n, int nx, const float* const* x, const float* c, void* stream) {
     if (nx < 1 || nx > 4) return -1;
     LincombArgs a{};

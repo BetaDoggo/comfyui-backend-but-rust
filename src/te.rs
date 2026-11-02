@@ -1,11 +1,12 @@
 //! Krea2 text encoder: Qwen3-VL-4B language model (int8 ConvRot weights), conditioning taken
 //! from the hidden states entering layers 2, 5, ..., 35 (no final norm), fp32 activations.
 
-use crate::cuda::{memcpy_2d_d2d, DevBuf, Stream};
+use crate::cuda::{memcpy_2d_d2d, memcpy_d2d, DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_F32, PM, PRO_PLAIN, PRO_RMS, PRO_SWIGLU};
 use crate::offload::{plan, Layout, WeightSet};
 use crate::st::SafeTensors;
 use crate::tokenizer::Tokenizer;
+use crate::vision::Embeds;
 use anyhow::Result;
 use std::path::Path;
 
@@ -21,6 +22,8 @@ const QKV: usize = (HQ + 2 * HK) * HD; // 6144
 const EPS: f32 = 1e-6;
 const THETA: f32 = 5_000_000.0;
 const PRE: &str = "model.language_model.";
+const IMAGE_PAD: u32 = 151655;
+const VISION_BLOCK: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 
 pub struct TextEncoder {
     st: SafeTensors,
@@ -33,6 +36,54 @@ pub struct Cond {
     pub ctx: DevBuf,
     pub len: usize,
     pub token_ids: Vec<u32>,
+}
+
+/// The prompt SwarmTextEncodeAdvanced builds for `count` images. Its `input_image_N` replacement
+/// never reaches the tokens, because the node tokenizes each prompt leaf apart from that step, so
+/// the text stays and every image follows the prompt.
+pub fn image_prompt(prompt: &str, count: usize) -> String {
+    let mut text = prompt.to_string();
+    for i in 1..=count {
+        text.push_str(&format!("Picture {i}: {VISION_BLOCK}"));
+    }
+    text
+}
+
+/// MRoPE positions (T, H, W) of `l` tokens with images at `spans` (start, tokens, merged grid), as
+/// `qwen2vl_mrope_position_ids` lays them out: an image advances the text past its longest side.
+fn position_ids(l: usize, spans: &[(usize, usize, (usize, usize))]) -> Vec<[f32; 3]> {
+    let mut pos: Vec<[f32; 3]> = (0..l).map(|i| [i as f32; 3]).collect();
+    let mut offset = 0i64;
+    for &(start, size, (gh, gw)) in spans {
+        let end = start + size;
+        let len_max = gh.max(gw).max(1) as i64;
+        let next = len_max + start as i64 + offset;
+        for (i, p) in pos[end..].iter_mut().enumerate() {
+            *p = [(next + i as i64) as f32; 3];
+        }
+        let origin = start as i64 + offset;
+        for i in 0..size {
+            pos[start + i] = [origin as f32, (origin + (i / gw) as i64) as f32, (origin + (i % gw) as i64) as f32];
+        }
+        offset += len_max - size as i64;
+    }
+    pos
+}
+
+/// RoPE table [l][64][(cos, sin)]. Interleaved MRoPE: T by default, H and W take every third pair of
+/// the first 60.
+fn rope_table(pos: &[[f32; 3]]) -> Vec<f32> {
+    let inv: Vec<f32> = (0..64).map(|j| 1.0f32 / THETA.powf((2 * j) as f32 / HD as f32)).collect();
+    let mut rope = Vec::with_capacity(pos.len() * 128);
+    for p in pos {
+        for (j, f) in inv.iter().enumerate() {
+            let axis = if j < 60 { j % 3 } else { 0 };
+            let a = f * p[axis];
+            rope.push(a.cos());
+            rope.push(a.sin());
+        }
+    }
+    rope
 }
 
 impl TextEncoder {
@@ -69,14 +120,28 @@ impl TextEncoder {
     }
 
     pub fn encode(&mut self, prompt: &str, st: &Stream) -> Result<Cond> {
+        self.encode_with_images(prompt, &[], st)
+    }
+
+    /// `images` go in place of the prompt's first `<|image_pad|>` tokens; add them with [`image_prompt`].
+    pub fn encode_with_images(&mut self, prompt: &str, images: &[&Embeds], st: &Stream) -> Result<Cond> {
         let ids = self.tokenize(prompt)?;
-        let l = ids.len();
+        let pads: Vec<usize> = ids.iter().enumerate().filter(|(_, &t)| t == IMAGE_PAD).map(|(i, _)| i).take(images.len()).collect();
+        // the image tokens' places, in the sequence with the images in it
+        let mut spans = Vec::with_capacity(pads.len());
+        let mut grown = 0;
+        for (&pad, img) in pads.iter().zip(images) {
+            spans.push((pad + grown, img.tokens, img.grid));
+            grown += img.tokens - 1;
+        }
+        let l0 = ids.len();
+        let l = l0 + grown;
 
         // Embedding rows: gather int8 rows + scales on the host, dequantize + un-rotate on device.
         let emb = self.st.bytes(&format!("{PRE}embed_tokens.weight"))?;
         let emb_s = self.st.bytes(&format!("{PRE}embed_tokens.weight_scale"))?;
-        let mut q = Vec::with_capacity(l * D);
-        let mut sc = Vec::with_capacity(l * 4);
+        let mut q = Vec::with_capacity(l0 * D);
+        let mut sc = Vec::with_capacity(l0 * 4);
         for &t in &ids {
             let t = t as usize;
             q.extend_from_slice(&emb[t * D..(t + 1) * D]);
@@ -86,19 +151,34 @@ impl TextEncoder {
         q_d.upload(0, &q, st)?;
         let s_d = DevBuf::alloc_async(sc.len(), st)?;
         s_d.upload(0, &sc, st)?;
+        let text = DevBuf::alloc_async(l0 * D * 4, st)?;
+        k!(krea_embed_dequant(q_d.ptr(), s_d.ptr(), text.ptr(), l0 as i32, D as i32, 1, s(st)))?;
         let x = DevBuf::alloc_async(l * D * 4, st)?;
-        k!(krea_embed_dequant(q_d.ptr(), s_d.ptr(), x.ptr(), l as i32, D as i32, 1, s(st)))?;
-
-        // RoPE (split-half, text-only positions 0..l)
-        let mut rope = Vec::with_capacity(l * 128);
-        for pos in 0..l {
-            for j in 0..64 {
-                let inv = 1.0f32 / THETA.powf((2 * j) as f32 / HD as f32);
-                let a = inv * pos as f32;
-                rope.push(a.cos());
-                rope.push(a.sin());
+        let row = D * 4;
+        let (mut from, mut to) = (0, 0);
+        for (&pad, img) in pads.iter().zip(images) {
+            memcpy_d2d(off(x.ptr(), to * row), off(text.ptr(), from * row), (pad - from) * row, st)?;
+            to += pad - from;
+            memcpy_d2d(off(x.ptr(), to * row), img.merged.ptr(), img.tokens * row, st)?;
+            to += img.tokens;
+            from = pad + 1;
+        }
+        memcpy_d2d(off(x.ptr(), to * row), off(text.ptr(), from * row), (l0 - from) * row, st)?;
+        // DeepStack: features added at the image tokens after each of the first layers
+        let mut deepstack = Vec::new();
+        if !pads.is_empty() {
+            for d in 0..images[0].deepstack.len() {
+                let b = DevBuf::alloc_async(l * row, st)?;
+                b.upload(0, &vec![0u8; l * row], st)?;
+                for (&(start, size, _), img) in spans.iter().zip(images) {
+                    memcpy_d2d(off(b.ptr(), start * row), img.deepstack[d].ptr(), size * row, st)?;
+                }
+                deepstack.push(b);
             }
         }
+
+        // RoPE (split-half)
+        let rope = rope_table(&position_ids(l, &spans));
         let rope_d = DevBuf::alloc_async(rope.len() * 4, st)?;
         rope_d.upload(0, &crate::st::f32_bytes(&rope), st)?;
 
@@ -146,6 +226,10 @@ impl TextEncoder {
                 FF as i32, s(st)))?;
             lin(xr.ptr(), "wd", "sd", D, FF, xp, 1.0)?;
             self.ws.release(i, st)?;
+            if let Some(d) = deepstack.get(i) {
+                let (p, c) = ([xp as crate::ffi::P, d.ptr() as crate::ffi::P], [1.0f32, 1.0]);
+                k!(krea_lincomb(xp, (l * D) as i64, 2, p.as_ptr(), c.as_ptr(), s(st)))?;
+            }
         }
 
         // Drop the system prompt + "<|im_start|>user\n" (Krea2TEModel.encode_token_weights).
@@ -157,7 +241,7 @@ impl TextEncoder {
                 count += 1;
             }
         }
-        if l > template_end + 3 && ids[template_end + 1] == 872 && ids[template_end + 2] == 198 {
+        if l0 > template_end + 3 && ids[template_end + 1] == 872 && ids[template_end + 2] == 198 {
             template_end += 3;
         }
         let len = l - template_end;
@@ -165,5 +249,26 @@ impl TextEncoder {
         let ctx = DevBuf::alloc_async(len * row * 2, st)?;
         k!(krea_f32_to_bf16(off(taps.ptr(), template_end * row * 4), ctx.ptr(), (len * row) as i64, s(st)))?;
         Ok(Cond { ctx, len, token_ids: ids })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_prompt_follows_swarm() {
+        let block = VISION_BLOCK;
+        assert_eq!(image_prompt("lake", 1), format!("lakePicture 1: {block}"));
+        assert_eq!(image_prompt("a input_image_2", 2), format!("a input_image_2Picture 1: {block}Picture 2: {block}"));
+    }
+
+    #[test]
+    fn positions_match_mrope() {
+        // comfy.text_encoders.qwen_vl.qwen2vl_mrope_position_ids on a 2 x 3 image at token 2 of 10
+        let p = position_ids(10, &[(2, 6, (2, 3))]);
+        assert_eq!(p.iter().map(|v| v[0]).collect::<Vec<_>>(), [0., 1., 2., 2., 2., 2., 2., 2., 5., 6.]);
+        assert_eq!(p.iter().map(|v| v[1]).collect::<Vec<_>>(), [0., 1., 2., 2., 2., 3., 3., 3., 5., 6.]);
+        assert_eq!(p.iter().map(|v| v[2]).collect::<Vec<_>>(), [0., 1., 2., 3., 4., 2., 3., 4., 5., 6.]);
     }
 }

@@ -1,6 +1,7 @@
 //! [`Engine`] implementation on the krea2 library: text-to-image for int8 ConvRot checkpoints of
-//! Krea 2, Anima and MOSS Image, with every ComfyUI sampler and scheduler, any CFG and LoRAs. Each
-//! file's architecture is read from its keys, so one backend serves all three.
+//! Krea 2, Anima and MOSS Image, with every ComfyUI sampler and scheduler, any CFG and LoRAs, plus
+//! Krea 2's prompt images and reference latents. Each file's architecture is read from its keys, so
+//! one backend serves all three.
 //!
 //! Text encoding is deferred to `sample`, so the negative prompt SwarmUI always sends costs nothing
 //! at CFG 1. Everything the pipeline can't do is refused with [`EngineError::Unsupported`], which
@@ -12,10 +13,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use krea2::pipeline::{AnimaRequest, Cancelled, Generator, LoadOptions, MossRequest, Request, Sampling};
+use krea2::pipeline::{AnimaRequest, Cancelled, Generator, LoadOptions, MossRequest, Reference, Request, Sampling};
 use krea2::samplers::{self, ModelSampling, SigmaRange};
 use krea2::lora::{self, Lora};
 use krea2::tokenizer::token_weights;
+use krea2::vision::PromptImage;
 use swarm_engine_api::prompt::PromptLeafKind;
 use swarm_engine_api::*;
 
@@ -70,6 +72,8 @@ struct DeferredCond {
     prompt: Result<Vec<(String, f32)>, String>,
     /// MOSS Image: the chat template, None for ComfyUI's own.
     template: Option<String>,
+    /// Krea 2: prompt images for the vision tower.
+    images: Vec<PromptImage>,
 }
 
 /// Sampled latents, `[B, 16, H/8, W/8]`, or `[B, 128, H/16, W/16]` for MOSS Image.
@@ -179,7 +183,7 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<(String
         TextEncodeMode::Plain { text } if family != Family::Anima => Ok(vec![(text.clone(), 1.0)]),
         TextEncodeMode::Plain { text } => Ok(token_weights(text, 1.0)),
         TextEncodeMode::Swarm(s) => {
-            if s.images.is_some() {
+            if s.images.is_some() && family != Family::Krea2 {
                 return Err("Prompt Images".into());
             }
             if s.minimax_refs.is_some() || s.clip_vision.is_some() {
@@ -199,8 +203,22 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<(String
     }
 }
 
-/// The one plain prompt of a conditioning: anything regional or image-based is refused.
-fn single_prompt(c: &Conditioning) -> EngineResult<(&DeferredCond, &[(String, f32)])> {
+/// RGB frames of a batch, with alpha over white as SwarmTextEncodeAdvanced does.
+fn prompt_images(b: &ImageBatch) -> Vec<PromptImage> {
+    let channels = b.channels as usize;
+    (0..b.count).map(|i| {
+        let rgb = b.frame_f32(i).chunks_exact(channels).flat_map(|px| {
+            let a = if channels == 4 { px[3] } else { 1.0 };
+            let c = |v: usize| px[v.min(channels.min(3) - 1)] * a + 1.0 - a;
+            [c(0), c(1), c(2)]
+        }).collect();
+        PromptImage { width: b.width as usize, height: b.height as usize, rgb }
+    }).collect()
+}
+
+/// The one plain prompt of a conditioning: anything regional or image-based is refused, except
+/// that Krea 2 reads reference latents with [`reference_latents`].
+fn single_prompt(c: &Conditioning, family: Family) -> EngineResult<(&DeferredCond, &[(String, f32)])> {
     let [e] = c.entries.as_slice() else {
         return Err(unsupported("regional prompts (more than one conditioning entry)"));
     };
@@ -210,7 +228,7 @@ fn single_prompt(c: &Conditioning) -> EngineResult<(&DeferredCond, &[(String, f3
         && m.multiplier == 1.0
         && !m.zeroed
         && m.mask.is_none()
-        && m.reference_latents.is_empty()
+        && (family == Family::Krea2 || m.reference_latents.is_empty())
         && m.gligen.is_empty()
         && m.inpaint.is_none()
         && m.embedding_ops.is_empty()
@@ -222,6 +240,30 @@ fn single_prompt(c: &Conditioning) -> EngineResult<(&DeferredCond, &[(String, f3
     let cond = e.embedding.downcast_ref::<DeferredCond>().ok_or_else(|| unsupported("conditioning from another text encoder"))?;
     let segments = cond.prompt.as_deref().map_err(|e| unsupported(e.clone()))?;
     Ok((cond, segments))
+}
+
+/// A Krea 2 conditioning's reference latents, and whether they use `index_timestep_zero`. Without a
+/// method ComfyUI's model ignores them.
+fn reference_latents(c: &Conditioning) -> EngineResult<(Vec<Reference>, bool)> {
+    let [e] = c.entries.as_slice() else { return Ok((Vec::new(), false)) };
+    let timestep_zero = match e.meta.reference_latents_method.as_deref() {
+        None => return Ok((Vec::new(), false)),
+        Some("index") => false,
+        Some("index_timestep_zero") => true,
+        Some(m) => return Err(unsupported(format!("reference latent method {m}"))),
+    };
+    let mut out = Vec::with_capacity(e.meta.reference_latents.len());
+    for l in &e.meta.reference_latents {
+        let LatentSamples::Single(t) = &l.samples else {
+            return Err(unsupported("audio/video reference latents"));
+        };
+        let &[1, 16, height, width] = t.shape.as_slice() else {
+            return Err(unsupported(format!("reference latent of shape {:?}", t.shape)));
+        };
+        let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("a reference latent this engine didn't encode"))?;
+        out.push(Reference { latent: latent.data.clone(), height, width });
+    }
+    Ok((out, timestep_zero))
 }
 
 /// `ModelSamplingFlux`: `max_shift` applies at 2560 latent patches, `base_shift` at 256.
@@ -344,10 +386,10 @@ impl Krea2Engine {
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
-        let (cond, positive) = single_prompt(&req.positive)?;
+        let (cond, positive) = single_prompt(&req.positive, Family::Anima)?;
         let text_encoder = &cond.text_encoder;
         let first = sampling(req, settings, shape, 0)?;
-        let negative = if first.uses_negative() { single_prompt(&req.negative)?.1 } else { &[] };
+        let negative = if first.uses_negative() { single_prompt(&req.negative, Family::Anima)?.1 } else { &[] };
         let mut gen = self.gen();
         gen.ensure_anima(&file.path).map_err(internal)?;
         gen.ensure_qwen3(text_encoder).map_err(internal)?;
@@ -379,8 +421,8 @@ impl Krea2Engine {
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
-        let (cond, positive) = single_prompt(&req.positive)?;
-        let negative = if sampling(req, settings, shape, 0)?.uses_negative() { single_prompt(&req.negative)?.1[0].0.clone() } else { String::new() };
+        let (cond, positive) = single_prompt(&req.positive, Family::Moss)?;
+        let negative = if sampling(req, settings, shape, 0)?.uses_negative() { single_prompt(&req.negative, Family::Moss)?.1[0].0.clone() } else { String::new() };
         let mut gen = self.gen();
         gen.ensure_moss(&file.path).map_err(internal)?;
         gen.ensure_qwen35(&cond.text_encoder).map_err(internal)?;
@@ -485,7 +527,11 @@ impl Engine for Krea2Engine {
             TextEncodeMode::Swarm(s) if s.llama_template.as_deref() == Some("krea2") => Some(krea2::te::TEMPLATE.to_string()),
             _ => None,
         };
-        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), template };
+        let images = match &req.mode {
+            TextEncodeMode::Swarm(s) if family == Family::Krea2 => s.images.as_ref().map(prompt_images).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), template, images };
         Ok(Conditioning::single(Opaque::new(cond), CondMeta::default()))
     }
 
@@ -534,11 +580,20 @@ impl Engine for Krea2Engine {
         if family == Family::Moss {
             return finish(self.sample_moss(req, (batch, lh, lw), &settings, progress)?);
         }
-        let (cond, prompt) = single_prompt(&req.positive)?;
+        let (cond, prompt) = single_prompt(&req.positive, family)?;
         let (text_encoder, prompt) = (&cond.text_encoder, &prompt[0].0);
+        let (references, timestep_zero) = reference_latents(&req.positive)?;
         let (width, height) = (lw * 8, lh * 8);
         let shape = (batch, lh, lw);
-        let negative = if sampling(req, &settings, shape, 0)?.uses_negative() { single_prompt(&req.negative)?.1[0].0.clone() } else { String::new() };
+        let (negative, negative_images) = if sampling(req, &settings, shape, 0)?.uses_negative() {
+            let (c, p) = single_prompt(&req.negative, family)?;
+            if !reference_latents(&req.negative)?.0.is_empty() {
+                return Err(unsupported("reference latents on the negative prompt"));
+            }
+            (p[0].0.clone(), c.images.clone())
+        } else {
+            (String::new(), Vec::new())
+        };
 
         let mut gen = self.gen();
         gen.ensure_dit(&file.path).map_err(internal)?;
@@ -550,7 +605,8 @@ impl Engine for Krea2Engine {
         for i in 0..batch {
             let image = noise::swarm_noise(req.noise_seed, req.variation, i as u64, 16, lh, lw);
             let r = Request { prompt: prompt.to_string(), negative: negative.clone(), seed: req.noise_seed, width, height,
-                sampling: sampling(req, &settings, shape, i)?, noise: Some(image) };
+                sampling: sampling(req, &settings, shape, i)?, noise: Some(image), images: cond.images.clone(),
+                negative_images: negative_images.clone(), references: references.clone(), timestep_zero };
             let (latent, stats) = gen
                 .sample_latent(&r, |step, steps| {
                     progress.progress((i * steps + step) as u32, (batch * steps) as u32);
@@ -599,8 +655,26 @@ impl Engine for Krea2Engine {
         Ok(ImageBatch::from_u8(batch as u32, height as u32, width as u32, 3, rgb))
     }
 
-    fn vae_encode(&self, _req: &VaeEncodeRequest) -> EngineResult<Latent> {
-        Err(unsupported("VAE encoding (init images, refiners, reference images)"))
+    fn vae_encode(&self, req: &VaeEncodeRequest) -> EngineResult<Latent> {
+        if req.tiling.is_some() {
+            return Err(unsupported("VAE tiling"));
+        }
+        let file = req.vae.source.as_ref().ok_or_else(|| unsupported("the pixel-space VAE"))?;
+        if is_flux2_vae(file) {
+            return Err(unsupported("VAE encoding with the Flux 2 VAE"));
+        }
+        let mut gen = self.gen();
+        gen.ensure_vae(&file.path).map_err(internal)?;
+        let frames = prompt_images(&req.pixels);
+        let (mut data, mut size) = (Vec::new(), (0, 0));
+        for f in &frames {
+            let r = gen.encode_image(&f.rgb, f.width, f.height).map_err(internal)?;
+            data.extend_from_slice(&r.latent);
+            size = (r.height, r.width);
+        }
+        let (lh, lw) = size;
+        let tensor = LatentTensor { format: LatentFormat::Image16Ch, shape: vec![frames.len(), 16, lh, lw], data: Opaque::new(HostLatent { data }) };
+        Ok(Latent::single(tensor, PixelInfo::image(lw as u32 * 8, lh as u32 * 8, frames.len() as u32)))
     }
 
     fn vae_decode_audio(&self, _req: &VaeDecodeAudioRequest) -> EngineResult<AudioData> {

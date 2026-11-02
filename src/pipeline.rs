@@ -2,10 +2,12 @@
 
 use crate::cuda::{self, DevBuf, Event, Stream};
 use crate::samplers::{self, Eval, ModelSampling, Uncond};
+use crate::vision::{self, PromptImage};
 use crate::{anima, dit, ffi, flux2vae, lora, moss, offload, qwen3, qwen35, sampling, st, te, tokenizer, vae};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 const MB: usize = 1 << 20;
@@ -66,6 +68,28 @@ pub struct Request {
     pub sampling: Sampling,
     /// Use this noise instead of the seed (parity tests).
     pub noise: Option<Vec<f32>>,
+    /// Prompt images, through the vision tower into the text encoder.
+    pub images: Vec<PromptImage>,
+    pub negative_images: Vec<PromptImage>,
+    /// Reference latents of the positive prompt, see [`Generator::encode_image`].
+    pub references: Vec<Reference>,
+    /// ComfyUI's `index_timestep_zero` rather than `index`.
+    pub timestep_zero: bool,
+}
+
+/// A reference latent, [16, height, width] f32 at model scale.
+#[derive(Clone)]
+pub struct Reference {
+    pub latent: Vec<f32>,
+    pub height: usize,
+    pub width: usize,
+}
+
+/// A prompt as the text encoder saw it.
+#[derive(PartialEq)]
+struct PromptKey {
+    text: String,
+    images: Vec<PromptImage>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -202,8 +226,12 @@ pub struct Generator {
     moss_contexts: Vec<(Vec<u32>, moss::Context)>,
     vae: Option<(PathBuf, vae::Vae)>,
     flux2: Option<(PathBuf, flux2vae::Vae)>,
-    cached: Option<(String, te::Cond, DevBuf)>,
-    cached_negative: Option<(String, te::Cond, DevBuf)>,
+    cached: Option<(PromptKey, te::Cond, DevBuf)>,
+    cached_negative: Option<(PromptKey, te::Cond, DevBuf)>,
+    /// Loaded from the text encoder's file by the first prompt image.
+    vision: Option<vision::Vision>,
+    /// Latest images, most recent last.
+    vision_cache: Vec<(PromptImage, Arc<vision::Embeds>)>,
     pub max_pixels: usize,
     max_width: usize,
     max_height: usize,
@@ -253,13 +281,15 @@ fn rebalance(st: &Stream, blocks: &mut offload::WeightSet, dst: &st::SafeTensors
 
 const LT_MAX: usize = 512; // text tokens budgeted for activation planning
 const ANIMA_CONTEXTS: usize = 4; // encoded prompts kept in VRAM
+const VISION_CACHE: usize = 10; // the most prompt images SwarmUI sends
 /// MOSS Image latents are at /16 and the VAE's latent has no text budget; 300 tokens is a long prompt.
 const MOSS_TEXT: usize = 300;
 
 /// Peak activation memory of one request (denoising step or VAE decode, whichever is larger).
-fn activation_need(width: usize, height: usize) -> usize {
+/// `extra` is the tokens of its prompt images and reference latents.
+fn activation_need(width: usize, height: usize, extra: usize) -> usize {
     let (lh, lw) = (height / 8, width / 8);
-    dit::step_activation_bytes(LT_MAX + (lh / 2) * (lw / 2)).max(vae::Vae::activation_bytes(lh, lw))
+    dit::step_activation_bytes(LT_MAX + extra + (lh / 2) * (lw / 2)).max(vae::Vae::activation_bytes(lh, lw))
 }
 
 fn moss_need(width: usize, height: usize) -> usize {
@@ -281,7 +311,8 @@ impl Generator {
         let (_, total) = cuda::mem_info()?;
         eprintln!("GPU memory: {} MB free (device-wide) / {} MB total", cuda::device_free()? / MB, total / MB);
         Ok(Generator { st: st0, te: None, dit: None, anima: None, qwen3: None, tokenizers: None, contexts: Vec::new(), moss: None, qwen35: None,
-            moss_tokenizer: None, moss_contexts: Vec::new(), vae: None, flux2: None, cached: None, cached_negative: None, max_pixels: o.max_pixels,
+            moss_tokenizer: None, moss_contexts: Vec::new(), vae: None, flux2: None, cached: None, cached_negative: None, vision: None, vision_cache: Vec::new(),
+            max_pixels: o.max_pixels,
             max_width: o.max_width, max_height: o.max_height, reserve: o.reserve_vram_mb * MB,
             resident_blocks: o.resident_blocks, slots: o.slots, threads: o.threads, attn_variant: o.attn_variant,
             int8_attn: o.int8_attn, dynamic: o.resident_blocks.is_none() })
@@ -315,6 +346,8 @@ impl Generator {
             return Ok(());
         }
         self.te = None;
+        self.vision = None;
+        self.vision_cache.clear();
         self.cached = None;
         self.cached_negative = None;
         let t0 = Instant::now();
@@ -338,7 +371,7 @@ impl Generator {
         let globals = dit::globals_layout(&dst)?.size;
         let txt_slots = 2 * dit::txt_layouts(&dst)?.iter().map(|l| l.size).max().unwrap_or(0);
         let te_slots = 2 * 110 * MB;
-        let act = activation_need(self.max_width, self.max_height) + txt_slots + te_slots;
+        let act = activation_need(self.max_width, self.max_height, 0) + txt_slots + te_slots;
         let free = cuda::device_free()?;
         let mut budget = free.saturating_sub(self.reserve + globals + act);
         if let Some(r) = self.resident_blocks {
@@ -359,6 +392,8 @@ impl Generator {
         self.cached_negative = None;
         self.dit = None;
         self.te = None;
+        self.vision = None;
+        self.vision_cache.clear();
         cuda::trim_pool()
     }
 
@@ -777,6 +812,8 @@ impl Generator {
         self.contexts.clear();
         self.dit = None;
         self.te = None;
+        self.vision = None;
+        self.vision_cache.clear();
         self.anima = None;
         self.qwen3 = None;
         self.moss_contexts.clear();
@@ -816,6 +853,75 @@ impl Generator {
         self.denoise(r, progress, None)
     }
 
+    /// The vision tower's tokens for `images`, through the cache.
+    fn vision_embeds(&mut self, images: &[PromptImage], mut dump: Option<&mut Dump>) -> Result<Vec<Arc<vision::Embeds>>> {
+        let mut out = Vec::with_capacity(images.len());
+        for img in images {
+            if let Some(i) = self.vision_cache.iter().position(|(k, _)| k == img) {
+                let hit = self.vision_cache.remove(i);
+                out.push(hit.1.clone());
+                self.vision_cache.push(hit);
+                continue;
+            }
+            if self.vision.is_none() {
+                let t0 = Instant::now();
+                let path = &self.te.as_ref().context("no text encoder loaded")?.0;
+                self.vision = Some(vision::Vision::load(st::SafeTensors::open(path)?, self.threads, &self.st)?);
+                eprintln!("vision tower ready in {:.1}s", t0.elapsed().as_secs_f64());
+            }
+            let t0 = Instant::now();
+            let st = &self.st;
+            let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut probe = |name: &str, b: &DevBuf, bytes: usize| {
+                let mut v = vec![0u8; bytes];
+                b.download(0, &mut v, st).unwrap();
+                probes.push((name.to_string(), v));
+            };
+            let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if dump.is_some() { Some(&mut probe) } else { None };
+            let e = Arc::new(self.vision.as_mut().unwrap().encode(img, st, probe_ref)?);
+            eprintln!("vision: {}x{}, {} tokens in {:.0} ms", img.width, img.height, e.tokens, t0.elapsed().as_secs_f64() * 1e3);
+            if let Some(d) = dump.as_deref_mut() {
+                for (name, v) in probes {
+                    d.entry(name).or_insert(("F32".into(), vec![v.len() / 4], v));
+                }
+            }
+            out.push(e.clone());
+            self.vision_cache.push((img.clone(), e));
+            if self.vision_cache.len() > VISION_CACHE {
+                self.vision_cache.remove(0);
+            }
+        }
+        Ok(out)
+    }
+
+    /// VAE-encode RGB f32 [height, width, 3], 0 to 1, into a reference latent. Pixels past a multiple
+    /// of 8 are cropped evenly from each side, as ComfyUI's VAE does.
+    pub fn encode_image(&mut self, rgb: &[f32], width: usize, height: usize) -> Result<Reference> {
+        if rgb.len() != width * height * 3 {
+            bail!("image has {} values, expected {}", rgb.len(), width * height * 3);
+        }
+        let (cw, ch) = (width / 8 * 8, height / 8 * 8);
+        if cw == 0 || ch == 0 {
+            bail!("{width}x{height} is too small to encode");
+        }
+        let (x0, y0) = ((width - cw) / 2, (height - ch) / 2);
+        let mut cropped = Vec::with_capacity(cw * ch * 3);
+        for y in y0..y0 + ch {
+            cropped.extend_from_slice(&rgb[(y * width + x0) * 3..][..cw * 3]);
+        }
+        let st = &self.st;
+        let need = vae::Vae::activation_bytes(ch / 8, cw / 8);
+        if let Some(m) = self.dit.as_mut().filter(|_| self.dynamic) {
+            if cuda::device_free()? < need + self.reserve {
+                rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, need, true)?;
+            }
+        }
+        let t0 = Instant::now();
+        let latent = self.vae.as_ref().context("no VAE loaded")?.1.encode(&cropped, ch, cw, st)?;
+        eprintln!("VAE encode {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        Ok(Reference { latent, height: ch / 8, width: cw / 8 })
+    }
+
     /// Decode a host latent from [`Generator::sample_latent`] to RGB8 pixels.
     pub fn decode_latent(&mut self, latent: &[f32], width: usize, height: usize) -> Result<Vec<u8>> {
         let (lh, lw) = (height / 8, width / 8);
@@ -835,9 +941,17 @@ impl Generator {
         if r.width * r.height > self.max_pixels {
             bail!("{}x{} exceeds the {} pixel limit (--max-side)", r.width, r.height, self.max_pixels);
         }
+        let guided = r.sampling.uses_negative();
+        let t0 = Instant::now();
+        let pos_vision = self.vision_embeds(&r.images, dump.as_deref_mut())?;
+        let neg_vision = if guided { self.vision_embeds(&r.negative_images, None)? } else { Vec::new() };
+        let vision_ms = t0.elapsed().as_secs_f64() * 1e3;
         let m = self.dit.as_mut().context("no diffusion model loaded")?;
         let te = &mut self.te.as_mut().context("no text encoder loaded")?.1;
-        let need = activation_need(r.width, r.height);
+        let ref_grids: Vec<(usize, usize)> = r.references.iter().map(|l| (l.height.div_ceil(dit::PATCH), l.width.div_ceil(dit::PATCH))).collect();
+        let extra = pos_vision.iter().chain(&neg_vision).map(|e| e.tokens).max().unwrap_or(0) * r.images.len().max(r.negative_images.len())
+            + ref_grids.iter().map(|(h, w)| h * w).sum::<usize>();
+        let need = activation_need(r.width, r.height, extra);
         if self.dynamic {
             rebalance(&self.st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, need, false)?;
         }
@@ -847,24 +961,29 @@ impl Generator {
 
         // text encoding (reused while the prompt is unchanged)
         let t0 = Instant::now();
-        if self.cached.as_ref().map_or(true, |(p, _, _)| *p != r.prompt) {
+        let refs: Vec<&vision::Embeds> = pos_vision.iter().map(|e| &**e).collect();
+        let key = PromptKey { text: r.prompt.clone(), images: r.images.clone() };
+        if self.cached.as_ref().map_or(true, |(p, _, _)| *p != key) {
             drop(self.cached.take());
-            let cond = te.encode(&r.prompt, st)?;
+            let text = if refs.is_empty() { r.prompt.clone() } else { te::image_prompt(&r.prompt, refs.len()) };
+            let cond = te.encode_with_images(&text, &refs, st)?;
             let ctx = m.dit.encode_context(&cond.ctx, cond.len, st)?;
             st.sync()?;
             eprintln!("text: {} tokens ({} conditioning) in {:.0} ms", cond.token_ids.len(), cond.len,
                 t0.elapsed().as_secs_f64() * 1e3);
-            self.cached = Some((r.prompt.clone(), cond, ctx));
+            self.cached = Some((key, cond, ctx));
         }
-        let guided = r.sampling.uses_negative();
-        if guided && self.cached_negative.as_ref().map_or(true, |(p, _, _)| *p != r.negative) {
+        let key = PromptKey { text: r.negative.clone(), images: r.negative_images.clone() };
+        if guided && self.cached_negative.as_ref().map_or(true, |(p, _, _)| *p != key) {
             drop(self.cached_negative.take());
-            let cond = te.encode(&r.negative, st)?;
+            let refs: Vec<&vision::Embeds> = neg_vision.iter().map(|e| &**e).collect();
+            let text = if refs.is_empty() { r.negative.clone() } else { te::image_prompt(&r.negative, refs.len()) };
+            let cond = te.encode_with_images(&text, &refs, st)?;
             let ctx = m.dit.encode_context(&cond.ctx, cond.len, st)?;
             st.sync()?;
-            self.cached_negative = Some((r.negative.clone(), cond, ctx));
+            self.cached_negative = Some((key, cond, ctx));
         }
-        stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;
+        stats.text_ms = vision_ms + t0.elapsed().as_secs_f64() * 1e3;
         let (_, cond, ctx) = self.cached.as_ref().unwrap();
         if let Some(d) = dump.as_deref_mut() {
             let mut b = vec![0u8; cond.ctx.size()];
@@ -886,16 +1005,18 @@ impl Generator {
         if noise.len() != n {
             bail!("noise has {} values, expected {n}", noise.len());
         }
-        let upload_rope = |lt: usize| -> Result<DevBuf> {
-            let rope = dit::Dit::rope_table(lt, lh / 2, lw / 2);
+        let upload_rope = |lt: usize, grids: &[(usize, usize)]| -> Result<DevBuf> {
+            let rope = dit::Dit::rope_table(lt, lh / 2, lw / 2, grids);
             let d = DevBuf::alloc_async(rope.len() * 4, st)?;
             d.upload(0, &st::f32_bytes(&rope), st)?;
             Ok(d)
         };
         let lt = cond.len;
-        let rope_d = upload_rope(lt)?;
+        let rope_d = upload_rope(lt, &ref_grids)?;
+        let latents: Vec<(Vec<f32>, usize, usize)> = r.references.iter().map(|l| (l.latent.clone(), l.height, l.width)).collect();
+        let references = if latents.is_empty() { None } else { Some(m.dit.references(&latents, r.timestep_zero, st)?) };
         let negative = if guided { self.cached_negative.as_ref().map(|(_, c, ctx)| (ctx, c.len)) } else { None };
-        let neg_rope = negative.map(|(_, len)| upload_rope(len)).transpose()?;
+        let neg_rope = negative.map(|(_, len)| upload_rope(len, &[])).transpose()?;
 
         // denoise
         let copied0 = m.dit.blocks.copied_bytes;
@@ -903,7 +1024,7 @@ impl Generator {
         let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, neg: bool, eval: usize| -> Result<()> {
             if neg {
                 let (c, len) = negative.unwrap();
-                return m.dit.step(x, lh, lw, c, len, neg_rope.as_ref().unwrap(), sigma, sigma, st, Some(out), None);
+                return m.dit.step(x, lh, lw, c, len, None, neg_rope.as_ref().unwrap(), sigma, sigma, st, Some(out), None);
             }
             // another application took VRAM mid-run: demote blocks before the driver starts
             // paging to shared system memory (which would be far slower than streaming)
@@ -911,7 +1032,7 @@ impl Generator {
                 eprintln!("VRAM pressure: free {} MB < {} MB", cuda::device_free()? / MB, reserve / 2 / MB);
                 // NVML clamps free at 0 when oversubscribed, hiding the real shortfall: ask for an
                 // extra reserve each time so blocks keep moving out until pressure clears
-                let step_need = dit::step_activation_bytes(LT_MAX + (lh / 2) * (lw / 2));
+                let step_need = dit::step_activation_bytes(LT_MAX + extra + (lh / 2) * (lw / 2));
                 rebalance(st, &mut m.dit.blocks, &m.st, reserve, slots, step_need + reserve, true)?;
             }
             let mut probe_store: Vec<(String, Vec<u8>)> = Vec::new();
@@ -925,7 +1046,7 @@ impl Generator {
                 };
                 let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> =
                     if dump.is_some() { Some(&mut probe) } else { None };
-                m.dit.step(x, lh, lw, ctx, lt, &rope_d, sigma, sigma, st, Some(out), probe_ref)?;
+                m.dit.step(x, lh, lw, ctx, lt, references.as_ref(), &rope_d, sigma, sigma, st, Some(out), probe_ref)?;
             }
             if let Some(d) = dump.as_deref_mut() {
                 for (name, v) in probe_store {

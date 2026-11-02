@@ -18,3 +18,4 @@ pub mod st;
 pub mod te;
 pub mod tokenizer;
 pub mod vae;
+pub mod vision;

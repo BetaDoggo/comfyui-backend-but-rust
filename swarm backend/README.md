@@ -2,14 +2,14 @@
 
 A ComfyUI-API-compatible server that SwarmUI can use as a normal **"ComfyUI API By URL"** backend,
 fronting a native Rust generation engine. It ships with two engines: **krea2**, which really generates Krea 2
-Turbo text-to-image with the Rust + CUDA pipeline in the parent repository, and the **mock engine**, which
-returns placeholder images/video/audio of the correct shapes for every other model family.
+Turbo and Anima text-to-image with the Rust + CUDA pipelines in the parent repository, and the **mock engine**,
+which returns placeholder images/video/audio of the correct shapes for every other model family.
 
 ```
 crates/
   engine-api/     the contract: Engine trait + typed request structs (no web deps)
   comfy-server/   HTTP + websocket server that speaks ComfyUI's protocol, validates and runs graphs
-  krea2-engine/   the real engine: Krea 2 W8A8 turbo text-to-image (optional, `--features krea2`)
+  krea2-engine/   the real engine: Krea 2 and Anima int8 text-to-image (optional, `--features krea2`)
 docs/
   INPUT_MAPPING.md   what SwarmUI sends for Krea 2 / Anima / MiniMax H3 / MOSS Image / Qwen Image 2.1, and what the engine receives
   COMPATIBILITY.md   every Swarm parameter probed live, and the node classes served through the generic custom_node route
@@ -58,6 +58,13 @@ Everything else is refused with an error in SwarmUI rather than silently ignored
 prompts, samplers other than `euler` / `simple`, `<weight>` and other per-step or per-chunk prompt syntax, LoRAs,
 Prompt Images, init images and refiners (no VAE encoder), ControlNet, regions, VAE tiling, Seamless Tileable, and
 non-W8A8 Krea 2 files.
+
+**Anima** runs from the same `--engine krea2` server. The checkpoint's keys pick the family, and one family is
+loaded at a time, so switching took 4 s to Anima and 9 s to Krea 2 with the files cached. Select an int8 ConvRot Anima checkpoint with
+Steps 8 and CFG Scale 1 for turbo models. These work: `er_sde` and `euler` with `simple`, any CFG with a negative
+prompt, `(word:1.2)` and `<weight>`, seed, Variation Seed, Batch Size, Sigma Shift, Model Attention Backend, cancelling and
+Free VRAM. Other samplers and schedulers, LoRAs, LLLite ControlNets, `<break>`, `<alternate>`, `<fromto>`, init images and
+VAE tiling are refused with an error.
 
 **Alongside ComfyUI.** Add this server next to SwarmUI's normal ComfyUI backend. In a live test with both running,
 SwarmUI sent every Krea 2 job here and Anima to ComfyUI, keeping each model on the backend that had it loaded.

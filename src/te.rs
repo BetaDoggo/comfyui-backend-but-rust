@@ -131,10 +131,11 @@ impl TextEncoder {
             // attention
             k!(krea_rotate_rows_f32(PRO_RMS, xp, D as i64, 0, w("ln1"), EPS, xr.ptr(), m, D as i32, s(st)))?;
             lin(xr.ptr(), "wqkv", "sqkv", QKV, D, qkv.ptr(), 0.0)?;
-            k!(krea_qk_norm_rope(DT_F32, qkv.ptr(), QKV as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32, w("qn"),
+            k!(krea_qk_norm_rope(DT_F32, HD as i32, qkv.ptr(), QKV as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32, w("qn"),
                 w("kn"), EPS, rope_d.ptr(), 2, m, s(st)))?;
-            k!(krea_attn_small_f32(qkv.ptr(), QKV as i64, 0, (HQ * HD) as i32, ((HQ + HK) * HD) as i32, HQ as i32,
-                HK as i32, m, attn.ptr(), (HQ * HD) as i64, 1.0 / (HD as f32).sqrt(), 1, s(st)))?;
+            k!(krea_attn_small(DT_F32, qkv.ptr(), QKV as i64, off(qkv.ptr(), HQ * HD * 4),
+                off(qkv.ptr(), (HQ + HK) * HD * 4), QKV as i64, HQ as i32, HK as i32, HD as i32, m, m, attn.ptr(),
+                (HQ * HD) as i64, 1.0 / (HD as f32).sqrt(), 1, s(st)))?;
             k!(krea_rotate_rows_f32(PRO_PLAIN, attn.ptr(), (HQ * HD) as i64, 0, null(), 0.0, xr.ptr(), m,
                 (HQ * HD) as i32, s(st)))?;
             lin(xr.ptr(), "wo", "so", D, HQ * HD, xp, 1.0)?;

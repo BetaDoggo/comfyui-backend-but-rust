@@ -77,6 +77,72 @@ struct Args {
     /// Write intermediate tensors (safetensors) for parity checks
     #[arg(long)]
     dump: Option<PathBuf>,
+    /// Run Anima instead of Krea 2 (--dit and --te then default to the Anima files, --shift to 3)
+    #[arg(long)]
+    anima: bool,
+    /// Anima: negative prompt (used when --cfg isn't 1)
+    #[arg(long, default_value = "")]
+    negative: String,
+    /// Anima: CFG scale
+    #[arg(long, default_value_t = 1.0)]
+    cfg: f64,
+    /// Anima: sampler (er_sde | euler)
+    #[arg(long, default_value = "er_sde")]
+    sampler: String,
+}
+
+const ANIMA_DIT: &str = r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\animaInt8Mxfp8_turboV11Int8.safetensors";
+const ANIMA_TE: &str = r"G:\stable-diffusion-webui-forge\models\clip\qwen_3_600m.safetensors";
+
+fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
+    let sampler = match args.sampler.as_str() {
+        "er_sde" => pipeline::AnimaSampler::ErSde,
+        "euler" => pipeline::AnimaSampler::Euler,
+        s => bail!("unknown --sampler {s} (er_sde | euler)"),
+    };
+    let default_dit = PathBuf::from(r"G:\stable-diffusion-webui-forge\models\Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors");
+    let dit = if args.dit == default_dit { PathBuf::from(ANIMA_DIT) } else { args.dit.clone() };
+    let te = if args.te.ends_with("qwen3vl_4b.safetensors") { PathBuf::from(ANIMA_TE) } else { args.te.clone() };
+    let shift = if args.shift == 1.15 { 3.0 } else { args.shift };
+    let mut gen = pipeline::Generator::new(&load)?;
+    gen.ensure_vae(&args.vae)?;
+    gen.ensure_anima(&dit)?;
+    gen.ensure_qwen3(&te)?;
+    let n = 16 * (args.height / 8) * (args.width / 8);
+    for i in 0..args.count {
+        let seed = args.seed + i as u64;
+        let noise = match &args.ref_noise {
+            Some(p) => st::SafeTensors::open(p)?.f32_vec("noise", false)?,
+            None => krea2::sampling::torch_randn(seed, n),
+        };
+        let r = pipeline::AnimaRequest {
+            positive: krea2::tokenizer::token_weights(&args.prompt, 1.0),
+            negative: krea2::tokenizer::token_weights(&args.negative, 1.0),
+            cfg: args.cfg,
+            sampler,
+            seed,
+            batch_index: 0,
+            batch_size: 1,
+            width: args.width,
+            height: args.height,
+            steps: args.steps,
+            shift,
+            noise,
+        };
+        let mut dump = pipeline::Dump::new();
+        let t0 = Instant::now();
+        let (latent, _) = gen.sample_anima(&r, |_, _| true, args.dump.as_ref().map(|_| &mut dump))?;
+        let rgb = gen.decode_latent(&latent, args.width, args.height)?;
+        eprintln!("image done in {:.2}s", t0.elapsed().as_secs_f64());
+        let path = out_path(&args.out, i, args.count);
+        std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("[{i}] saved {} (seed {seed})", path.display());
+        if let Some(d) = &args.dump {
+            write_safetensors(d, &dump)?;
+        }
+    }
+    Ok(())
 }
 
 /// Minimal safetensors writer for debug dumps.
@@ -136,6 +202,9 @@ fn main() -> Result<()> {
         attn_variant: args.attn_variant,
         int8_attn,
     };
+    if args.anima {
+        return run_anima(&args, load);
+    }
     if let Some(addr) = &args.serve {
         return serve::run(load, serve::ServeOptions {
             addr: addr.clone(),

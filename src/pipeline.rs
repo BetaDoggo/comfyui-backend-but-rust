@@ -1,7 +1,7 @@
 //! Loaded models + one text-to-image generation, shared by the CLI and the web server.
 
 use crate::cuda::{self, DevBuf, Event, Stream};
-use crate::{dit, ffi, offload, sampling, st, te, vae};
+use crate::{anima, dit, ffi, offload, qwen3, sampling, st, te, tokenizer, vae};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -67,10 +67,48 @@ struct DitModel {
     st: st::SafeTensors,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimaSampler {
+    Euler,
+    ErSde,
+}
+
+pub struct AnimaRequest {
+    /// (text, weight) segments, see [`tokenizer::token_weights`]
+    pub positive: Vec<(String, f32)>,
+    /// Only encoded when `cfg` isn't 1.
+    pub negative: Vec<(String, f32)>,
+    pub cfg: f64,
+    pub sampler: AnimaSampler,
+    /// Seed of the sampler's own noise (ComfyUI's `noise_seed`).
+    pub seed: u64,
+    /// This image's place in its batch: the sampler noise is one tensor for the whole batch.
+    pub batch_index: usize,
+    pub batch_size: usize,
+    pub width: usize,
+    pub height: usize,
+    pub steps: usize,
+    pub shift: f64,
+    pub noise: Vec<f32>,
+}
+
+struct AnimaModel {
+    path: PathBuf,
+    dit: anima::Dit,
+    st: st::SafeTensors,
+}
+
+type AnimaPrompt = Vec<(String, f32)>;
+
 pub struct Generator {
     st: Stream,
     te: Option<(PathBuf, te::TextEncoder)>,
     dit: Option<DitModel>,
+    anima: Option<AnimaModel>,
+    qwen3: Option<(PathBuf, qwen3::TextEncoder)>,
+    tokenizers: Option<(tokenizer::Tokenizer, tokenizer::T5Tokenizer)>,
+    /// Latest encoded prompts, most recent last.
+    contexts: Vec<(AnimaPrompt, anima::Context)>,
     vae: Option<(PathBuf, vae::Vae)>,
     cached: Option<(String, te::Cond, DevBuf)>,
     pub max_pixels: usize,
@@ -89,12 +127,11 @@ pub struct Generator {
 /// Re-plan which DiT blocks live in VRAM from the memory free right now (other applications
 /// included), keeping `need` bytes for activations plus `reserve`. Blocks are promoted from or
 /// demoted to pinned RAM; nothing is reloaded from disk. The stream is synchronized first.
-fn rebalance(st: &Stream, dit: &mut dit::Dit, dst: &st::SafeTensors, reserve: usize, slots: usize, need: usize,
+fn rebalance(st: &Stream, blocks: &mut offload::WeightSet, dst: &st::SafeTensors, reserve: usize, slots: usize, need: usize,
     demote_only: bool) -> Result<()> {
     st.sync()?;
     cuda::trim_pool()?;
     let free = cuda::device_free()?;
-    let blocks = &dit.blocks;
     let owned = blocks.vram_bytes();
     let avail = (free + owned).saturating_sub(need + reserve);
     let mut p = offload::plan(&blocks.layouts, avail, slots);
@@ -116,17 +153,23 @@ fn rebalance(st: &Stream, dit: &mut dit::Dit, dst: &st::SafeTensors, reserve: us
     }
     let want_slots = if p.resident < n { p.slots } else { 0 };
     if p.resident != blocks.resident() || want_slots != blocks.slot_count() {
-        dit.blocks.set_resident(p.resident, p.slots, dst)?;
+        blocks.set_resident(p.resident, p.slots, dst)?;
     }
     Ok(())
 }
 
 const LT_MAX: usize = 512; // text tokens budgeted for activation planning
+const ANIMA_CONTEXTS: usize = 4; // encoded prompts kept in VRAM
 
 /// Peak activation memory of one request (denoising step or VAE decode, whichever is larger).
 fn activation_need(width: usize, height: usize) -> usize {
     let (lh, lw) = (height / 8, width / 8);
     dit::step_activation_bytes(LT_MAX + (lh / 2) * (lw / 2)).max(vae::Vae::activation_bytes(lh, lw))
+}
+
+fn anima_need(width: usize, height: usize) -> usize {
+    let (lh, lw) = (height / 8, width / 8);
+    anima::step_activation_bytes((lh / 2) * (lw / 2)).max(vae::Vae::activation_bytes(lh, lw))
 }
 
 impl Generator {
@@ -137,7 +180,8 @@ impl Generator {
         let st0 = Stream::new()?;
         let (_, total) = cuda::mem_info()?;
         eprintln!("GPU memory: {} MB free (device-wide) / {} MB total", cuda::device_free()? / MB, total / MB);
-        Ok(Generator { st: st0, te: None, dit: None, vae: None, cached: None, max_pixels: o.max_pixels,
+        Ok(Generator { st: st0, te: None, dit: None, anima: None, qwen3: None, tokenizers: None, contexts: Vec::new(), vae: None,
+            cached: None, max_pixels: o.max_pixels,
             max_width: o.max_width, max_height: o.max_height, reserve: o.reserve_vram_mb * MB,
             resident_blocks: o.resident_blocks, slots: o.slots, threads: o.threads, attn_variant: o.attn_variant,
             int8_attn: o.int8_attn, dynamic: o.resident_blocks.is_none() })
@@ -183,6 +227,7 @@ impl Generator {
         if self.dit.as_ref().is_some_and(|m| m.path == path) {
             return Ok(());
         }
+        self.drop_anima()?;
         self.dit = None;
         self.cached = None;
         let t0 = Instant::now();
@@ -205,10 +250,242 @@ impl Generator {
         Ok(())
     }
 
+    fn drop_krea(&mut self) -> Result<()> {
+        self.st.sync()?;
+        self.cached = None;
+        self.dit = None;
+        self.te = None;
+        cuda::trim_pool()
+    }
+
+    fn drop_anima(&mut self) -> Result<()> {
+        self.st.sync()?;
+        self.contexts.clear();
+        self.anima = None;
+        self.qwen3 = None;
+        cuda::trim_pool()
+    }
+
+    /// Load an Anima checkpoint unless `path` is loaded. One model family is loaded at a time.
+    pub fn ensure_anima(&mut self, path: &Path) -> Result<()> {
+        if self.anima.as_ref().is_some_and(|m| m.path == path) {
+            return Ok(());
+        }
+        self.drop_krea()?;
+        self.contexts.clear();
+        self.anima = None;
+        let t0 = Instant::now();
+        let dst = st::SafeTensors::open(path)?;
+        let globals = anima::globals_layout(&dst)?.size;
+        let free = cuda::device_free()?;
+        let budget = free.saturating_sub(self.reserve + globals + anima_need(self.max_width, self.max_height));
+        let mut dit = anima::Dit::load(&dst, budget, self.slots, self.threads, &self.st)?;
+        dit.attn_variant = self.attn_variant;
+        dit.int8_attn = self.int8_attn;
+        eprintln!("Anima ready in {:.1}s", t0.elapsed().as_secs_f64());
+        self.anima = Some(AnimaModel { path: path.to_path_buf(), dit, st: dst });
+        Ok(())
+    }
+
+    /// Load Anima's Qwen3 text encoder unless `path` is loaded; in VRAM if it fits, else streamed.
+    pub fn ensure_qwen3(&mut self, path: &Path) -> Result<()> {
+        if self.qwen3.as_ref().is_some_and(|(p, _)| p == path) {
+            return Ok(());
+        }
+        self.drop_krea()?;
+        self.contexts.clear();
+        self.qwen3 = None;
+        let t0 = Instant::now();
+        if self.tokenizers.is_none() {
+            self.tokenizers = Some((tokenizer::Tokenizer::new()?, tokenizer::T5Tokenizer::new()?));
+        }
+        let size = qwen3::weight_bytes(&st::SafeTensors::open(path)?)?;
+        let keep = self.reserve + anima_need(self.max_width, self.max_height);
+        let budget = if cuda::device_free()? >= size + keep { size } else { 0 };
+        self.qwen3 = Some((path.to_path_buf(), qwen3::TextEncoder::load(path, budget, self.threads, &self.st)?));
+        eprintln!("text encoder ready in {:.1}s", t0.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    /// Move `prompt`'s context to the end of the cache, encoding it if needed.
+    fn anima_context(&mut self, prompt: &[(String, f32)], dump: Option<&mut Dump>) -> Result<()> {
+        if let Some(i) = self.contexts.iter().position(|(p, _)| p == prompt) {
+            let hit = self.contexts.remove(i);
+            self.contexts.push(hit);
+            return Ok(());
+        }
+        let st = &self.st;
+        let m = self.anima.as_mut().context("no diffusion model loaded")?;
+        let te = &mut self.qwen3.as_mut().context("no text encoder loaded")?.1;
+        let (tq, tt) = self.tokenizers.as_ref().context("no text encoder loaded")?;
+        let t0 = Instant::now();
+        let (qids, tids, weights) = tokenizer::anima_tokens(tq, tt, prompt)?;
+        let hidden = te.encode(&qids, st)?;
+        let ctx = m.dit.encode_context(&m.st, &hidden, qids.len(), &tids, &weights, st)?;
+        st.sync()?;
+        eprintln!("text: {} Qwen3 / {} T5 tokens in {:.0} ms", qids.len(), tids.len(), t0.elapsed().as_secs_f64() * 1e3);
+        if let Some(d) = dump {
+            let ids = |v: &[u32]| v.iter().flat_map(|&t| (t as i64).to_le_bytes()).collect::<Vec<u8>>();
+            d.insert("qwen_ids".into(), ("I64".into(), vec![qids.len()], ids(&qids)));
+            d.insert("t5_ids".into(), ("I64".into(), vec![tids.len()], ids(&tids)));
+            let mut b = vec![0u8; hidden.size()];
+            hidden.download(0, &mut b, st)?;
+            d.insert("cond".into(), ("F32".into(), vec![qids.len(), qwen3::D], b));
+            let mut b = vec![0u8; ctx.ctx.size()];
+            ctx.ctx.download(0, &mut b, st)?;
+            d.insert("dit_in_ctx".into(), ("BF16".into(), vec![ctx.len, anima::CTX], b));
+        }
+        self.contexts.push((prompt.to_vec(), ctx));
+        if self.contexts.len() > ANIMA_CONTEXTS {
+            self.contexts.remove(0);
+        }
+        Ok(())
+    }
+
+    /// One Anima image: the same sampling as ComfyUI's KSampler with the `simple` scheduler.
+    pub fn sample_anima(&mut self, r: &AnimaRequest, mut progress: impl FnMut(usize, usize) -> bool, mut dump: Option<&mut Dump>)
+        -> Result<(Vec<f32>, Stats)> {
+        if r.width % 16 != 0 || r.height % 16 != 0 || r.width == 0 || r.height == 0 {
+            bail!("width and height must be positive multiples of 16");
+        }
+        if r.width * r.height > self.max_pixels {
+            bail!("{}x{} exceeds the {} pixel limit", r.width, r.height, self.max_pixels);
+        }
+        let (lh, lw) = (r.height / 8, r.width / 8);
+        let n = dit::CH * lh * lw;
+        if r.noise.len() != n {
+            bail!("noise has {} values, expected {n}", r.noise.len());
+        }
+        if self.dynamic {
+            let m = self.anima.as_mut().context("no diffusion model loaded")?;
+            rebalance(&self.st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, anima_need(r.width, r.height), false)?;
+        }
+        let mut stats = Stats::default();
+        let t0 = Instant::now();
+        let guided = (r.cfg - 1.0).abs() > 1e-6;
+        if guided {
+            self.anima_context(&r.negative, None)?;
+        }
+        self.anima_context(&r.positive, dump.as_deref_mut())?;
+        stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let st = &self.st;
+        let m = self.anima.as_mut().unwrap();
+        let find = |p: &[(String, f32)]| self.contexts.iter().find(|(k, _)| k == p).map(|(_, c)| c).unwrap();
+        let pos = find(&r.positive);
+        let neg = guided.then(|| find(&r.negative));
+        let x = DevBuf::alloc_async(n * 4, st)?;
+        x.upload(0, &st::f32_bytes(&r.noise), st)?;
+        let den = DevBuf::alloc_async(n * 4, st)?;
+        let und = DevBuf::alloc_async(n * 4, st)?;
+        let (old, d, old_d, u) = (DevBuf::alloc_async(n * 4, st)?, DevBuf::alloc_async(n * 4, st)?, DevBuf::alloc_async(n * 4, st)?,
+            DevBuf::alloc_async(n * 4, st)?);
+        let rope = m.dit.rope(lh / 2, lw / 2, st)?;
+
+        let mut sigmas = sampling::flow_sigmas(r.shift, r.steps);
+        if r.sampler == AnimaSampler::ErSde && sigmas[0] >= 1.0 {
+            sigmas[0] = sampling::flow_percent_to_sigma(r.shift, 1e-4);
+        }
+        let er = sampling::er_sde_steps(&sigmas);
+        let (e0, e1) = (Event::timing()?, Event::timing()?);
+        let copied0 = m.dit.blocks.copied_bytes;
+        let threads = unsafe { ffi::krea_randn_threads() };
+        if threads <= 0 {
+            bail!("could not read the GPU's core count");
+        }
+        let mut randn = sampling::CudaRandn::new(r.seed, n * r.batch_size, threads as usize);
+        let lin = |out: &DevBuf, terms: &[(&DevBuf, f32)]| -> Result<()> {
+            let (p, c): (Vec<ffi::P>, Vec<f32>) = terms.iter().map(|(b, w)| (b.ptr() as ffi::P, *w)).unzip();
+            ffi::k!(krea_lincomb(out.ptr(), n as i64, p.len() as i32, p.as_ptr(), c.as_ptr(), ffi::s(st)))
+        };
+        for i in 0..r.steps {
+            e0.record(st)?;
+            let sigma = sigmas[i];
+            let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
+            {
+                let mut probe = |name: &str, b: &DevBuf, bytes: usize| {
+                    if i == 0 && matches!(name, "x_embedder_out" | "block0" | "block27" | "final_tokens" | "block0_self_attn_raw") {
+                        let mut v = vec![0u8; bytes];
+                        b.download(0, &mut v, st).unwrap();
+                        probes.push((name.to_string(), v));
+                    }
+                };
+                let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if dump.is_some() { Some(&mut probe) } else { None };
+                m.dit.predict(&x, lh, lw, pos, &rope, sigma, &den, st, probe_ref)?;
+            }
+            if let Some(neg) = neg {
+                m.dit.predict(&x, lh, lw, neg, &rope, sigma, &und, st, None)?;
+                lin(&den, &[(&und, 1.0 - r.cfg as f32), (&den, r.cfg as f32)])?;
+            }
+            match r.sampler {
+                AnimaSampler::Euler => {
+                    let t = (sigmas[i + 1] - sigma) / sigma;
+                    lin(&x, &[(&x, 1.0 + t), (&den, -t)])?;
+                }
+                AnimaSampler::ErSde => match &er[i] {
+                    None => cuda::memcpy_d2d(x.ptr(), den.ptr(), n * 4, st)?,
+                    Some(c) => {
+                        lin(&x, &[(&x, c.keep), (&den, c.denoised)])?;
+                        if i >= 1 {
+                            lin(&d, &[(&den, 1.0 / c.d_div), (&old, -1.0 / c.d_div)])?;
+                            lin(&x, &[(&x, 1.0), (&d, c.d_weight)])?;
+                            if i >= 2 {
+                                lin(&u, &[(&d, 1.0 / c.u_div), (&old_d, -1.0 / c.u_div)])?;
+                                lin(&x, &[(&x, 1.0), (&u, c.u_weight)])?;
+                            }
+                            cuda::memcpy_d2d(old_d.ptr(), d.ptr(), n * 4, st)?;
+                        }
+                        let noise = randn.next(r.batch_index * n, n);
+                        let z = DevBuf::alloc_async(n * 4, st)?;
+                        z.upload(0, &st::f32_bytes(&noise), st)?;
+                        lin(&x, &[(&x, 1.0), (&z, c.noise)])?;
+                    }
+                },
+            }
+            cuda::memcpy_d2d(old.ptr(), den.ptr(), n * 4, st)?;
+            if let Some(dm) = dump.as_deref_mut() {
+                let mut v = vec![0u8; n * 4];
+                x.download(0, &mut v, st)?;
+                dm.insert(format!("x_after_{i}"), ("F32".into(), vec![n], v));
+            }
+            e1.record(st)?;
+            e1.sync()?;
+            let ms = e1.elapsed_ms(&e0)? as f64;
+            stats.sample_ms += ms;
+            eprintln!("step {}/{} sigma {:.4}: {:.0} ms", i + 1, r.steps, sigma, ms);
+            if let Some(dm) = dump.as_deref_mut() {
+                for (name, v) in probes {
+                    dm.insert(name, ("BF16".into(), vec![v.len() / 2], v));
+                }
+            }
+            if self.dynamic && i + 1 < r.steps && cuda::device_free()? < self.reserve / 2 {
+                eprintln!("VRAM pressure: free {} MB < {} MB", cuda::device_free()? / MB, self.reserve / 2 / MB);
+                let need = anima::step_activation_bytes((lh / 2) * (lw / 2)) + self.reserve;
+                rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, need, true)?;
+            }
+            if !progress(i + 1, r.steps) {
+                st.sync()?;
+                return Err(Cancelled.into());
+            }
+        }
+        stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
+        eprintln!("sampling {:.2}s ({:.0} ms/step avg, {:.2} GB streamed over PCIe)", stats.sample_ms / 1e3,
+            stats.sample_ms / r.steps as f64, stats.streamed_gb);
+        let mut b = vec![0u8; n * 4];
+        x.download(0, &mut b, st)?;
+        if let Some(dm) = dump {
+            dm.insert("samples".into(), ("F32".into(), vec![dit::CH, lh, lw], b.clone()));
+        }
+        Ok((b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(), stats))
+    }
+
     /// Choose the DiT attention: INT8 (fastest) or bf16 FlashAttention. Takes effect on the next step.
     pub fn set_int8_attention(&mut self, on: bool) {
         self.int8_attn = on;
         if let Some(m) = &mut self.dit {
+            m.dit.int8_attn = on;
+        }
+        if let Some(m) = &mut self.anima {
             m.dit.int8_attn = on;
         }
     }
@@ -217,8 +494,11 @@ impl Generator {
     pub fn unload(&mut self) -> Result<()> {
         self.st.sync()?;
         self.cached = None;
+        self.contexts.clear();
         self.dit = None;
         self.te = None;
+        self.anima = None;
+        self.qwen3 = None;
         self.vae = None;
         cuda::trim_pool()
     }
@@ -282,7 +562,7 @@ impl Generator {
         let te = &mut self.te.as_mut().context("no text encoder loaded")?.1;
         let need = activation_need(r.width, r.height);
         if self.dynamic {
-            rebalance(&self.st, &mut m.dit, &m.st, self.reserve, self.slots, need, false)?;
+            rebalance(&self.st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, need, false)?;
         }
         let st = &self.st;
         let mut stats = Stats::default();
@@ -365,7 +645,7 @@ impl Generator {
                 // NVML clamps free at 0 when oversubscribed, hiding the real shortfall: ask for an
                 // extra reserve each time so blocks keep moving out until pressure clears
                 let step_need = dit::step_activation_bytes(LT_MAX + (lh / 2) * (lw / 2));
-                rebalance(st, &mut m.dit, &m.st, self.reserve, self.slots, step_need + self.reserve, true)?;
+                rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, step_need + self.reserve, true)?;
             }
             if !progress(i + 1, r.steps) {
                 st.sync()?;
@@ -389,7 +669,12 @@ impl Generator {
         // the decoder's activations may need memory freed since the request started
         if let Some(m) = self.dit.as_mut().filter(|_| self.dynamic) {
             if cuda::device_free()? < vae::Vae::activation_bytes(lh, lw) + self.reserve {
-                rebalance(st, &mut m.dit, &m.st, self.reserve, self.slots, vae::Vae::activation_bytes(lh, lw), true)?;
+                rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, vae::Vae::activation_bytes(lh, lw), true)?;
+            }
+        }
+        if let Some(m) = self.anima.as_mut().filter(|_| self.dynamic) {
+            if cuda::device_free()? < vae::Vae::activation_bytes(lh, lw) + self.reserve {
+                rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, vae::Vae::activation_bytes(lh, lw), true)?;
             }
         }
         self.vae.as_ref().context("no VAE loaded")?.1.decode(latent, lh, lw, st)

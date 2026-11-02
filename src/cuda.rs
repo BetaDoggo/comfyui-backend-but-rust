@@ -237,9 +237,15 @@ impl DevBuf {
     pub fn size(&self) -> usize {
         self.size
     }
+    /// `src` may be freed on return. CUDA buffers small copies itself, but a larger copy from
+    /// pageable memory can still be pending behind earlier work, so that case waits for it.
     pub fn upload(&self, off: usize, src: &[u8], s: &Stream) -> Result<()> {
         assert!(off + src.len() <= self.size);
-        ck!(cudaMemcpyAsync(self.at(off), src.as_ptr() as *const c_void, src.len(), H2D, s.0))
+        ck!(cudaMemcpyAsync(self.at(off), src.as_ptr() as *const c_void, src.len(), H2D, s.0))?;
+        if src.len() > 64 << 10 {
+            s.sync()?;
+        }
+        Ok(())
     }
     pub fn download(&self, off: usize, dst: &mut [u8], s: &Stream) -> Result<()> {
         assert!(off + dst.len() <= self.size);

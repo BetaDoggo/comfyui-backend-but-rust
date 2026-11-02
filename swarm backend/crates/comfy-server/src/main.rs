@@ -10,6 +10,7 @@ fn make_engine(cfg: &Config) -> anyhow::Result<Arc<dyn Engine>> {
         "mock" => Ok(Arc::new(if cfg.mock_native_only { MockEngine::native_only(cfg.mock_step_ms) } else { MockEngine::new(cfg.mock_step_ms) })),
         #[cfg(feature = "krea2")]
         "krea2" => {
+            // Serves Krea 2 and Anima; the checkpoint picks which.
             let options = krea2_engine::Krea2Options { reserve_vram_mb: cfg.krea2_reserve_vram, max_side: cfg.krea2_max_side, ..Default::default() };
             Ok(Arc::new(krea2_engine::Krea2Engine::new(&options)?))
         }

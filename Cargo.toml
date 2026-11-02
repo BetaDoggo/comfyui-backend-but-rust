@@ -21,6 +21,7 @@ half = "2"
 png = "0.17"
 memmap2 = "0.9"
 tiny_http = "0.12"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 
 [build-dependencies]
 cc = "1"

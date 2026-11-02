@@ -127,3 +127,117 @@ impl Tokenizer {
         parts
     }
 }
+
+const T5_JSON: &[u8] = include_bytes!("../assets/t5_tokenizer/tokenizer.json");
+const QWEN_PAD: u32 = 151643;
+const T5_END: u32 = 1;
+
+/// T5 tokenizer (ids only: Anima's adapter embeds them itself).
+pub struct T5Tokenizer(tokenizers::Tokenizer);
+
+impl T5Tokenizer {
+    pub fn new() -> Result<Self> {
+        Ok(T5Tokenizer(tokenizers::Tokenizer::from_bytes(T5_JSON).map_err(|e| anyhow!("T5 tokenizer: {e}"))?))
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        Ok(self.0.encode(text, false).map_err(|e| anyhow!("T5 tokenizer: {e}"))?.get_ids().to_vec())
+    }
+}
+
+/// `sd1_clip.parse_parentheses`.
+fn parse_parentheses(text: &str) -> Vec<String> {
+    let (mut out, mut cur, mut nesting) = (Vec::new(), String::new(), 0i32);
+    for c in text.chars() {
+        match c {
+            '(' => {
+                if nesting == 0 {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                    cur.push('(');
+                } else {
+                    cur.push(c);
+                }
+                nesting += 1;
+            }
+            ')' => {
+                nesting -= 1;
+                if nesting == 0 {
+                    cur.push(')');
+                    out.push(std::mem::take(&mut cur));
+                } else {
+                    cur.push(c);
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn weights_inner(text: &str, weight: f64, out: &mut Vec<(String, f32)>) {
+    for x in parse_parentheses(text) {
+        if x.len() >= 2 && x.starts_with('(') && x.ends_with(')') {
+            let inner = &x[1..x.len() - 1];
+            let mut w = weight * 1.1;
+            let mut body = inner;
+            if let Some(i) = inner.rfind(':').filter(|i| *i > 0) {
+                if let Ok(v) = inner[i + 1..].trim().parse::<f64>() {
+                    w = v;
+                    body = &inner[..i];
+                }
+            }
+            weights_inner(body, w, out);
+        } else {
+            out.push((x, weight as f32));
+        }
+    }
+}
+
+/// ComfyUI's emphasis syntax: `(text:1.2)` and `(text)`, `\(` and `\)` being literal.
+pub fn token_weights(text: &str, weight: f32) -> Vec<(String, f32)> {
+    let escaped = text.replace("\\)", "\0\u{1}").replace("\\(", "\0\u{2}");
+    let mut out = Vec::new();
+    weights_inner(&escaped, weight as f64, &mut out);
+    for (t, _) in &mut out {
+        *t = t.replace("\0\u{1}", ")").replace("\0\u{2}", "(");
+    }
+    out
+}
+
+/// `AnimaTokenizer`: Qwen3 ids (weights dropped) and T5 ids with weights, for weighted segments.
+pub fn anima_tokens(qwen: &Tokenizer, t5: &T5Tokenizer, segments: &[(String, f32)]) -> Result<(Vec<u32>, Vec<u32>, Vec<f32>)> {
+    let (mut q, mut t, mut w) = (Vec::new(), Vec::new(), Vec::new());
+    for (text, weight) in segments.iter().filter(|(text, _)| !text.is_empty()) {
+        q.extend(qwen.encode(text)?);
+        for id in t5.encode(text)? {
+            t.push(id);
+            w.push(*weight);
+        }
+    }
+    if q.is_empty() {
+        q.push(QWEN_PAD);
+    }
+    t.push(T5_END);
+    w.push(1.0);
+    Ok((q, t, w))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emphasis_matches_comfy() {
+        let w = token_weights("a (b:1.2) c \\(d\\) (e)", 1.0);
+        assert_eq!(w[0], ("a ".to_string(), 1.0));
+        assert_eq!(w[1], ("b".to_string(), 1.2));
+        assert_eq!(w[2], (" c (d) ".to_string(), 1.0));
+        assert_eq!(w[3].0, "e");
+        assert!((w[3].1 - 1.1).abs() < 1e-6);
+    }
+}

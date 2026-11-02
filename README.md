@@ -1,4 +1,53 @@
-# krea2 — ComfyUI's Krea 2 (int8 W8A8) pipeline in Rust + CUDA
+# Native ComfyUI replacement for SwarmUI
+
+A Rust and CUDA backend that speaks ComfyUI's API and replaces the ComfyUI features SwarmUI uses most, so
+SwarmUI can generate without Python or ComfyUI. The goal is speed first: Krea 2 Turbo takes about 4.65 s per
+1024x1024 image here, against about 9 s in ComfyUI on the same machine, and Anima Turbo samples 8 steps in
+0.92 s against 1.59 s.
+
+**Status:** two model families really generate, text-to-image only: Krea 2 Turbo and Anima. The server accepts far more of
+SwarmUI's features than that, but they only reach a mock engine so far. The
+[project board](https://claude.ai/artifact/ARcm3yAXPwmZ5ZUHHhdNX9) lists everything that works and everything
+still to do, in priority order. Run it today beside a normal ComfyUI backend.
+
+* `swarm backend/` is the server: the ComfyUI protocol, the node graph, and the `Engine` interface. Start it with
+  [`start-krea2.bat`](swarm%20backend/start-krea2.bat) and see [its README](swarm%20backend/README.md).
+* The repository root is the real engine: the Krea 2 and Anima pipelines described below. They also run alone
+  from the command line, and Krea 2 has a small web UI.
+
+## Anima engine
+
+Runs int8 ConvRot Anima checkpoints with the Qwen3 0.6B text encoder and the Qwen-Image VAE. Files are read in
+place, as with Krea 2. `er_sde` (SwarmUI's default) and `euler` work with the `simple` scheduler, at any CFG, with
+negative prompts and `(word:1.2)` emphasis.
+
+```bash
+target/release/krea2.exe --anima -p "no humans, scenery, mountain lake at sunrise" --seed 42 -o lake.png
+```
+
+Measured at 1024x1024 with 8 steps, CFG 1 and `er_sde`, after warm-up:
+
+| | ComfyUI | krea2 (`--attention flash`) | krea2 (default, `int8`) |
+|---|---|---|---|
+| Sampling | 1.59 s (199 ms/step) | 1.31 s (164 ms/step) | 0.92 s (115 ms/step) |
+
+A whole image takes about 1.04 s from the command line and 1.14 s through SwarmUI, decode included.
+
+Where it is faster than ComfyUI:
+
+* Each block's cross-attention k and v depend only on the prompt, so they're computed once per prompt.
+* Block modulation depends only on sigma, so it's cached per sigma across images.
+* `silu(t_emb)` is quantized once for all 84 modulation networks, and the all-zero padding-mask channel is
+  dropped from the patch embedding.
+
+The output is not pixel-identical to ComfyUI. Tokens, Qwen3 hidden states (error 1e-6), the sigma schedule and
+the sampler's noise match, including torch's CUDA Philox layout, which depends on the GPU's core count. The LLM
+adapter output differs by about 1.7%, cause not yet found, so the same seed gives the same picture at
+26 dB PSNR with flash attention and 25 dB with int8.
+
+Test prompts here should be scenery with no people: this model drifts towards explicit images even on neutral prompts.
+
+## Krea 2 engine
 
 A standalone reimplementation of ComfyUI's **Krea-2 Turbo** text-to-image workflow
 (`blueprints/Text to Image (Krea-2 Turbo).json`: 1024², 8 steps, euler / simple, CFG 1, shift 1.15)
@@ -93,12 +142,6 @@ Streaming *all* 28 blocks still costs only ~5% per step, because a block's copy 
 than its compute (~24 ms). The text encoder and text-fusion adapter stream the same way. Planning
 stays conservative on purpose: oversubscribing VRAM makes Windows fall back to shared system memory,
 which doubles step time.
-
-## SwarmUI
-
-`swarm backend/` is a ComfyUI-API-compatible server that SwarmUI can add as a "ComfyUI API By URL" backend, with this
-pipeline as its engine (`src/lib.rs` exposes it as the `krea2` library). See
-[swarm backend/README.md](swarm%20backend/README.md).
 
 ## Layout
 

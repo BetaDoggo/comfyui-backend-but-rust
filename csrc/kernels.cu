@@ -1,4 +1,4 @@
-// Custom kernels for the krea2 pipeline (DiT, Qwen3-VL text encoder, Wan VAE decoder).
+// Custom kernels for the Krea 2 and Anima pipelines (DiTs, Qwen text encoders, Wan VAE decoder).
 //
 // Where ComfyUI materializes an intermediate tensor in the activation dtype (bf16 for the DiT),
 // the kernels round to that dtype at the same point (rnd<T>) so results track ComfyUI closely.
@@ -8,7 +8,7 @@
 // Row prologue -> optional ConvRot rotation -> per-row int8 quantization.
 // Produces the A operand (+ per-row scales) of the fused int8 GEMM.
 // ---------------------------------------------------------------------------------------------
-enum { PRO_PLAIN = 0, PRO_RMS = 1, PRO_GATE = 2, PRO_SWIGLU = 3 };
+enum { PRO_PLAIN = 0, PRO_RMS = 1, PRO_GATE = 2, PRO_SWIGLU = 3, PRO_LAYERNORM = 4, PRO_SILU = 5, PRO_GELU = 6 };
 
 struct QuantParams {
     const void* x;       // PLAIN/RMS: input row; GATE: attention output; SWIGLU: [gate | up] row
@@ -18,7 +18,7 @@ struct QuantParams {
     int64_t up_offset;   // SWIGLU: column of `up` inside the x row
     const float* norm_w; // RMS weight (zero-centered offset already applied); null = 1
     float eps;
-    const void* mod_scale;  // RMS modulation (T): v = (1 + scale) * v + shift; null = none
+    const void* mod_scale;  // RMS/LAYERNORM modulation (T): v = (1 + scale) * v + shift; null = none
     const void* mod_shift;
     int8_t* q;           // [M, K]
     float* scales;       // [M]
@@ -89,10 +89,32 @@ __global__ void __launch_bounds__(1024) quant_rows_kernel(QuantParams p) {
             if (PRO == PRO_RMS) {
 #pragma unroll
                 for (int j = 0; j < 8; ++j) ss += v[gi][j] * v[gi][j];
+            } else if (PRO == PRO_LAYERNORM) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) ss += v[gi][j];
+            } else if (PRO == PRO_SILU) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) v[gi][j] = rnd<T>(silu_f(v[gi][j]));
+            } else if (PRO == PRO_GELU) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) v[gi][j] = rnd<T>(gelu_f(v[gi][j]));
             }
         }
     }
-    if (PRO == PRO_RMS) {
+    if (PRO == PRO_LAYERNORM) {
+        const float mean = block_sum(ss, red) / (float)K;
+        ss = 0.f;
+#pragma unroll
+        for (int gi = 0; gi < G; ++gi) {
+            if (warp + gi * nwarps >= ngroups) break;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                v[gi][j] -= mean;
+                ss += v[gi][j] * v[gi][j];
+            }
+        }
+    }
+    if (PRO == PRO_RMS || PRO == PRO_LAYERNORM) {
         ss = block_sum(ss, red);
         const float rstd = rsqrtf(ss / (float)K + p.eps);
         const T* ms = (const T*)p.mod_scale;
@@ -213,6 +235,9 @@ KREA_API int krea_quant_rows(int dtype, int prologue, const void* x, int64_t x_s
         case PRO_RMS: return launch_quant<T, PRO_RMS>(p, M, st);       \
         case PRO_GATE: return launch_quant<T, PRO_GATE>(p, M, st);     \
         case PRO_SWIGLU: return launch_quant<T, PRO_SWIGLU>(p, M, st); \
+        case PRO_LAYERNORM: return launch_quant<T, PRO_LAYERNORM>(p, M, st); \
+        case PRO_SILU: return launch_quant<T, PRO_SILU>(p, M, st);     \
+        case PRO_GELU: return launch_quant<T, PRO_GELU>(p, M, st);     \
         default: return -3;                                            \
     }
     if (dtype == DT_BF16) { QDISPATCH(bf16) }
@@ -261,10 +286,15 @@ __global__ void prologue_rows_kernel(QuantParams p, T* out, int64_t out_stride) 
     const int64_t m = blockIdx.x;
     const T* x = (const T*)p.x + m * p.x_stride;
     T* o = out + m * out_stride;
-    if (PRO == PRO_RMS) {
+    if (PRO == PRO_RMS || PRO == PRO_LAYERNORM) {
+        float mean = 0.f;
+        if (PRO == PRO_LAYERNORM) {
+            for (int k = threadIdx.x; k < K; k += blockDim.x) mean += ldf(x, k);
+            mean = block_sum(mean, red) / (float)K;
+        }
         float ss = 0.f;
         for (int k = threadIdx.x; k < K; k += blockDim.x) {
-            const float v = ldf(x, k);
+            const float v = ldf(x, k) - mean;
             ss += v * v;
         }
         ss = block_sum(ss, red);
@@ -272,7 +302,7 @@ __global__ void prologue_rows_kernel(QuantParams p, T* out, int64_t out_stride) 
         const T* ms = (const T*)p.mod_scale;
         const T* sh = (const T*)p.mod_shift;
         for (int k = threadIdx.x; k < K; k += blockDim.x) {
-            float n = ldf(x, k) * rstd;
+            float n = (ldf(x, k) - mean) * rstd;
             if (p.norm_w) n *= p.norm_w[k];
             n = rnd<T>(n);
             if (ms) {
@@ -293,6 +323,10 @@ __global__ void prologue_rows_kernel(QuantParams p, T* out, int64_t out_stride) 
             const float s = rnd<T>(silu_f(ldf(x, k)));
             stf(o, k, s * ldf(x, p.up_offset + k));
         }
+    } else if (PRO == PRO_SILU) {
+        for (int k = threadIdx.x; k < K; k += blockDim.x) stf(o, k, silu_f(ldf(x, k)));
+    } else if (PRO == PRO_GELU) {
+        for (int k = threadIdx.x; k < K; k += blockDim.x) stf(o, k, gelu_f(ldf(x, k)));
     } else {
         for (int k = threadIdx.x; k < K; k += blockDim.x) stf(o, k, ldf(x, k));
     }
@@ -311,6 +345,9 @@ KREA_API int krea_prologue_rows(int dtype, int prologue, const void* x, int64_t 
         case PRO_RMS: prologue_rows_kernel<T, PRO_RMS><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break;       \
         case PRO_GATE: prologue_rows_kernel<T, PRO_GATE><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break;     \
         case PRO_SWIGLU: prologue_rows_kernel<T, PRO_SWIGLU><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break; \
+        case PRO_LAYERNORM: prologue_rows_kernel<T, PRO_LAYERNORM><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break; \
+        case PRO_SILU: prologue_rows_kernel<T, PRO_SILU><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break;     \
+        case PRO_GELU: prologue_rows_kernel<T, PRO_GELU><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break;     \
         default: return -3;                                                                                \
     }
     if (dtype == DT_BF16) { PDISPATCH(bf16) }
@@ -322,103 +359,110 @@ KREA_API int krea_prologue_rows(int dtype, int prologue, const void* x, int64_t 
 }
 
 // ---------------------------------------------------------------------------------------------
-// Per-head RMSNorm of q and k (head dim 128) + rotary embedding, in place.
-// rope_mode 1: interleaved pairs (Flux/Krea2 EmbedND), 2: split-half (Llama/Qwen).
-// rope table: [L][64] x (cos, sin) float.
+// Per-head RMSNorm of q and k (head dim 32 * EPL) + rotary embedding, in place.
+// rope_mode 1: interleaved pairs (Flux/Krea2 EmbedND), 2: split-half (Llama/Qwen/Cosmos).
+// rope table: [L][D/2] x (cos, sin) float.
 // ---------------------------------------------------------------------------------------------
-template <typename T>
+template <typename T, int EPL>
 __global__ void qk_norm_rope_kernel(T* buf, int64_t row_stride, int q_off, int k_off, int hq, int hk,
                                     const float* qw, const float* kw, float eps, const float* rope,
                                     int rope_mode, int L) {
+    constexpr int D = 32 * EPL, PP = EPL / 2;
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
     const int heads = hq + hk;
     if (warp >= L * heads) return;
     const int t = warp / heads, h = warp % heads;
     const bool isq = h < hq;
-    T* x = buf + (int64_t)t * row_stride + (isq ? q_off + h * 128 : k_off + (h - hq) * 128);
+    T* x = buf + (int64_t)t * row_stride + (isq ? q_off + h * D : k_off + (h - hq) * D);
     const float* w = isq ? qw : kw;
     // element indices owned by this lane
-    int idx[4];
-    if (rope_mode == 2) {
-        idx[0] = 2 * lane; idx[1] = 2 * lane + 1; idx[2] = 64 + 2 * lane; idx[3] = 65 + 2 * lane;
-    } else {
-        idx[0] = 4 * lane; idx[1] = 4 * lane + 1; idx[2] = 4 * lane + 2; idx[3] = 4 * lane + 3;
+    int idx[EPL];
+#pragma unroll
+    for (int i = 0; i < PP; ++i) {
+        if (rope_mode == 2) {
+            idx[i] = PP * lane + i;
+            idx[PP + i] = D / 2 + PP * lane + i;
+        } else {
+            idx[i] = EPL * lane + i;
+            idx[PP + i] = EPL * lane + PP + i;
+        }
     }
-    float v[4];
+    float v[EPL];
     float ss = 0.f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < EPL; ++i) {
         v[i] = ldf(x, idx[i]);
         ss += v[i] * v[i];
     }
     ss = warp_sum(ss);
-    const float rstd = rsqrtf(ss / 128.f + eps);
+    const float rstd = rsqrtf(ss / (float)D + eps);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) v[i] = rnd<T>(v[i] * rstd * (w ? w[idx[i]] : 1.f));
+    for (int i = 0; i < EPL; ++i) v[i] = rnd<T>(v[i] * rstd * (w ? w[idx[i]] : 1.f));
     if (rope && rope_mode == 1) {
-        const float* r = rope + (int64_t)t * 128;
+        const float* r = rope + (int64_t)t * D;
 #pragma unroll
-        for (int pi = 0; pi < 2; ++pi) {
-            const int j = 2 * lane + pi;
+        for (int pi = 0; pi < PP; ++pi) {
+            const int j = PP * lane + pi;
             const float c = r[2 * j], s = r[2 * j + 1];
             const float a = v[2 * pi], b = v[2 * pi + 1];
             v[2 * pi] = c * a - s * b;
             v[2 * pi + 1] = s * a + c * b;
         }
     } else if (rope && rope_mode == 2) {
-        const float* r = rope + (int64_t)t * 128;
+        const float* r = rope + (int64_t)t * D;
 #pragma unroll
-        for (int pi = 0; pi < 2; ++pi) {
-            const int j = 2 * lane + pi;
+        for (int pi = 0; pi < PP; ++pi) {
+            const int j = PP * lane + pi;
             const float c = r[2 * j], s = r[2 * j + 1];
-            const float a = v[pi], b = v[2 + pi];
+            const float a = v[pi], b = v[PP + pi];
             v[pi] = a * c - b * s;
-            v[2 + pi] = b * c + a * s;
+            v[PP + pi] = b * c + a * s;
         }
     }
 #pragma unroll
-    for (int i = 0; i < 4; ++i) stf(x, idx[i], v[i]);
+    for (int i = 0; i < EPL; ++i) stf(x, idx[i], v[i]);
 }
 
-KREA_API int krea_qk_norm_rope(int dtype, void* buf, int64_t row_stride, int q_off, int k_off, int hq, int hk,
-                               const float* qw, const float* kw, float eps, const float* rope, int rope_mode,
+KREA_API int krea_qk_norm_rope(int dtype, int head_dim, void* buf, int64_t row_stride, int q_off, int k_off, int hq,
+                               int hk, const float* qw, const float* kw, float eps, const float* rope, int rope_mode,
                                int L, void* stream) {
     const int64_t warps = (int64_t)L * (hq + hk);
     const int threads = 256;
     const int blocks = (int)((warps * 32 + threads - 1) / threads);
     cudaStream_t st = (cudaStream_t)stream;
-    if (dtype == DT_BF16)
-        qk_norm_rope_kernel<bf16><<<blocks, threads, 0, st>>>((bf16*)buf, row_stride, q_off, k_off, hq, hk, qw, kw, eps, rope, rope_mode, L);
-    else if (dtype == DT_F32)
-        qk_norm_rope_kernel<float><<<blocks, threads, 0, st>>>((float*)buf, row_stride, q_off, k_off, hq, hk, qw, kw, eps, rope, rope_mode, L);
-    else
-        return -4;
+#define QKN(T, EPL) qk_norm_rope_kernel<T, EPL><<<blocks, threads, 0, st>>>((T*)buf, row_stride, q_off, k_off, hq, hk, qw, kw, eps, rope, rope_mode, L)
+    if (dtype == DT_BF16 && head_dim == 128) QKN(bf16, 4);
+    else if (dtype == DT_BF16 && head_dim == 64) QKN(bf16, 2);
+    else if (dtype == DT_F32 && head_dim == 128) QKN(float, 4);
+    else return -4;
+#undef QKN
     KCHECK();
     return 0;
 }
 
 // ---------------------------------------------------------------------------------------------
-// Small exact attention (fp32), used for the text encoder (causal, GQA, short sequences).
-// grid (L, hq), block 128 (one thread per head-dim element). out: [L, hq*128].
+// Small exact attention, used for text encoders and the Anima LLM adapter (short sequences).
+// grid (lq, hq), one thread per head-dim element. q: [lq, hq*d], k and v: [lk, hk*d], out: [lq, hq*d].
 // ---------------------------------------------------------------------------------------------
-__global__ void attn_small_f32_kernel(const float* qkv, int64_t row_stride, int q_off, int k_off, int v_off,
-                                      int hq, int hk, int L, float* out, int64_t out_stride, float scale,
-                                      int causal) {
+template <typename T>
+__global__ void attn_small_kernel(const T* q, int64_t q_stride, const T* kp, const T* vp, int64_t kv_stride, int hq,
+                                  int hk, int lk, T* out, int64_t out_stride, float scale, int causal) {
     extern __shared__ float sm[];
-    float* qs = sm;          // 128
-    float* p = sm + 128;     // L
+    const int d = blockDim.x;
+    float* qs = sm;       // d
+    float* p = sm + d;    // lk
     __shared__ float red[33];
-    const int i = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const int i = blockIdx.x, h = blockIdx.y, e0 = threadIdx.x;
     const int kh = h / (hq / hk);
-    qs[d] = qkv[(int64_t)i * row_stride + q_off + h * 128 + d];
+    qs[e0] = ldf(q, (int64_t)i * q_stride + h * d + e0);
     __syncthreads();
-    const int n = causal ? i + 1 : L;
+    const int n = causal ? i + 1 : lk;
     float mx = -INFINITY;
     for (int j = threadIdx.x; j < n; j += blockDim.x) {
-        const float* kr = qkv + (int64_t)j * row_stride + k_off + kh * 128;
+        const T* kr = kp + (int64_t)j * kv_stride + kh * d;
         float s = 0.f;
-        for (int e = 0; e < 128; ++e) s += qs[e] * kr[e];
+        for (int e = 0; e < d; ++e) s += qs[e] * ldf(kr, e);
         s *= scale;
         p[j] = s;
         mx = fmaxf(mx, s);
@@ -432,20 +476,24 @@ __global__ void attn_small_f32_kernel(const float* qkv, int64_t row_stride, int 
     }
     sum = block_sum(sum, red);
     float acc = 0.f;
-    for (int j = 0; j < n; ++j) acc += p[j] * qkv[(int64_t)j * row_stride + v_off + kh * 128 + d];
-    out[(int64_t)i * out_stride + h * 128 + d] = acc / sum;
+    for (int j = 0; j < n; ++j) acc += p[j] * ldf(vp, (int64_t)j * kv_stride + kh * d + e0);
+    stf(out, (int64_t)i * out_stride + h * d + e0, acc / sum);
 }
 
-KREA_API int krea_attn_small_f32(const float* qkv, int64_t row_stride, int q_off, int k_off, int v_off, int hq,
-                                 int hk, int L, float* out, int64_t out_stride, float scale, int causal,
-                                 void* stream) {
-    dim3 grid(L, hq);
-    const size_t smem = (128 + (size_t)L) * sizeof(float);
-    if (smem > 48 * 1024) {
-        cudaFuncSetAttribute(attn_small_f32_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    }
-    attn_small_f32_kernel<<<grid, 128, smem, (cudaStream_t)stream>>>(qkv, row_stride, q_off, k_off, v_off, hq, hk, L,
-                                                                     out, out_stride, scale, causal);
+KREA_API int krea_attn_small(int dtype, const void* q, int64_t q_stride, const void* k, const void* v,
+                             int64_t kv_stride, int hq, int hk, int d, int lq, int lk, void* out, int64_t out_stride,
+                             float scale, int causal, void* stream) {
+    dim3 grid(lq, hq);
+    const size_t smem = ((size_t)d + lk) * sizeof(float);
+    cudaStream_t st = (cudaStream_t)stream;
+#define ATTN(T)                                                                                                 \
+    if (smem > 48 * 1024) cudaFuncSetAttribute(attn_small_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem); \
+    attn_small_kernel<T><<<grid, d, smem, st>>>((const T*)q, q_stride, (const T*)k, (const T*)v, kv_stride, hq, hk, lk, \
+                                                (T*)out, out_stride, scale, causal)
+    if (dtype == DT_F32) { ATTN(float); }
+    else if (dtype == DT_BF16) { ATTN(bf16); }
+    else return -4;
+#undef ATTN
     KCHECK();
     return 0;
 }
@@ -527,6 +575,45 @@ KREA_API int krea_f32_to_bf16(const float* in, void* out, int64_t n, void* strea
     return 0;
 }
 
+// GPU threads torch.randn splits a large tensor across (multiProcessorCount * blocks per SM * 256).
+KREA_API int krea_randn_threads() {
+    cudaDeviceProp p{};
+    if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) return -1;
+    return p.multiProcessorCount * (p.maxThreadsPerMultiProcessor / 256) * 256;
+}
+
+__global__ void bf16_to_f32_kernel(const bf16* in, float* out, int64_t n) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __bfloat162float(in[i]);
+}
+KREA_API int krea_bf16_to_f32(const void* in, float* out, int64_t n, void* stream) {
+    bf16_to_f32_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const bf16*)in, out, n);
+    KCHECK();
+    return 0;
+}
+
+// out[i] = c[0] * x[0][i] + ... + c[nx-1] * x[nx-1][i]; out may alias any input. Every sampler
+// update and CFG is one or two of these.
+struct LincombArgs {
+    const float* x[4];
+    float c[4];
+};
+__global__ void lincomb_kernel(LincombArgs a, int nx, float* out, int64_t n) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = 0.f;
+    for (int j = 0; j < nx; ++j) v += a.c[j] * a.x[j][i];
+    out[i] = v;
+}
+KREA_API int krea_lincomb(float* out, int64_t n, int nx, const float* const* x, const float* c, void* stream) {
+    if (nx < 1 || nx > 4) return -1;
+    LincombArgs a{};
+    for (int j = 0; j < nx; ++j) { a.x[j] = x[j]; a.c[j] = c[j]; }
+    lincomb_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(a, nx, out, n);
+    KCHECK();
+    return 0;
+}
+
 // Krea2 txtfusion projector: out[l, d] = sum_n x[l*nl + n, d] * w[n]   (Linear(nl -> 1), no bias)
 __global__ void layer_project_kernel(const bf16* x, const bf16* w, bf16* out, int L, int nl, int D) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -589,6 +676,29 @@ KREA_API int krea_unpatch_euler(const void* tok, int64_t tok_stride, float* lat,
     const int64_t n = (int64_t)C * H * W;
     unpatch_euler_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(
         (const bf16*)tok, tok_stride, lat, C, H, W, p, sigma, sigma_next, denoised_out);
+    KCHECK();
+    return 0;
+}
+
+// Anima output tokens to denoised latent: den = x - v * sigma. Tokens are bf16 [(H/p)*(W/p), p*p*C]
+// in (ph, pw, c) order (Cosmos unpatchify), unlike the (c, ph, pw) order of the input side.
+__global__ void unpatch_denoised_kernel(const bf16* tok, int64_t tok_stride, const float* lat, float* den, int C, int H,
+                                        int W, int p, float sigma) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t n = (int64_t)C * H * W;
+    if (i >= n) return;
+    const int c = (int)(i / ((int64_t)H * W));
+    const int y = (int)((i / W) % H), xx = (int)(i % W);
+    const int ty = y / p, tx = xx / p, py = y % p, px = xx % p;
+    const int64_t t = (int64_t)ty * (W / p) + tx;
+    const int f = (py * p + px) * C + c;
+    den[i] = lat[i] - __bfloat162float(tok[t * tok_stride + f]) * sigma;
+}
+KREA_API int krea_unpatch_denoised(const void* tok, int64_t tok_stride, const float* lat, float* den, int C, int H,
+                                   int W, int p, float sigma, void* stream) {
+    const int64_t n = (int64_t)C * H * W;
+    unpatch_denoised_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(
+        (const bf16*)tok, tok_stride, lat, den, C, H, W, p, sigma);
     KCHECK();
     return 0;
 }

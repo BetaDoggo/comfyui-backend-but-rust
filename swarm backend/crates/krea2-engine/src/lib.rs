@@ -1,5 +1,6 @@
-//! [`Engine`] implementation on the krea2 pipeline: turbo text-to-image for the Krea 2 W8A8
-//! (ConvRot int8) checkpoint, the same way ComfyUI samples it at CFG 1 with `euler` / `simple`.
+//! [`Engine`] implementation on the krea2 library: text-to-image for int8 ConvRot checkpoints of
+//! Krea 2 (turbo: CFG 1, `euler` / `simple`) and Anima (`er_sde` or `euler`, `simple`, any CFG).
+//! Each file's architecture is read from its keys, so one backend serves both.
 //!
 //! Text encoding is deferred to `sample`, so the negative prompt SwarmUI always sends costs nothing
 //! at CFG 1. Everything the pipeline can't do is refused with [`EngineError::Unsupported`], which
@@ -11,14 +12,25 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use krea2::pipeline::{Cancelled, Generator, LoadOptions, Request};
+use krea2::pipeline::{AnimaRequest, AnimaSampler, Cancelled, Generator, LoadOptions, Request};
+use krea2::tokenizer::token_weights;
 use swarm_engine_api::prompt::PromptLeafKind;
 use swarm_engine_api::*;
 
 /// Attention backends, default first. SwarmUI's "pytorch attention" maps to the first entry.
 const ATTENTION: [&str; 2] = ["int8", "flash"];
-/// ComfyUI's `Krea2.sampling_settings`, used when SwarmUI sends no Sigma Shift.
-const DEFAULT_SHIFT: f64 = 1.15;
+/// ComfyUI's `sampling_settings`, used when SwarmUI sends no Sigma Shift.
+const KREA2_SHIFT: f64 = 1.15;
+const ANIMA_SHIFT: f64 = 3.0;
+/// [`TextEncoderHandle::encoder_type`] of Anima's Qwen3 0.6B; SwarmUI's own type is the generic
+/// `stable_diffusion`.
+const ANIMA_ENCODER: &str = "anima";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    Krea2,
+    Anima,
+}
 
 pub struct Krea2Options {
     /// VRAM (MB) to leave untouched for the desktop and other applications.
@@ -36,14 +48,14 @@ impl Default for Krea2Options {
 
 pub struct Krea2Engine {
     gen: Mutex<Generator>,
-    default_shift: f64,
 }
 
 /// The prompt to encode, or why this conditioning can't be used. Only checked when a prompt is
 /// really needed: at CFG 1 the negative is never read.
 struct DeferredCond {
     text_encoder: PathBuf,
-    prompt: Result<String, String>,
+    /// (text, weight) segments; Krea 2 has exactly one, of weight 1.
+    prompt: Result<Vec<(String, f32)>, String>,
 }
 
 /// Sampled latents, `[B, 16, H/8, W/8]`.
@@ -73,21 +85,32 @@ fn read_header(path: &Path) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::from_slice(&h)?)
 }
 
-/// Refuses other architectures and formats before any weights are touched.
-fn check_dit(file: &ModelFile) -> EngineResult<()> {
+/// The file's architecture. Refuses other models and formats before any weights are touched.
+fn check_dit(file: &ModelFile) -> EngineResult<Family> {
     let h = read_header(&file.path).map_err(|e| unsupported(format!("{}: not a readable safetensors file ({e})", file.name)))?;
+    if let Some(p) = krea2::anima::key_prefix(|k| h.get(k).is_some()) {
+        if h.get(format!("{p}blocks.0.mlp.layer1.weight_scale")).is_none() {
+            return Err(unsupported(format!("{}: this backend only runs int8 ConvRot Anima checkpoints", file.name)));
+        }
+        return Ok(Family::Anima);
+    }
     // The keys SwarmUI's `isKrea2` tests.
     if ["txtfusion.projector.weight", "blocks.0.attn.gate.weight", "blocks.0.mod.lin"].iter().any(|k| h.get(k).is_none()) {
-        return Err(unsupported(format!("{}: this backend only runs Krea 2 models", file.name)));
+        return Err(unsupported(format!("{}: this backend only runs Krea 2 and Anima models", file.name)));
     }
     if h.get("blocks.0.attn.gate.weight_scale").is_none() {
         return Err(unsupported(format!("{}: this backend only runs W8A8 (ConvRot int8) Krea 2 checkpoints", file.name)));
     }
-    Ok(())
+    Ok(Family::Krea2)
 }
 
-/// The plain text of a prompt, or why it needs something the pipeline doesn't have.
-fn prompt_text(p: &ParsedPrompt, steps: u32) -> Result<String, String> {
+/// Anima's `CLIPLoader` type is the generic `stable_diffusion`; this tells its encoder by shape.
+fn is_qwen3_600m(file: &ModelFile) -> bool {
+    read_header(&file.path).is_ok_and(|h| h["model.layers.0.input_layernorm.weight"]["shape"][0] == 1024)
+}
+
+/// A prompt's (text, weight) segments, or why it needs something the pipeline doesn't have.
+fn prompt_segments(p: &ParsedPrompt, steps: u32, family: Family) -> Result<Vec<(String, f32)>, String> {
     if p.has_steps() {
         return Err("<alternate> and <fromto> prompts".into());
     }
@@ -96,26 +119,33 @@ fn prompt_text(p: &ParsedPrompt, steps: u32) -> Result<String, String> {
         return Err("<break> in prompts".into());
     }
     let mut text = String::new();
+    let mut segments = Vec::new();
     for leaf in &chunks[0] {
-        if leaf.weight != 1.0 {
+        if family == Family::Krea2 && leaf.weight != 1.0 {
             return Err("prompt weights (<weight>)".into());
         }
         match &leaf.kind {
+            PromptLeafKind::Text(t) if family == Family::Anima => segments.extend(token_weights(t, leaf.weight as f32)),
             PromptLeafKind::Text(t) => text.push_str(t),
             PromptLeafKind::Embed(_) => return Err("embeddings in prompts".into()),
             PromptLeafKind::LoraHook(_) => return Err("LoRA hooks in prompts".into()),
             PromptLeafKind::Break => unreachable!("chunks() splits on breaks"),
         }
     }
-    Ok(text)
+    if family == Family::Krea2 {
+        segments.push((text, 1.0));
+    }
+    Ok(segments)
 }
 
-fn encode_request(req: &TextEncodeRequest) -> Result<String, String> {
+fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<(String, f32)>, String> {
     if !req.text_encoder.patches.is_empty() {
         return Err("LoRAs and CLIP Stop At Layer".into());
     }
     match &req.mode {
-        TextEncodeMode::Plain { text } => Ok(text.clone()),
+        // Qwen3-VL tokenizes with weights disabled, Anima's T5 tokens take ComfyUI's emphasis.
+        TextEncodeMode::Plain { text } if family == Family::Krea2 => Ok(vec![(text.clone(), 1.0)]),
+        TextEncodeMode::Plain { text } => Ok(token_weights(text, 1.0)),
         TextEncodeMode::Swarm(s) => {
             if s.images.is_some() {
                 return Err("Prompt Images".into());
@@ -132,13 +162,13 @@ fn encode_request(req: &TextEncodeRequest) -> Result<String, String> {
             if !matches!(s.llama_template.as_deref(), None | Some("krea2")) {
                 return Err(format!("prompt template {:?}", s.llama_template));
             }
-            prompt_text(&s.prompt, s.steps)
+            prompt_segments(&s.prompt, s.steps, family)
         }
     }
 }
 
 /// The one plain prompt of a conditioning: anything regional or image-based is refused.
-fn single_prompt(c: &Conditioning) -> EngineResult<(&Path, &str)> {
+fn single_prompt(c: &Conditioning) -> EngineResult<(&Path, &[(String, f32)])> {
     let [e] = c.entries.as_slice() else {
         return Err(unsupported("regional prompts (more than one conditioning entry)"));
     };
@@ -158,8 +188,8 @@ fn single_prompt(c: &Conditioning) -> EngineResult<(&Path, &str)> {
         return Err(unsupported("conditioning features (regions, references, ControlNet, style models, ...)"));
     }
     let cond = e.embedding.downcast_ref::<DeferredCond>().ok_or_else(|| unsupported("conditioning from another text encoder"))?;
-    let text = cond.prompt.as_deref().map_err(|e| unsupported(e.clone()))?;
-    Ok((&cond.text_encoder, text))
+    let segments = cond.prompt.as_deref().map_err(|e| unsupported(e.clone()))?;
+    Ok((&cond.text_encoder, segments))
 }
 
 /// `ModelSamplingFlux`: `max_shift` applies at 2560 latent patches, `base_shift` at 256.
@@ -173,11 +203,15 @@ struct ModelSettings {
     int8_attention: bool,
 }
 
-fn model_settings(model: &ModelHandle, default_shift: f64) -> EngineResult<ModelSettings> {
-    let mut s = ModelSettings { shift: default_shift, int8_attention: true };
+fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
+    let shift = if family == Family::Anima { ANIMA_SHIFT } else { KREA2_SHIFT };
+    let mut s = ModelSettings { shift, int8_attention: true };
     for p in &model.patches {
         match p {
-            ModelPatch::SamplingFlux { max_shift, base_shift, width, height } => s.shift = flux_shift(*max_shift, *base_shift, *width, *height),
+            ModelPatch::SamplingFlux { max_shift, base_shift, width, height } if family == Family::Krea2 => {
+                s.shift = flux_shift(*max_shift, *base_shift, *width, *height)
+            }
+            ModelPatch::SamplingAuraFlow { shift, sampling } if family == Family::Anima && sampling == "flow" => s.shift = *shift,
             ModelPatch::AttentionBackend { backend } => {
                 s.int8_attention = match backend.as_str() {
                     "int8" => true,
@@ -198,12 +232,16 @@ fn model_settings(model: &ModelHandle, default_shift: f64) -> EngineResult<Model
 }
 
 /// Everything in a sampler request beyond seeded turbo text-to-image is refused here.
-fn check_sample(req: &SampleRequest) -> EngineResult<()> {
-    if (req.cfg - 1.0).abs() > 1e-6 {
-        return Err(unsupported(format!("CFG Scale {} (this backend runs Krea 2 Turbo: set CFG Scale to 1)", req.cfg)));
-    }
-    if req.sampler != "euler" {
-        return Err(unsupported(format!("sampler {} (use euler)", req.sampler)));
+fn check_sample(req: &SampleRequest, family: Family) -> EngineResult<()> {
+    if family == Family::Krea2 {
+        if (req.cfg - 1.0).abs() > 1e-6 {
+            return Err(unsupported(format!("CFG Scale {} (this backend runs Krea 2 Turbo: set CFG Scale to 1)", req.cfg)));
+        }
+        if req.sampler != "euler" {
+            return Err(unsupported(format!("sampler {} (use euler)", req.sampler)));
+        }
+    } else if !matches!(req.sampler.as_str(), "er_sde" | "euler") {
+        return Err(unsupported(format!("sampler {} (use er_sde or euler)", req.sampler)));
     }
     if req.scheduler != "simple" {
         return Err(unsupported(format!("scheduler {} (use simple)", req.scheduler)));
@@ -239,12 +277,63 @@ impl Krea2Engine {
             attn_variant: 0,
             int8_attn: true,
         };
-        Ok(Self { gen: Mutex::new(Generator::new(&load)?), default_shift: DEFAULT_SHIFT })
+        Ok(Self { gen: Mutex::new(Generator::new(&load)?) })
     }
 
     fn gen(&self) -> std::sync::MutexGuard<'_, Generator> {
         // A panic mid-generation leaves nothing the next prompt depends on.
         self.gen.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn load_model(&self, file: &ModelFile) -> EngineResult<ModelHandle> {
+        // `weight_dtype` doesn't apply: the file's int8 weights are used as stored.
+        let (family, name) = match check_dit(file)? {
+            Family::Krea2 => (self.gen().ensure_dit(&file.path), "krea-2"),
+            Family::Anima => (self.gen().ensure_anima(&file.path), "anima"),
+        };
+        family.map_err(internal)?;
+        Ok(ModelHandle::new(Some(file.clone()), Some(name.into()), Opaque::none()))
+    }
+
+    fn sample_anima(&self, req: &SampleRequest, shape: (usize, usize, usize), int8_attention: bool, shift: f64, progress: &mut dyn ProgressSink)
+        -> EngineResult<Vec<f32>> {
+        let (batch, lh, lw) = shape;
+        let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
+        let (text_encoder, positive) = single_prompt(&req.positive)?;
+        let guided = (req.cfg - 1.0).abs() > 1e-6;
+        let negative = if guided { single_prompt(&req.negative)?.1 } else { &[] };
+        let sampler = if req.sampler == "er_sde" { AnimaSampler::ErSde } else { AnimaSampler::Euler };
+        let steps = req.steps as usize;
+        let mut gen = self.gen();
+        gen.ensure_anima(&file.path).map_err(internal)?;
+        gen.ensure_qwen3(text_encoder).map_err(internal)?;
+        gen.set_int8_attention(int8_attention);
+        let mut data = Vec::with_capacity(batch * 16 * lh * lw);
+        for i in 0..batch {
+            let r = AnimaRequest {
+                positive: positive.to_vec(),
+                negative: negative.to_vec(),
+                cfg: req.cfg,
+                sampler,
+                seed: req.noise_seed,
+                batch_index: i,
+                batch_size: batch,
+                width: lw * 8,
+                height: lh * 8,
+                steps,
+                shift,
+                noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, lh, lw),
+            };
+            let (latent, stats) = gen
+                .sample_anima(&r, |step, _| {
+                    progress.progress((i * steps + step) as u32, (batch * steps) as u32);
+                    !progress.interrupted()
+                }, None)
+                .map_err(internal)?;
+            tracing::info!("anima: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
+            data.extend_from_slice(&latent);
+        }
+        Ok(data)
     }
 }
 
@@ -265,31 +354,33 @@ impl Engine for Krea2Engine {
     fn load_checkpoint(&self, req: &LoadCheckpoint) -> EngineResult<(ModelHandle, TextEncoderHandle, VaeHandle)> {
         // SwarmUI picks this loader for anything in its Stable-Diffusion folder, by folder alone.
         // The file holds only the diffusion model; SwarmUI adds its own CLIPLoader and VAELoader.
-        check_dit(&req.file)?;
-        self.gen().ensure_dit(&req.file.path).map_err(internal)?;
         Ok((
-            ModelHandle::new(Some(req.file.clone()), Some("krea-2".into()), Opaque::none()),
+            self.load_model(&req.file)?,
             TextEncoderHandle { sources: vec![], encoder_type: "krea2".into(), device: "default".into(), engine: Opaque::none(), patches: vec![] },
             VaeHandle::new(None, Opaque::none()),
         ))
     }
 
     fn load_diffusion_model(&self, req: &LoadDiffusionModel) -> EngineResult<ModelHandle> {
-        check_dit(&req.file)?;
-        self.gen().ensure_dit(&req.file.path).map_err(internal)?;
-        // `weight_dtype` doesn't apply: the file's int8 weights are used as stored.
-        Ok(ModelHandle::new(Some(req.file.clone()), Some("krea-2".into()), Opaque::none()))
+        self.load_model(&req.file)
     }
 
     fn load_text_encoder(&self, req: &LoadTextEncoder) -> EngineResult<TextEncoderHandle> {
         let [file] = req.files.as_slice() else {
             return Err(unsupported("dual text encoders"));
         };
-        if req.encoder_type != "krea2" {
-            return Err(unsupported(format!("text encoder type {} (this backend only runs Krea 2)", req.encoder_type)));
-        }
-        self.gen().ensure_te(&file.path).map_err(internal)?;
-        Ok(TextEncoderHandle { sources: req.files.clone(), encoder_type: req.encoder_type.clone(), device: req.device.clone(), engine: Opaque::none(), patches: vec![] })
+        let encoder_type = match req.encoder_type.as_str() {
+            "krea2" => {
+                self.gen().ensure_te(&file.path).map_err(internal)?;
+                "krea2"
+            }
+            "stable_diffusion" if is_qwen3_600m(file) => {
+                self.gen().ensure_qwen3(&file.path).map_err(internal)?;
+                ANIMA_ENCODER
+            }
+            t => return Err(unsupported(format!("text encoder type {t} (this backend only runs Krea 2 and Anima)"))),
+        };
+        Ok(TextEncoderHandle { sources: req.files.clone(), encoder_type: encoder_type.into(), device: req.device.clone(), engine: Opaque::none(), patches: vec![] })
     }
 
     fn load_vae(&self, req: &LoadVae) -> EngineResult<VaeHandle> {
@@ -299,9 +390,10 @@ impl Engine for Krea2Engine {
 
     fn encode_text(&self, req: &TextEncodeRequest) -> EngineResult<Conditioning> {
         let [file] = req.text_encoder.sources.as_slice() else {
-            return Err(unsupported("this text encoder (Krea 2 needs one Qwen3-VL file)"));
+            return Err(unsupported("this text encoder (Krea 2 needs one Qwen3-VL file, Anima one Qwen3 file)"));
         };
-        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req) };
+        let family = if req.text_encoder.encoder_type == ANIMA_ENCODER { Family::Anima } else { Family::Krea2 };
+        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family) };
         Ok(Conditioning::single(Opaque::new(cond), CondMeta::default()))
     }
 
@@ -317,16 +409,28 @@ impl Engine for Krea2Engine {
     }
 
     fn sample(&self, req: &SampleRequest, progress: &mut dyn ProgressSink) -> EngineResult<Latent> {
-        check_sample(req)?;
-        let (text_encoder, prompt) = single_prompt(&req.positive)?;
-        let settings = model_settings(&req.model, self.default_shift)?;
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
+        let family = check_dit(file)?;
+        check_sample(req, family)?;
+        let settings = model_settings(&req.model, family)?;
         let LatentSamples::Single(tensor) = &req.latent.samples else {
             return Err(unsupported("audio/video latents"));
         };
         let &[batch, 16, lh, lw] = tensor.shape.as_slice() else {
             return Err(unsupported(format!("latent shape {:?}", tensor.shape)));
         };
+        let finish = |data| {
+            Ok(req.latent.with_samples(LatentSamples::Single(LatentTensor {
+                format: LatentFormat::Image16Ch,
+                shape: tensor.shape.clone(),
+                data: Opaque::new(HostLatent { data }),
+            })))
+        };
+        if family == Family::Anima {
+            return finish(self.sample_anima(req, (batch, lh, lw), settings.int8_attention, settings.shift, progress)?);
+        }
+        let (text_encoder, prompt) = single_prompt(&req.positive)?;
+        let prompt = &prompt[0].0;
         let (width, height) = (lw * 8, lh * 8);
         let steps = req.steps as usize;
 
@@ -348,11 +452,7 @@ impl Engine for Krea2Engine {
             tracing::info!("krea2: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
             data.extend_from_slice(&latent);
         }
-        Ok(req.latent.with_samples(LatentSamples::Single(LatentTensor {
-            format: LatentFormat::Image16Ch,
-            shape: tensor.shape.clone(),
-            data: Opaque::new(HostLatent { data }),
-        })))
+        finish(data)
     }
 
     fn vae_decode(&self, req: &VaeDecodeRequest, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
@@ -394,12 +494,16 @@ impl Engine for Krea2Engine {
     }
 
     fn warmup(&self, req: &WarmupRequest) -> EngineResult<()> {
-        let mut gen = self.gen();
         if let Some(f) = &req.model.source {
-            gen.ensure_dit(&f.path).map_err(internal)?;
+            self.load_model(f)?;
         }
+        let mut gen = self.gen();
         if let [f] = req.text_encoder.sources.as_slice() {
-            gen.ensure_te(&f.path).map_err(internal)?;
+            if req.text_encoder.encoder_type == ANIMA_ENCODER {
+                gen.ensure_qwen3(&f.path).map_err(internal)?;
+            } else {
+                gen.ensure_te(&f.path).map_err(internal)?;
+            }
         }
         if let Some(f) = &req.vae.source {
             gen.ensure_vae(&f.path).map_err(internal)?;
@@ -429,14 +533,24 @@ mod tests {
     #[test]
     fn plain_prompts_keep_comfy_literal_parentheses() {
         // Qwen3-VL tokenizes with weights disabled, so `(x:1.2)` stays in the text.
-        assert_eq!(prompt_text(&ParsedPrompt::parse("a (red:1.2) fox"), 8).unwrap(), "a (red:1.2) fox");
+        let p = ParsedPrompt::parse("a (red:1.2) fox");
+        assert_eq!(prompt_segments(&p, 8, Family::Krea2).unwrap(), [("a (red:1.2) fox".to_string(), 1.0)]);
     }
 
     #[test]
     fn prompt_syntax_the_pipeline_cant_honor_is_refused() {
         for p in ["a <weight[1.3]:fox>", "a<break>b", "<alternate:a, b>", "<fromto[0.5]:a, b>", "<embed:x>"] {
-            assert!(prompt_text(&ParsedPrompt::parse(p), 8).is_err(), "{p}");
+            assert!(prompt_segments(&ParsedPrompt::parse(p), 8, Family::Krea2).is_err(), "{p}");
         }
+    }
+
+    #[test]
+    fn anima_takes_weights_from_both_syntaxes() {
+        let segments = prompt_segments(&ParsedPrompt::parse("lake, <weight[1.3]:pine> (sky:1.2)"), 8, Family::Anima).unwrap();
+        let weight = |t: &str| segments.iter().find(|(s, _)| s.contains(t)).unwrap().1;
+        assert!((weight("pine") - 1.3).abs() < 1e-6);
+        assert!((weight("sky") - 1.2).abs() < 1e-6);
+        assert_eq!(weight("lake"), 1.0);
     }
 
     #[test]

@@ -159,7 +159,7 @@ impl Dit {
             TXT_D as i32, s(st)))?;
         k!(krea_gemm(h.ptr(), d, w("wqkvg"), d, qkvg.ptr(), TXT_QKVG as i64, null(), m as i64, TXT_QKVG as i64, d, 1,
             DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
-        k!(krea_qk_norm_rope(DT_BF16, qkvg.ptr(), TXT_QKVG as i64, 0, TXT_D as i32, TXT_H as i32, TXT_H as i32,
+        k!(krea_qk_norm_rope(DT_BF16, HD as i32, qkvg.ptr(), TXT_QKVG as i64, 0, TXT_D as i32, TXT_H as i32, TXT_H as i32,
             w("qn"), w("kn"), EPS, null(), 0, mi, s(st)))?;
         let q = qkvg.ptr();
         self.flash(q, off(q, TXT_D * 2), off(q, 2 * TXT_D * 2), attn.ptr(), lse.ptr(), nb, sl, TXT_H, TXT_H,
@@ -316,7 +316,7 @@ impl Dit {
                 asc.ptr(), m, F as i32, 1, s(st)))?;
             k!(krea_int8_gemm(a8.ptr(), wp("wqkvg"), asc.ptr(), wp("sqkvg"), null(), qkvg.ptr(), l as i64,
                 QKVG as i64, fi, DT_BF16, s(st)))?;
-            k!(krea_qk_norm_rope(DT_BF16, qkvg.ptr(), QKVG as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32,
+            k!(krea_qk_norm_rope(DT_BF16, HD as i32, qkvg.ptr(), QKVG as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32,
                 wp("qn"), wp("kn"), EPS, rope.ptr(), 1, m, s(st)))?;
             let q = qkvg.ptr();
             let (kp, vp) = (off(q, HQ * HD * 2), off(q, (HQ + HK) * HD * 2));

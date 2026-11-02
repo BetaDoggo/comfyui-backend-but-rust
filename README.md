@@ -210,6 +210,47 @@ Differences to know about:
 * No edit LoRA for Krea 2 is installed here, so reference latents have only run on the base model.
 * The other reference methods (`offset`, `uxo/uno` and so on) are refused, and so are references on the negative prompt, which SwarmUI doesn't send.
 
+## MiniMax H3 engine
+
+H3 runs text to video with audio, from SwarmUI or with `--h3` on the CLI: the `w6a8` checkpoint, the nvfp4 text encoder, and the turbo LoRA in its ComfyUI form.
+The CLI writes an mp4 through `ffmpeg`, which must be on `PATH`.
+
+```bash
+diffusion --h3 --width 512 --height 512 --frames 5 --steps 4 --lora "$MODELS_ROOT/Lora/minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16_comfyui.safetensors" -p "a stone lighthouse on a sea cliff at dawn, no people" -o clip.mp4
+```
+
+`--frames` snaps up to the model's 17k + 5 grid, so 12 becomes 22. The defaults are ComfyUI's template: `res_multistep`, `simple`, CFG 1, 4 steps with the LoRA.
+
+Warm files, 512x512, 4 steps, turbo LoRA, on this machine:
+
+| Stage | ComfyUI, 5 frames | Here, 5 frames | Here, 22 frames |
+|---|---|---|---|
+| Text encoding | 13.1 s | 2.2 s | 2.3 s |
+| Per step, warm | 1.59 s | 0.65 s | 0.82 s |
+| Sampling, first run | 36 to 41 s | 5.4 s, with text encoding | 6.0 s, with text encoding |
+| Video decode | 28.3 s | about 2.5 s | 2.2 s |
+| Audio decode | 3.6 s | 0.2 s | 0.3 s |
+
+Through real SwarmUI with everything warm, a repeat generation took 4.6 s at 5 frames and 5.3 s at 22, because the bake and the encoded prompt are kept.
+
+Baking the LoRA adds about 11 s when it changes, and text encoding from a cold disk takes about 140 s on both engines, as the drive reads at about 100 MB/s.
+ComfyUI's text encoding took 151 s cold. Runs longer than 22 frames and sizes above 512x512 haven't been tested.
+
+Offloading is the lazy kind in [`src/offload.rs`](src/offload.rs): nothing is read at load, reader threads fill four pinned staging buffers ahead of compute, and file pages stay evictable.
+Weights stay in packed 6-bit form in VRAM and decode to int8 before each GEMM, which leaves room for 23 of the 50 blocks at 512x512.
+LoRA-baked blocks keep a host copy in ordinary pageable memory, about 15 GB. The blocks leave VRAM before the video decode and come back for the next clip, re-planned for its size.
+The text encoder and refiner only hold VRAM while they run.
+
+Compared with ComfyUI on the same noise, the context is within 8.6e-4, and the first step within 3.4% on video and 13% on audio. Frames come to 21 dB with the same composition.
+That gap is rounding: both engines are about 1.2% from an exact float32 run of the token refiner (`tools/h3_refiner_check.py`), and differ by 1.5% from each other because their int8 activations round differently.
+The audio hasn't been listened to or judged by ear. `tools/h3_ref.py` and `tools/h3_cmp.py` repeat the comparison.
+
+The LoRA's diffusers file, `minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors`, matches no key here or in ComfyUI. Use the `_comfyui` file.
+
+SwarmUI's Sigma Shift, CFG, every sampler and LoRAs work. These are refused with an error: Variation Seed, first and last frame or reference conditioning, single-frame generation, and VAE tile sizes other than 256 / 64.
+
+Not done: the video and audio encoders, sparse attention for long clips, and the web UI.
+
 ## MOSS Image engine
 
 Runs int8 ConvRot MOSS Image checkpoints with fused q/k/v, the Qwen3.5 9B text encoder and the Flux 2 VAE. Both

@@ -20,13 +20,13 @@ extern "C" void launch_sage_attn_kernel(const void* q, const void* k, const void
     int64_t stride_h_v, int stride_d_v, int64_t stride_bz_o, int stride_seq_o, int64_t stride_h_o, float sm_scale,
     int output_dtype_code, cudaStream_t stream, const float* mask_tile_bias);
 
-static int cta_k_for(int lk) { return lk > 1024 ? 128 : 64; }
+static int cta_k_for(int lk, int d) { return lk > 1024 && d != 64 ? 128 : 64; }
 
 // Scratch bytes needed for b batches, h/hk heads, lengths lq/lk, head dim 128.
-extern "C" int64_t gpu_int8_attn_workspace(int b, int h, int hk, int lq, int lk) {
-    const int ck = cta_k_for(lk);
+extern "C" int64_t gpu_int8_attn_workspace_d(int b, int h, int hk, int lq, int lk, int head_dim) {
+    const int ck = cta_k_for(lk, head_dim);
     const int64_t plk = (int64_t)(lk + ck - 1) / ck * ck;
-    const int64_t d = 128;
+    const int64_t d = head_dim;
     int64_t n = 0;
     auto add = [&](int64_t bytes) { n += (bytes + 255) / 256 * 256; };
     add((int64_t)b * h * lq * d);                                  // q int8
@@ -39,14 +39,18 @@ extern "C" int64_t gpu_int8_attn_workspace(int b, int h, int hk, int lq, int lk)
     return n;
 }
 
-// q/k/v: bf16 [b, seq, heads, 128] with element strides; o: bf16, same convention.
-extern "C" int gpu_int8_attn(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk,
-                              int h, int hk, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs,
+extern "C" int64_t gpu_int8_attn_workspace(int b, int h, int hk, int lq, int lk) {
+    return gpu_int8_attn_workspace_d(b, h, hk, lq, lk, 128);
+}
+
+// q/k/v: bf16 [b, seq, heads, D] with element strides; o: bf16, same convention.
+extern "C" int gpu_int8_attn_d(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk,
+                              int h, int hk, int D, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs,
                               int64_t k_hs, int64_t v_bs, int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs,
                               int64_t o_hs, float scale, void* stream) {
     try {
         cudaStream_t st = (cudaStream_t)stream;
-        const int D = 128, ck = cta_k_for(lk);
+        const int ck = cta_k_for(lk, D);
         const int plk = (lk + ck - 1) / ck * ck;
         char* p = (char*)ws;
         auto take = [&](int64_t bytes) { char* r = p; p += (bytes + 255) / 256 * 256; return r; };
@@ -69,4 +73,11 @@ extern "C" int gpu_int8_attn(const void* q, const void* k, const void* v, void* 
         return -400;
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -401;
+}
+
+extern "C" int gpu_int8_attn(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk,
+                              int h, int hk, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs,
+                              int64_t k_hs, int64_t v_bs, int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs,
+                              int64_t o_hs, float scale, void* stream) {
+    return gpu_int8_attn_d(q, k, v, o, ws, b, lq, lk, h, hk, 128, q_bs, q_rs, q_hs, k_bs, k_rs, k_hs, v_bs, v_rs, v_hs, o_bs, o_rs, o_hs, scale, stream);
 }

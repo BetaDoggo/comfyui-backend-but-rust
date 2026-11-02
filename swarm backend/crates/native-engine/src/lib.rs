@@ -1,7 +1,7 @@
 //! [`Engine`] implementation on the diffusion library: text-to-image for int8 ConvRot checkpoints of
-//! Krea 2, Anima and MOSS Image, with every ComfyUI sampler and scheduler, any CFG and LoRAs, plus
-//! Krea 2's prompt images and reference latents. Each file's architecture is read from its keys, so
-//! one backend serves all three.
+//! Krea 2, Anima and MOSS Image and text-to-video with audio for MiniMax H3, with every ComfyUI
+//! sampler and scheduler, any CFG and LoRAs, plus Krea 2's prompt images and reference latents. Each
+//! file's architecture is read from its keys, so one backend serves them all.
 //!
 //! Text encoding is deferred to `sample`, so the negative prompt SwarmUI always sends costs nothing
 //! at CFG 1. Everything the pipeline can't do is refused with [`EngineError::Unsupported`], which
@@ -11,9 +11,10 @@ mod noise;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, LoadOptions, MossRequest, Reference, Request, Sampling};
+use diffusion::h3;
+use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, LoadOptions, MossRequest, Reference, Request, Sampling};
 use diffusion::samplers::{self, ModelSampling, SigmaRange};
 use diffusion::lora::{self, Lora};
 use diffusion::tokenizer::token_weights;
@@ -31,12 +32,14 @@ const MOSS_SHIFT: f64 = 5.0;
 /// `stable_diffusion`.
 const ANIMA_ENCODER: &str = "anima";
 const MOSS_ENCODER: &str = "moss_image";
+const MINIMAX_ENCODER: &str = "minimax";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
     Krea2,
     Anima,
     Moss,
+    H3,
 }
 
 impl Family {
@@ -122,9 +125,15 @@ fn check_dit(file: &ModelFile) -> EngineResult<Family> {
         }
         return Ok(Family::Moss);
     }
+    if h3::is_h3(|k| h.get(k).is_some()) {
+        if h.get("blocks.0.attn.qkv_proj.weight_s_rel").is_none() {
+            return Err(unsupported(format!("{}: this backend only runs w6a8 MiniMax H3 checkpoints", file.name)));
+        }
+        return Ok(Family::H3);
+    }
     // The keys SwarmUI's `isKrea2` tests.
     if ["txtfusion.projector.weight", "blocks.0.attn.gate.weight", "blocks.0.mod.lin"].iter().any(|k| h.get(k).is_none()) {
-        return Err(unsupported(format!("{}: this backend only runs Krea 2, Anima and MOSS Image models", file.name)));
+        return Err(unsupported(format!("{}: this backend only runs Krea 2, Anima, MOSS Image and MiniMax H3 models", file.name)));
     }
     if h.get("blocks.0.attn.gate.weight_scale").is_none() {
         return Err(unsupported(format!("{}: this backend only runs W8A8 (ConvRot int8) Krea 2 checkpoints", file.name)));
@@ -280,6 +289,8 @@ struct ModelSettings {
     model_sampling: ModelSampling,
     int8_attention: bool,
     loras: Vec<Lora>,
+    /// MiniMax H3's audio flow shift.
+    audio_shift: f64,
 }
 
 fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
@@ -287,8 +298,10 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::Krea2 => ModelSampling::Flux { shift: KREA2_SHIFT },
         Family::Anima => ModelSampling::Flow { shift: ANIMA_SHIFT },
         Family::Moss => ModelSampling::Flow { shift: MOSS_SHIFT },
+        Family::H3 => ModelSampling::Flow { shift: h3::SHIFT_VIDEO },
     };
-    let mut s = ModelSettings { model_sampling, int8_attention: true, loras: Vec::new() };
+    // H3's attention sink rows make int8's per-channel V scale lossy
+    let mut s = ModelSettings { model_sampling, int8_attention: family != Family::H3, loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO };
     for p in &model.patches {
         match p {
             ModelPatch::SamplingFlux { max_shift, base_shift, width, height } if family == Family::Krea2 => {
@@ -296,6 +309,10 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
             }
             ModelPatch::SamplingAuraFlow { shift, sampling } if family != Family::Krea2 && sampling == "flow" => {
                 s.model_sampling = ModelSampling::Flow { shift: *shift }
+            }
+            ModelPatch::MiniMaxH3Shift { shift_video, shift_audio } if family == Family::H3 => {
+                s.model_sampling = ModelSampling::Flow { shift: *shift_video };
+                s.audio_shift = *shift_audio;
             }
             ModelPatch::AttentionBackend { backend } => {
                 s.int8_attention = match backend.as_str() {
@@ -381,6 +398,7 @@ impl NativeEngine {
             Family::Krea2 => (self.gen().ensure_dit(&file.path), "krea-2"),
             Family::Anima => (self.gen().ensure_anima(&file.path), "anima"),
             Family::Moss => (self.gen().ensure_moss(&file.path), "moss-image"),
+            Family::H3 => (self.gen().ensure_h3(&file.path), "minimax-h3"),
         };
         family.map_err(internal)?;
         Ok(ModelHandle::new(Some(file.clone()), Some(name.into()), Opaque::none()))
@@ -428,6 +446,77 @@ impl NativeEngine {
         Ok(data)
     }
 
+    /// A text-to-video clip: returns the video and audio latents.
+    fn sample_h3(&self, req: &SampleRequest, settings: &ModelSettings, progress: &mut dyn ProgressSink) -> EngineResult<Latent> {
+        let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
+        let LatentSamples::AudioVideo { video, audio } = &req.latent.samples else {
+            return Err(unsupported("MiniMax H3 needs its joint audio/video latent"));
+        };
+        let (&[1, 24, t, lh, lw], &[1, 32, 2, audio_t]) = (video.shape.as_slice(), audio.shape.as_slice()) else {
+            return Err(unsupported(format!("MiniMax H3 latents of shape {:?} and {:?}", video.shape, audio.shape)));
+        };
+        if t < 2 || lh % 2 != 0 || lw % 2 != 0 {
+            return Err(unsupported("MiniMax H3 needs at least 2 video frames and a width and height in multiples of 32"));
+        }
+        if req.variation.is_some() {
+            return Err(unsupported("Variation Seed on MiniMax H3"));
+        }
+        if req.positive.entries.iter().any(|e| !e.meta.minimax_keyframes.is_empty()) {
+            return Err(unsupported("first and last frame conditioning on MiniMax H3 (no VAE encoder yet)"));
+        }
+        let (cond, positive) = single_prompt(&req.positive, Family::H3)?;
+        let shape = h3::Shape { t, h: lh, w: lw, audio_t };
+        let sampling = sampling(req, settings, (1, lh, lw), 0)?;
+        let negative = if sampling.uses_negative() { single_prompt(&req.negative, Family::H3)?.1[0].0.clone() } else { String::new() };
+        let ModelSampling::Flow { shift } = settings.model_sampling else { unreachable!("H3 is a flow model") };
+        let mut gen = self.gen();
+        gen.ensure_h3(&file.path).map_err(internal)?;
+        gen.ensure_h3_te(&cond.text_encoder).map_err(internal)?;
+        gen.set_int8_attention(settings.int8_attention);
+        gen.set_loras(&settings.loras).map_err(internal)?;
+        let noise = diffusion::sampling::torch_randn_streams(req.noise_seed, &[shape.video_len(), shape.audio_len()]).concat();
+        let r = H3Request { prompt: positive[0].0.clone(), negative, shape, sampling, shifts: (shift, settings.audio_shift), noise };
+        let (mut latent, stats) = gen
+            .sample_h3(&r, |step, steps| {
+                progress.progress(step as u32, steps as u32);
+                !progress.interrupted()
+            }, None)
+            .map_err(internal)?;
+        tracing::info!("h3: text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
+        let audio_data = latent.split_off(shape.video_len());
+        Ok(req.latent.with_samples(LatentSamples::AudioVideo {
+            video: LatentTensor { format: video.format, shape: video.shape.clone(), data: Opaque::new(HostLatent { data: latent }) },
+            audio: LatentTensor { format: audio.format, shape: audio.shape.clone(), data: Opaque::new(HostLatent { data: audio_data }) },
+        }))
+    }
+
+    fn decode_h3(&self, req: &VaeDecodeRequest, t: &LatentTensor) -> EngineResult<ImageBatch> {
+        if req.tiling.as_ref().is_some_and(|v| v.tile_size != 256 || v.overlap != 64) {
+            return Err(unsupported("VAE tile sizes other than 256 / 64 on MiniMax H3"));
+        }
+        let &[1, 24, lt, lh, lw] = t.shape.as_slice() else {
+            return Err(unsupported(format!("latent shape {:?}", t.shape)));
+        };
+        let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("decoding a latent this engine didn't sample"))?;
+        let file = req.vae.source.as_ref().ok_or_else(|| unsupported("the pixel-space VAE"))?;
+        if !is_h3_vae(file) {
+            return Err(unsupported("this VAE on a MiniMax H3 latent"));
+        }
+        let frames = (lt - 2) / 5 * 17 + 5;
+        let shape = h3::Shape { t: lt, h: lh, w: lw, audio_t: 0 };
+        let clip = self.gen().decode_h3(&file.path, &latent.data, shape, frames).map_err(internal)?;
+        let (h, w) = (clip.h, clip.w);
+        let mut rgb = vec![0u8; frames * h * w * 3];
+        for c in 0..3 {
+            for f in 0..frames {
+                for i in 0..h * w {
+                    rgb[(f * h * w + i) * 3 + c] = (clip.data[((c * frames + f) * h) * w + i] * 255.0).round() as u8;
+                }
+            }
+        }
+        Ok(ImageBatch::from_u8(frames as u32, h as u32, w as u32, 3, rgb))
+    }
+
     fn sample_moss(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, progress: &mut dyn ProgressSink)
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
@@ -468,6 +557,11 @@ impl NativeEngine {
         }
         Ok(data)
     }
+}
+
+/// True for MiniMax H3's video or audio VAE, which load when they decode.
+fn is_h3_vae(file: &ModelFile) -> bool {
+    read_header(&file.path).is_ok_and(|h| h.get("decoder.transformer_blocks.0.scale1").is_some() || h.get("pre_block.attn.zero_k_bias").is_some())
 }
 
 /// True for the Flux 2 VAE, which MOSS Image uses.
@@ -520,12 +614,19 @@ impl Engine for NativeEngine {
                 self.gen().ensure_qwen35(&file.path).map_err(internal)?;
                 MOSS_ENCODER
             }
-            t => return Err(unsupported(format!("text encoder type {t} (this backend only runs Krea 2, Anima and MOSS Image)"))),
+            MINIMAX_ENCODER => {
+                self.gen().ensure_h3_te(&file.path).map_err(internal)?;
+                MINIMAX_ENCODER
+            }
+            t => return Err(unsupported(format!("text encoder type {t} (this backend only runs Krea 2, Anima, MOSS Image and MiniMax H3)"))),
         };
         Ok(TextEncoderHandle { sources: req.files.clone(), encoder_type: encoder_type.into(), device: req.device.clone(), engine: Opaque::none(), patches: vec![] })
     }
 
     fn load_vae(&self, req: &LoadVae) -> EngineResult<VaeHandle> {
+        if is_h3_vae(&req.file) {
+            return Ok(VaeHandle::new(Some(req.file.clone()), Opaque::none()));
+        }
         let mut gen = self.gen();
         if is_flux2_vae(&req.file) { gen.ensure_flux2_vae(&req.file.path) } else { gen.ensure_vae(&req.file.path) }.map_err(internal)?;
         Ok(VaeHandle::new(Some(req.file.clone()), Opaque::none()))
@@ -533,11 +634,12 @@ impl Engine for NativeEngine {
 
     fn encode_text(&self, req: &TextEncodeRequest) -> EngineResult<Conditioning> {
         let [file] = req.text_encoder.sources.as_slice() else {
-            return Err(unsupported("this text encoder (Krea 2 needs one Qwen3-VL file, Anima one Qwen3 file, MOSS Image one Qwen3.5 file)"));
+            return Err(unsupported("this text encoder (Krea 2 needs one Qwen3-VL file, Anima one Qwen3 file, MOSS Image one Qwen3.5 file, MiniMax H3 one Qwen3-VL 32B file)"));
         };
         let family = match req.text_encoder.encoder_type.as_str() {
             ANIMA_ENCODER => Family::Anima,
             MOSS_ENCODER => Family::Moss,
+            MINIMAX_ENCODER => Family::H3,
             _ => Family::Krea2,
         };
         // SwarmUI sends the Krea 2 template for MOSS Image as well.
@@ -558,6 +660,17 @@ impl Engine for NativeEngine {
     }
 
     fn empty_latent(&self, req: &EmptyLatentRequest) -> EngineResult<Latent> {
+        if let EmptyLatentKind::MiniMaxH3AudioVideo { width, height, length } = req.kind {
+            let (frames, t, audio_t) = requests::minimax_h3::temporal_shape(length);
+            let (h, w) = (height as usize / 16, width as usize / 16);
+            let tensor = |format, shape| LatentTensor { format, shape, data: Opaque::none() };
+            let samples = LatentSamples::AudioVideo {
+                video: tensor(LatentFormat::MiniMaxH3Video, vec![1, 24, t as usize, h, w]),
+                audio: tensor(LatentFormat::MiniMaxH3Audio, vec![1, 32, 2, audio_t as usize]),
+            };
+            let pixel = PixelInfo { frames, fps: Some(24.0), audio_seconds: Some(audio_t as f64 / 40.0), ..PixelInfo::image(width, height, 1) };
+            return Ok(Latent { samples, pixel, noise_mask: None, audio_noise_mask: None, batch_index: None, empty: false });
+        }
         if let EmptyLatentKind::Flux2 { width, height } = req.kind {
             let (b, h, w) = (req.batch_size as usize, height as usize / 16, width as usize / 16);
             return Ok(Latent::single(
@@ -580,6 +693,9 @@ impl Engine for NativeEngine {
         let family = check_dit(file)?;
         check_sample(req)?;
         let settings = model_settings(&req.model, family)?;
+        if family == Family::H3 {
+            return self.sample_h3(req, &settings, progress);
+        }
         let LatentSamples::Single(tensor) = &req.latent.samples else {
             return Err(unsupported("audio/video latents"));
         };
@@ -644,6 +760,11 @@ impl Engine for NativeEngine {
     }
 
     fn vae_decode(&self, req: &VaeDecodeRequest, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        match &req.latent.samples {
+            LatentSamples::AudioVideo { video, .. } => return self.decode_h3(req, video),
+            LatentSamples::Single(t) if t.format == LatentFormat::MiniMaxH3Video => return self.decode_h3(req, t),
+            _ => {}
+        }
         if req.tiling.is_some() {
             return Err(unsupported("VAE tiling"));
         }
@@ -687,6 +808,9 @@ impl Engine for NativeEngine {
         if is_flux2_vae(file) {
             return Err(unsupported("VAE encoding with the Flux 2 VAE"));
         }
+        if is_h3_vae(file) {
+            return Err(unsupported("VAE encoding with MiniMax H3's VAE"));
+        }
         let mut gen = self.gen();
         gen.ensure_vae(&file.path).map_err(internal)?;
         let frames = prompt_images(&req.pixels);
@@ -701,8 +825,20 @@ impl Engine for NativeEngine {
         Ok(Latent::single(tensor, PixelInfo::image(lw as u32 * 8, lh as u32 * 8, frames.len() as u32)))
     }
 
-    fn vae_decode_audio(&self, _req: &VaeDecodeAudioRequest) -> EngineResult<AudioData> {
-        Err(unsupported("audio"))
+    fn vae_decode_audio(&self, req: &VaeDecodeAudioRequest) -> EngineResult<AudioData> {
+        let t = match &req.latent.samples {
+            LatentSamples::AudioVideo { audio, .. } => audio,
+            LatentSamples::Single(t) if t.format == LatentFormat::MiniMaxH3Audio => t,
+            _ => return Err(unsupported("audio latents of other models")),
+        };
+        let &[1, 32, 2, audio_t] = t.shape.as_slice() else {
+            return Err(unsupported(format!("audio latent shape {:?}", t.shape)));
+        };
+        let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("decoding a latent this engine didn't sample"))?;
+        let file = req.vae.source.as_ref().ok_or_else(|| unsupported("audio without an audio VAE"))?;
+        let mut wave = self.gen().decode_h3_audio(&file.path, &latent.data, audio_t).map_err(internal)?;
+        let right = wave.split_off(wave.len() / 2);
+        Ok(AudioData { sample_rate: 32000, channels: vec![Arc::new(wave), Arc::new(right)] })
     }
 
     fn warmup(&self, req: &WarmupRequest) -> EngineResult<()> {
@@ -714,11 +850,12 @@ impl Engine for NativeEngine {
             match req.text_encoder.encoder_type.as_str() {
                 ANIMA_ENCODER => gen.ensure_qwen3(&f.path),
                 MOSS_ENCODER => gen.ensure_qwen35(&f.path),
+                MINIMAX_ENCODER => gen.ensure_h3_te(&f.path),
                 _ => gen.ensure_te(&f.path),
             }
             .map_err(internal)?;
         }
-        if let Some(f) = &req.vae.source {
+        if let Some(f) = req.vae.source.as_ref().filter(|f| !is_h3_vae(f)) {
             if is_flux2_vae(f) { gen.ensure_flux2_vae(&f.path) } else { gen.ensure_vae(&f.path) }.map_err(internal)?;
         }
         Ok(())

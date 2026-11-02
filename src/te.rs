@@ -52,7 +52,7 @@ pub fn image_prompt(prompt: &str, count: usize) -> String {
 
 /// MRoPE positions (T, H, W) of `l` tokens with images at `spans` (start, tokens, merged grid), as
 /// `qwen2vl_mrope_position_ids` lays them out: an image advances the text past its longest side.
-fn position_ids(l: usize, spans: &[(usize, usize, (usize, usize))]) -> Vec<[f32; 3]> {
+pub fn position_ids(l: usize, spans: &[(usize, usize, (usize, usize))]) -> Vec<[f32; 3]> {
     let mut pos: Vec<[f32; 3]> = (0..l).map(|i| [i as f32; 3]).collect();
     let mut offset = 0i64;
     for &(start, size, (gh, gw)) in spans {
@@ -73,7 +73,7 @@ fn position_ids(l: usize, spans: &[(usize, usize, (usize, usize))]) -> Vec<[f32;
 
 /// RoPE table [l][64][(cos, sin)]. Interleaved MRoPE: T by default, H and W take every third pair of
 /// the first 60.
-fn rope_table(pos: &[[f32; 3]]) -> Vec<f32> {
+pub fn rope_table(pos: &[[f32; 3]]) -> Vec<f32> {
     let inv: Vec<f32> = (0..64).map(|j| 1.0f32 / THETA.powf((2 * j) as f32 / HD as f32)).collect();
     let mut rope = Vec::with_capacity(pos.len() * 128);
     for p in pos {

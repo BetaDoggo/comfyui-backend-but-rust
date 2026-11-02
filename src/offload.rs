@@ -6,14 +6,19 @@
 //! streamed into a small ring of VRAM slots on a dedicated copy stream. Copies for upcoming units
 //! are issued as soon as a slot is released, so PCIe transfers overlap the compute of earlier
 //! blocks and the compute stream only waits on an event when a copy is genuinely late.
+//!
+//! A lazy set ([`WeightSet::lazy`]) keeps no pinned copy of the model: units are read from the file's
+//! mapping when they are about to be used, by reader threads that fill a few pinned staging buffers
+//! ahead of compute. Clean file pages can be dropped without touching the pagefile, so a model larger
+//! than free RAM costs reads, not paging. Units rewritten by a LoRA keep a pageable host image.
 
 use crate::cuda::{memcpy_d2d, memcpy_h2d, DevBuf, Event, PinnedBuf, Stream};
 use crate::st::{f32_bytes, Dt, SafeTensors};
 use anyhow::{bail, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::Instant;
 
 pub const ALIGN: usize = 256;
@@ -206,6 +211,25 @@ impl Store<'_> {
     }
 }
 
+/// Units staged per reader thread, ahead of compute.
+const STAGING: usize = 4;
+
+type Staged = (usize, u64, Result<PinnedBuf>);
+
+/// What a lazy set adds: the readers and what they have staged.
+struct Lazy {
+    st: Arc<SafeTensors>,
+    images: Arc<Vec<RwLock<Option<Vec<u8>>>>>,
+    want: mpsc::Sender<(usize, u64)>,
+    done: mpsc::Receiver<Staged>,
+    free: mpsc::Sender<(PinnedBuf, Option<Event>)>,
+    staged: HashMap<usize, PinnedBuf>,
+    asked: HashSet<usize>,
+    /// Resident units whose VRAM holds their data.
+    filled: Vec<bool>,
+    generation: u64,
+}
+
 pub struct WeightSet {
     pub name: String,
     pub layouts: Vec<Layout>,
@@ -218,6 +242,7 @@ pub struct WeightSet {
     rr: usize,                      // next slot to fill
     slots: Vec<Slot>,
     copy: Stream,
+    lazy: Option<Lazy>,
     pub copied_bytes: usize,
 }
 
@@ -333,10 +358,132 @@ impl WeightSet {
         let mut ws = WeightSet {
             name: name.to_string(), layouts, stores, rewritten: vec![false; n], streamed, slot_of: HashMap::new(), next_rank: 0, rr: 0, slots,
             copy,
+            lazy: None,
             copied_bytes: 0,
         };
         ws.prefetch_initial()?;
         Ok(ws)
+    }
+
+    /// A set that reads nothing until it is used. VRAM for the plan is taken now.
+    pub fn lazy(name: &str, st: Arc<SafeTensors>, layouts: Vec<Layout>, plan: Plan, threads: usize) -> Result<Self> {
+        let n = layouts.len();
+        let max_size = layouts.iter().map(|l| l.size).max().unwrap_or(0);
+        let stores = (0..n).map(|i| Ok(Copies { dev: if i < plan.resident { Some(DevBuf::alloc(layouts[i].size)?) } else { None }, host: None })).collect::<Result<Vec<_>>>()?;
+        let streamed: Vec<usize> = (plan.resident..n).collect();
+        let mut slots = Vec::new();
+        if !streamed.is_empty() {
+            for _ in 0..plan.slots {
+                slots.push(Slot { buf: DevBuf::alloc(max_size)?, unit: None, ready: Event::new()?, free: Event::new()?, released: true });
+            }
+        }
+        let (want, want_rx) = mpsc::channel::<(usize, u64)>();
+        let (done_tx, done) = mpsc::channel::<Staged>();
+        let (free, free_rx) = mpsc::channel::<(PinnedBuf, Option<Event>)>();
+        for _ in 0..STAGING {
+            free.send((PinnedBuf::alloc(max_size)?, None))?;
+        }
+        let images: Arc<Vec<RwLock<Option<Vec<u8>>>>> = Arc::new((0..n).map(|_| RwLock::new(None)).collect());
+        let (want_rx, free_rx) = (Arc::new(Mutex::new(want_rx)), Arc::new(Mutex::new(free_rx)));
+        for _ in 0..threads.clamp(1, 3) {
+            let (want_rx, free_rx, done_tx, st, layouts, images) = (want_rx.clone(), free_rx.clone(), done_tx.clone(), st.clone(), layouts.clone(), images.clone());
+            std::thread::spawn(move || loop {
+                let Ok((unit, generation)) = want_rx.lock().unwrap().recv() else { break };
+                let Ok((mut buf, event)) = free_rx.lock().unwrap().recv() else { break };
+                let r = (|| -> Result<()> {
+                    if let Some(e) = event {
+                        e.sync()?;
+                    }
+                    let size = layouts[unit].size;
+                    match &*images[unit].read().unwrap() {
+                        Some(img) => buf.as_mut_slice()[..size].copy_from_slice(img),
+                        None => layouts[unit].pack(&st, &mut buf.as_mut_slice()[..size])?,
+                    }
+                    Ok(())
+                })();
+                if done_tx.send((unit, generation, r.map(|_| buf))).is_err() {
+                    break;
+                }
+            });
+        }
+        let total: usize = layouts.iter().map(|l| l.size).sum();
+        eprintln!("[{name}] {n} units, {:.2} GB: {} resident, {} streamed via {} slots, read on use", total as f64 / 1e9, plan.resident, streamed.len(), slots.len());
+        let lazy = Lazy { st, images, want, done, free, staged: HashMap::new(), asked: HashSet::new(), filled: vec![false; n], generation: 0 };
+        Ok(WeightSet { name: name.to_string(), layouts, stores, rewritten: vec![false; n], streamed, slot_of: HashMap::new(), next_rank: 0, rr: 0, slots, copy: Stream::new()?, lazy: Some(lazy), copied_bytes: 0 })
+    }
+
+    /// Move a lazy set to `p`, freeing VRAM before taking any. What leaves VRAM is read again on use,
+    /// LoRA bakes included. The compute stream must be idle. Keeps everything if `p` is the current plan.
+    pub fn replan(&mut self, p: Plan) -> Result<()> {
+        let n = self.len();
+        if self.resident() == p.resident.min(n) && self.slots.len() == p.slots {
+            return Ok(());
+        }
+        self.copy.sync()?;
+        for s in &mut self.stores {
+            s.dev = None;
+        }
+        self.slots.clear();
+        for i in 0..p.resident.min(n) {
+            self.stores[i].dev = Some(DevBuf::alloc(self.layouts[i].size)?);
+        }
+        let max_size = self.layouts.iter().map(|l| l.size).max().unwrap_or(0);
+        for _ in 0..p.slots {
+            self.slots.push(Slot { buf: DevBuf::alloc(max_size)?, unit: None, ready: Event::new()?, free: Event::new()?, released: true });
+        }
+        self.streamed = (p.resident.min(n)..n).collect();
+        if let Some(l) = &mut self.lazy {
+            l.filled.iter_mut().for_each(|f| *f = false);
+        }
+        eprintln!("[{}] {} units in VRAM, {} streamed via {} slots", self.name, self.resident(), self.streamed.len(), self.slots.len());
+        self.restart_ring()
+    }
+
+    /// True when `unit`'s data will have to come from the host.
+    fn needs_data(&self, unit: usize) -> bool {
+        let Some(l) = &self.lazy else { return false };
+        if self.stores[unit].dev.is_some() { !l.filled[unit] } else { !self.slot_of.contains_key(&unit) }
+    }
+
+    /// Ask the readers for the units after `unit`, as far as the staging buffers go.
+    fn read_ahead(&mut self, unit: usize) -> Result<()> {
+        let n = self.len();
+        for j in 0..n.min(STAGING - 1) {
+            let v = (unit + j) % n;
+            if self.needs_data(v) {
+                let l = self.lazy.as_mut().unwrap();
+                if l.asked.insert(v) {
+                    l.want.send((v, l.generation))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy `unit` from its staging buffer to `dst` on the copy stream. Blocks until it is read.
+    fn fill(&mut self, unit: usize, dst: *mut c_void) -> Result<Event> {
+        let size = self.layouts[unit].size;
+        let l = self.lazy.as_mut().unwrap();
+        if l.asked.insert(unit) {
+            l.want.send((unit, l.generation))?;
+        }
+        while !l.staged.contains_key(&unit) {
+            let (u, generation, r) = l.done.recv()?;
+            let buf = r?;
+            if generation == l.generation {
+                l.staged.insert(u, buf);
+            } else {
+                l.free.send((buf, None))?;
+            }
+        }
+        let buf = l.staged.remove(&unit).unwrap();
+        l.asked.remove(&unit);
+        memcpy_h2d(dst, buf.ptr(), size, &self.copy)?;
+        let done = Event::new()?;
+        done.record(&self.copy)?;
+        l.free.send((buf, Some(Event::new_like(&done, &self.copy)?)))?;
+        self.copied_bytes += size;
+        Ok(done)
     }
 
     pub fn len(&self) -> usize {
@@ -411,6 +558,13 @@ impl WeightSet {
 
     /// Forget what the ring holds. Compute and copy streams must be idle.
     pub fn restart_ring(&mut self) -> Result<()> {
+        if let Some(l) = &mut self.lazy {
+            l.generation += 1;
+            l.asked.clear();
+            for (_, buf) in l.staged.drain() {
+                l.free.send((buf, None))?;
+            }
+        }
         self.slot_of.clear();
         for s in &mut self.slots {
             s.unit = None;
@@ -429,6 +583,19 @@ impl WeightSet {
     /// Copy `len` bytes of `src` over every copy of `unit`. Call [`Self::restart_ring`] when done.
     fn write(&mut self, unit: usize, off: usize, src: &DevBuf, len: usize, st: &Stream) -> Result<()> {
         self.rewritten[unit] = true;
+        if let Some(l) = &self.lazy {
+            let mut image = l.images[unit].write().unwrap();
+            if image.is_none() {
+                let mut b = vec![0u8; self.layouts[unit].size];
+                self.layouts[unit].pack(&l.st, &mut b)?;
+                *image = Some(b);
+            }
+            src.download(0, &mut image.as_mut().unwrap()[off..off + len], st)?;
+            if let (Some(d), true) = (&self.stores[unit].dev, l.filled[unit]) {
+                memcpy_d2d(d.at(off), src.ptr(), len, st)?;
+            }
+            return Ok(());
+        }
         let store = &mut self.stores[unit];
         if let Some(d) = &store.dev {
             memcpy_d2d(d.at(off), src.ptr(), len, st)?;
@@ -450,9 +617,14 @@ impl WeightSet {
         let unit = self.streamed[self.next_rank];
         // the slot's previous occupant must be finished on the compute stream
         self.copy.wait(&self.slots[si].free)?;
-        let h = self.stores[unit].host.as_ref().expect("streamed unit without host copy");
-        memcpy_h2d(self.slots[si].buf.ptr(), h.ptr(), h.size(), &self.copy)?;
-        self.copied_bytes += h.size();
+        if self.lazy.is_some() {
+            let dst = self.slots[si].buf.ptr();
+            self.fill(unit, dst)?;
+        } else {
+            let h = self.stores[unit].host.as_ref().expect("streamed unit without host copy");
+            memcpy_h2d(self.slots[si].buf.ptr(), h.ptr(), h.size(), &self.copy)?;
+            self.copied_bytes += h.size();
+        }
         let slot = &mut self.slots[si];
         slot.ready.record(&self.copy)?;
         if let Some(old) = slot.unit.replace(unit) {
@@ -466,6 +638,9 @@ impl WeightSet {
     }
 
     fn prefetch_initial(&mut self) -> Result<()> {
+        if self.lazy.is_some() {
+            return Ok(());
+        }
         while !self.slots.is_empty() && self.issue_next()? {
             if self.slot_of.len() == self.streamed.len() {
                 break;
@@ -476,6 +651,15 @@ impl WeightSet {
 
     /// Device base pointer of `unit`, making `compute` wait for its copy if it is streamed.
     pub fn acquire(&mut self, unit: usize, compute: &Stream) -> Result<*mut c_void> {
+        if self.lazy.is_some() {
+            self.read_ahead(unit)?;
+            if self.stores[unit].dev.is_some() && self.needs_data(unit) {
+                let dst = self.stores[unit].dev.as_ref().unwrap().ptr();
+                let done = self.fill(unit, dst)?;
+                compute.wait(&done)?;
+                self.lazy.as_mut().unwrap().filled[unit] = true;
+            }
+        }
         if let Some(d) = &self.stores[unit].dev {
             return Ok(d.ptr());
         }
@@ -495,7 +679,9 @@ impl WeightSet {
             self.slots[si].free.record(compute)?;
             self.slots[si].released = true;
             if self.streamed.len() > self.slots.len() {
-                while self.issue_next()? {}
+                if self.lazy.is_none() {
+                    while self.issue_next()? {}
+                }
             }
         }
         Ok(())

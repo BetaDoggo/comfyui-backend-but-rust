@@ -79,6 +79,16 @@ extern "C" {
     pub fn gpu_convrot_dequant(dtype: i32, q: P, s_: P, out: PM, n: i64, k: i32, s: PM) -> i32;
     pub fn gpu_convrot_requant(dtype: i32, x: P, q: PM, s_: PM, n: i64, k: i32, seed: u64, s: PM) -> i32;
     pub fn gpu_lora_add(dtype: i32, w: PM, d: P, scale: f32, n: i64, s: PM) -> i32;
+    pub fn gpu_w6_decode(q: P, s_rel: P, out: PM, n: i64, k: i32, g: i32, s: PM) -> i32;
+    pub fn gpu_int8_attn_workspace_d(b: i32, h: i32, hk: i32, lq: i32, lk: i32, d: i32) -> i64;
+    pub fn gpu_int8_attn_d(q: P, k: P, v: P, o: PM, ws: PM, b: i32, lq: i32, lk: i32, h: i32, hk: i32, d: i32, q_bs: i64, q_rs: i64, q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64,
+        v_hs: i64, o_bs: i64, o_rs: i64, o_hs: i64, scale: f32, s: PM) -> i32;
+    pub fn gpu_w6_requant(w: P, q: PM, s_rel: PM, s_channel: PM, n: i64, k: i32, seed: u64, s: PM) -> i32;
+    pub fn gpu_nvfp4_dequant(q: P, scales: P, scale2: f32, pre: P, out: PM, n: i64, k: i32, s: PM) -> i32;
+    pub fn gpu_rope_bf16(x: PM, stride: i64, hs: i64, w: P, eps: f32, rope: P, l: i32, h: i32, d: i32, pairs: i32, s: PM) -> i32;
+    pub fn gpu_conv1d(x: P, w: P, bias: P, out: PM, b: i32, ci: i32, co: i32, t: i32, k: i32, dil: i32, pad: i32, s: PM) -> i32;
+    pub fn gpu_conv_t1d(x: P, w: P, bias: P, out: PM, b: i32, ci: i32, co: i32, t: i32, k: i32, u: i32, pad: i32, s: PM) -> i32;
+    pub fn gpu_aa_snake(x: PM, alpha: P, beta: P, up: P, down: P, tmp: PM, b: i32, c: i32, t: i32, s: PM) -> i32;
     pub fn gpu_group_norm(x: P, out: PM, w: P, b: P, stats: PM, p: i64, c: i32, groups: i32, eps: f32, silu: i32, s: PM) -> i32;
 }
 

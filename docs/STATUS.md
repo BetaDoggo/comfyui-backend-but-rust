@@ -30,6 +30,9 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | MOSS Image | MOSS Image LoRAs | Baked like ComfyUI, including fused q/k/v slices. All 168 weights identical. Tested through SwarmUI with the DMD LoRA; the edit LoRA applies but has no image input yet. |
 | P1 | Krea 2 | Variation Seed | Direct workflow test; output changes as expected. Not compared with ComfyUI. |
 | P1 | Krea 2 | Sigma Shift | ModelSamplingFlux. Direct workflow test. |
+| P1 | MiniMax H3 | H3 text to video with audio | Through real SwarmUI and the CLI: w6a8 DiT, nvfp4 text encoder, turbo LoRA, video and audio decoders, mp4 through ffmpeg. 512x512, 5 and 22 frames, 0.65 to 0.82 s/step against 1.59 in ComfyUI. Same picture at 21 dB; both are 1.2% from an exact refiner run. Audio not judged by ear. |
+| P1 | MiniMax H3 | H3 Variation Seed | Refused with an error. SwarmUI slerps each stream's noise. |
+| P1 | Engine core | Lazy offloading | H3 reads weights on use through a few pinned staging buffers, ahead of compute. Other models still pin everything at load. |
 | P1 | MOSS Image | MOSS engine | Int8 ConvRot checkpoint through real SwarmUI: 550 to 573 ms/step at CFG 4, against 601 in ComfyUI, VAE 268 ms against 530 or more. Same picture at about 34 dB, not pixel-identical. |
 | P1 | Anima | Anima prompt weights | (word:1.2) and <weight> scale the T5 tokens, as ComfyUI does. Token ids match ComfyUI. |
 | P1 | Anima | Anima Batch Size, Sigma Shift and CFG | Generated through real SwarmUI. Output not compared with ComfyUI at CFG above 1. |
@@ -107,6 +110,8 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Anima | Other Anima checkpoint formats | bf16 and fp8 files are refused. Only int8 ConvRot runs. |
 | P1 | Anima | Close the ComfyUI output gap | LLM adapter output differs by 1.7%, cause unknown. Same picture at about 25 dB PSNR. |
 | P1 | Anima | Anima <break>, <alternate> and <fromto> | Per-chunk and per-step conditioning. |
+| P1 | MiniMax H3 | H3 first and last frame, references | Needs the video and audio encoders and the 32B vision tower. The turbo LoRA is trained for these modes. |
+| P1 | MiniMax H3 | H3 long clips | Longer than 22 frames and above 512x512 untested. Sparse attention isn't ported; its source is in comfy-kitchen. |
 | P1 | MOSS Image | MOSS Image reference images | Prompt Images and edit LoRAs need Qwen3.5's vision encoder, the VAE encoder and reference tokens. |
 | P1 | MOSS Image | Other MOSS Image checkpoint formats | bf16 and unfused q/k/v files are refused. Only fused int8 ConvRot runs. |
 | P2 | Server | ComfyUI node editor page | SwarmUI's Comfy Workflow tab won't render. Generation doesn't need it. |

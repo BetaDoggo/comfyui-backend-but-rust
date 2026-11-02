@@ -3,7 +3,7 @@
 use crate::cuda::{self, DevBuf, Event, Stream};
 use crate::samplers::{self, Eval, ModelSampling, Uncond};
 use crate::vision::{self, PromptImage};
-use crate::{anima, dit, ffi, flux2vae, lora, moss, offload, qwen3, qwen35, sampling, st, te, tokenizer, vae};
+use crate::{anima, dit, ffi, flux2vae, h3, h3te, h3vae, lora, moss, offload, qwen3, qwen35, sampling, st, te, tokenizer, vae};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -160,6 +160,25 @@ struct MossModel {
     lora: lora::State,
 }
 
+pub struct H3Request {
+    pub prompt: String,
+    /// Only encoded when the sampling uses it.
+    pub negative: String,
+    pub shape: h3::Shape,
+    pub sampling: Sampling,
+    /// video, audio
+    pub shifts: (f64, f64),
+    /// video, then audio
+    pub noise: Vec<f32>,
+}
+
+struct H3Model {
+    path: PathBuf,
+    dit: h3::Dit,
+    st: Arc<st::SafeTensors>,
+    lora: lora::State,
+}
+
 /// One run of a sampler. `model(x, out, sigma, negative, evaluation)` writes a denoised latent, and
 /// is called twice per evaluation under CFG, always positive first.
 fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
@@ -224,6 +243,11 @@ pub struct Generator {
     moss_tokenizer: Option<tokenizer::Tokenizer>,
     /// Latest encoded token ids, most recent last.
     moss_contexts: Vec<(Vec<u32>, moss::Context)>,
+    h3: Option<H3Model>,
+    h3_te: Option<(PathBuf, h3te::TextEncoder)>,
+    h3_tokenizer: Option<tokenizer::Tokenizer>,
+    /// Latest encoded token ids, most recent last.
+    h3_contexts: Vec<(Vec<u32>, DevBuf)>,
     vae: Option<(PathBuf, vae::Vae)>,
     flux2: Option<(PathBuf, flux2vae::Vae)>,
     cached: Option<(PromptKey, te::Cond, DevBuf)>,
@@ -311,7 +335,7 @@ impl Generator {
         let (_, total) = cuda::mem_info()?;
         eprintln!("GPU memory: {} MB free (device-wide) / {} MB total", cuda::device_free()? / MB, total / MB);
         Ok(Generator { st: st0, te: None, dit: None, anima: None, qwen3: None, tokenizers: None, contexts: Vec::new(), moss: None, qwen35: None,
-            moss_tokenizer: None, moss_contexts: Vec::new(), vae: None, flux2: None, cached: None, cached_negative: None, vision: None, vision_cache: Vec::new(),
+            moss_tokenizer: None, moss_contexts: Vec::new(), h3: None, h3_te: None, h3_tokenizer: None, h3_contexts: Vec::new(), vae: None, flux2: None, cached: None, cached_negative: None, vision: None, vision_cache: Vec::new(),
             max_pixels: o.max_pixels,
             max_width: o.max_width, max_height: o.max_height, reserve: o.reserve_vram_mb * MB,
             resident_blocks: o.resident_blocks, slots: o.slots, threads: o.threads, attn_variant: o.attn_variant,
@@ -410,6 +434,9 @@ impl Generator {
         self.moss_contexts.clear();
         self.moss = None;
         self.qwen35 = None;
+        self.h3_contexts.clear();
+        self.h3 = None;
+        self.h3_te = None;
         self.flux2 = None;
         cuda::trim_pool()
     }
@@ -477,6 +504,160 @@ impl Generator {
         eprintln!("MOSS Image ready in {:.1}s", t0.elapsed().as_secs_f64());
         self.moss = Some(MossModel { path: path.to_path_buf(), dit, st: dst, lora: lora::State::default() });
         Ok(())
+    }
+
+    /// Load a MiniMax H3 diffusion model unless `path` is loaded. VRAM is taken when it samples.
+    pub fn ensure_h3(&mut self, path: &Path) -> Result<()> {
+        if self.h3.as_ref().is_some_and(|m| m.path == path) {
+            return Ok(());
+        }
+        self.drop_krea()?;
+        self.drop_anima()?;
+        self.drop_moss()?;
+        self.h3_contexts.clear();
+        self.h3 = None;
+        let t0 = Instant::now();
+        let dst = Arc::new(st::SafeTensors::open(path)?);
+        let mut dit = h3::Dit::load(&dst, self.threads, &self.st)?;
+        dit.attn_variant = self.attn_variant;
+        dit.int8_attn = self.int8_attn;
+        eprintln!("MiniMax H3 loaded in {:.1}s", t0.elapsed().as_secs_f64());
+        self.h3 = Some(H3Model { path: path.to_path_buf(), dit, st: dst, lora: lora::State::default() });
+        Ok(())
+    }
+
+    /// Load H3's text encoder unless `path` is loaded. It streams from pinned RAM.
+    pub fn ensure_h3_te(&mut self, path: &Path) -> Result<()> {
+        if self.h3_te.as_ref().is_some_and(|(p, _)| p == path) {
+            return Ok(());
+        }
+        self.h3_te = None;
+        let t = h3te::TextEncoder::load(path, self.threads)?;
+        self.h3_te = Some((path.to_path_buf(), t));
+        if self.h3_tokenizer.is_none() {
+            self.h3_tokenizer = Some(tokenizer::Tokenizer::new()?);
+        }
+        Ok(())
+    }
+
+    /// The refined context of `prompt`, as its place in the cache and its length.
+    fn h3_context(&mut self, prompt: &str, dump: Option<&mut Dump>) -> Result<(usize, usize)> {
+        let tok = self.h3_tokenizer.as_ref().context("no H3 tokenizer")?;
+        let mut ids = tok.encode(prompt)?;
+        if ids.is_empty() {
+            ids.push(151643);
+        }
+        if let Some(i) = self.h3_contexts.iter().position(|(k, _)| *k == ids) {
+            return Ok((i, ids.len()));
+        }
+        let t0 = Instant::now();
+        let st = &self.st;
+        let (_, te) = self.h3_te.as_mut().context("no H3 text encoder")?;
+        let cond = te.encode(&ids, st)?;
+        if let Some(d) = dump {
+            let mut b = vec![0u8; ids.len() * h3te::D * 4];
+            cond.download(0, &mut b, st)?;
+            d.insert("context".into(), ("F32".into(), vec![1, ids.len(), h3te::D], b));
+        }
+        let m = self.h3.as_mut().context("no H3 model")?;
+        let ctx = m.dit.encode_context(&cond, ids.len(), st)?;
+        st.sync()?;
+        eprintln!("text encoded in {:.2}s, {} tokens", t0.elapsed().as_secs_f64(), ids.len());
+        if self.h3_contexts.len() >= 4 {
+            self.h3_contexts.remove(0);
+        }
+        let len = ids.len();
+        self.h3_contexts.push((ids, ctx));
+        Ok((self.h3_contexts.len() - 1, len))
+    }
+
+    /// The stream the models run on.
+    pub fn stream(&self) -> &Stream {
+        &self.st
+    }
+
+    /// The diffusion model leaves VRAM for a decoder, keeping its LoRAs and encoded prompts.
+    fn park_h3(&mut self) -> Result<()> {
+        self.st.sync()?;
+        if let Some(m) = self.h3.as_mut() {
+            m.dit.park()?;
+        }
+        cuda::trim_pool()
+    }
+
+    /// Decode the audio of a clip, [32, 2, t] latents to stereo samples.
+    pub fn decode_h3_audio(&mut self, path: &Path, latent: &[f32], t: usize) -> Result<Vec<f32>> {
+        self.park_h3()?;
+        h3vae::decode_audio(path, latent, t, &self.st)
+    }
+
+    /// Decode the video of a clip. Without the diffusion model in VRAM, the decoder's layers stay
+    /// resident rather than crossing the bus once per tile.
+    pub fn decode_h3(&mut self, path: &Path, latent: &[f32], sh: h3::Shape, frames: usize) -> Result<h3vae::Clip> {
+        self.park_h3()?;
+        let budget = cuda::device_free()?.saturating_sub(self.reserve + (3 << 30));
+        let mut v = h3vae::VideoDecoder::load(path, budget, self.threads, &self.st)?;
+        let out = v.decode(&latent[..sh.video_len()], sh.t, sh.h, sh.w, frames, &self.st)?;
+        self.st.sync()?;
+        Ok(out)
+    }
+
+    /// Sample a clip; returns the pack of latents, video then audio.
+    pub fn sample_h3(&mut self, r: &H3Request, mut progress: impl FnMut(usize, usize) -> bool, mut dump: Option<&mut Dump>) -> Result<(Vec<f32>, Stats)> {
+        let t0 = Instant::now();
+        let mut stats = Stats::default();
+        let shifts = (r.shifts.0 as f32, r.shifts.1 as f32);
+        self.h3.as_mut().context("no H3 model")?.dit.shifts = shifts;
+        let (pos, text) = self.h3_context(&r.prompt, dump.as_deref_mut())?;
+        if let Some(d) = dump.as_deref_mut() {
+            let bytes = text * 5376 * 2;
+            let mut v = vec![0u8; bytes];
+            self.h3_contexts[pos].1.download(0, &mut v, &self.st)?;
+            d.insert("ctx".into(), ("BF16".into(), vec![bytes / 2], v));
+        }
+        let neg = if r.sampling.uses_negative() { Some(self.h3_context(&r.negative, None)?) } else { None };
+        stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let st = &self.st;
+        let contexts = &self.h3_contexts;
+        let m = self.h3.as_mut().context("no H3 model")?;
+        // what is left after the activations goes to the blocks, re-planned for this shape
+        st.sync()?;
+        cuda::trim_pool()?;
+        let tokens = text.max(neg.map_or(0, |n| n.1)) + 2 * r.shape.audio_t + r.shape.t * (r.shape.h / 2) * (r.shape.w / 2);
+        let budget = (cuda::device_free()? + m.dit.blocks_vram()).saturating_sub(self.reserve + (1 << 29) + h3::step_activation_bytes(tokens));
+        m.dit.reserve(budget, self.slots)?;
+        let rope = m.dit.rope(text, &r.shape, st)?;
+        let rope_neg = neg.map(|(_, l)| m.dit.rope(l, &r.shape, st)).transpose()?;
+        let dit = &mut m.dit;
+        let n = r.noise.len();
+        let mut first = dump;
+        let mut model = |x: &DevBuf, den: &DevBuf, sigma: f32, negative: bool, e: usize| -> Result<()> {
+            let mut keep = |name: &str, b: &DevBuf, bytes: usize| {
+                if let (0, false, Some(d)) = (e, negative, first.as_mut()) {
+                    let mut v = vec![0u8; bytes];
+                    if b.download(0, &mut v, st).is_ok() {
+                        d.insert(name.to_string(), ("BF16".into(), vec![bytes / 2], v));
+                    }
+                }
+            };
+            match (negative, neg, &rope_neg) {
+                (true, Some((i, l)), Some(rn)) => dit.predict(x, &r.shape, &contexts[i].1, l, rn, sigma, den, st, None)?,
+                _ => dit.predict(x, &r.shape, &contexts[pos].1, text, &rope, sigma, den, st, Some(&mut keep))?,
+            }
+            if let (0, false, Some(d)) = (e, negative, first.as_mut()) {
+                let mut b = vec![0u8; n * 4];
+                den.download(0, &mut b, st)?;
+                d.insert("denoised0".into(), ("F32".into(), vec![n], b));
+            }
+            Ok(())
+        };
+        let mut out = run_sampler(&r.sampling, &r.noise, st, &mut stats, &mut model, &mut progress)?;
+        // the sampler carries the audio scaled onto the video schedule
+        let scale = shifts.0 / shifts.1;
+        for v in &mut out[r.shape.video_len()..] {
+            *v /= scale;
+        }
+        Ok((out, stats))
     }
 
     /// Load MOSS Image's Qwen3.5 text encoder unless `path` is loaded; streamed from pinned RAM,
@@ -767,6 +948,12 @@ impl Generator {
     /// Bake `loras` into the loaded diffusion model, in place of any others. Prompts encoded through
     /// the old weights are dropped: their contexts come out of the diffusion model.
     pub fn set_loras(&mut self, loras: &[lora::Lora]) -> Result<()> {
+        if let Some(m) = self.h3.as_mut() {
+            if lora::apply(lora::Arch::H3, &m.st, "", m.dit.stores(), &mut m.lora, loras, &self.st)? {
+                self.h3_contexts.clear();
+            }
+            return Ok(());
+        }
         let st = &self.st;
         if let Some(m) = &mut self.dit {
             if lora::apply(lora::Arch::Krea2, &m.st, "", m.dit.stores(), &mut m.lora, loras, st)? {
@@ -826,6 +1013,9 @@ impl Generator {
         if let Some(m) = &mut self.moss {
             m.dit.int8_attn = on;
         }
+        if let Some(m) = &mut self.h3 {
+            m.dit.int8_attn = on;
+        }
     }
 
     /// Drop every model and give their VRAM and pinned RAM back. `ensure_*` loads them again.
@@ -843,6 +1033,9 @@ impl Generator {
         self.moss_contexts.clear();
         self.moss = None;
         self.qwen35 = None;
+        self.h3_contexts.clear();
+        self.h3 = None;
+        self.h3_te = None;
         self.flux2 = None;
         self.vae = None;
         cuda::trim_pool()

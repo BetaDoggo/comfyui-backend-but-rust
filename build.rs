@@ -68,6 +68,8 @@ fn main() {
     let units = vec![
         Unit { src: csrc.join("kernels.cu"), fast_math: false, quiet: false },
         Unit { src: csrc.join("gemm.cu"), fast_math: false, quiet: true },
+        Unit { src: csrc.join("h3.cu"), fast_math: false, quiet: false },
+        Unit { src: csrc.join("vendor/w6a8_requant.cu"), fast_math: false, quiet: true },
         Unit { src: csrc.join("attn.cu"), fast_math: true, quiet: true },
         Unit { src: csrc.join("vendor/cutlass_gemm_int8.cu"), fast_math: false, quiet: true },
         Unit { src: csrc.join("attn_int8.cu"), fast_math: false, quiet: false },

@@ -1,10 +1,13 @@
-//! diffusion: Rust + CUDA reimplementation of ComfyUI's image generation, for int8 ConvRot checkpoints of Krea 2, Anima and MOSS Image.
+//! diffusion: Rust + CUDA reimplementation of ComfyUI's image generation, for quantized checkpoints of Krea 2, Anima, MOSS Image and MiniMax H3.
 
 pub mod anima;
 pub mod cuda;
 pub mod dit;
 pub mod ffi;
 pub mod flux2vae;
+pub mod h3;
+pub mod h3te;
+pub mod h3vae;
 pub mod lora;
 mod lora_adapters;
 pub mod moss;

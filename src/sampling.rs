@@ -72,6 +72,28 @@ pub fn torch_randn(seed: u64, n: usize) -> Vec<f32> {
     d
 }
 
+/// Consecutive `torch.randn` calls on one generator, as ComfyUI draws noise for a nested latent.
+pub fn torch_randn_streams(seed: u64, sizes: &[usize]) -> Vec<Vec<f32>> {
+    let mut g = Mt19937::new(seed);
+    sizes.iter().map(|&n| {
+        assert!(n >= 16);
+        let mut d: Vec<f32> = (0..n).map(|_| g.uniform_f32()).collect();
+        let mut i = 0;
+        while i + 16 <= n {
+            normal_fill_16(&mut d[i..i + 16]);
+            i += 16;
+        }
+        if n % 16 != 0 {
+            let s = n - 16;
+            for v in &mut d[s..] {
+                *v = g.uniform_f32();
+            }
+            normal_fill_16(&mut d[s..]);
+        }
+        d
+    }).collect()
+}
+
 fn philox4x32(mut c: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
     const M0: u64 = 0xD251_1F53;
     const M1: u64 = 0xCD9E_8D57;

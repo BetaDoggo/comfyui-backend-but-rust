@@ -36,6 +36,7 @@ pub enum Arch {
     Krea2,
     Anima,
     Moss,
+    H3,
     /// `comfy` names the encoder inside ComfyUI's text encoder model, as in `qwen3vl_4b`.
     TextEncoder { comfy: &'static str },
 }
@@ -548,10 +549,12 @@ impl Model<'_> {
         let bytes = match place.2.kind {
             Stored::Raw => {
                 if let Some(stem) = tensor.strip_suffix(".weight") {
-                    let scale = format!("{stem}.weight_scale");
-                    let d = upload(self.st.bytes(&self.file_name(&scale))?, st)?;
-                    let sp = self.place(&scale)?;
-                    self.write(sp, &d, st)?;
+                    let names = if self.st.has(&self.file_name(&format!("{stem}.weight_s_rel"))) { vec![format!("{stem}.weight_s_rel"), format!("{stem}.weight_s_channel")] } else { vec![format!("{stem}.weight_scale")] };
+                    for scale in names {
+                        let d = upload(self.st.bytes(&self.file_name(&scale))?, st)?;
+                        let sp = self.place(&scale)?;
+                        self.write(sp, &d, st)?;
+                    }
                 }
                 self.st.bytes(&name)?.to_vec()
             }
@@ -569,6 +572,9 @@ impl Model<'_> {
         let rows = info.shape.first().copied().unwrap_or(1);
         let per_row = info.numel() / rows.max(1);
         let dt = self.arch.dtype();
+        if let Some(stem) = tensor.strip_suffix(".weight").filter(|s| self.st.has(&self.file_name(&format!("{s}.weight_s_rel")))) {
+            return self.bake_w6(tensor, stem, patches, files, st);
+        }
         let w = DevBuf::alloc_async(info.numel() * elem(dt), st)?;
         match place.2.kind {
             Stored::Raw => {
@@ -601,6 +607,30 @@ impl Model<'_> {
     }
 }
 
+impl Model<'_> {
+    /// As [`Model::bake`] for w6a8 weights: 6-bit codes -> int8 -> bf16 -> patches -> 6-bit codes.
+    fn bake_w6(&mut self, tensor: &str, stem: &str, patches: &[Patch], files: &[SafeTensors], st: &Stream) -> Result<()> {
+        const G: usize = 32;
+        let (rel, chan) = (format!("{stem}.weight_s_rel"), format!("{stem}.weight_s_channel"));
+        let (place, rp, cp) = (self.place(tensor)?, self.place(&rel)?, self.place(&chan)?);
+        let rows = self.st.info(&self.file_name(tensor))?.shape[0];
+        let per_row = self.st.info(&self.file_name(&rel))?.shape[1] * G;
+        let q = upload(self.st.bytes(&self.file_name(tensor))?, st)?;
+        let r = upload(self.st.bytes(&self.file_name(&rel))?, st)?;
+        let c = upload(self.st.bytes(&self.file_name(&chan))?, st)?;
+        let i8s = DevBuf::alloc_async(rows * per_row, st)?;
+        let w = DevBuf::alloc_async(rows * per_row * 2, st)?;
+        k!(gpu_w6_decode(q.ptr(), r.ptr(), i8s.ptr(), rows as i64, per_row as i32, G as i32, s(st)))?;
+        k!(gpu_convrot_dequant(DT_BF16, i8s.ptr(), c.ptr(), w.ptr(), rows as i64, per_row as i32, s(st)))?;
+        add_patches(&w, DT_BF16, rows, per_row, patches, files, tensor, st)?;
+        let seed = string_to_seed(&self.arch.module(stem));
+        k!(gpu_w6_requant(w.ptr(), q.ptr(), r.ptr(), c.ptr(), rows as i64, per_row as i32, seed, s(st)))?;
+        self.write(place, &q, st)?;
+        self.write(rp, &r, st)?;
+        self.write(cp, &c, st)
+    }
+}
+
 /// Make the model's weights hold `loras`, in order. Only tensors whose patches changed are touched.
 /// Returns true if any weight changed, so whatever was derived from the weights must be dropped.
 pub fn apply(arch: Arch, st: &SafeTensors, prefix: &str, mut stores: Vec<Store>, state: &mut State, loras: &[Lora], s0: &Stream) -> Result<bool> {
@@ -610,7 +640,7 @@ pub fn apply(arch: Arch, st: &SafeTensors, prefix: &str, mut stores: Vec<Store>,
     let t0 = Instant::now();
     let tensors: HashMap<String, usize> = st.tensors.iter()
         .filter_map(|(k, i)| Some((k.strip_prefix(prefix)?.to_string(), i.shape.first().copied().unwrap_or(1))))
-        .filter(|(k, _)| !k.ends_with(".weight_scale") && !k.ends_with(".comfy_quant"))
+        .filter(|(k, _)| !k.ends_with(".weight_scale") && !k.ends_with(".weight_s_rel") && !k.ends_with(".weight_s_channel") && !k.ends_with(".comfy_quant"))
         .collect();
     let keys: Vec<(String, usize)> = tensors.iter().map(|(k, r)| (k.clone(), *r)).collect();
     let map = key_map(arch, &keys);

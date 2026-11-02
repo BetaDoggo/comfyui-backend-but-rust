@@ -1,4 +1,4 @@
-//! diffusion: Rust + CUDA reimplementation of ComfyUI's image generation, for int8 ConvRot checkpoints of Krea 2, Anima and MOSS Image.
+//! diffusion: Rust + CUDA reimplementation of ComfyUI's generation, for quantized checkpoints of Krea 2, Anima, MOSS Image and MiniMax H3.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -64,9 +64,10 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     attn_variant: i32,
     /// Attention for the DiT blocks: "int8" (SageAttention-style INT8 attention from comfy-kitchen,
-    /// fastest) or "flash" (bf16 FlashAttention-2, matches ComfyUI's default numerics most closely)
-    #[arg(long, default_value = "int8")]
-    attention: String,
+    /// fastest) or "flash" (bf16 FlashAttention-2, matches ComfyUI's default numerics most closely).
+    /// Default int8, except flash for MiniMax H3, whose attention sink rows suit int8 poorly
+    #[arg(long)]
+    attention: Option<String>,
     /// Use the noise stored in a ComfyUI reference dump (tools/ref_dump.py) instead of the seed
     #[arg(long)]
     ref_noise: Option<PathBuf>,
@@ -90,6 +91,12 @@ struct Args {
     /// Run MOSS Image instead of Krea 2 (--dit, --te and --vae then default to the MOSS files, --shift to 5)
     #[arg(long)]
     moss: bool,
+    /// Run MiniMax H3 (text to video with audio); --dit and --te then default to its files
+    #[arg(long)]
+    h3: bool,
+    /// MiniMax H3: frames at 24 fps, snapped up to the model's 17k + 5 grid
+    #[arg(long, default_value_t = 5)]
+    frames: usize,
     /// MOSS Image: encode with the Krea 2 template, as SwarmUI does
     #[arg(long)]
     swarm_template: bool,
@@ -269,6 +276,115 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     Ok(())
 }
 
+const H3_DIT: &str = "Stable-diffusion/minimax_h3_fl2va_pruned_w6a8.safetensors";
+const H3_TE: &str = "clip/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors";
+const H3_VAE: &str = "VAE/MiniMaxH3/minimax_h3_video_vae_int8_convrot.safetensors";
+const H3_AUDIO_VAE: &str = "VAE/MiniMaxH3/minimax_h3_audio_vae_fp32.safetensors";
+
+fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
+    use diffusion::h3;
+    let t_all = Instant::now();
+    let (dit, te) = (args.model(&args.dit, H3_DIT), args.model(&args.te, H3_TE));
+    let frames = h3::align_frames(args.frames);
+    if args.width % 32 != 0 || args.height % 32 != 0 {
+        bail!("MiniMax H3 needs a width and height in multiples of 32");
+    }
+    let shape = h3::Shape::new(args.width, args.height, frames);
+    let mut gen = pipeline::Generator::new(&load)?;
+    let t0 = Instant::now();
+    gen.ensure_h3(&dit)?;
+    gen.ensure_h3_te(&te)?;
+    eprintln!("MiniMax H3 ready in {:.1}s", t0.elapsed().as_secs_f64());
+    let (model, _) = parse_loras(args)?;
+    gen.set_loras(&model)?;
+    let noise = match &args.ref_noise {
+        Some(p) => {
+            let st = st::SafeTensors::open(p)?;
+            let mut v = st.f32_vec("noise0", false)?;
+            v.extend(st.f32_vec("noise1", false)?);
+            v
+        }
+        None => diffusion::sampling::torch_randn_streams(args.seed, &[shape.video_len(), shape.audio_len()]).concat(),
+    };
+    let sampling = args.sampling("res_multistep", ModelSampling::Flow { shift: h3::SHIFT_VIDEO }, args.seed, (args.width / 16, args.height / 16))?;
+    let r = pipeline::H3Request { prompt: args.prompt.clone(), negative: args.negative.clone(), shape, sampling, shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO), noise };
+    let mut dump = pipeline::Dump::new();
+    let t0 = Instant::now();
+    let (latent, _) = gen.sample_h3(&r, |_, _| true, args.dump.as_ref().map(|_| &mut dump))?;
+    eprintln!("sampled in {:.2}s", t0.elapsed().as_secs_f64());
+    dump.insert("samples".into(), ("F32".into(), vec![latent.len()], st::f32_bytes(&latent).to_vec()));
+    if let Some(d) = &args.dump {
+        write_safetensors(d, &dump)?;
+    }
+    let t1 = Instant::now();
+    let vae = args.model(&args.vae, H3_VAE);
+    let clip = gen.decode_h3(&vae, &latent, shape, frames)?;
+    eprintln!("video decoded in {:.2}s", t1.elapsed().as_secs_f64());
+    let t1 = Instant::now();
+    let wave = gen.decode_h3_audio(&args.model(&None, H3_AUDIO_VAE), &latent[shape.video_len()..], shape.audio_t)?;
+    eprintln!("audio decoded in {:.2}s", t1.elapsed().as_secs_f64());
+    let (h, w) = (clip.h, clip.w);
+    let mut frames_hwc = vec![0f32; frames * h * w * 3];
+    let mut rgb = vec![0u8; frames * h * w * 3];
+    for c in 0..3 {
+        for f in 0..frames {
+            for i in 0..h * w {
+                let v = clip.data[((c * frames + f) * h) * w + i];
+                frames_hwc[(f * h * w + i) * 3 + c] = v;
+                rgb[(f * h * w + i) * 3 + c] = (v * 255.0).round() as u8;
+            }
+        }
+    }
+    let samples = wave.len() / 2;
+    let stereo: Vec<f32> = (0..samples).flat_map(|i| [wave[i], wave[samples + i]]).collect();
+    dump.insert("frames".into(), ("F32".into(), vec![1, frames, h, w, 3], st::f32_bytes(&frames_hwc).to_vec()));
+    dump.insert("wave".into(), ("F32".into(), vec![1, samples, 2], st::f32_bytes(&stereo).to_vec()));
+    if let Some(d) = &args.dump {
+        write_safetensors(d, &dump)?;
+    }
+    write_video(&args.out, &rgb, w, h, &stereo)?;
+    eprintln!("saved {} ({frames} frames at 24 fps, seed {}), {:.1}s in all", args.out.display(), args.seed, t_all.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// Encode with ffmpeg, which reads the frames from a pipe and the audio from a WAV next to the output.
+fn write_video(out: &Path, rgb: &[u8], w: usize, h: usize, stereo: &[f32]) -> Result<()> {
+    use std::io::Write;
+    let wav = out.with_extension("wav");
+    let data = (stereo.len() * 2) as u32;
+    let mut b = Vec::with_capacity(44 + data as usize);
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&2u16.to_le_bytes());
+    b.extend_from_slice(&32000u32.to_le_bytes());
+    b.extend_from_slice(&(32000u32 * 4).to_le_bytes());
+    b.extend_from_slice(&4u16.to_le_bytes());
+    b.extend_from_slice(&16u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data.to_le_bytes());
+    for v in stereo {
+        b.extend_from_slice(&((v * 32767.0).round() as i16).to_le_bytes());
+    }
+    std::fs::write(&wav, b)?;
+    let mut child = std::process::Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{w}x{h}"), "-r", "24", "-i", "-", "-i"])
+        .arg(&wav)
+        .args(["-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest"])
+        .arg(out)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("running ffmpeg")?;
+    child.stdin.take().unwrap().write_all(rgb)?;
+    if !child.wait()?.success() {
+        bail!("ffmpeg failed");
+    }
+    std::fs::remove_file(wav)?;
+    Ok(())
+}
+
 /// Minimal safetensors writer for debug dumps.
 fn write_safetensors(path: &Path, tensors: &BTreeMap<String, (String, Vec<usize>, Vec<u8>)>) -> Result<()> {
     let mut header = serde_json::Map::new();
@@ -302,7 +418,7 @@ fn out_path(base: &Path, i: usize, count: usize) -> PathBuf {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let int8_attn = match args.attention.as_str() {
+    let int8_attn = match args.attention.as_deref().unwrap_or(if args.h3 { "flash" } else { "int8" }) {
         "flash" => false,
         "int8" | "sage" => true,
         a => bail!("unknown --attention {a} (flash | int8)"),
@@ -326,6 +442,9 @@ fn main() -> Result<()> {
         attn_variant: args.attn_variant,
         int8_attn,
     };
+    if args.h3 {
+        return run_h3(&args, load);
+    }
     if args.anima {
         return run_anima(&args, load);
     }

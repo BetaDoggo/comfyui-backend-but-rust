@@ -175,6 +175,7 @@ impl Drop for Stream {
 
 pub struct Event(pub cudaEvent_t);
 unsafe impl Send for Event {}
+unsafe impl Sync for Event {}
 impl Event {
     /// Synchronization-only event (no timing).
     pub fn new() -> Result<Self> {
@@ -182,6 +183,13 @@ impl Event {
         ck!(cudaEventCreateWithFlags(&mut e, 2))?; // disable timing
         Ok(Event(e))
     }
+    /// A second event recorded right after `first`, for another thread to wait on.
+    pub fn new_like(_first: &Event, s: &Stream) -> Result<Self> {
+        let e = Self::new()?;
+        e.record(s)?;
+        Ok(e)
+    }
+
     pub fn timing() -> Result<Self> {
         let mut e = std::ptr::null_mut();
         ck!(cudaEventCreateWithFlags(&mut e, 0))?;

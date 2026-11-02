@@ -54,21 +54,23 @@ Model Attention Backend (`int8`, or `flash` for ComfyUI's numerics), Free VRAM. 
 `Stable-Diffusion/` as well as `diffusion_models/`, and a generation is pixel-identical to the `krea2` CLI for the
 same seed. There are no live previews.
 
-Everything else is refused with an error in SwarmUI rather than silently ignored: CFG other than 1 and negative
-prompts, samplers other than `euler` / `simple`, `<weight>` and other per-step or per-chunk prompt syntax,
+Every sampler and scheduler works on all three families, at any CFG with a negative prompt, along with Sampler Sigma Min,
+Sigma Max and Rho. Only the `ltxv-image` scheduler is refused. See the [README](../README.md#samplers).
+
+Everything else is refused with an error in SwarmUI rather than silently ignored: `<weight>` and other per-step or per-chunk prompt syntax,
 Prompt Images, init images and refiners (no VAE encoder), ControlNet, regions, VAE tiling, Seamless Tileable, and
 non-W8A8 Krea 2 files.
 
 **Anima** runs from the same `--engine krea2` server. The checkpoint's keys pick the family, and one family is
 loaded at a time, so switching took 4 s to Anima and 9 s to Krea 2 with the files cached. Select an int8 ConvRot Anima checkpoint with
-Steps 8 and CFG Scale 1 for turbo models. These work: `er_sde` and `euler` with `simple`, any CFG with a negative
+Steps 8 and CFG Scale 1 for turbo models. These work: any CFG with a negative
 prompt, `(word:1.2)` and `<weight>`, seed, Variation Seed, Batch Size, Sigma Shift, Model Attention Backend, cancelling and
-Free VRAM. Other samplers and schedulers, LLLite ControlNets, `<break>`, `<alternate>`, `<fromto>`, init images and
+Free VRAM. LLLite ControlNets, `<break>`, `<alternate>`, `<fromto>`, init images and
 VAE tiling are refused with an error.
 
 **MOSS Image** runs from the same server. Select an int8 ConvRot MOSS Image checkpoint; SwarmUI adds
 `qwen3.5_9b_int8_convrot.safetensors` and the Flux 2 VAE itself. Tested through SwarmUI at 1024x1024 and 832x1216: `euler` and `er_sde` with
-`simple`, CFG 1 and CFG 4 with a negative prompt, seed, Batch Size and Sigma Shift. Other samplers and schedulers, Prompt Images, `<weight>`,
+`simple`, CFG 1 and CFG 4 with a negative prompt, seed, Batch Size and Sigma Shift. Prompt Images, `<weight>`,
 `<break>`, `<alternate>`, `<fromto>` and init images are refused with an error. A 20-step CFG 4 image took 11.5 s through SwarmUI,
 and switching from Krea 2 or Anima took about 3 s extra.
 

@@ -7,7 +7,8 @@
 //!   GET  /api/job/<id>        one job
 //!   GET  /api/image/<id>.png  the result
 
-use crate::pipeline::{encode_png, Generator, LoadOptions, Request, Stats};
+use crate::samplers::ModelSampling;
+use crate::pipeline::{encode_png, Generator, LoadOptions, Request, Sampling, Stats};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -116,8 +117,9 @@ pub fn run(load: LoadOptions, opts: ServeOptions) -> Result<()> {
                     let mut s = state.lock().unwrap();
                     let Some(j) = s.jobs.iter_mut().find(|j| j.id == id) else { continue };
                     j.state = "running";
-                    Request { prompt: j.prompt.clone(), seed: j.seed, width: j.width, height: j.height,
-                        steps: j.steps, shift, noise: None }
+                    let ms = ModelSampling::Flux { shift };
+                    let sampling = Sampling::new("euler", "simple", ms, j.steps, 1.0, j.seed, (j.width / 8, j.height / 8)).unwrap();
+                    Request { prompt: j.prompt.clone(), negative: String::new(), seed: j.seed, width: j.width, height: j.height, sampling, noise: None }
                 };
                 let st2 = state.clone();
                 let result = gen

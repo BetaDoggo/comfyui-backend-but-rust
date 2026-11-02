@@ -32,6 +32,11 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Anima | Anima prompt weights | (word:1.2) and <weight> scale the T5 tokens, as ComfyUI does. Token ids match ComfyUI. |
 | P1 | Anima | Anima Batch Size, Sigma Shift and CFG | Generated through real SwarmUI. Output not compared with ComfyUI at CFG above 1. |
 | P1 | MOSS Image | MOSS Image Batch Size, Sigma Shift and CFG | Generated through real SwarmUI at 1024x1024 and 832x1216. Euler at CFG 4 compared with ComfyUI; er_sde and CFG 1 not compared. |
+| P0 | Engine core | Sampler: euler for all flow models | Every flow model now samples on the host, Krea 2 included. Real images on all three. |
+| P0 | Engine core | Sampler: res_multistep | Ported with the other samplers. Tested on Anima against ComfyUI; 25 dB with flash attention. |
+| P1 | Engine core | Samplers: dpmpp_2m, dpmpp_2m_sde, uni_pc, ddim | All 45 ComfyUI samplers: within 8e-6 of ComfyUI's own code on a mock model. Real images on all three models, through the server API and CLI, not the SwarmUI page. dpm_adaptive picks steps per image, not per batch. |
+| P1 | Engine core | Schedulers: normal, karras, sgm_uniform, beta | All 9 ComfyUI schedulers plus turbo, align_your_steps, flux2 and ideogram4. Within 2e-6 of ComfyUI on 1105 schedules. ltxv-image is refused. |
+| P2 | Engine core | Sigma overrides | Sigma Min, Sigma Max and Rho for karras and exponential, as SwarmKSampler does. Run once through the server API. |
 
 ## Doing
 
@@ -39,9 +44,9 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 |---|---|---|---|
 | P0 | Engine core | Route each model to its engine | One backend now serves Krea 2, Anima and MOSS Image, picked from the checkpoint's keys. Still inside krea2-engine; other families need a real router. |
 | P0 | Engine core | Dynamic VRAM offloading | Live residency works and adapted to ComfyUI's memory. Open: 16 to 11 drop at 1024, one 867 ms/step run after ComfyUI. |
-| P0 | Engine core | CFG and negative prompts | Works for Anima and MOSS Image through SwarmUI. Krea 2 still refuses it. |
-| P0 | Engine core | Sampler: euler for all flow models | Anima's and MOSS Image's Euler are separate from the model and work. Krea 2's is still fused into its un-patchify kernel. |
 | P1 | Krea 2 | Model Attention Backend | int8 and flash, per request. flash not yet run through the server. |
+| P0 | Engine core | CFG and negative prompts | Anima and MOSS Image work. Krea 2 works from the CLI and isn't tested through SwarmUI yet. |
+| P0 | Krea 2 | CFG above 1 and negative prompts | Works from the CLI, with real images at CFG 2. Not yet tested through SwarmUI or compared with ComfyUI. |
 
 ## Plumbing
 
@@ -85,12 +90,8 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | Priority | Area | Item | Notes |
 |---|---|---|---|
 | P0 | Engine core | Move krea2 behind a shared engine crate | Share the CUDA runtime, kernels, offloading and sampler between model families instead of hard-coding Krea 2. |
-| P0 | Engine core | Sampler: res_multistep | Swarm's default for MiniMax H3. |
 | P0 | Engine core | Latent operations | Add, multiply, blend, batch, repeat and upscale. Needed by init images, refiners and regions. |
-| P0 | Krea 2 | CFG above 1 and negative prompts | Needs the engine core CFG work. |
 | P0 | Image workflows | VAE encoder | Nothing can encode an image yet. Blocks init images, refiners, inpainting and references. |
-| P1 | Engine core | Samplers: dpmpp_2m, dpmpp_2m_sde, uni_pc, ddim | The common choices beyond each model's default. |
-| P1 | Engine core | Schedulers: normal, karras, sgm_uniform, beta | Only simple exists. Also align_your_steps for Qwen 2.1 Turbo. |
 | P1 | Engine core | Live previews | Latent-to-RGB preview during sampling. Swarm shows none for krea2 today. |
 | P1 | Engine core | Hardware beyond this card | Everything targets sm_120 on Windows. Other GPUs and Linux are untested. |
 | P1 | Krea 2 | Prompt weights | <weight> through SwarmAttnTokenWeights, inside attention. |
@@ -107,7 +108,6 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | MOSS Image | Other MOSS Image checkpoint formats | bf16 and unfused q/k/v files are refused. Only fused int8 ConvRot runs. |
 | P2 | Server | ComfyUI node editor page | SwarmUI's Comfy Workflow tab won't render. Generation doesn't need it. |
 | P2 | Engine core | Tiled sampling | Swarm's Tile Sample and refiner tiling. |
-| P2 | Engine core | Sigma overrides | Sampler Sigma Min, Sigma Max and Rho. |
 | P2 | Krea 2 | Prompt Images | Needs the Qwen3-VL vision tower. |
 | P2 | Krea 2 | Reference latents | Edit mode, needs the VAE encoder too. |
 | P2 | MiniMax H3 | MiniMax H3 video and audio engine | Installed. Largest of the five: joint video and audio latents, tiled video VAE. |

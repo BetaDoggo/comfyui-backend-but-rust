@@ -109,6 +109,9 @@ This also sets the limit. Where GPU time is already almost all GEMM and attentio
 The scripts in [`tools/`](../tools) run the real ComfyUI pipeline and compare tokens, hidden states, single model
 evaluations, baked LoRA weights and final images with this engine. They need Python and a ComfyUI checkout, but only for that testing.
 
+Samplers and schedulers ([`src/samplers.rs`](../src/samplers.rs)) are checked against ComfyUI's own code on a mock model by
+`tools/sampler_ref.py` and `tests/samplers_match_comfy.rs`, which needs no checkpoint.
+
 Noise is reimplemented in [`src/sampling.rs`](../src/sampling.rs): `mt19937` for torch's CPU generator and Philox for its
 CUDA generator, so seeds give the same noise as ComfyUI. Images are close but not identical, because rounding differs
 at some steps. The README gives the measured PSNR for each model.

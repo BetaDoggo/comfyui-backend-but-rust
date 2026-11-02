@@ -1,6 +1,6 @@
 //! [`Engine`] implementation on the krea2 library: text-to-image for int8 ConvRot checkpoints of
-//! Krea 2 (turbo: CFG 1, `euler` / `simple`), Anima and MOSS Image (`er_sde` or `euler`, `simple`, any
-//! CFG), with LoRAs. Each file's architecture is read from its keys, so one backend serves all three.
+//! Krea 2, Anima and MOSS Image, with every ComfyUI sampler and scheduler, any CFG and LoRAs. Each
+//! file's architecture is read from its keys, so one backend serves all three.
 //!
 //! Text encoding is deferred to `sample`, so the negative prompt SwarmUI always sends costs nothing
 //! at CFG 1. Everything the pipeline can't do is refused with [`EngineError::Unsupported`], which
@@ -12,7 +12,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use krea2::pipeline::{AnimaRequest, Cancelled, FlowSampler, Generator, LoadOptions, MossRequest, Request};
+use krea2::pipeline::{AnimaRequest, Cancelled, Generator, LoadOptions, MossRequest, Request, Sampling};
+use krea2::samplers::{self, ModelSampling, SigmaRange};
 use krea2::lora::{self, Lora};
 use krea2::tokenizer::token_weights;
 use swarm_engine_api::prompt::PromptLeafKind;
@@ -230,24 +231,26 @@ fn flux_shift(max_shift: f64, base_shift: f64, width: u32, height: u32) -> f64 {
 }
 
 struct ModelSettings {
-    shift: f64,
+    model_sampling: ModelSampling,
     int8_attention: bool,
     loras: Vec<Lora>,
 }
 
 fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
-    let shift = match family {
-        Family::Krea2 => KREA2_SHIFT,
-        Family::Anima => ANIMA_SHIFT,
-        Family::Moss => MOSS_SHIFT,
+    let model_sampling = match family {
+        Family::Krea2 => ModelSampling::Flux { shift: KREA2_SHIFT },
+        Family::Anima => ModelSampling::Flow { shift: ANIMA_SHIFT },
+        Family::Moss => ModelSampling::Flow { shift: MOSS_SHIFT },
     };
-    let mut s = ModelSettings { shift, int8_attention: true, loras: Vec::new() };
+    let mut s = ModelSettings { model_sampling, int8_attention: true, loras: Vec::new() };
     for p in &model.patches {
         match p {
             ModelPatch::SamplingFlux { max_shift, base_shift, width, height } if family == Family::Krea2 => {
-                s.shift = flux_shift(*max_shift, *base_shift, *width, *height)
+                s.model_sampling = ModelSampling::Flux { shift: flux_shift(*max_shift, *base_shift, *width, *height) }
             }
-            ModelPatch::SamplingAuraFlow { shift, sampling } if family != Family::Krea2 && sampling == "flow" => s.shift = *shift,
+            ModelPatch::SamplingAuraFlow { shift, sampling } if family != Family::Krea2 && sampling == "flow" => {
+                s.model_sampling = ModelSampling::Flow { shift: *shift }
+            }
             ModelPatch::AttentionBackend { backend } => {
                 s.int8_attention = match backend.as_str() {
                     "int8" => true,
@@ -267,20 +270,13 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
     Ok(s)
 }
 
-/// Everything in a sampler request beyond seeded turbo text-to-image is refused here.
-fn check_sample(req: &SampleRequest, family: Family) -> EngineResult<()> {
-    if family == Family::Krea2 {
-        if (req.cfg - 1.0).abs() > 1e-6 {
-            return Err(unsupported(format!("CFG Scale {} (this backend runs Krea 2 Turbo: set CFG Scale to 1)", req.cfg)));
-        }
-        if req.sampler != "euler" {
-            return Err(unsupported(format!("sampler {} (use euler)", req.sampler)));
-        }
-    } else if !matches!(req.sampler.as_str(), "er_sde" | "euler") {
-        return Err(unsupported(format!("sampler {} (use er_sde or euler)", req.sampler)));
+/// Everything in a sampler request beyond seeded text-to-image is refused here.
+fn check_sample(req: &SampleRequest) -> EngineResult<()> {
+    if !samplers::SAMPLERS.contains(&req.sampler.as_str()) {
+        return Err(unsupported(format!("sampler {}", req.sampler)));
     }
-    if req.scheduler != "simple" {
-        return Err(unsupported(format!("scheduler {} (use simple)", req.scheduler)));
+    if !samplers::SCHEDULERS.contains(&req.scheduler.as_str()) {
+        return Err(unsupported(format!("scheduler {}", req.scheduler)));
     }
     if req.start_at_step != 0 || req.end_at_step < req.steps || !req.add_noise || req.denoise != 1.0 {
         return Err(unsupported("partial sampling (init images, refiners)"));
@@ -288,13 +284,25 @@ fn check_sample(req: &SampleRequest, family: Family) -> EngineResult<()> {
     if !req.latent.empty || req.latent.noise_mask.is_some() {
         return Err(unsupported("init images and masks (no VAE encoder yet)"));
     }
-    if req.sigma_min.is_some() || req.sigma_max.is_some() {
-        return Err(unsupported("sigma min / max overrides"));
-    }
     if req.tile_size.is_some() {
         return Err(unsupported("tiled sampling"));
     }
     Ok(())
+}
+
+/// The sampling of image `index` of `batch`.
+fn sampling(req: &SampleRequest, settings: &ModelSettings, (batch, lh, lw): (usize, usize, usize), index: usize) -> EngineResult<Sampling> {
+    let range = req.sigma_min.zip(req.sigma_max).map(|(sigma_min, sigma_max)| SigmaRange { sigma_min, sigma_max, rho: req.rho });
+    let sigmas = samplers::sigmas(settings.model_sampling, &req.sampler, &req.scheduler, req.steps as usize, (lw, lh), range).map_err(internal)?;
+    Ok(Sampling {
+        sampler: req.sampler.clone(),
+        model_sampling: settings.model_sampling,
+        sigmas,
+        cfg: req.cfg,
+        seed: req.noise_seed,
+        batch_index: index,
+        batch_size: batch,
+    })
 }
 
 impl Krea2Engine {
@@ -338,10 +346,8 @@ impl Krea2Engine {
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, positive) = single_prompt(&req.positive)?;
         let text_encoder = &cond.text_encoder;
-        let guided = (req.cfg - 1.0).abs() > 1e-6;
-        let negative = if guided { single_prompt(&req.negative)?.1 } else { &[] };
-        let sampler = flow_sampler(req);
-        let steps = req.steps as usize;
+        let first = sampling(req, settings, shape, 0)?;
+        let negative = if first.uses_negative() { single_prompt(&req.negative)?.1 } else { &[] };
         let mut gen = self.gen();
         gen.ensure_anima(&file.path).map_err(internal)?;
         gen.ensure_qwen3(text_encoder).map_err(internal)?;
@@ -352,19 +358,13 @@ impl Krea2Engine {
             let r = AnimaRequest {
                 positive: positive.to_vec(),
                 negative: negative.to_vec(),
-                cfg: req.cfg,
-                sampler,
-                seed: req.noise_seed,
-                batch_index: i,
-                batch_size: batch,
                 width: lw * 8,
                 height: lh * 8,
-                steps,
-                shift: settings.shift,
+                sampling: sampling(req, settings, shape, i)?,
                 noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, 16, lh, lw),
             };
             let (latent, stats) = gen
-                .sample_anima(&r, |step, _| {
+                .sample_anima(&r, |step, steps| {
                     progress.progress((i * steps + step) as u32, (batch * steps) as u32);
                     !progress.interrupted()
                 }, None)
@@ -380,9 +380,7 @@ impl Krea2Engine {
         let (batch, lh, lw) = shape;
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, positive) = single_prompt(&req.positive)?;
-        let guided = (req.cfg - 1.0).abs() > 1e-6;
-        let negative = if guided { single_prompt(&req.negative)?.1[0].0.clone() } else { String::new() };
-        let steps = req.steps as usize;
+        let negative = if sampling(req, settings, shape, 0)?.uses_negative() { single_prompt(&req.negative)?.1[0].0.clone() } else { String::new() };
         let mut gen = self.gen();
         gen.ensure_moss(&file.path).map_err(internal)?;
         gen.ensure_qwen35(&cond.text_encoder).map_err(internal)?;
@@ -394,19 +392,13 @@ impl Krea2Engine {
                 positive: positive[0].0.clone(),
                 negative: negative.clone(),
                 template: cond.template.clone(),
-                cfg: req.cfg,
-                sampler: flow_sampler(req),
-                seed: req.noise_seed,
-                batch_index: i,
-                batch_size: batch,
                 width: lw * 16,
                 height: lh * 16,
-                steps,
-                shift: settings.shift,
+                sampling: sampling(req, settings, shape, i)?,
                 noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, krea2::moss::CH, lh, lw),
             };
             let (latent, stats) = gen
-                .sample_moss(&r, |step, _| {
+                .sample_moss(&r, |step, steps| {
                     progress.progress((i * steps + step) as u32, (batch * steps) as u32);
                     !progress.interrupted()
                 }, None)
@@ -416,10 +408,6 @@ impl Krea2Engine {
         }
         Ok(data)
     }
-}
-
-fn flow_sampler(req: &SampleRequest) -> FlowSampler {
-    if req.sampler == "er_sde" { FlowSampler::ErSde } else { FlowSampler::Euler }
 }
 
 /// True for the Flux 2 VAE, which MOSS Image uses.
@@ -522,7 +510,7 @@ impl Engine for Krea2Engine {
     fn sample(&self, req: &SampleRequest, progress: &mut dyn ProgressSink) -> EngineResult<Latent> {
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let family = check_dit(file)?;
-        check_sample(req, family)?;
+        check_sample(req)?;
         let settings = model_settings(&req.model, family)?;
         let LatentSamples::Single(tensor) = &req.latent.samples else {
             return Err(unsupported("audio/video latents"));
@@ -549,7 +537,8 @@ impl Engine for Krea2Engine {
         let (cond, prompt) = single_prompt(&req.positive)?;
         let (text_encoder, prompt) = (&cond.text_encoder, &prompt[0].0);
         let (width, height) = (lw * 8, lh * 8);
-        let steps = req.steps as usize;
+        let shape = (batch, lh, lw);
+        let negative = if sampling(req, &settings, shape, 0)?.uses_negative() { single_prompt(&req.negative)?.1[0].0.clone() } else { String::new() };
 
         let mut gen = self.gen();
         gen.ensure_dit(&file.path).map_err(internal)?;
@@ -560,9 +549,10 @@ impl Engine for Krea2Engine {
         let mut data = Vec::with_capacity(batch * 16 * lh * lw);
         for i in 0..batch {
             let image = noise::swarm_noise(req.noise_seed, req.variation, i as u64, 16, lh, lw);
-            let r = Request { prompt: prompt.to_string(), seed: req.noise_seed, width, height, steps, shift: settings.shift, noise: Some(image) };
+            let r = Request { prompt: prompt.to_string(), negative: negative.clone(), seed: req.noise_seed, width, height,
+                sampling: sampling(req, &settings, shape, i)?, noise: Some(image) };
             let (latent, stats) = gen
-                .sample_latent(&r, |step, _| {
+                .sample_latent(&r, |step, steps| {
                     progress.progress((i * steps + step) as u32, (batch * steps) as u32);
                     !progress.interrupted()
                 })

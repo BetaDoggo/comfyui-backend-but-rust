@@ -30,7 +30,7 @@ echo  Connect SwarmUI:
 echo    1. Server tab, Backends, add "ComfyUI API By URL"
 echo    2. Address: http://127.0.0.1:%PORT%
 echo    3. Pick the kroma W8A8 model, an int8 Anima model or an int8 MOSS Image model
-echo    4. Set CFG Scale 1 and Steps 8
+echo    4. For turbo models, set CFG Scale 1 and Steps 8
 echo.
 echo  With ComfyUI as well, set Exact Backend ID to this backend's
 echo  number in a preset to keep Krea 2 here.

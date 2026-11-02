@@ -1,7 +1,7 @@
 """Run ComfyUI's Anima pipeline headlessly and dump intermediate tensors for parity tests.
 
 usage: python anima_ref.py <out_dir> [prompt] [--seed N] [--size W H] [--steps N] [--cfg X]
-                           [--sampler er_sde] [--negative TEXT] [--repeat N]
+                           [--sampler er_sde] [--scheduler simple] [--negative TEXT] [--repeat N]
 
 --repeat runs the sampler that many times; the timings of the later runs are the warm baseline.
 """
@@ -21,6 +21,7 @@ ap.add_argument("--size", type=int, nargs=2, default=[1024, 1024])
 ap.add_argument("--steps", type=int, default=8)
 ap.add_argument("--cfg", type=float, default=1.0)
 ap.add_argument("--sampler", default="er_sde")
+ap.add_argument("--scheduler", default="simple")
 ap.add_argument("--negative", default="")
 ap.add_argument("--repeat", type=int, default=1)
 args, _ = ap.parse_known_args()
@@ -118,7 +119,7 @@ put("noise", noise)
 
 for run in range(args.repeat):
     t1 = time.perf_counter()
-    samples = comfy.sample.sample(model, noise, args.steps, args.cfg, args.sampler, "simple", cond, neg, latent,
+    samples = comfy.sample.sample(model, noise, args.steps, args.cfg, args.sampler, args.scheduler, cond, neg, latent,
                                   denoise=1.0, seed=args.seed)
     torch.cuda.synchronize()
     print(f"run {run}: sample time {time.perf_counter() - t1:.3f}s ({(time.perf_counter() - t1) / args.steps:.3f} s/step)")

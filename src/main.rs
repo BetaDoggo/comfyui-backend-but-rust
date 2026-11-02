@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use krea2::samplers::ModelSampling;
 use krea2::{pipeline, serve, st};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -92,15 +93,18 @@ struct Args {
     /// MOSS Image: encode with the Krea 2 template, as SwarmUI does
     #[arg(long)]
     swarm_template: bool,
-    /// Anima, MOSS Image: negative prompt (used when --cfg isn't 1)
+    /// Negative prompt (used when --cfg isn't 1, and by the cfg_pp samplers)
     #[arg(long, default_value = "")]
     negative: String,
-    /// Anima, MOSS Image: CFG scale
+    /// CFG scale
     #[arg(long, default_value_t = 1.0)]
     cfg: f64,
-    /// Anima, MOSS Image: sampler (er_sde | euler), default er_sde for Anima, euler for MOSS Image
+    /// Any ComfyUI sampler, default er_sde for Anima, euler otherwise
     #[arg(long)]
     sampler: Option<String>,
+    /// Any ComfyUI scheduler
+    #[arg(long, default_value = "simple")]
+    scheduler: String,
     /// LoRA file, `path` or `path:strength`, in order (repeatable)
     #[arg(long)]
     lora: Vec<String>,
@@ -130,6 +134,10 @@ const MOSS_TE: &str = "clip/qwen3.5_9b_int8_convrot.safetensors";
 const MOSS_VAE: &str = "VAE/flux2-vae.safetensors";
 
 impl Args {
+    fn sampling(&self, default: &str, ms: ModelSampling, seed: u64, latent: (usize, usize)) -> Result<pipeline::Sampling> {
+        pipeline::Sampling::new(self.sampler.as_deref().unwrap_or(default), &self.scheduler, ms, self.steps, self.cfg, seed, latent)
+    }
+
     /// `path`, or `default` inside the models folder.
     fn model(&self, path: &Option<PathBuf>, default: &str) -> PathBuf {
         path.clone().unwrap_or_else(|| {
@@ -140,11 +148,6 @@ impl Args {
 }
 
 fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
-    let sampler = match args.sampler.as_deref().unwrap_or("er_sde") {
-        "er_sde" => pipeline::FlowSampler::ErSde,
-        "euler" => pipeline::FlowSampler::Euler,
-        s => bail!("unknown --sampler {s} (er_sde | euler)"),
-    };
     let (dit, te) = (args.model(&args.dit, ANIMA_DIT), args.model(&args.te, ANIMA_TE));
     let shift = if args.shift == 1.15 { 3.0 } else { args.shift };
     let mut gen = pipeline::Generator::new(&load)?;
@@ -162,15 +165,9 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         let r = pipeline::AnimaRequest {
             positive: krea2::tokenizer::token_weights(&args.prompt, 1.0),
             negative: krea2::tokenizer::token_weights(&args.negative, 1.0),
-            cfg: args.cfg,
-            sampler,
-            seed,
-            batch_index: 0,
-            batch_size: 1,
             width: args.width,
             height: args.height,
-            steps: args.steps,
-            shift,
+            sampling: args.sampling("er_sde", ModelSampling::Flow { shift }, seed, (args.width / 8, args.height / 8))?,
             noise,
         };
         let mut dump = pipeline::Dump::new();
@@ -190,11 +187,6 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
 }
 
 fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
-    let sampler = match args.sampler.as_deref().unwrap_or("euler") {
-        "euler" => pipeline::FlowSampler::Euler,
-        "er_sde" => pipeline::FlowSampler::ErSde,
-        s => bail!("unknown --sampler {s} (euler | er_sde)"),
-    };
     let (dit, te, vae) = (args.model(&args.dit, MOSS_DIT), args.model(&args.te, MOSS_TE), args.model(&args.vae, MOSS_VAE));
     let shift = if args.shift == 1.15 { 5.0 } else { args.shift };
     let mut gen = pipeline::Generator::new(&load)?;
@@ -213,15 +205,9 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             positive: args.prompt.clone(),
             negative: args.negative.clone(),
             template: args.swarm_template.then(|| krea2::te::TEMPLATE.to_string()),
-            cfg: args.cfg,
-            sampler,
-            seed,
-            batch_index: 0,
-            batch_size: 1,
             width: args.width,
             height: args.height,
-            steps: args.steps,
-            shift,
+            sampling: args.sampling("euler", ModelSampling::Flow { shift }, seed, (args.width / 16, args.height / 16))?,
             noise,
         };
         let mut dump = pipeline::Dump::new();
@@ -339,11 +325,11 @@ fn main() -> Result<()> {
     for (img_i, (prompt, seed_off)) in jobs.into_iter().enumerate() {
         let req = pipeline::Request {
             prompt,
+            negative: args.negative.clone(),
             seed: args.seed + seed_off,
             width: args.width,
             height: args.height,
-            steps: args.steps,
-            shift: args.shift,
+            sampling: args.sampling("euler", ModelSampling::Flux { shift: args.shift }, args.seed + seed_off, (args.width / 8, args.height / 8))?,
             noise: ref_noise.clone(),
         };
         let mut dump = pipeline::Dump::new();

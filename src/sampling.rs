@@ -1,4 +1,4 @@
-//! ComfyUI-compatible noise (torch CPU and CUDA randn) and flow sigma schedules.
+//! ComfyUI-compatible noise: torch's CPU and CUDA randn.
 
 /// std::mt19937 / at::mt19937 (torch.manual_seed uses the low 32 bits of the seed).
 struct Mt19937 {
@@ -72,47 +72,6 @@ pub fn torch_randn(seed: u64, n: usize) -> Vec<f32> {
     d
 }
 
-/// ModelSamplingFlux(shift) + "simple" scheduler.
-pub fn simple_sigmas(shift: f64, steps: usize) -> Vec<f32> {
-    let n = 10000usize;
-    let e = shift.exp();
-    let table: Vec<f32> = (1..=n)
-        .map(|i| {
-            let t = i as f32 / n as f32;
-            let v = (1.0f32 / t - 1.0) as f64;
-            (e / (e + v)) as f32
-        })
-        .collect();
-    let ss = n as f64 / steps as f64;
-    let mut sig: Vec<f32> = (0..steps).map(|x| table[n - 1 - (x as f64 * ss) as usize]).collect();
-    sig.push(0.0);
-    sig
-}
-
-/// `time_snr_shift`.
-fn snr_shift(alpha: f64, t: f32) -> f32 {
-    if alpha == 1.0 {
-        return t;
-    }
-    let a = alpha as f32;
-    a * t / (1.0 + (a - 1.0) * t)
-}
-
-/// ModelSamplingDiscreteFlow(shift) + "simple" scheduler.
-pub fn flow_sigmas(shift: f64, steps: usize) -> Vec<f32> {
-    let n = 1000usize;
-    let table: Vec<f32> = (1..=n).map(|i| snr_shift(shift, i as f32 / n as f32)).collect();
-    let ss = n as f64 / steps as f64;
-    let mut sig: Vec<f32> = (0..steps).map(|x| table[n - 1 - (x as f64 * ss) as usize]).collect();
-    sig.push(0.0);
-    sig
-}
-
-/// `percent_to_sigma` of ModelSamplingDiscreteFlow.
-pub fn flow_percent_to_sigma(shift: f64, percent: f64) -> f32 {
-    snr_shift(shift, (1.0 - percent) as f32)
-}
-
 fn philox4x32(mut c: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
     const M0: u64 = 0xD251_1F53;
     const M1: u64 = 0xCD9E_8D57;
@@ -146,74 +105,31 @@ impl CudaRandn {
     /// Elements `start..start + n` of the next call.
     pub fn next(&mut self, start: usize, n: usize) -> Vec<f32> {
         const TWO32: f64 = 2.328_306_4e-10;
-        let out = (start..start + n)
-            .map(|e| {
-                let (q, idx) = (e / self.threads, e % self.threads);
-                let c = philox4x32([self.offset + (q / 4) as u32, 0, idx as u32, 0], self.key);
-                let (x, y) = if q % 4 < 2 { (c[0], c[1]) } else { (c[2], c[3]) };
-                let u = x as f64 * TWO32 + TWO32 / 2.0;
-                let v = (y as f64 * TWO32 + TWO32 / 2.0) * std::f64::consts::TAU;
-                let r = (-2.0 * u.ln()).sqrt();
-                (r * if q % 2 == 0 { v.sin() } else { v.cos() }) as f32
-            })
-            .collect();
+        let (threads, offset, key) = (self.threads, self.offset, self.key);
+        let normal = |e: usize| {
+            let (q, idx) = (e / threads, e % threads);
+            let c = philox4x32([offset + (q / 4) as u32, 0, idx as u32, 0], key);
+            let (x, y) = if q % 4 < 2 { (c[0], c[1]) } else { (c[2], c[3]) };
+            let u = x as f64 * TWO32 + TWO32 / 2.0;
+            let v = (y as f64 * TWO32 + TWO32 / 2.0) * std::f64::consts::TAU;
+            let r = (-2.0 * u.ln()).sqrt();
+            (r * if q % 2 == 0 { v.sin() } else { v.cos() }) as f32
+        };
+        let mut out = vec![0f32; n];
+        let chunk = n.div_ceil(std::thread::available_parallelism().map_or(1, |p| p.get())).max(4096);
+        std::thread::scope(|scope| {
+            for (i, part) in out.chunks_mut(chunk).enumerate() {
+                let normal = &normal;
+                scope.spawn(move || {
+                    for (j, v) in part.iter_mut().enumerate() {
+                        *v = normal(start + i * chunk + j);
+                    }
+                });
+            }
+        });
         self.offset += ((self.numel - 1) / (self.threads * 4) + 1) as u32;
         out
     }
-}
-
-/// Per-step coefficients of ComfyUI's `sample_er_sde` (VP ER-SDE-Solver-3, s_noise 1).
-pub struct ErSdeStep {
-    /// x = keep * x + denoised * x_denoised, when not the last step
-    pub keep: f32,
-    pub denoised: f32,
-    /// denoised_d = (denoised - old) / d_div, added with weight d_weight; 0 before stage 2
-    pub d_div: f32,
-    pub d_weight: f32,
-    /// denoised_u = (denoised_d - old_d) / u_div, added with weight u_weight; 0 before stage 3
-    pub u_div: f32,
-    pub u_weight: f32,
-    pub noise: f32,
-}
-
-fn er_scale(x: f32) -> f32 {
-    x * (x.powf(0.3).exp() + 10.0)
-}
-
-/// `sigmas` must already have the first sigma offset below 1. Empty entry for the final step to 0.
-pub fn er_sde_steps(sigmas: &[f32]) -> Vec<Option<ErSdeStep>> {
-    const POINTS: usize = 200;
-    let lam: Vec<f32> = sigmas.iter().map(|s| s / (1.0 - s)).collect();
-    (0..sigmas.len() - 1)
-        .map(|i| {
-            if sigmas[i + 1] == 0.0 {
-                return None;
-            }
-            let (ls, lt) = (lam[i], lam[i + 1]);
-            let (alpha_s, alpha_t) = (sigmas[i] / ls, sigmas[i + 1] / lt);
-            let r = er_scale(lt) / er_scale(ls);
-            let mut st = ErSdeStep { keep: alpha_t / alpha_s * r, denoised: alpha_t * (1.0 - r), d_div: 0.0, d_weight: 0.0,
-                u_div: 0.0, u_weight: 0.0, noise: alpha_t * (lt * lt - ls * ls * r * r).max(0.0).sqrt() };
-            if i >= 1 {
-                let dt = lt - ls;
-                let h = -dt / POINTS as f32;
-                let (mut sum, mut sum_u) = (0f32, 0f32);
-                for p in 0..POINTS {
-                    let pos = lt + p as f32 * h;
-                    let sp = er_scale(pos);
-                    sum += 1.0 / sp;
-                    sum_u += (pos - ls) / sp;
-                }
-                st.d_div = ls - lam[i - 1];
-                st.d_weight = alpha_t * (dt + sum * h * er_scale(lt));
-                if i >= 2 {
-                    st.u_div = (ls - lam[i - 2]) / 2.0;
-                    st.u_weight = alpha_t * (dt * dt / 2.0 + sum_u * h * er_scale(lt));
-                }
-            }
-            Some(st)
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -242,18 +158,5 @@ mod tests {
         let v = (c[1] as f64 * 2.328_306_4e-10 + 1.164_153_2e-10) * std::f64::consts::TAU;
         assert!((first as f64 - (-2.0 * u.ln()).sqrt() * v.sin()).abs() < 1e-6);
         assert!((second as f64 - (-2.0 * u.ln()).sqrt() * v.cos()).abs() < 1e-6);
-    }
-
-    #[test]
-    fn er_sde_first_step_matches_comfy() {
-        let mut s = flow_sigmas(3.0, 8);
-        assert!((s[1] - 0.954_545_4).abs() < 1e-6, "{s:?}");
-        s[0] = flow_percent_to_sigma(3.0, 1e-4);
-        assert!((s[0] - 0.999_966_7).abs() < 1e-6, "{}", s[0]);
-        let e = er_sde_steps(&s);
-        let c = e[0].as_ref().unwrap();
-        assert!((c.denoised - 0.045_454_56).abs() < 1e-5, "{}", c.denoised);
-        assert!((c.noise - 0.954_545_4).abs() < 1e-5, "{}", c.noise);
-        assert!(e[7].is_none());
     }
 }

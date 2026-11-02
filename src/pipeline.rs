@@ -1,6 +1,7 @@
 //! Loaded models + one text-to-image generation, shared by the CLI and the web server.
 
 use crate::cuda::{self, DevBuf, Event, Stream};
+use crate::samplers::{self, Eval, ModelSampling, Uncond};
 use crate::{anima, dit, ffi, flux2vae, lora, moss, offload, qwen3, qwen35, sampling, st, te, tokenizer, vae};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
@@ -26,13 +27,43 @@ pub struct LoadOptions {
     pub int8_attn: bool,
 }
 
+/// What the three families share in a request: a sampler, its sigmas and the guidance.
+#[derive(Clone, Debug)]
+pub struct Sampling {
+    /// A name from [`samplers::SAMPLERS`].
+    pub sampler: String,
+    pub model_sampling: ModelSampling,
+    /// From [`samplers::sigmas`]; one step fewer than values.
+    pub sigmas: Vec<f32>,
+    pub cfg: f64,
+    /// Seed of the sampler's own noise (ComfyUI's `noise_seed`).
+    pub seed: u64,
+    /// This image's place in its batch: the sampler noise is one tensor for the whole batch.
+    pub batch_index: usize,
+    pub batch_size: usize,
+}
+
+impl Sampling {
+    /// One image at `cfg` with the given sampler and scheduler.
+    pub fn new(sampler: &str, scheduler: &str, model_sampling: ModelSampling, steps: usize, cfg: f64, seed: u64, latent: (usize, usize)) -> Result<Self> {
+        let sigmas = samplers::sigmas(model_sampling, sampler, scheduler, steps, latent, None)?;
+        Ok(Sampling { sampler: sampler.to_string(), model_sampling, sigmas, cfg, seed, batch_index: 0, batch_size: 1 })
+    }
+
+    /// True when the negative prompt has to be encoded.
+    pub fn uses_negative(&self) -> bool {
+        (self.cfg - 1.0).abs() > 1e-6 || samplers::forces_uncond(&self.sampler)
+    }
+}
+
 pub struct Request {
     pub prompt: String,
+    /// Only encoded when the sampling uses it.
+    pub negative: String,
     pub seed: u64,
     pub width: usize,
     pub height: usize,
-    pub steps: usize,
-    pub shift: f64,
+    pub sampling: Sampling,
     /// Use this noise instead of the seed (parity tests).
     pub noise: Option<Vec<f32>>,
 }
@@ -68,29 +99,14 @@ struct DitModel {
     lora: lora::State,
 }
 
-/// Samplers shared by the flow models with a separate velocity prediction (not Krea 2's fused Euler).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FlowSampler {
-    Euler,
-    ErSde,
-}
-
 pub struct AnimaRequest {
     /// (text, weight) segments, see [`tokenizer::token_weights`]
     pub positive: Vec<(String, f32)>,
-    /// Only encoded when `cfg` isn't 1.
+    /// Only encoded when the sampling uses it.
     pub negative: Vec<(String, f32)>,
-    pub cfg: f64,
-    pub sampler: FlowSampler,
-    /// Seed of the sampler's own noise (ComfyUI's `noise_seed`).
-    pub seed: u64,
-    /// This image's place in its batch: the sampler noise is one tensor for the whole batch.
-    pub batch_index: usize,
-    pub batch_size: usize,
     pub width: usize,
     pub height: usize,
-    pub steps: usize,
-    pub shift: f64,
+    pub sampling: Sampling,
     pub noise: Vec<f32>,
 }
 
@@ -103,19 +119,13 @@ struct AnimaModel {
 
 pub struct MossRequest {
     pub positive: String,
-    /// Only encoded when `cfg` isn't 1.
+    /// Only encoded when the sampling uses it.
     pub negative: String,
     /// `{}` marks the prompt; None is ComfyUI's own (the prompt is trimmed and the think block left open).
     pub template: Option<String>,
-    pub cfg: f64,
-    pub sampler: FlowSampler,
-    pub seed: u64,
-    pub batch_index: usize,
-    pub batch_size: usize,
     pub width: usize,
     pub height: usize,
-    pub steps: usize,
-    pub shift: f64,
+    pub sampling: Sampling,
     pub noise: Vec<f32>,
 }
 
@@ -126,83 +136,52 @@ struct MossModel {
     lora: lora::State,
 }
 
-/// x and the sampler's state between steps of a flow model.
-struct FlowState {
-    kind: FlowSampler,
-    sigmas: Vec<f32>,
-    er: Vec<Option<sampling::ErSdeStep>>,
-    randn: sampling::CudaRandn,
-    batch_index: usize,
-    n: usize,
-    x: DevBuf,
-    old: DevBuf,
-    d: DevBuf,
-    old_d: DevBuf,
-    u: DevBuf,
-}
-
-impl FlowState {
-    fn new(kind: FlowSampler, shift: f64, steps: usize, noise: &[f32], seed: u64, batch_index: usize, batch_size: usize, st: &Stream)
-        -> Result<Self> {
-        let n = noise.len();
-        let alloc = || DevBuf::alloc_async(n * 4, st);
-        let x = alloc()?;
-        x.upload(0, &st::f32_bytes(noise), st)?;
-        let mut sigmas = sampling::flow_sigmas(shift, steps);
-        if kind == FlowSampler::ErSde && sigmas[0] >= 1.0 {
-            sigmas[0] = sampling::flow_percent_to_sigma(shift, 1e-4);
+/// One run of a sampler. `model(x, out, sigma, negative, evaluation)` writes a denoised latent, and
+/// is called twice per evaluation under CFG, always positive first.
+fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
+    model: &mut dyn FnMut(&DevBuf, &DevBuf, f32, bool, usize) -> Result<()>, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<Vec<f32>> {
+    let threads = unsafe { ffi::krea_randn_threads() };
+    if threads <= 0 {
+        bail!("could not read the GPU's core count");
+    }
+    let n = noise.len();
+    let (x, den, und) = (DevBuf::alloc_async(n * 4, st)?, DevBuf::alloc_async(n * 4, st)?, DevBuf::alloc_async(n * 4, st)?);
+    let (e0, e1) = (Event::timing()?, Event::timing()?);
+    let cfg = s.cfg as f32;
+    let guided = (s.cfg - 1.0).abs() > 1e-6;
+    let mut evals = 0;
+    let mut sample_ms = 0.0;
+    let mut eval = |v: &[f32], sigma: f32, mode: Uncond| -> Result<Eval> {
+        e0.record(st)?;
+        x.upload(0, &st::f32_bytes(v), st)?;
+        model(&x, &den, sigma, false, evals)?;
+        let negative = guided || mode == Uncond::Force;
+        if negative {
+            model(&x, &und, sigma, true, evals)?;
+            let (p, c) = ([und.ptr() as ffi::P, den.ptr() as ffi::P], [1.0 - cfg, cfg]);
+            ffi::k!(krea_lincomb(den.ptr(), n as i64, 2, p.as_ptr(), c.as_ptr(), ffi::s(st)))?;
         }
-        let er = sampling::er_sde_steps(&sigmas);
-        let threads = unsafe { ffi::krea_randn_threads() };
-        if threads <= 0 {
-            bail!("could not read the GPU's core count");
-        }
-        let randn = sampling::CudaRandn::new(seed, n * batch_size, threads as usize);
-        Ok(FlowState { kind, sigmas, er, randn, batch_index, n, x, old: alloc()?, d: alloc()?, old_d: alloc()?, u: alloc()? })
-    }
-
-    fn lin(&self, out: &DevBuf, terms: &[(&DevBuf, f32)], st: &Stream) -> Result<()> {
-        let (p, c): (Vec<ffi::P>, Vec<f32>) = terms.iter().map(|(b, w)| (b.ptr() as ffi::P, *w)).unzip();
-        ffi::k!(krea_lincomb(out.ptr(), self.n as i64, p.len() as i32, p.as_ptr(), c.as_ptr(), ffi::s(st)))
-    }
-
-    /// den = uncond + (den - uncond) * cfg
-    fn guide(&self, den: &DevBuf, und: &DevBuf, cfg: f32, st: &Stream) -> Result<()> {
-        self.lin(den, &[(und, 1.0 - cfg), (den, cfg)], st)
-    }
-
-    /// Update x from the denoised latent of step `i`.
-    fn step(&mut self, i: usize, den: &DevBuf, st: &Stream) -> Result<()> {
-        let (x, n) = (&self.x, self.n);
-        let sigma = self.sigmas[i];
-        match self.kind {
-            FlowSampler::Euler => {
-                let t = (self.sigmas[i + 1] - sigma) / sigma;
-                self.lin(x, &[(x, 1.0 + t), (den, -t)], st)?;
-            }
-            FlowSampler::ErSde => match &self.er[i] {
-                None => cuda::memcpy_d2d(x.ptr(), den.ptr(), n * 4, st)?,
-                Some(c) => {
-                    self.lin(x, &[(x, c.keep), (den, c.denoised)], st)?;
-                    if i >= 1 {
-                        let (d, u, old, old_d) = (&self.d, &self.u, &self.old, &self.old_d);
-                        self.lin(d, &[(den, 1.0 / c.d_div), (old, -1.0 / c.d_div)], st)?;
-                        self.lin(x, &[(x, 1.0), (d, c.d_weight)], st)?;
-                        if i >= 2 {
-                            self.lin(u, &[(d, 1.0 / c.u_div), (old_d, -1.0 / c.u_div)], st)?;
-                            self.lin(x, &[(x, 1.0), (u, c.u_weight)], st)?;
-                        }
-                        cuda::memcpy_d2d(old_d.ptr(), d.ptr(), n * 4, st)?;
-                    }
-                    let noise = self.randn.next(self.batch_index * n, n);
-                    let z = DevBuf::alloc_async(n * 4, st)?;
-                    z.upload(0, &st::f32_bytes(&noise), st)?;
-                    self.lin(x, &[(x, 1.0), (&z, c.noise)], st)?;
-                }
-            },
-        }
-        cuda::memcpy_d2d(self.old.ptr(), den.ptr(), n * 4, st)
-    }
+        let read = |b: &DevBuf| -> Result<Vec<f32>> {
+            let mut bytes = vec![0u8; n * 4];
+            b.download(0, &mut bytes, st)?;
+            Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        };
+        let denoised = read(&den)?;
+        let uncond = if negative && mode != Uncond::Skip { Some(read(&und)?) } else { None };
+        e1.record(st)?;
+        e1.sync()?;
+        let ms = e1.elapsed_ms(&e0)? as f64;
+        sample_ms += ms;
+        evals += 1;
+        eprintln!("evaluation {evals} sigma {sigma:.4}: {ms:.0} ms");
+        Ok(Eval { denoised, uncond })
+    };
+    let mut step = |i: usize, total: usize| if progress(i, total) { Ok(()) } else { Err(Cancelled.into()) };
+    let batch = samplers::Batch { index: s.batch_index, size: s.batch_size, threads: threads as usize };
+    let out = samplers::sample(&s.sampler, s.model_sampling, &s.sigmas, noise, s.seed, batch, &mut eval, &mut step)?;
+    stats.sample_ms = sample_ms;
+    eprintln!("sampling {:.2}s ({:.0} ms/evaluation)", sample_ms / 1e3, sample_ms / evals.max(1) as f64);
+    Ok(out)
 }
 
 type AnimaPrompt = Vec<(String, f32)>;
@@ -224,6 +203,7 @@ pub struct Generator {
     vae: Option<(PathBuf, vae::Vae)>,
     flux2: Option<(PathBuf, flux2vae::Vae)>,
     cached: Option<(String, te::Cond, DevBuf)>,
+    cached_negative: Option<(String, te::Cond, DevBuf)>,
     pub max_pixels: usize,
     max_width: usize,
     max_height: usize,
@@ -301,7 +281,7 @@ impl Generator {
         let (_, total) = cuda::mem_info()?;
         eprintln!("GPU memory: {} MB free (device-wide) / {} MB total", cuda::device_free()? / MB, total / MB);
         Ok(Generator { st: st0, te: None, dit: None, anima: None, qwen3: None, tokenizers: None, contexts: Vec::new(), moss: None, qwen35: None,
-            moss_tokenizer: None, moss_contexts: Vec::new(), vae: None, flux2: None, cached: None, max_pixels: o.max_pixels,
+            moss_tokenizer: None, moss_contexts: Vec::new(), vae: None, flux2: None, cached: None, cached_negative: None, max_pixels: o.max_pixels,
             max_width: o.max_width, max_height: o.max_height, reserve: o.reserve_vram_mb * MB,
             resident_blocks: o.resident_blocks, slots: o.slots, threads: o.threads, attn_variant: o.attn_variant,
             int8_attn: o.int8_attn, dynamic: o.resident_blocks.is_none() })
@@ -336,6 +316,7 @@ impl Generator {
         }
         self.te = None;
         self.cached = None;
+        self.cached_negative = None;
         let t0 = Instant::now();
         self.te = Some((path.to_path_buf(), te::TextEncoder::load(path, 0, self.threads, &self.st)?));
         eprintln!("text encoder ready in {:.1}s", t0.elapsed().as_secs_f64());
@@ -351,6 +332,7 @@ impl Generator {
         self.drop_moss()?;
         self.dit = None;
         self.cached = None;
+        self.cached_negative = None;
         let t0 = Instant::now();
         let dst = st::SafeTensors::open(path)?;
         let globals = dit::globals_layout(&dst)?.size;
@@ -374,6 +356,7 @@ impl Generator {
     fn drop_krea(&mut self) -> Result<()> {
         self.st.sync()?;
         self.cached = None;
+        self.cached_negative = None;
         self.dit = None;
         self.te = None;
         cuda::trim_pool()
@@ -546,7 +529,7 @@ impl Generator {
         Ok(())
     }
 
-    /// One MOSS Image latent: the same sampling as ComfyUI's KSampler with the `simple` scheduler.
+    /// One MOSS Image latent, sampled as ComfyUI's KSampler does.
     pub fn sample_moss(&mut self, r: &MossRequest, mut progress: impl FnMut(usize, usize) -> bool, mut dump: Option<&mut Dump>)
         -> Result<(Vec<f32>, Stats)> {
         if r.width % 16 != 0 || r.height % 16 != 0 || r.width == 0 || r.height == 0 {
@@ -566,7 +549,7 @@ impl Generator {
         }
         let mut stats = Stats::default();
         let t0 = Instant::now();
-        let guided = (r.cfg - 1.0).abs() > 1e-6;
+        let guided = r.sampling.uses_negative();
         let pos_ids = self.moss_ids(&r.positive, r.template.as_deref())?;
         let neg_ids = self.moss_ids(&r.negative, r.template.as_deref())?;
         if guided {
@@ -580,67 +563,45 @@ impl Generator {
         let find = |p: &[u32]| self.moss_contexts.iter().find(|(k, _)| k == p).map(|(_, c)| c).unwrap();
         let pos = find(&pos_ids);
         let neg = guided.then(|| find(&neg_ids));
-        let den = DevBuf::alloc_async(n * 4, st)?;
-        let und = DevBuf::alloc_async(n * 4, st)?;
         let rope = m.dit.rope(lh, lw, pos.len, st)?;
         let neg_rope = neg.map(|c| m.dit.rope(lh, lw, c.len, st)).transpose()?;
-        let mut flow = FlowState::new(r.sampler, r.shift, r.steps, &r.noise, r.seed, r.batch_index, r.batch_size, st)?;
-        let (e0, e1) = (Event::timing()?, Event::timing()?);
         let copied0 = m.dit.blocks.copied_bytes;
-        for i in 0..r.steps {
-            e0.record(st)?;
-            let sigma = flow.sigmas[i];
+        let (dynamic, reserve, slots) = (self.dynamic, self.reserve, self.slots);
+        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, eval: usize| -> Result<()> {
+            if negative {
+                return m.dit.predict(x, lh, lw, neg.unwrap(), neg_rope.as_ref().unwrap(), sigma, out, st, None);
+            }
+            if dynamic && eval > 0 && cuda::device_free()? < reserve / 2 {
+                eprintln!("VRAM pressure: free {} MB < {} MB", cuda::device_free()? / MB, reserve / 2 / MB);
+                let need = moss::step_activation_bytes(lh * lw + MOSS_TEXT) + reserve;
+                rebalance(st, &mut m.dit.blocks, &m.st, reserve, slots, need, true)?;
+            }
             let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
             {
                 let mut probe = |name: &str, b: &DevBuf, bytes: usize| {
-                    if i == 0 && matches!(name, "video_embedder_out" | "block0" | "block1" | "block41" | "final_tokens") {
+                    if eval == 0 && matches!(name, "video_embedder_out" | "block0" | "block1" | "block41" | "final_tokens") {
                         let mut v = vec![0u8; bytes];
                         b.download(0, &mut v, st).unwrap();
                         probes.push((name.to_string(), v));
                     }
                 };
                 let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if dump.is_some() { Some(&mut probe) } else { None };
-                m.dit.predict(&flow.x, lh, lw, pos, &rope, sigma, &den, st, probe_ref)?;
+                m.dit.predict(x, lh, lw, pos, &rope, sigma, out, st, probe_ref)?;
             }
-            if let (Some(c), Some(nr)) = (neg, &neg_rope) {
-                m.dit.predict(&flow.x, lh, lw, c, nr, sigma, &und, st, None)?;
-                flow.guide(&den, &und, r.cfg as f32, st)?;
-            }
-            flow.step(i, &den, st)?;
-            if let Some(dm) = dump.as_deref_mut() {
-                let mut v = vec![0u8; n * 4];
-                flow.x.download(0, &mut v, st)?;
-                dm.insert(format!("x_after_{i}"), ("F32".into(), vec![n], v));
-            }
-            e1.record(st)?;
-            e1.sync()?;
-            let ms = e1.elapsed_ms(&e0)? as f64;
-            stats.sample_ms += ms;
-            eprintln!("step {}/{} sigma {:.4}: {:.0} ms", i + 1, r.steps, sigma, ms);
             if let Some(dm) = dump.as_deref_mut() {
                 for (name, v) in probes {
                     dm.insert(name, ("BF16".into(), vec![v.len() / 2], v));
                 }
             }
-            if self.dynamic && i + 1 < r.steps && cuda::device_free()? < self.reserve / 2 {
-                eprintln!("VRAM pressure: free {} MB < {} MB", cuda::device_free()? / MB, self.reserve / 2 / MB);
-                let need = moss::step_activation_bytes(lh * lw + MOSS_TEXT) + self.reserve;
-                rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, need, true)?;
-            }
-            if !progress(i + 1, r.steps) {
-                st.sync()?;
-                return Err(Cancelled.into());
-            }
-        }
+            Ok(())
+        };
+        let latent = run_sampler(&r.sampling, &r.noise, st, &mut stats, &mut model, &mut progress)?;
         stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
-        eprintln!("sampling {:.2}s ({:.0} ms/step avg, {:.2} GB streamed over PCIe)", stats.sample_ms / 1e3,
-            stats.sample_ms / r.steps as f64, stats.streamed_gb);
-        let mut b = vec![0u8; n * 4];
-        flow.x.download(0, &mut b, st)?;
+        eprintln!("{:.2} GB streamed over PCIe", stats.streamed_gb);
         if let Some(dm) = dump {
-            dm.insert("samples".into(), ("F32".into(), vec![moss::CH, lh, lw], b.clone()));
+            dm.insert("samples".into(), ("F32".into(), vec![moss::CH, lh, lw], st::f32_bytes(&latent).to_vec()));
         }
-        Ok((b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(), stats))
+        Ok((latent, stats))
     }
 
     /// Decode a host MOSS Image latent ([128, H/16, W/16] f32) to RGB8 pixels.
@@ -696,7 +657,7 @@ impl Generator {
         Ok(())
     }
 
-    /// One Anima image: the same sampling as ComfyUI's KSampler with the `simple` scheduler.
+    /// One Anima latent, sampled as ComfyUI's KSampler does.
     pub fn sample_anima(&mut self, r: &AnimaRequest, mut progress: impl FnMut(usize, usize) -> bool, mut dump: Option<&mut Dump>)
         -> Result<(Vec<f32>, Stats)> {
         if r.width % 16 != 0 || r.height % 16 != 0 || r.width == 0 || r.height == 0 {
@@ -716,7 +677,7 @@ impl Generator {
         }
         let mut stats = Stats::default();
         let t0 = Instant::now();
-        let guided = (r.cfg - 1.0).abs() > 1e-6;
+        let guided = r.sampling.uses_negative();
         if guided {
             self.anima_context(&r.negative, None)?;
         }
@@ -728,66 +689,44 @@ impl Generator {
         let find = |p: &[(String, f32)]| self.contexts.iter().find(|(k, _)| k == p).map(|(_, c)| c).unwrap();
         let pos = find(&r.positive);
         let neg = guided.then(|| find(&r.negative));
-        let den = DevBuf::alloc_async(n * 4, st)?;
-        let und = DevBuf::alloc_async(n * 4, st)?;
         let rope = m.dit.rope(lh / 2, lw / 2, st)?;
-        let mut flow = FlowState::new(r.sampler, r.shift, r.steps, &r.noise, r.seed, r.batch_index, r.batch_size, st)?;
-        let (e0, e1) = (Event::timing()?, Event::timing()?);
         let copied0 = m.dit.blocks.copied_bytes;
-        for i in 0..r.steps {
-            e0.record(st)?;
-            let sigma = flow.sigmas[i];
+        let (dynamic, reserve, slots) = (self.dynamic, self.reserve, self.slots);
+        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, eval: usize| -> Result<()> {
+            if negative {
+                return m.dit.predict(x, lh, lw, neg.unwrap(), &rope, sigma, out, st, None);
+            }
+            if dynamic && eval > 0 && cuda::device_free()? < reserve / 2 {
+                eprintln!("VRAM pressure: free {} MB < {} MB", cuda::device_free()? / MB, reserve / 2 / MB);
+                let need = anima::step_activation_bytes((lh / 2) * (lw / 2)) + reserve;
+                rebalance(st, &mut m.dit.blocks, &m.st, reserve, slots, need, true)?;
+            }
             let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
             {
                 let mut probe = |name: &str, b: &DevBuf, bytes: usize| {
-                    if i == 0 && matches!(name, "x_embedder_out" | "block0" | "block27" | "final_tokens" | "block0_self_attn_raw") {
+                    if eval == 0 && matches!(name, "x_embedder_out" | "block0" | "block27" | "final_tokens" | "block0_self_attn_raw") {
                         let mut v = vec![0u8; bytes];
                         b.download(0, &mut v, st).unwrap();
                         probes.push((name.to_string(), v));
                     }
                 };
                 let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if dump.is_some() { Some(&mut probe) } else { None };
-                m.dit.predict(&flow.x, lh, lw, pos, &rope, sigma, &den, st, probe_ref)?;
+                m.dit.predict(x, lh, lw, pos, &rope, sigma, out, st, probe_ref)?;
             }
-            if let Some(neg) = neg {
-                m.dit.predict(&flow.x, lh, lw, neg, &rope, sigma, &und, st, None)?;
-                flow.guide(&den, &und, r.cfg as f32, st)?;
-            }
-            flow.step(i, &den, st)?;
-            if let Some(dm) = dump.as_deref_mut() {
-                let mut v = vec![0u8; n * 4];
-                flow.x.download(0, &mut v, st)?;
-                dm.insert(format!("x_after_{i}"), ("F32".into(), vec![n], v));
-            }
-            e1.record(st)?;
-            e1.sync()?;
-            let ms = e1.elapsed_ms(&e0)? as f64;
-            stats.sample_ms += ms;
-            eprintln!("step {}/{} sigma {:.4}: {:.0} ms", i + 1, r.steps, sigma, ms);
             if let Some(dm) = dump.as_deref_mut() {
                 for (name, v) in probes {
                     dm.insert(name, ("BF16".into(), vec![v.len() / 2], v));
                 }
             }
-            if self.dynamic && i + 1 < r.steps && cuda::device_free()? < self.reserve / 2 {
-                eprintln!("VRAM pressure: free {} MB < {} MB", cuda::device_free()? / MB, self.reserve / 2 / MB);
-                let need = anima::step_activation_bytes((lh / 2) * (lw / 2)) + self.reserve;
-                rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, need, true)?;
-            }
-            if !progress(i + 1, r.steps) {
-                st.sync()?;
-                return Err(Cancelled.into());
-            }
-        }
+            Ok(())
+        };
+        let latent = run_sampler(&r.sampling, &r.noise, st, &mut stats, &mut model, &mut progress)?;
         stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
-        eprintln!("sampling {:.2}s ({:.0} ms/step avg, {:.2} GB streamed over PCIe)", stats.sample_ms / 1e3,
-            stats.sample_ms / r.steps as f64, stats.streamed_gb);
-        let mut b = vec![0u8; n * 4];
-        flow.x.download(0, &mut b, st)?;
+        eprintln!("{:.2} GB streamed over PCIe", stats.streamed_gb);
         if let Some(dm) = dump {
-            dm.insert("samples".into(), ("F32".into(), vec![dit::CH, lh, lw], b.clone()));
+            dm.insert("samples".into(), ("F32".into(), vec![dit::CH, lh, lw], st::f32_bytes(&latent).to_vec()));
         }
-        Ok((b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(), stats))
+        Ok((latent, stats))
     }
 
     /// Bake `loras` into the loaded diffusion model, in place of any others. Prompts encoded through
@@ -797,6 +736,7 @@ impl Generator {
         if let Some(m) = &mut self.dit {
             if lora::apply(lora::Arch::Krea2, &m.st, "", m.dit.stores(), &mut m.lora, loras, st)? {
                 self.cached = None;
+                self.cached_negative = None;
             }
         } else if let Some(m) = &mut self.anima {
             let prefix = m.dit.prefix();
@@ -833,6 +773,7 @@ impl Generator {
     pub fn unload(&mut self) -> Result<()> {
         self.st.sync()?;
         self.cached = None;
+        self.cached_negative = None;
         self.contexts.clear();
         self.dit = None;
         self.te = None;
@@ -860,7 +801,7 @@ impl Generator {
         let (latent, mut stats) = self.denoise(r, progress, dump.as_deref_mut())?;
         let (lh, lw) = (r.height / 8, r.width / 8);
         let t0 = Instant::now();
-        let rgb = self.decode(&latent, lh, lw)?;
+        let rgb = self.decode_latent(&latent, r.width, r.height)?;
         stats.vae_ms = t0.elapsed().as_secs_f64() * 1e3;
         stats.total_ms = t_img.elapsed().as_secs_f64() * 1e3;
         eprintln!("VAE decode {:.0} ms, image done in {:.2}s", stats.vae_ms, stats.total_ms / 1e3);
@@ -872,11 +813,7 @@ impl Generator {
 
     /// Text encoding and denoising only; returns the final latent ([16, H/8, W/8] f32) on the host.
     pub fn sample_latent(&mut self, r: &Request, progress: impl FnMut(usize, usize) -> bool) -> Result<(Vec<f32>, Stats)> {
-        let (latent, stats) = self.denoise(r, progress, None)?;
-        let mut b = vec![0u8; latent.size()];
-        latent.download(0, &mut b, &self.st)?;
-        self.st.sync()?;
-        Ok((b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(), stats))
+        self.denoise(r, progress, None)
     }
 
     /// Decode a host latent from [`Generator::sample_latent`] to RGB8 pixels.
@@ -891,15 +828,12 @@ impl Generator {
     }
 
     fn denoise(&mut self, r: &Request, mut progress: impl FnMut(usize, usize) -> bool, mut dump: Option<&mut Dump>)
-        -> Result<(DevBuf, Stats)> {
+        -> Result<(Vec<f32>, Stats)> {
         if r.width % 16 != 0 || r.height % 16 != 0 || r.width == 0 || r.height == 0 {
             bail!("width and height must be positive multiples of 16");
         }
         if r.width * r.height > self.max_pixels {
             bail!("{}x{} exceeds the {} pixel limit (--max-side)", r.width, r.height, self.max_pixels);
-        }
-        if r.steps == 0 || r.steps > 100 {
-            bail!("steps must be in 1..=100");
         }
         let m = self.dit.as_mut().context("no diffusion model loaded")?;
         let te = &mut self.te.as_mut().context("no text encoder loaded")?.1;
@@ -921,6 +855,14 @@ impl Generator {
             eprintln!("text: {} tokens ({} conditioning) in {:.0} ms", cond.token_ids.len(), cond.len,
                 t0.elapsed().as_secs_f64() * 1e3);
             self.cached = Some((r.prompt.clone(), cond, ctx));
+        }
+        let guided = r.sampling.uses_negative();
+        if guided && self.cached_negative.as_ref().map_or(true, |(p, _, _)| *p != r.negative) {
+            drop(self.cached_negative.take());
+            let cond = te.encode(&r.negative, st)?;
+            let ctx = m.dit.encode_context(&cond.ctx, cond.len, st)?;
+            st.sync()?;
+            self.cached_negative = Some((r.negative.clone(), cond, ctx));
         }
         stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;
         let (_, cond, ctx) = self.cached.as_ref().unwrap();
@@ -944,23 +886,38 @@ impl Generator {
         if noise.len() != n {
             bail!("noise has {} values, expected {n}", noise.len());
         }
-        let latent = DevBuf::alloc_async(n * 4, st)?;
-        latent.upload(0, &st::f32_bytes(&noise), st)?;
+        let upload_rope = |lt: usize| -> Result<DevBuf> {
+            let rope = dit::Dit::rope_table(lt, lh / 2, lw / 2);
+            let d = DevBuf::alloc_async(rope.len() * 4, st)?;
+            d.upload(0, &st::f32_bytes(&rope), st)?;
+            Ok(d)
+        };
         let lt = cond.len;
-        let rope = dit::Dit::rope_table(lt, lh / 2, lw / 2);
-        let rope_d = DevBuf::alloc_async(rope.len() * 4, st)?;
-        rope_d.upload(0, &st::f32_bytes(&rope), st)?;
+        let rope_d = upload_rope(lt)?;
+        let negative = if guided { self.cached_negative.as_ref().map(|(_, c, ctx)| (ctx, c.len)) } else { None };
+        let neg_rope = negative.map(|(_, len)| upload_rope(len)).transpose()?;
 
         // denoise
-        let sigmas = sampling::simple_sigmas(r.shift, r.steps);
-        let (e0, e1) = (Event::timing()?, Event::timing()?);
         let copied0 = m.dit.blocks.copied_bytes;
-        for i in 0..r.steps {
-            e0.record(st)?;
+        let (dynamic, reserve, slots) = (self.dynamic, self.reserve, self.slots);
+        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, neg: bool, eval: usize| -> Result<()> {
+            if neg {
+                let (c, len) = negative.unwrap();
+                return m.dit.step(x, lh, lw, c, len, neg_rope.as_ref().unwrap(), sigma, sigma, st, Some(out), None);
+            }
+            // another application took VRAM mid-run: demote blocks before the driver starts
+            // paging to shared system memory (which would be far slower than streaming)
+            if dynamic && eval > 0 && cuda::device_free()? < reserve / 2 {
+                eprintln!("VRAM pressure: free {} MB < {} MB", cuda::device_free()? / MB, reserve / 2 / MB);
+                // NVML clamps free at 0 when oversubscribed, hiding the real shortfall: ask for an
+                // extra reserve each time so blocks keep moving out until pressure clears
+                let step_need = dit::step_activation_bytes(LT_MAX + (lh / 2) * (lw / 2));
+                rebalance(st, &mut m.dit.blocks, &m.st, reserve, slots, step_need + reserve, true)?;
+            }
             let mut probe_store: Vec<(String, Vec<u8>)> = Vec::new();
             {
                 let mut probe = |name: &str, b: &DevBuf, bytes: usize| {
-                    if i == 0 && (name == "block0" || name == "block27" || name == "dit_out_tokens") {
+                    if eval == 0 && (name == "block0" || name == "block27" || name == "dit_out_tokens") {
                         let mut v = vec![0u8; bytes];
                         b.download(0, &mut v, st).unwrap();
                         probe_store.push((name.to_string(), v));
@@ -968,41 +925,21 @@ impl Generator {
                 };
                 let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> =
                     if dump.is_some() { Some(&mut probe) } else { None };
-                m.dit.step(&latent, lh, lw, ctx, lt, &rope_d, sigmas[i], sigmas[i + 1], st, None, probe_ref)?;
+                m.dit.step(x, lh, lw, ctx, lt, &rope_d, sigma, sigma, st, Some(out), probe_ref)?;
             }
-            e1.record(st)?;
-            e1.sync()?;
-            let ms = e1.elapsed_ms(&e0)? as f64;
-            stats.sample_ms += ms;
-            eprintln!("step {}/{} sigma {:.4}: {:.0} ms", i + 1, r.steps, sigmas[i], ms);
             if let Some(d) = dump.as_deref_mut() {
                 for (name, v) in probe_store {
                     let shape = if name == "dit_out_tokens" { vec![(lh / 2) * (lw / 2), 64] } else { vec![v.len() / 2 / dit::F, dit::F] };
                     d.insert(name, ("BF16".into(), shape, v));
                 }
             }
-            // another application took VRAM mid-run: demote blocks before the driver starts
-            // paging to shared system memory (which would be far slower than streaming)
-            if self.dynamic && i + 1 < r.steps && cuda::device_free()? < self.reserve / 2 {
-                eprintln!("VRAM pressure: free {} MB < {} MB", cuda::device_free()? / MB, self.reserve / 2 / MB);
-                // NVML clamps free at 0 when oversubscribed, hiding the real shortfall: ask for an
-                // extra reserve each time so blocks keep moving out until pressure clears
-                let step_need = dit::step_activation_bytes(LT_MAX + (lh / 2) * (lw / 2));
-                rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, step_need + self.reserve, true)?;
-            }
-            if !progress(i + 1, r.steps) {
-                st.sync()?;
-                return Err(Cancelled.into());
-            }
-        }
+            Ok(())
+        };
+        let latent = run_sampler(&r.sampling, &noise, st, &mut stats, &mut model, &mut progress)?;
         stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
-        eprintln!("sampling {:.2}s ({:.0} ms/step avg, {:.2} GB streamed over PCIe)", stats.sample_ms / 1e3,
-            stats.sample_ms / r.steps as f64, stats.streamed_gb);
-        drop(rope_d);
+        eprintln!("{:.2} GB streamed over PCIe", stats.streamed_gb);
         if let Some(d) = dump {
-            let mut b = vec![0u8; n * 4];
-            latent.download(0, &mut b, st)?;
-            d.insert("latent_final".into(), ("F32".into(), vec![dit::CH, lh, lw], b));
+            d.insert("latent_final".into(), ("F32".into(), vec![dit::CH, lh, lw], st::f32_bytes(&latent).to_vec()));
         }
         Ok((latent, stats))
     }

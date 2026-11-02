@@ -109,10 +109,45 @@ Like ComfyUI, keys that match nothing in the model are logged and ignored, so a 
 Plain LoRA, `diff` and `set` patches work. These are refused with an error: LoHa, LoKr, GLoRA, OFT, DoRA, LoCon mid
 weights, reshaped patches, MOSS Image control LoRAs, LoRA hooks, and LoRAs with text encoder keys.
 
+## Samplers
+
+All 45 ComfyUI samplers and all 9 ComfyUI schedulers run on all three models, plus SwarmUI's `turbo`, `align_your_steps`,
+`flux2`, `ideogram4`, `ideogram4turbo` and `ltxv` (`ltxv-image` is refused), its Sigma Min, Sigma Max and Rho overrides,
+and any CFG with a negative prompt, now including Krea 2:
+
+```bash
+target/release/krea2.exe --anima --sampler dpmpp_2m_sde_gpu --scheduler karras --steps 12 --cfg 4 --negative "lowres" -p "no humans, scenery, mountain lake"
+```
+
+They are ports of ComfyUI's code in f32 ([`src/samplers.rs`](src/samplers.rs)), running on the host between model evaluations.
+Evaluations cost what they did: Anima at 122 ms and Krea 2 at 574 ms at 1024x1024, with the latent's transfers included.
+The Brownian samplers reimplement `torchsde.BrownianTree` and `numpy.random.SeedSequence`, for the CPU and GPU variants.
+
+`tools/sampler_ref.py` runs ComfyUI's own samplers on an analytic mock model, and `tests/samplers_match_comfy.rs` replays that:
+
+| Check | Result |
+|---|---|
+| 1105 schedules (5 model samplings, 7 step counts) | worst relative error 1.7e-6 |
+| 45 samplers in 5 setups (225 runs), same sigmas passed to the model in the same order | worst relative error 8.1e-6, most about 1e-7 |
+| Brownian increments at full latent size, CPU and GPU | equal to rounding |
+
+So the gap to ComfyUI on a real model is the gap the model already has. Stochastic and high CFG paths magnify it: on
+Anima, `dpmpp_2m_sde_gpu` with `beta` at CFG 4 is 11 dB from ComfyUI, and also 12 dB from this engine under the other
+attention backend. `dpmpp_2m_sde` with `karras` is 24 dB.
+
+Differences to know about:
+
+* `dpm_adaptive` picks its steps from the whole batch in ComfyUI, and from each image here, so its batches can differ.
+* `dpm_fast` and `dpm_adaptive` stop at the last non-zero sigma, as in ComfyUI, so they can leave visible noise.
+* Combinations ComfyUI runs badly run badly here too: `turbo` and `align_your_steps` use sigmas above 1 on these models.
+* The Brownian samplers (`dpmpp_sde`, `dpmpp_2m_sde`, `dpmpp_3m_sde` and their variants) generate their noise on the CPU, even
+  the `_gpu` ones. An 8-step Anima image at 1024x1024 took 2.4 s with `dpmpp_2m_sde` and 2.0 s with its `_gpu` variant, against
+  1.3 s with `euler`.
+
 ## MOSS Image engine
 
 Runs int8 ConvRot MOSS Image checkpoints with fused q/k/v, the Qwen3.5 9B text encoder and the Flux 2 VAE. Both
-published key layouts of that VAE load. `euler` (SwarmUI's default) and `er_sde` work with the `simple` scheduler, at any CFG.
+published key layouts of that VAE load. Every sampler and scheduler works, at any CFG (see [Samplers](#samplers)); SwarmUI's default is `euler`.
 Prompts are literal: like ComfyUI, this encoder has no `(word:1.2)` emphasis.
 
 ```bash
@@ -144,7 +179,7 @@ generate people.
 ## Anima engine
 
 Runs int8 ConvRot Anima checkpoints with the Qwen3 0.6B text encoder and the Qwen-Image VAE. Files are read in
-place, as with Krea 2. `er_sde` (SwarmUI's default) and `euler` work with the `simple` scheduler, at any CFG, with
+place, as with Krea 2. Every sampler and scheduler works (see [Samplers](#samplers); SwarmUI's default is `er_sde`), at any CFG, with
 negative prompts and `(word:1.2)` emphasis.
 
 ```bash
@@ -209,6 +244,7 @@ Useful flags:
 | --- | --- |
 | `--width/--height` | multiples of 16 (default 1024×1024) |
 | `--steps`, `--shift`, `--seed` | sampler settings; the seed gives the **same noise as ComfyUI's KSampler** |
+| `--sampler`, `--scheduler`, `--cfg`, `--negative` | any ComfyUI sampler and scheduler, on any model |
 | `--prompt-file f.txt`, `-n N` | many prompts / seeds with the models loaded once |
 | `--attention flash` | bf16 FlashAttention-2 like ComfyUI's default (closest numerics, ~15% slower per step); the default is `int8`, comfy-kitchen's SageAttention-style INT8 attention |
 | `--reserve-vram MB` | VRAM left untouched for the desktop (default 512) |
@@ -248,8 +284,8 @@ move, but changing only the attention tile order in this implementation moves th
   The text-fusion adapter is timestep-independent, so it runs once per prompt instead of every step.
 * **VAE** (`src/vae.rs`): for one frame every causal 3D conv equals a 2D conv with the kernel's last
   temporal slice, so the decoder runs as NHWC CUTLASS implicit-GEMM 2D convolutions.
-* **Sampling** (`src/sampling.rs`): torch-compatible `mt19937` + Box-Muller noise, ModelSamplingFlux
-  sigmas and the "simple" scheduler, Euler steps fused into the final un-patchify kernel.
+* **Sampling** (`src/sampling.rs`, `src/samplers.rs`): torch-compatible `mt19937` + Box-Muller noise, and
+  ComfyUI's samplers and schedulers on the host.
 
 ## System-memory offloading (`src/offload.rs`)
 
@@ -284,5 +320,5 @@ tools/              ComfyUI reference dump / comparison / benchmark scripts
 The CUTLASS and flash-attention checkouts default to `ref/comfy-kitchen/third_party/*` (override with
 `KREA_CUTLASS_DIR` / `KREA_FLASH_ATTN_DIR`). Object files are cached by content hash.
 
-Not implemented: CFG > 1 / negative prompts (the turbo workflow uses CFG 1), image inputs to the
+Not implemented: image inputs to the
 text encoder and reference latents (edit mode).

@@ -80,8 +80,8 @@ and switching from Krea 2 or Anima took about 3 s extra.
 **LoRAs** work on all three, from the LoRA parameter or `<lora:name:weight>`, stacked, at any strength. The first image
 after a change bakes them into the weights (about 3 s on Krea 2, 1 s on the others, with the files cached), and sampling
 stays as fast as without. Tested through SwarmUI: repeats, strength changes, stacks, removal (the base image comes back
-pixel-identical), and baked blocks moving to RAM and back. LoHa, LoKr, GLoRA, OFT, DoRA, LoRA hooks and LoRAs with text
-encoder keys are refused with an error. See the [README](../README.md#loras).
+pixel-identical), and baked blocks moving to RAM and back. Every LoRA format ComfyUI reads works, text encoder patches included;
+LoRA hooks are refused with an error. See the [README](../README.md#loras).
 
 **Alongside ComfyUI.** Add this server next to SwarmUI's normal ComfyUI backend. In a live test with both running,
 SwarmUI sent every Krea 2 job here and Anima to ComfyUI, keeping each model on the backend that had it loaded.

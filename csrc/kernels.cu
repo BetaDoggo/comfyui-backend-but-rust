@@ -1102,17 +1102,27 @@ GPU_API int gpu_group_norm(const void* x, void* out, const void* w, const void* 
 }
 
 // ---------------------------------------------------------------------------------------------
-// ConvRot int8 weights <-> bf16, to bake LoRAs. The same arithmetic as comfy-kitchen's
+// ConvRot int8 weights <-> bf16 or f32, to bake LoRAs. The same arithmetic as comfy-kitchen's
 // dequantize_int8_convrot_weight and quantize_int8_rowwise_convrot64 with stochastic rounding.
 // ---------------------------------------------------------------------------------------------
-__global__ void convrot_dequant_kernel(const int8_t* q, const float* s, bf16* out, int K) {
+__device__ __forceinline__ float lora_load(float v) { return v; }
+__device__ __forceinline__ float lora_load(bf16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ void lora_store(float* p, float v) { *p = v; }
+__device__ __forceinline__ void lora_store(bf16* p, float v) { *p = __float2bfloat16_rn(v); }
+__device__ __forceinline__ float noisy_sum(float scaled, float noise, float*) { return scaled + noise; }
+__device__ __forceinline__ float noisy_sum(float scaled, float noise, bf16*) {
+    return __bfloat162float(__hadd(__float2bfloat16_rn(scaled), __float2bfloat16_rn(noise)));
+}
+
+template <typename T>
+__global__ void convrot_dequant_kernel(const int8_t* q, const float* s, T* out, int K) {
     extern __shared__ float row[];
     const int64_t m = blockIdx.x;
     const float sc = s[m];
     for (int k = threadIdx.x; k < K; k += blockDim.x) row[k] = (float)q[m * K + k] * sc;
     __syncthreads();
     fht256_rows_smem(row, K);
-    for (int k = threadIdx.x; k < K; k += blockDim.x) out[m * K + k] = __float2bfloat16_rn(row[k]);
+    for (int k = threadIdx.x; k < K; k += blockDim.x) lora_store(&out[m * K + k], row[k]);
 }
 
 __device__ __forceinline__ uint32_t pcg_hash(uint32_t x) {
@@ -1121,26 +1131,26 @@ __device__ __forceinline__ uint32_t pcg_hash(uint32_t x) {
     return (word >> 22u) ^ word;
 }
 
-__global__ void convrot_requant_kernel(const bf16* x, int8_t* q, float* scales, int K, uint64_t seed) {
+template <typename T>
+__global__ void convrot_requant_kernel(const T* x, int8_t* q, float* scales, int K, uint64_t seed) {
     extern __shared__ float smem[];
     float* red = smem;
     float* row = smem + 33;
     const int64_t m = blockIdx.x;
-    for (int k = threadIdx.x; k < K; k += blockDim.x) row[k] = __bfloat162float(x[m * K + k]);
+    for (int k = threadIdx.x; k < K; k += blockDim.x) row[k] = lora_load(x[m * K + k]);
     __syncthreads();
     fht256_rows_smem(row, K);
     float amax = 0.f;
     for (int k = threadIdx.x; k < K; k += blockDim.x) amax = fmaxf(amax, fabsf(row[k]));
     amax = block_max(amax, red);
-    const float scale = fmaxf(fminf(amax, finite_max<bf16>()) * (1.f / 127.f), 1.0e-30f);
+    const float scale = fmaxf(fminf(amax, finite_max<T>()) * (1.f / 127.f), 1.0e-30f);
     if (threadIdx.x == 0) scales[m] = scale;
-    const float scale_t = rnd<bf16>(scale);
+    const float scale_t = rnd<T>(scale);
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
-        const float scaled = rnd<bf16>(rnd<bf16>(row[k]) / scale_t);
+        const float scaled = rnd<T>(rnd<T>(row[k]) / scale_t);
         const uint64_t key = (uint64_t)(m * K + k) + seed;
         const uint32_t folded = (uint32_t)key ^ (uint32_t)(key >> 32);
-        const bf16 noise = __float2bfloat16_rn((float)(pcg_hash(folded) >> 8) * 0x1.0p-24f);
-        const float v = floorf(__bfloat162float(__hadd(__float2bfloat16_rn(scaled), noise)));
+        const float v = floorf(noisy_sum(scaled, (float)(pcg_hash(folded) >> 8) * 0x1.0p-24f, (T*)nullptr));
         q[m * K + k] = (int8_t)fminf(127.f, fmaxf(-128.f, v));
     }
 }
@@ -1148,31 +1158,46 @@ __global__ void convrot_requant_kernel(const bf16* x, int8_t* q, float* scales, 
 static int convrot_threads(int K) { return K >= 6144 ? 1024 : 256; }
 
 // out = the weight in its original basis; q [N, K], s [N]
-GPU_API int gpu_convrot_dequant_bf16(const void* q, const void* s, void* out, int64_t N, int K, void* stream) {
+GPU_API int gpu_convrot_dequant(int dtype, const void* q, const void* s, void* out, int64_t N, int K, void* stream) {
     const int smem = K * sizeof(float);
-    cudaFuncSetAttribute(convrot_dequant_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    convrot_dequant_kernel<<<(unsigned)N, convrot_threads(K), smem, (cudaStream_t)stream>>>((const int8_t*)q, (const float*)s, (bf16*)out, K);
+    cudaFuncSetAttribute(convrot_dequant_kernel<float>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(convrot_dequant_kernel<bf16>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (dtype == DT_F32) {
+        convrot_dequant_kernel<float><<<(unsigned)N, convrot_threads(K), smem, (cudaStream_t)stream>>>((const int8_t*)q, (const float*)s, (float*)out, K);
+    } else {
+        convrot_dequant_kernel<bf16><<<(unsigned)N, convrot_threads(K), smem, (cudaStream_t)stream>>>((const int8_t*)q, (const float*)s, (bf16*)out, K);
+    }
     KCHECK();
     return 0;
 }
 
 // x [N, K] in its original basis -> rotated q [N, K] and row scales s [N]
-GPU_API int gpu_convrot_requant_bf16(const void* x, void* q, void* s, int64_t N, int K, uint64_t seed, void* stream) {
+GPU_API int gpu_convrot_requant(int dtype, const void* x, void* q, void* s, int64_t N, int K, uint64_t seed, void* stream) {
     const int smem = (K + 33) * sizeof(float);
-    cudaFuncSetAttribute(convrot_requant_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    convrot_requant_kernel<<<(unsigned)N, convrot_threads(K), smem, (cudaStream_t)stream>>>((const bf16*)x, (int8_t*)q, (float*)s, K, seed);
+    cudaFuncSetAttribute(convrot_requant_kernel<float>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(convrot_requant_kernel<bf16>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (dtype == DT_F32) {
+        convrot_requant_kernel<float><<<(unsigned)N, convrot_threads(K), smem, (cudaStream_t)stream>>>((const float*)x, (int8_t*)q, (float*)s, K, seed);
+    } else {
+        convrot_requant_kernel<bf16><<<(unsigned)N, convrot_threads(K), smem, (cudaStream_t)stream>>>((const bf16*)x, (int8_t*)q, (float*)s, K, seed);
+    }
     KCHECK();
     return 0;
 }
 
-__global__ void lora_add_kernel(bf16* w, const bf16* d, float scale, int64_t n) {
+template <typename T>
+__global__ void lora_add_kernel(T* w, const T* d, float scale, int64_t n) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) w[i] = __float2bfloat16_rn(__bfloat162float(w[i]) + rnd<bf16>(__bfloat162float(d[i]) * scale));
+    if (i < n) lora_store(&w[i], lora_load(w[i]) + rnd<T>(lora_load(d[i]) * scale));
 }
 
-// w += scale * d, every intermediate in bf16 as torch computes it
-GPU_API int gpu_lora_add_bf16(void* w, const void* d, float scale, int64_t n, void* stream) {
-    lora_add_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((bf16*)w, (const bf16*)d, scale, n);
+// w += scale * d, every intermediate in dtype as torch computes it
+GPU_API int gpu_lora_add(int dtype, void* w, const void* d, float scale, int64_t n, void* stream) {
+    if (dtype == DT_F32) {
+        lora_add_kernel<float><<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((float*)w, (const float*)d, scale, n);
+    } else {
+        lora_add_kernel<bf16><<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((bf16*)w, (const bf16*)d, scale, n);
+    }
     KCHECK();
     return 0;
 }

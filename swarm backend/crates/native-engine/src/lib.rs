@@ -74,6 +74,8 @@ struct DeferredCond {
     template: Option<String>,
     /// Krea 2: prompt images for the vision tower.
     images: Vec<PromptImage>,
+    /// `LoraLoader`'s clip half.
+    loras: Vec<Lora>,
 }
 
 /// Sampled latents, `[B, 16, H/8, W/8]`, or `[B, 128, H/16, W/16]` for MOSS Image.
@@ -167,13 +169,7 @@ fn prompt_segments(p: &ParsedPrompt, steps: u32, family: Family) -> Result<Vec<(
 fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<(String, f32)>, String> {
     for p in &req.text_encoder.patches {
         match p {
-            TextEncoderPatch::Lora { file, .. } => {
-                let h = read_header(&file.path).map_err(|e| format!("{}: not a readable safetensors file ({e})", file.name))?;
-                let keys = h.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default();
-                if lora::has_text_encoder_keys(keys) {
-                    return Err(format!("{}: LoRAs that patch the text encoder", file.name));
-                }
-            }
+            TextEncoderPatch::Lora { .. } => {}
             TextEncoderPatch::Hooks { .. } => return Err("LoRA hooks".into()),
             TextEncoderPatch::StopAtLayer { .. } => return Err("CLIP Stop At Layer".into()),
         }
@@ -264,6 +260,14 @@ fn reference_latents(c: &Conditioning) -> EngineResult<(Vec<Reference>, bool)> {
         out.push(Reference { latent: latent.data.clone(), height, width });
     }
     Ok((out, timestep_zero))
+}
+
+/// The positive and negative prompts share one baked text encoder.
+fn check_text_encoder_loras(positive: &DeferredCond, negative: &DeferredCond) -> EngineResult<()> {
+    if positive.loras != negative.loras {
+        return Err(unsupported("different LoRAs on the positive and negative text encoders"));
+    }
+    Ok(())
 }
 
 /// `ModelSamplingFlux`: `max_shift` applies at 2560 latent patches, `base_shift` at 256.
@@ -389,12 +393,19 @@ impl NativeEngine {
         let (cond, positive) = single_prompt(&req.positive, Family::Anima)?;
         let text_encoder = &cond.text_encoder;
         let first = sampling(req, settings, shape, 0)?;
-        let negative = if first.uses_negative() { single_prompt(&req.negative, Family::Anima)?.1 } else { &[] };
+        let negative = if first.uses_negative() {
+            let (c, p) = single_prompt(&req.negative, Family::Anima)?;
+            check_text_encoder_loras(cond, c)?;
+            p
+        } else {
+            &[]
+        };
         let mut gen = self.gen();
         gen.ensure_anima(&file.path).map_err(internal)?;
         gen.ensure_qwen3(text_encoder).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
+        gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
         let mut data = Vec::with_capacity(batch * 16 * lh * lw);
         for i in 0..batch {
             let r = AnimaRequest {
@@ -422,12 +433,19 @@ impl NativeEngine {
         let (batch, lh, lw) = shape;
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, positive) = single_prompt(&req.positive, Family::Moss)?;
-        let negative = if sampling(req, settings, shape, 0)?.uses_negative() { single_prompt(&req.negative, Family::Moss)?.1[0].0.clone() } else { String::new() };
+        let negative = if sampling(req, settings, shape, 0)?.uses_negative() {
+            let (c, p) = single_prompt(&req.negative, Family::Moss)?;
+            check_text_encoder_loras(cond, c)?;
+            p[0].0.clone()
+        } else {
+            String::new()
+        };
         let mut gen = self.gen();
         gen.ensure_moss(&file.path).map_err(internal)?;
         gen.ensure_qwen35(&cond.text_encoder).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
+        gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
         let mut data = Vec::with_capacity(batch * diffusion::moss::CH * lh * lw);
         for i in 0..batch {
             let r = MossRequest {
@@ -531,7 +549,11 @@ impl Engine for NativeEngine {
             TextEncodeMode::Swarm(s) if family == Family::Krea2 => s.images.as_ref().map(prompt_images).unwrap_or_default(),
             _ => Vec::new(),
         };
-        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), template, images };
+        let loras = req.text_encoder.patches.iter().filter_map(|p| match p {
+            TextEncoderPatch::Lora { file, strength } => Some(Lora { path: file.path.clone(), strength: *strength }),
+            _ => None,
+        }).collect();
+        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), template, images, loras };
         Ok(Conditioning::single(Opaque::new(cond), CondMeta::default()))
     }
 
@@ -587,6 +609,7 @@ impl Engine for NativeEngine {
         let shape = (batch, lh, lw);
         let (negative, negative_images) = if sampling(req, &settings, shape, 0)?.uses_negative() {
             let (c, p) = single_prompt(&req.negative, family)?;
+            check_text_encoder_loras(cond, c)?;
             if !reference_latents(&req.negative)?.0.is_empty() {
                 return Err(unsupported("reference latents on the negative prompt"));
             }
@@ -600,6 +623,7 @@ impl Engine for NativeEngine {
         gen.ensure_te(text_encoder).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
+        gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
 
         let mut data = Vec::with_capacity(batch * 16 * lh * lw);
         for i in 0..batch {

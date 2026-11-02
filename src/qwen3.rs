@@ -24,6 +24,7 @@ pub struct TextEncoder {
     ws: WeightSet,
     /// final RMSNorm, f32
     norm: DevBuf,
+    lora: crate::lora::State,
 }
 
 /// Bytes of the weights, for deciding how much of the encoder can stay in VRAM.
@@ -59,7 +60,12 @@ impl TextEncoder {
         let norm = DevBuf::alloc(v.len() * 4)?;
         norm.upload(0, &crate::st::f32_bytes(&v), s0)?;
         s0.sync()?;
-        Ok(TextEncoder { st, ws, norm })
+        Ok(TextEncoder { st, ws, norm, lora: Default::default() })
+    }
+
+    /// Bake `loras` into the encoder. Returns true if any weight changed.
+    pub fn apply_loras(&mut self, loras: &[crate::lora::Lora], s0: &Stream) -> Result<bool> {
+        crate::lora::apply(crate::lora::Arch::TextEncoder { comfy: "qwen3_06b" }, &self.st, "model.", vec![crate::offload::Store::Set(&mut self.ws)], &mut self.lora, loras, s0)
     }
 
     /// ids -> hidden states f32 [len, 1024].

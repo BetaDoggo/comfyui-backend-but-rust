@@ -2,7 +2,8 @@
 
 usage: python lora_cmp.py <ref_dir> <ours_dir> [ours.png]
 
-ours_dir is $LORA_DUMP of a diffusion run: create an empty `<stem>.want` there for each module without `diffusion_model.`.
+ours_dir is $LORA_DUMP of a diffusion run: create an empty `<stem>.want` there for each module without
+`diffusion_model.` or `<encoder>.transformer.model.`.
 """
 import os
 import sys
@@ -15,13 +16,13 @@ from safetensors.torch import load_file
 ref = load_file(os.path.join(sys.argv[1], "ref.safetensors"))
 for key in sorted(k for k in ref if k.endswith(".q")):
     m = key[:-2]
-    stem = m[len("diffusion_model."):]
+    stem = m.split(".transformer.model.")[-1].removeprefix("diffusion_model.")
     q = ref[key]
     n, k = q.shape
     ours_q = torch.from_numpy(np.fromfile(os.path.join(sys.argv[2], f"{stem}.q.bin"), dtype=np.int8)).reshape(n, k)
     ours_s = torch.from_numpy(np.fromfile(os.path.join(sys.argv[2], f"{stem}.scale.bin"), dtype=np.float32))
     raw = np.fromfile(os.path.join(sys.argv[2], f"{stem}.float.bin"), dtype=np.uint8)
-    ours_f = torch.frombuffer(bytearray(raw.tobytes()), dtype=torch.bfloat16).reshape(n, k).float()
+    ours_f = torch.frombuffer(bytearray(raw.tobytes()), dtype=torch.float32 if raw.size == n * k * 4 else torch.bfloat16).reshape(n, k).float()
     rf = ref[f"{m}.float"]
     rs = ref[f"{m}.scale"].flatten().float()
     df = (rf - ours_f).abs()

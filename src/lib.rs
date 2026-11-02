@@ -6,6 +6,7 @@ pub mod dit;
 pub mod ffi;
 pub mod flux2vae;
 pub mod lora;
+mod lora_adapters;
 pub mod moss;
 pub mod offload;
 pub mod pipeline;

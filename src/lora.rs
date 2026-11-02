@@ -3,7 +3,8 @@
 //! and stochastic rounding seeded by the module's name. Sampling then runs the normal int8 kernels.
 
 use crate::cuda::{DevBuf, Stream};
-use crate::ffi::{k, null, off, s, DT_BF16, PM};
+use crate::ffi::{k, null, off, s, DT_BF16, DT_F32};
+use crate::lora_adapters::{self as adapters, Tensor, Work};
 use crate::offload::{Placed, Store, Stored};
 use crate::st::{f32_bytes, SafeTensors};
 use anyhow::{anyhow, Context, Result};
@@ -35,6 +36,49 @@ pub enum Arch {
     Krea2,
     Anima,
     Moss,
+    /// `comfy` names the encoder inside ComfyUI's text encoder model, as in `qwen3vl_4b`.
+    TextEncoder { comfy: &'static str },
+}
+
+impl Arch {
+    /// ComfyUI's name for a module, which seeds its requantization.
+    fn module(self, stem: &str) -> String {
+        match self {
+            Arch::TextEncoder { comfy } => format!("{comfy}.transformer.model.{stem}"),
+            _ => format!("diffusion_model.{stem}"),
+        }
+    }
+
+    /// The dtype ComfyUI patches in: its compute dtype, float32 for text encoders (`full_precision_mm`).
+    fn dtype(self) -> i32 {
+        if matches!(self, Arch::TextEncoder { .. }) { DT_F32 } else { DT_BF16 }
+    }
+}
+
+fn elem(dt: i32) -> usize {
+    if dt == DT_F32 { 4 } else { 2 }
+}
+
+fn encode(dt: i32, v: &[f32]) -> Vec<u8> {
+    if dt == DT_F32 {
+        return f32_bytes(v).to_vec();
+    }
+    let mut out = vec![0u8; v.len() * 2];
+    adapters::par_items(&mut out, 2, |i, o| o.copy_from_slice(&bf16::from_f32(v[i]).to_le_bytes()));
+    out
+}
+
+fn decode(dt: i32, b: &[u8]) -> Vec<f32> {
+    let mut out = vec![0.0; b.len() / elem(dt)];
+    adapters::par_items(&mut out, 1, |i, o| {
+        o[0] = if dt == DT_F32 { f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap()) } else { bf16::from_le_bytes([b[i * 2], b[i * 2 + 1]]).to_f32() };
+    });
+    out
+}
+
+/// A tensor of a LoRA file as device bytes in `dt`.
+fn bytes_of(f: &SafeTensors, name: &str, dt: i32) -> Result<Vec<u8>> {
+    if dt == DT_F32 { Ok(f32_bytes(&f.f32_vec(name, false)?).to_vec()) } else { f.bf16_bytes(name) }
 }
 
 /// What is currently baked into a model.
@@ -90,9 +134,26 @@ fn krea2_to_diffusers(layers: usize) -> Vec<(String, String)> {
     v
 }
 
-/// `comfy.lora.model_lora_keys_unet` for these models. `keys` are the model's tensors with
-/// `.0` the row count of each.
+/// `comfy.lora.model_lora_keys_clip` for an encoder of one Llama-like model: `lora_te_` is kohya's.
+fn text_encoder_keys(comfy: &str, keys: &[(String, usize)]) -> HashMap<String, Target> {
+    let mut map = HashMap::new();
+    for (k, _) in keys {
+        if let Some(base) = k.strip_suffix(".weight") {
+            let to = Target { tensor: k.clone(), rows: None };
+            map.insert(format!("text_encoders.{comfy}.transformer.model.{base}"), to.clone());
+            map.insert(format!("text_encoders.transformer.model.{base}"), to.clone());
+            map.insert(format!("lora_te_{}", base.replace('.', "_")), to);
+        }
+    }
+    map
+}
+
+/// `comfy.lora.model_lora_keys_unet` for these models, or the text encoder's. `keys` are the model's
+/// tensors with `.0` the row count of each.
 fn key_map(arch: Arch, keys: &[(String, usize)]) -> HashMap<String, Target> {
+    if let Arch::TextEncoder { comfy } = arch {
+        return text_encoder_keys(comfy, keys);
+    }
     let mut map = HashMap::new();
     let whole = |t: &str| Target { tensor: t.to_string(), rows: None };
     for (k, rows) in keys {
@@ -132,66 +193,43 @@ fn key_map(arch: Arch, keys: &[(String, usize)]) -> HashMap<String, Target> {
     map
 }
 
-/// The parts of one patched module in a LoRA file.
-#[derive(Default, Debug)]
-struct Parts {
-    up: Option<String>,
-    down: Option<String>,
-    mid: bool,
-    alpha: Option<String>,
-    dora: bool,
-    reshape: bool,
-    diff: Option<String>,
-    diff_b: Option<String>,
-    set: Option<String>,
-    w_norm: Option<String>,
-    b_norm: Option<String>,
+/// What follows a module's name in the tensors of a LoRA file, for each thing that can patch it.
+const SUFFIXES: [&str; 36] = [".lora_up.weight", "_lora.up.weight", ".lora_B.weight", ".lora.up.weight", ".lora_B", ".lora_linear_layer.up.weight",
+    ".lora_B.default.weight", ".lora_down.weight", "_lora.down.weight", ".lora_A.weight", ".lora.down.weight", ".lora_A", ".lora_linear_layer.down.weight",
+    ".lora_A.default.weight", ".hada_w1_a", ".lokr_w1", ".lokr_w2", ".lokr_w1_a", ".lokr_w2_a", ".a1.weight", ".oft_blocks", ".w_norm", ".b_norm", ".diff",
+    ".diff_b", ".set_weight", ".alpha", ".dora_scale", ".reshape_weight", ".lora_mid.weight", ".lokr_w1_b", ".lokr_w2_b", ".hada_w1_b", ".a2.weight",
+    ".b1.weight", ".b2.weight"];
+
+fn module_names(st: &SafeTensors) -> Vec<&str> {
+    let mut names: Vec<&str> = st.tensors.keys().filter_map(|k| SUFFIXES.iter().find_map(|sfx| k.strip_suffix(sfx))).collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
-/// Formats that have no adapter here yet (LoHa, LoKr, GLoRA, OFT/BOFT).
-const OTHER_ADAPTERS: [&str; 7] = [".hada_w1_a", ".lokr_w1", ".lokr_w2", ".lokr_w1_a", ".a1.weight", ".oft_blocks", ".oft_diag"];
-
-fn parts_of(st: &SafeTensors, name: &str) -> Result<HashMap<String, Parts>> {
-    let mut parts: HashMap<String, Parts> = HashMap::new();
-    for key in st.tensors.keys() {
-        if OTHER_ADAPTERS.iter().any(|a| key.ends_with(a)) {
-            return Err(Unsupported(format!("{name}: LoHa, LoKr, GLoRA and OFT patches")).into());
-        }
-        const ROLES: [(&str, usize); 22] = [(".lora_up.weight", 0), ("_lora.up.weight", 0), (".lora_B.weight", 0), (".lora.up.weight", 0), (".lora_B", 0),
-            (".lora_linear_layer.up.weight", 0), (".lora_B.default.weight", 0), (".lora_down.weight", 1), ("_lora.down.weight", 1), (".lora_A.weight", 1),
-            (".lora.down.weight", 1), (".lora_A", 1), (".lora_linear_layer.down.weight", 1), (".lora_A.default.weight", 1), (".lora_mid.weight", 2),
-            (".alpha", 3), (".dora_scale", 4), (".reshape_weight", 5), (".diff", 6), (".diff_b", 7), (".set_weight", 8), (".w_norm", 9)];
-        let found = ROLES.iter().find_map(|(sfx, r)| key.strip_suffix(sfx).map(|x| (x, *r)));
-        let (x, role) = match (found, key.strip_suffix(".b_norm")) {
-            (Some(f), _) => f,
-            (None, Some(x)) => (x, 10),
-            _ => continue,
-        };
-        let p = parts.entry(x.to_string()).or_default();
-        let k = Some(key.clone());
-        match role {
-            0 => p.up = k,
-            1 => p.down = k,
-            2 => p.mid = true,
-            3 => p.alpha = k,
-            4 => p.dora = true,
-            5 => p.reshape = true,
-            6 => p.diff = k,
-            7 => p.diff_b = k,
-            8 => p.set = k,
-            9 => p.w_norm = k,
-            _ => p.b_norm = k,
-        }
-    }
-    Ok(parts)
-}
-
+/// One patch, with tensors named as the LoRA file names them. Everything but `Diff` and `Set` is a
+/// `comfy.weight_adapter`; `dora` is its `dora_scale`.
 #[derive(Clone, Debug)]
 enum Op {
     /// `strength * alpha / rank * up @ down`
-    Lora { up: String, down: String, alpha: Option<f32> },
+    Lora { up: String, down: String, mid: Option<String>, alpha: Option<f32>, dora: Option<String> },
+    Loha { w1: (String, String), w2: (String, String), tucker: Option<(String, String)>, alpha: Option<f32>, dora: Option<String> },
+    Lokr { w1: Factor, w2: Factor, alpha: Option<f32>, dora: Option<String> },
+    Glora { a: (String, String), b: (String, String), alpha: Option<f32>, dora: Option<String> },
+    Oft { blocks: String, alpha: Option<f32>, dora: Option<String> },
+    Boft { blocks: String, rescale: Option<String>, alpha: Option<f32>, dora: Option<String> },
     Diff(String),
     Set(String),
+    /// A MOSS Image control adapter's wider `video_embedder`: with no control image its extra inputs
+    /// are zeros, so only the columns the model has count.
+    SetLeft(String),
+}
+
+/// One side of a Kronecker product: a whole tensor, or two with an optional Tucker core.
+#[derive(Clone, Debug)]
+enum Factor {
+    Full(String),
+    Pair(String, String, Option<String>),
 }
 
 #[derive(Clone, Debug)]
@@ -206,97 +244,252 @@ fn bias_of(t: &Target) -> Target {
     Target { tensor: format!("{}.bias", t.tensor.strip_suffix(".weight").unwrap_or(&t.tensor)), rows: t.rows }
 }
 
-/// Every patch of `file`, as (model tensor, patch), like `comfy.lora.load_lora` + `add_patches`.
-fn load_patches(st: &SafeTensors, file: usize, name: &str, strength: f32, map: &HashMap<String, Target>, tensors: &HashMap<String, usize>)
-    -> Result<(Vec<(String, Patch)>, usize)> {
-    if st.has("video_embedder.weight") && st.has("layers.0.proj.q.lora_A.weight") {
-        return Err(Unsupported(format!("{name}: MOSS Image control LoRAs")).into());
+/// The adapter of module `x`, like the loop in `comfy.lora.load_lora`: the last that matches wins.
+fn adapter_of(st: &SafeTensors, x: &str, alpha: Option<f32>, dora: Option<&String>, name: &str) -> Result<Option<Op>> {
+    let n = |sfx: &str| format!("{x}{sfx}");
+    let has = |sfx: &str| st.has(&n(sfx));
+    let dora = dora.cloned();
+    let mut op = None;
+    const PAIRS: [(&str, &str); 7] = [(".lora_up.weight", ".lora_down.weight"), ("_lora.up.weight", "_lora.down.weight"), (".lora_B.weight", ".lora_A.weight"),
+        (".lora.up.weight", ".lora.down.weight"), (".lora_B", ".lora_A"), (".lora_linear_layer.up.weight", ".lora_linear_layer.down.weight"),
+        (".lora_B.default.weight", ".lora_A.default.weight")];
+    if let Some((up, down)) = PAIRS.iter().find(|(up, _)| has(up)) {
+        if has(".reshape_weight") {
+            return Err(Unsupported(format!("{name}: reshaped patches, which widen a model's inputs")).into());
+        }
+        let mid = (*up == ".lora_up.weight" && has(".lora_mid.weight")).then(|| n(".lora_mid.weight"));
+        op = Some(Op::Lora { up: n(up), down: n(down), mid, alpha, dora: dora.clone() });
     }
-    let parts = parts_of(st, name)?;
-    let mut out = Vec::new();
-    let mut ignored = 0;
-    let mut names: Vec<_> = parts.keys().collect();
-    names.sort();
-    for x in names {
-        let (p, Some(to)) = (&parts[x], map.get(x)) else {
-            ignored += 1;
-            continue;
-        };
-        if p.mid || p.dora || p.reshape {
-            return Err(Unsupported(format!("{name}: LoCon mid weights, DoRA and reshaped patches")).into());
-        }
-        let mut push = |to: &Target, op: Op| {
-            if tensors.contains_key(&to.tensor) {
-                out.push((to.tensor.clone(), Patch { file, op, strength, rows: to.rows }));
-            }
-        };
-        if let (Some(up), Some(down)) = (&p.up, &p.down) {
-            let alpha = p.alpha.as_ref().map(|a| st.f32_vec(a, false).map(|v| v[0])).transpose()?;
-            push(to, Op::Lora { up: up.clone(), down: down.clone(), alpha });
-        }
-        if let Some(d) = &p.w_norm {
-            push(to, Op::Diff(d.clone()));
-        }
-        if let Some(d) = &p.b_norm {
-            push(&bias_of(to), Op::Diff(d.clone()));
-        }
-        if let Some(d) = &p.diff {
-            push(to, Op::Diff(d.clone()));
-        }
-        if let Some(d) = &p.diff_b {
-            push(&bias_of(to), Op::Diff(d.clone()));
-        }
-        if let Some(d) = &p.set {
-            push(to, Op::Set(d.clone()));
+    if has(".hada_w1_a") {
+        let tucker = has(".hada_t1").then(|| (n(".hada_t1"), n(".hada_t2")));
+        op = Some(Op::Loha { w1: (n(".hada_w1_a"), n(".hada_w1_b")), w2: (n(".hada_w2_a"), n(".hada_w2_b")), tucker, alpha, dora: dora.clone() });
+    }
+    if [".lokr_w1", ".lokr_w2", ".lokr_w1_a", ".lokr_w2_a"].iter().any(|s| has(s)) {
+        let w1 = if has(".lokr_w1") { Factor::Full(n(".lokr_w1")) } else { Factor::Pair(n(".lokr_w1_a"), n(".lokr_w1_b"), None) };
+        let w2 = if has(".lokr_w2") { Factor::Full(n(".lokr_w2")) } else { Factor::Pair(n(".lokr_w2_a"), n(".lokr_w2_b"), has(".lokr_t2").then(|| n(".lokr_t2"))) };
+        op = Some(Op::Lokr { w1, w2, alpha, dora: dora.clone() });
+    }
+    if has(".a1.weight") {
+        op = Some(Op::Glora { a: (n(".a1.weight"), n(".a2.weight")), b: (n(".b1.weight"), n(".b2.weight")), alpha, dora: dora.clone() });
+    }
+    if has(".oft_blocks") {
+        let blocks = n(".oft_blocks");
+        match st.info(&blocks)?.shape.len() {
+            3 => op = Some(Op::Oft { blocks, alpha, dora }),
+            4 => op = Some(Op::Boft { blocks, rescale: has(".rescale").then(|| n(".rescale")), alpha, dora }),
+            _ => {}
         }
     }
-    Ok((out, ignored))
+    Ok(op)
 }
 
-/// Apply `patches` to the bf16 weight `w` of `elems_per_row` x rows values.
-fn add_patches(w: PM, rows: usize, per_row: usize, patches: &[Patch], files: &[SafeTensors], tensor: &str, st: &Stream) -> Result<()> {
-    let (bf, dt) = (DT_BF16, DT_BF16);
+/// Every patch of `file`, as (model tensor, patch), like `comfy.lora.load_lora` + `add_patches`: a
+/// file has one patch per target, the last one found. Also returns how many modules matched nothing.
+fn load_patches(st: &SafeTensors, file: usize, name: &str, strength: f32, arch: Arch, map: &HashMap<String, Target>, tensors: &HashMap<String, usize>)
+    -> Result<(Vec<(String, Patch)>, usize)> {
+    let text_encoder = matches!(arch, Arch::TextEncoder { .. });
+    let mut found: BTreeMap<(String, Option<(usize, usize)>), Op> = BTreeMap::new();
+    let mut put = |to: &Target, op: Op| {
+        if tensors.contains_key(&to.tensor) {
+            found.insert((to.tensor.clone(), to.rows), op);
+        }
+    };
+    if arch == Arch::Moss && st.has("video_embedder.weight") && st.has("layers.0.proj.q.lora_A.weight") {
+        for t in ["video_embedder.weight", "video_embedder.bias"] {
+            if st.has(t) {
+                put(&Target { tensor: t.to_string(), rows: None }, Op::SetLeft(t.to_string()));
+            }
+        }
+    }
+    let mut ignored = 0;
+    for x in module_names(st) {
+        if text_encoder && x.contains(".transformer.visual.") {
+            return Err(Unsupported(format!("{name}: LoRAs that patch the vision tower")).into());
+        }
+        let Some(to) = map.get(x) else {
+            ignored += ["lora_te", "text_encoder"].iter().all(|p| !x.starts_with(p)) as usize;
+            continue;
+        };
+        let scalar = |k: String| st.has(&k).then(|| st.f32_vec(&k, false).map(|v| v[0])).transpose();
+        let alpha = scalar(format!("{x}.alpha"))?;
+        let dora = format!("{x}.dora_scale");
+        let dora = st.has(&dora).then_some(dora);
+        if let Some(op) = adapter_of(st, x, alpha, dora.as_ref(), name)? {
+            put(to, op);
+        }
+        let n = |sfx: &str| format!("{x}{sfx}");
+        if st.has(&n(".w_norm")) {
+            put(to, Op::Diff(n(".w_norm")));
+            if st.has(&n(".b_norm")) {
+                put(&bias_of(to), Op::Diff(n(".b_norm")));
+            }
+        }
+        if st.has(&n(".diff")) {
+            put(to, Op::Diff(n(".diff")));
+        }
+        if st.has(&n(".diff_b")) {
+            put(&bias_of(to), Op::Diff(n(".diff_b")));
+        }
+        if st.has(&n(".set_weight")) {
+            put(to, Op::Set(n(".set_weight")));
+        }
+    }
+    Ok((found.into_iter().map(|((t, rows), op)| (t, Patch { file, op, strength, rows })).collect(), ignored))
+}
+
+/// A tensor of a LoRA file, cast to `dt` as `calculate_weight` casts it.
+fn tensor_of(f: &SafeTensors, name: &str, dt: i32) -> Result<Tensor> {
+    Ok(Tensor::new(f.info(name)?.shape.clone(), f.f32_vec(name, dt == DT_BF16)?))
+}
+
+/// A matrix product on the device, in `dt`.
+fn device_mm(a: &Tensor, b: &Tensor, dt: i32, st: &Stream) -> Result<Tensor> {
+    let (rows, k, cols) = (a.shape[0], a.shape[1], b.shape[1]);
+    let (x, y) = (upload(&encode(dt, &a.data), st)?, upload(&encode(dt, &b.data), st)?);
+    let d = DevBuf::alloc_async(rows * cols * elem(dt), st)?;
+    k!(gpu_gemm(x.ptr(), k as i64, y.ptr(), cols as i64, d.ptr(), cols as i64, null(), rows as i64, cols as i64, k as i64, 0, dt, dt, 1.0, 0.0, s(st)))?;
+    let mut bytes = vec![0u8; rows * cols * elem(dt)];
+    d.download(0, &mut bytes, st)?;
+    Ok(Tensor::new(vec![rows, cols], decode(dt, &bytes)))
+}
+
+/// What an adapter does to a weight.
+enum Change {
+    /// values to add
+    Add(Vec<f32>),
+    /// the new weight
+    Replace(Vec<f32>),
+}
+
+/// `calculate_weight` of an adapter. `weight` reads the weight as it stands, which only some need.
+fn change_of(op: &Op, f: &SafeTensors, strength: f32, dt: i32, weight: &mut dyn FnMut() -> Result<Tensor>, st: &Stream) -> Result<Change> {
+    let t = |n: &String| tensor_of(f, n, dt);
+    let work = if dt == DT_F32 { Work::F32 } else { Work::BF16 };
+    let mut mm = |a: &Tensor, b: &Tensor| device_mm(a, b, dt, st);
+    let per_rank = |alpha: &Option<f32>, rank: usize| alpha.map_or(1.0, |a| a / rank as f32);
+    let (diff, scale, dora) = match op {
+        Op::Lora { up, down, mid, alpha, dora } => {
+            let (u, d) = (t(up)?, t(down)?);
+            let diff = match mid {
+                Some(m) => adapters::lora_mid(&u, &d, &t(m)?, &mut mm)?,
+                None => mm(&u.flat(), &d.flat())?,
+            };
+            (diff, per_rank(alpha, d.rows()), dora)
+        }
+        Op::Loha { w1, w2, tucker, alpha, dora } => {
+            let (a, b) = ((t(&w1.0)?, t(&w1.1)?), (t(&w2.0)?, t(&w2.1)?));
+            let cores = tucker.as_ref().map(|(x, y)| Ok::<_, anyhow::Error>((t(x)?, t(y)?))).transpose()?;
+            (adapters::loha((&a.0, &a.1), (&b.0, &b.1), cores.as_ref().map(|(x, y)| (x, y)), work, &mut mm)?, per_rank(alpha, a.1.rows()), dora)
+        }
+        Op::Lokr { w1, w2, alpha, dora } => {
+            let mut dim = None;
+            let mut side = |w: &Factor, mm: &mut dyn FnMut(&Tensor, &Tensor) -> Result<Tensor>| -> Result<Tensor> {
+                Ok(match w {
+                    Factor::Full(n) => t(n)?,
+                    Factor::Pair(a, b, core) => {
+                        let (a, b) = (t(a)?, t(b)?);
+                        dim = Some(b.rows());
+                        match core {
+                            Some(c) => adapters::tucker(&t(c)?, &b, &a, mm)?,
+                            None => mm(&a.flat(), &b.flat())?,
+                        }
+                    }
+                })
+            };
+            let (a, b) = (side(w1, &mut mm)?, side(w2, &mut mm)?);
+            (adapters::kron(&a, &b, work), dim.map_or(1.0, |d| per_rank(alpha, d)), dora)
+        }
+        Op::Glora { a, b, alpha, dora } => {
+            let w = weight()?;
+            let (diff, rank) = adapters::glora(&t(&a.0)?, &t(&a.1)?, &t(&b.0)?, &t(&b.1)?, &w, work, &mut mm)?;
+            (diff, per_rank(alpha, rank), dora)
+        }
+        Op::Oft { blocks, alpha, dora } => {
+            let a = alpha.unwrap_or(0.0);
+            let diff = adapters::oft(&t(blocks)?, a, strength, &weight()?, &mut mm)?;
+            (diff, if dora.is_some() { a } else { 1.0 }, dora)
+        }
+        Op::Boft { blocks, rescale, alpha, dora } => {
+            let a = alpha.ok_or_else(|| anyhow!("BOFT without an alpha"))?;
+            let rescale = rescale.as_ref().map(t).transpose()?;
+            let diff = adapters::boft(&t(blocks)?, rescale.as_ref(), a, strength, &weight()?)?;
+            (diff, if dora.is_some() { a } else { 1.0 }, dora)
+        }
+        Op::Diff(_) | Op::Set(_) | Op::SetLeft(_) => unreachable!("handled by add_patches"),
+    };
+    Ok(match dora {
+        Some(d) => Change::Replace(adapters::dora(&t(d)?, &weight()?, &diff.data, scale, strength, work)?),
+        None => {
+            let mut v = diff.data;
+            adapters::par_items(&mut v, 1, |_, o| o[0] *= strength * scale);
+            Change::Add(v)
+        }
+    })
+}
+
+/// Apply `patches` to the weight `w` of `per_row` x rows values, in `dt`.
+fn add_patches(w: &DevBuf, dt: i32, rows: usize, per_row: usize, patches: &[Patch], files: &[SafeTensors], tensor: &str, st: &Stream) -> Result<()> {
+    let size = elem(dt);
     for p in patches {
         let f = &files[p.file];
         let (start, n) = p.rows.unwrap_or((0, rows));
-        let dst = off(w, start * per_row * 2);
+        let first = start * per_row * size;
+        let dst = off(w.ptr(), first);
         let want = n * per_row;
         match &p.op {
-            Op::Lora { up, down, alpha } => {
+            Op::Lora { up, down, alpha, mid: None, dora: None } if f.info(up)?.shape.len() == 2 && f.info(down)?.shape.len() == 2 => {
                 let (ui, di) = (f.info(up)?, f.info(down)?);
-                let [nu, ru] = ui.shape[..] else {
-                    eprintln!("[lora] {tensor}: skipping non-linear patch");
-                    continue;
-                };
-                let [rd, kd] = di.shape[..] else {
-                    eprintln!("[lora] {tensor}: skipping non-linear patch");
-                    continue;
-                };
+                let ([nu, ru], [rd, kd]) = (ui.shape[..2].try_into()?, di.shape[..2].try_into()?);
                 if ru != rd || nu * kd != want {
                     eprintln!("[lora] ERROR {tensor}: shape {nu}x{ru} @ {rd}x{kd} doesn't fit {want} values, not merged");
                     continue;
                 }
-                let a = DevBuf::alloc_async(nu * ru * 2, st)?;
-                let b = DevBuf::alloc_async(rd * kd * 2, st)?;
-                let d = DevBuf::alloc_async(want * 2, st)?;
-                a.upload(0, &f.bf16_bytes(up)?, st)?;
-                b.upload(0, &f.bf16_bytes(down)?, st)?;
-                k!(gpu_gemm(a.ptr(), ru as i64, b.ptr(), kd as i64, d.ptr(), kd as i64, null(), nu as i64, kd as i64, ru as i64, 0, bf, dt, 1.0, 0.0,
+                let a = upload(&bytes_of(f, up, dt)?, st)?;
+                let b = upload(&bytes_of(f, down, dt)?, st)?;
+                let d = DevBuf::alloc_async(want * size, st)?;
+                k!(gpu_gemm(a.ptr(), ru as i64, b.ptr(), kd as i64, d.ptr(), kd as i64, null(), nu as i64, kd as i64, ru as i64, 0, dt, dt, 1.0, 0.0,
                     s(st)))?;
                 let scale = p.strength as f64 * alpha.map_or(1.0, |v| v as f64 / rd as f64);
-                k!(gpu_lora_add_bf16(dst, d.ptr(), scale as f32, want as i64, s(st)))?;
+                k!(gpu_lora_add(dt, dst, d.ptr(), scale as f32, want as i64, s(st)))?;
             }
             Op::Diff(name) | Op::Set(name) => {
                 if f.info(name)?.numel() != want {
                     eprintln!("[lora] WARNING SHAPE MISMATCH {tensor} WEIGHT NOT MERGED");
                     continue;
                 }
-                let d = DevBuf::alloc_async(want * 2, st)?;
-                d.upload(0, &f.bf16_bytes(name)?, st)?;
+                let d = upload(&bytes_of(f, name, dt)?, st)?;
                 if matches!(p.op, Op::Set(_)) {
-                    crate::cuda::memcpy_d2d(dst, d.ptr(), want * 2, st)?;
+                    crate::cuda::memcpy_d2d(dst, d.ptr(), want * size, st)?;
                 } else if p.strength != 0.0 {
-                    k!(gpu_lora_add_bf16(dst, d.ptr(), p.strength, want as i64, s(st)))?;
+                    k!(gpu_lora_add(dt, dst, d.ptr(), p.strength, want as i64, s(st)))?;
+                }
+            }
+            Op::SetLeft(name) => {
+                let t = tensor_of(f, name, dt)?;
+                let cols = t.data.len() / t.rows().max(1);
+                if t.rows() != n || cols < per_row {
+                    eprintln!("[lora] WARNING SHAPE MISMATCH {tensor} WEIGHT NOT MERGED");
+                    continue;
+                }
+                let left: Vec<f32> = t.data.chunks_exact(cols).flat_map(|r| r[..per_row].iter().copied()).collect();
+                w.upload(first, &encode(dt, &left), st)?;
+            }
+            op => {
+                let mut weight = || {
+                    st.sync()?;
+                    let mut b = vec![0u8; want * size];
+                    w.download(first, &mut b, st)?;
+                    Ok(Tensor::new(vec![n, per_row], decode(dt, &b)))
+                };
+                // like ComfyUI, a patch that doesn't fit is reported and left out
+                match change_of(op, f, p.strength, dt, &mut weight, st) {
+                    Ok(Change::Add(v)) | Ok(Change::Replace(v)) if v.len() != want => eprintln!("[lora] ERROR {tensor}: {} values don't fit {want}, not merged", v.len()),
+                    Ok(Change::Add(v)) => {
+                        let d = upload(&encode(dt, &v), st)?;
+                        k!(gpu_lora_add(dt, dst, d.ptr(), 1.0, want as i64, s(st)))?;
+                    }
+                    Ok(Change::Replace(v)) => w.upload(first, &encode(dt, &v), st)?,
+                    Err(e) => eprintln!("[lora] ERROR {tensor}: {e:#}, not merged"),
                 }
             }
         }
@@ -326,6 +519,7 @@ fn dump_baked(stem: &str, w: &DevBuf, q: &DevBuf, sc: &DevBuf, st: &Stream) -> R
 }
 
 struct Model<'a> {
+    arch: Arch,
     st: &'a SafeTensors,
     prefix: &'a str,
     stores: Vec<Store<'a>>,
@@ -374,7 +568,8 @@ impl Model<'_> {
         let info = self.st.info(&name)?;
         let rows = info.shape.first().copied().unwrap_or(1);
         let per_row = info.numel() / rows.max(1);
-        let w = DevBuf::alloc_async(info.numel() * 2, st)?;
+        let dt = self.arch.dtype();
+        let w = DevBuf::alloc_async(info.numel() * elem(dt), st)?;
         match place.2.kind {
             Stored::Raw => {
                 let stem = tensor.strip_suffix(".weight").ok_or_else(|| anyhow!("{tensor}: not a weight"))?;
@@ -382,26 +577,24 @@ impl Model<'_> {
                 let sp = self.place(&scale_name)?;
                 let q = upload(self.st.bytes(&name)?, st)?;
                 let sc = upload(self.st.bytes(&self.file_name(&scale_name))?, st)?;
-                k!(gpu_convrot_dequant_bf16(q.ptr(), sc.ptr(), w.ptr(), rows as i64, per_row as i32, s(st)))?;
-                add_patches(w.ptr(), rows, per_row, patches, files, tensor, st)?;
-                let seed = string_to_seed(&format!("diffusion_model.{stem}"));
-                k!(gpu_convrot_requant_bf16(w.ptr(), q.ptr(), sc.ptr(), rows as i64, per_row as i32, seed, s(st)))?;
+                k!(gpu_convrot_dequant(dt, q.ptr(), sc.ptr(), w.ptr(), rows as i64, per_row as i32, s(st)))?;
+                add_patches(&w, dt, rows, per_row, patches, files, tensor, st)?;
+                let seed = string_to_seed(&self.arch.module(stem));
+                k!(gpu_convrot_requant(dt, w.ptr(), q.ptr(), sc.ptr(), rows as i64, per_row as i32, seed, s(st)))?;
                 dump_baked(stem, &w, &q, &sc, st)?;
                 self.write(place, &q, st)?;
                 self.write(sp, &sc, st)
             }
-            Stored::Bf16 => {
-                w.upload(0, &self.st.bf16_bytes(&name)?, st)?;
-                add_patches(w.ptr(), rows, per_row, patches, files, tensor, st)?;
-                self.write(place, &w, st)
-            }
-            Stored::F32(add) => {
-                w.upload(0, &self.st.bf16_bytes(&name)?, st)?;
-                add_patches(w.ptr(), rows, per_row, patches, files, tensor, st)?;
-                let mut b = vec![0u8; info.numel() * 2];
+            Stored::Bf16 | Stored::F32(_) => {
+                w.upload(0, &bytes_of(self.st, &name, dt)?, st)?;
+                add_patches(&w, dt, rows, per_row, patches, files, tensor, st)?;
+                let mut b = vec![0u8; info.numel() * elem(dt)];
                 w.download(0, &mut b, st)?;
-                let v: Vec<f32> = b.chunks_exact(2).map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32() + add).collect();
-                let d = upload(&f32_bytes(&v), st)?;
+                let v = decode(dt, &b);
+                let d = match place.2.kind {
+                    Stored::F32(add) => upload(&f32_bytes(&v.iter().map(|x| x + add).collect::<Vec<_>>()), st)?,
+                    _ => upload(&encode(DT_BF16, &v), st)?,
+                };
                 self.write(place, &d, st)
             }
         }
@@ -426,8 +619,8 @@ pub fn apply(arch: Arch, st: &SafeTensors, prefix: &str, mut stores: Vec<Store>,
     let mut want: BTreeMap<String, Vec<Patch>> = BTreeMap::new();
     for (i, l) in loras.iter().enumerate() {
         let name = file_label(&l.path);
-        let (patches, ignored) = load_patches(&files[i], i, &name, l.strength, &map, &tensors).with_context(|| format!("reading {name}"))?;
-        if ignored > 0 {
+        let (patches, ignored) = load_patches(&files[i], i, &name, l.strength, arch, &map, &tensors).with_context(|| format!("reading {name}"))?;
+        if ignored > 0 && !matches!(arch, Arch::TextEncoder { .. }) {
             eprintln!("[lora] {name}: {ignored} modules not loaded (no such key in this model)");
         }
         for (t, p) in patches {
@@ -449,6 +642,13 @@ pub fn apply(arch: Arch, st: &SafeTensors, prefix: &str, mut stores: Vec<Store>,
         }
     }
 
+    // an encoder's last layers can go unused and unloaded, and then nothing can read their patches
+    if matches!(arch, Arch::TextEncoder { .. }) {
+        let layer = |t: &str| t.strip_prefix("layers.")?.split('.').next()?.parse::<usize>().ok();
+        let last = places.keys().filter_map(|t| layer(t)).max().unwrap_or(0);
+        want.retain(|t, _| layer(t).is_none_or(|i| i <= last));
+    }
+
     s0.sync()?;
     for store in &stores {
         if let Store::Set(w) = store {
@@ -456,7 +656,7 @@ pub fn apply(arch: Arch, st: &SafeTensors, prefix: &str, mut stores: Vec<Store>,
         }
     }
     let restore: Vec<String> = state.baked.keys().filter(|k| !want.contains_key(*k)).cloned().collect();
-    let mut m = Model { st, prefix, stores: std::mem::take(&mut stores), places };
+    let mut m = Model { arch, st, prefix, stores: std::mem::take(&mut stores), places };
     for tensor in &restore {
         m.restore(tensor, s0)?;
         state.baked.remove(tensor);
@@ -487,11 +687,6 @@ pub fn apply(arch: Arch, st: &SafeTensors, prefix: &str, mut stores: Vec<Store>,
 
 fn file_label(p: &Path) -> String {
     p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
-}
-
-/// True if a LoRA file also patches a text encoder (`comfy.lora.model_lora_keys_clip`'s key names).
-pub fn has_text_encoder_keys(keys: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
-    keys.into_iter().any(|k| ["lora_te", "lora_prior_te", "text_encoders.", "text_encoder."].iter().any(|p| k.as_ref().starts_with(p)))
 }
 
 #[cfg(test)]
@@ -530,8 +725,12 @@ mod tests {
     }
 
     #[test]
-    fn text_encoder_keys_are_recognised() {
-        assert!(has_text_encoder_keys(["lora_te_layers_0_self_attn_q_proj.lora_up.weight"]));
-        assert!(!has_text_encoder_keys(["lora_unet_blocks_0.alpha"]));
+    fn text_encoders_use_comfys_three_names() {
+        let m = key_map(Arch::TextEncoder { comfy: "qwen3_06b" }, &[("layers.0.self_attn.q_proj.weight".to_string(), 4096)]);
+        for k in ["lora_te_layers_0_self_attn_q_proj", "text_encoders.transformer.model.layers.0.self_attn.q_proj",
+            "text_encoders.qwen3_06b.transformer.model.layers.0.self_attn.q_proj"] {
+            assert_eq!(m[k].tensor, "layers.0.self_attn.q_proj.weight");
+        }
+        assert_eq!(Arch::TextEncoder { comfy: "qwen3_06b" }.module("layers.0"), "qwen3_06b.transformer.model.layers.0");
     }
 }

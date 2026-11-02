@@ -790,6 +790,30 @@ impl Generator {
         Ok(())
     }
 
+    /// Bake `loras` into the loaded text encoder, in place of any others, at their clip strengths.
+    /// A strength of 0 skips a LoRA, as ComfyUI's loader does. Encoded prompts are then dropped.
+    pub fn set_text_encoder_loras(&mut self, loras: &[lora::Lora]) -> Result<()> {
+        let st = &self.st;
+        let loras: Vec<_> = loras.iter().filter(|l| l.strength != 0.0).cloned().collect();
+        if let Some((_, te)) = &mut self.te {
+            if te.apply_loras(&loras, st)? {
+                self.cached = None;
+                self.cached_negative = None;
+            }
+        } else if let Some((_, te)) = &mut self.qwen3 {
+            if te.apply_loras(&loras, st)? {
+                self.contexts.clear();
+            }
+        } else if let Some((_, te)) = &mut self.qwen35 {
+            if te.apply_loras(&loras, st)? {
+                self.moss_contexts.clear();
+            }
+        } else if !loras.is_empty() {
+            bail!("no text encoder loaded");
+        }
+        Ok(())
+    }
+
     /// Choose the DiT attention: INT8 (fastest) or bf16 FlashAttention. Takes effect on the next step.
     pub fn set_int8_attention(&mut self, on: bool) {
         self.int8_attn = on;

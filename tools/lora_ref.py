@@ -1,7 +1,9 @@
 """Run ComfyUI's real LoRA path (DynamicVRAM, as main.py sets it up) and dump the result for parity tests.
 
+Run with SwarmUI's ComfyUI: python_embeded/python.exe lora_ref.py ...
+
 usage: python lora_ref.py <krea|anima|moss> <out_dir> <lora[:strength]>... [--prompt TEXT] [--negative TEXT] [--seed N] [--size W H]
-                          [--steps N] [--cfg X] [--shift X] [--sampler NAME] [--capture MODULE]...
+                          [--steps N] [--cfg X] [--shift X] [--sampler NAME] [--capture MODULE]... [--clip-strength X]
 
 --capture saves a module's weight as ComfyUI requantizes it: `<module>.float` (bf16 after the patches),
 `<module>.q` and `<module>.scale`. Prompts must be scenery with no people.
@@ -11,8 +13,8 @@ import os
 import sys
 import time
 
-COMFY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ref", "ComfyUI")
-sys.path.insert(0, os.path.abspath(COMFY))
+SWARM = os.environ.get("SWARM_DIR", r"G:\StableSwarmUI")
+sys.path.insert(0, os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI"))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("family", choices=["krea", "anima", "moss"])
@@ -27,6 +29,7 @@ ap.add_argument("--cfg", type=float)
 ap.add_argument("--shift", type=float)
 ap.add_argument("--sampler")
 ap.add_argument("--capture", action="append", default=[])
+ap.add_argument("--clip-strength", type=float, default=0.0)
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
 
@@ -89,14 +92,14 @@ comfy.quant_ops.QuantizedTensor.requantize_from_float = capture
 
 t0 = time.perf_counter()
 clip = comfy.sd.load_clip(ckpt_paths=[f["te"]], clip_type=getattr(comfy.sd.CLIPType, f["clip"]))
-cond = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
-neg = clip.encode_from_tokens_scheduled(clip.tokenize(args.negative))
 model = comfy.sd.load_diffusion_model(f["dit"])
 print("patcher", type(model).__name__, "dynamic", model.is_dynamic())
 model.get_model_object("model_sampling").set_parameters(shift=shift, **({} if args.family == "krea" else {"multiplier": 1.0}))
 for l in args.loras:
     path, _, s = l.rpartition(":") if l.rsplit(":", 1)[-1].replace(".", "").replace("-", "").isdigit() else (l, "", "1")
-    model, _ = comfy.sd.load_lora_for_models(model, None, comfy.utils.load_torch_file(path, safe_load=True), float(s), 0.0)
+    model, clip = comfy.sd.load_lora_for_models(model, clip, comfy.utils.load_torch_file(path, safe_load=True), float(s), args.clip_strength)
+cond = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
+neg = clip.encode_from_tokens_scheduled(clip.tokenize(args.negative))
 print(f"load {time.perf_counter() - t0:.2f}s, {len(model.patches)} patched weights")
 
 w, h = args.size

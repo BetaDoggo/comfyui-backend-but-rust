@@ -76,9 +76,9 @@ extern "C" {
     pub fn gpu_take_odd(x: P, out: PM, h: i32, w: i32, c: i32, s: PM) -> i32;
     pub fn gpu_partial_rope(x: PM, stride: i64, w: P, eps: f32, rope: P, l: i32, h: i32, d: i32, pairs: i32, s: PM) -> i32;
     pub fn gpu_flux2_latent_in(lat: P, mean: P, std: P, out: PM, c: i32, h: i32, w: i32, s: PM) -> i32;
-    pub fn gpu_convrot_dequant_bf16(q: P, s_: P, out: PM, n: i64, k: i32, s: PM) -> i32;
-    pub fn gpu_convrot_requant_bf16(x: P, q: PM, s_: PM, n: i64, k: i32, seed: u64, s: PM) -> i32;
-    pub fn gpu_lora_add_bf16(w: PM, d: P, scale: f32, n: i64, s: PM) -> i32;
+    pub fn gpu_convrot_dequant(dtype: i32, q: P, s_: P, out: PM, n: i64, k: i32, s: PM) -> i32;
+    pub fn gpu_convrot_requant(dtype: i32, x: P, q: PM, s_: PM, n: i64, k: i32, seed: u64, s: PM) -> i32;
+    pub fn gpu_lora_add(dtype: i32, w: PM, d: P, scale: f32, n: i64, s: PM) -> i32;
     pub fn gpu_group_norm(x: P, out: PM, w: P, b: P, stats: PM, p: i64, c: i32, groups: i32, eps: f32, silu: i32, s: PM) -> i32;
 }
 

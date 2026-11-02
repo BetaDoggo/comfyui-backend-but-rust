@@ -24,7 +24,9 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | Krea 2 | Batch Size | Direct workflow test. Not yet tried from Swarm's UI. |
 | P0 | Krea 2 | LoRAs | Baked into the int8 ConvRot weights like ComfyUI. Weights bit-identical on the modules checked, 31.6 dB image, about 3 s to bake 12 GB. Tested through SwarmUI. |
 | P0 | Anima | Anima engine | Int8 turbo checkpoint through real SwarmUI: 115 ms/step, 1.14 s per image at 1024, against 199 ms/step in ComfyUI. Same picture as ComfyUI at about 25 dB, not pixel-identical. |
-| P0 | Anima | Anima LoRAs | Baked into the int8 ConvRot weights like ComfyUI, and cached contexts and modulation are dropped. Weights bit-identical on the modules checked. Tested through SwarmUI. LoRAs with text encoder keys are refused. |
+| P0 | Anima | Anima LoRAs | Baked into the int8 ConvRot weights like ComfyUI, and cached contexts and modulation are dropped. Weights bit-identical on the modules checked. Tested through SwarmUI. |
+| P0 | LoRA and control | LoRA formats | Every ComfyUI format on all three models: LoCon, DoRA, LoHa, LoKr, GLoRA, OFT, BOFT, diff, set, MOSS control adapters. Compared with ComfyUI on real modules, identical or within 2e-4 where ComfyUI can compute them. |
+| P0 | LoRA and control | Text encoder LoRAs | Baked in float32 at the clip strength. Weights match ComfyUI on Krea 2 and MOSS Image. Run through the server on Anima, not through SwarmUI. |
 | P0 | MOSS Image | MOSS Image LoRAs | Baked like ComfyUI, including fused q/k/v slices. All 168 weights identical. Tested through SwarmUI with the DMD LoRA; the edit LoRA applies but has no image input yet. |
 | P1 | Krea 2 | Variation Seed | Direct workflow test; output changes as expected. Not compared with ComfyUI. |
 | P1 | Krea 2 | Sigma Shift | ModelSamplingFlux. Direct workflow test. |
@@ -59,7 +61,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | Server | Swarm prompt syntax parsing | <break>, <weight>, <alternate>, <fromto>, <embed> and LoRA hooks parse. Krea 2 refuses all of them today. |
 | P0 | Image workflows | Init image and Creativity | Graph runs on the mock. Needs the VAE encoder and partial sampling. |
 | P0 | Image workflows | Refiner and upscale | Both latent and model upscale paths reach the engine API. |
-| P0 | LoRA and control | LoRAs on non-quantised models | Loader, patches and hooks reach the engine. No non-quantised model runs yet; int8 LoRAs work. Plain LoRA, diff and set patches are done in src/lora.rs. |
+| P0 | LoRA and control | LoRAs on non-quantised models | Loader, patches and hooks reach the engine. No non-quantised model runs yet; int8 LoRAs work. The LoRA formats are done in src/lora.rs. |
 | P1 | Server | Mask and image nodes | Crop, scale, blur, grow, threshold and composite run in the server. Not yet used with real generations. |
 | P1 | Server | Video and audio output | mp4, webm, mov, gif and audio encoding through ffmpeg. Only tested with placeholder frames. |
 | P1 | Image workflows | Masks and inpainting | Noise masks, Differential Diffusion and Use Inpainting Encode. |
@@ -101,8 +103,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Krea 2 | Non-W8A8 Krea 2 files | fp8 and other formats are refused. |
 | P1 | Qwen Image 2.1 | Qwen Image 2.1 engine | Installed. Qwen3-VL 8B text encoder, RGBA VAE, 2x placeholder latent. |
 | P1 | SD family | SD1 and SDXL engine | SD1 checkpoint installed. CLIP, UNet and classic VAE, and all-in-one checkpoints. Would widen coverage most. |
-| P1 | LoRA and control | Other LoRA formats | LoHa, LoKr, GLoRA, OFT, DoRA and LoCon mid weights are refused with an error. None of the installed LoRAs for these models use them. |
-| P1 | LoRA and control | Text encoder LoRAs and hooks | LoRAs with text encoder keys are refused. Those weights run in fp32 from int8, so they need their own path. LoRA hooks are refused too. |
+| P1 | LoRA and control | LoRA hooks | Refused with an error. |
 | P1 | Anima | Other Anima checkpoint formats | bf16 and fp8 files are refused. Only int8 ConvRot runs. |
 | P1 | Anima | Close the ComfyUI output gap | LLM adapter output differs by 1.7%, cause unknown. Same picture at about 25 dB PSNR. |
 | P1 | Anima | Anima <break>, <alternate> and <fromto> | Per-chunk and per-step conditioning. |

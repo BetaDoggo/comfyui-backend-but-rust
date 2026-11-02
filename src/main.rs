@@ -105,7 +105,7 @@ struct Args {
     /// Any ComfyUI scheduler
     #[arg(long, default_value = "simple")]
     scheduler: String,
-    /// LoRA file, `path` or `path:strength`, in order (repeatable)
+    /// LoRA file, `path`, `path:strength` or `path:strength:clip_strength`, in order (repeatable)
     #[arg(long)]
     lora: Vec<String>,
     /// Krea 2: PNG for the text encoder, at its own size; SwarmUI scales these to about 384x384 (repeatable)
@@ -135,18 +135,35 @@ fn read_png(path: &Path) -> Result<diffusion::vision::PromptImage> {
     Ok(diffusion::vision::PromptImage { width: info.width as usize, height: info.height as usize, rgb })
 }
 
-/// `path` or `path:strength`, as in `--lora`.
-fn parse_loras(args: &Args) -> Result<Vec<diffusion::lora::Lora>> {
-    args.lora.iter().map(|l| {
-        let (path, strength) = match l.rsplit_once(':').map(|(p, v)| (p, v.parse::<f32>())) {
-            Some((p, Ok(v))) => (p, v),
-            _ => (l.as_str(), 1.0),
-        };
+/// `path`, `path:strength` or `path:strength:clip_strength`, as in `--lora`: the LoRAs for the
+/// diffusion model and for the text encoder.
+fn parse_loras(args: &Args) -> Result<(Vec<diffusion::lora::Lora>, Vec<diffusion::lora::Lora>)> {
+    let (mut model, mut clip) = (Vec::new(), Vec::new());
+    for l in &args.lora {
+        let (mut path, mut values) = (l.as_str(), Vec::new());
+        while values.len() < 2 {
+            match path.rsplit_once(':').map(|(p, v)| (p, v.parse::<f32>())) {
+                Some((p, Ok(v))) => {
+                    values.insert(0, v);
+                    path = p;
+                }
+                _ => break,
+            }
+        }
         if !std::path::Path::new(path).exists() {
             bail!("no LoRA at {path}");
         }
-        Ok(diffusion::lora::Lora { path: PathBuf::from(path), strength })
-    }).collect()
+        let strength = values.first().copied().unwrap_or(1.0);
+        model.push(diffusion::lora::Lora { path: PathBuf::from(path), strength });
+        clip.push(diffusion::lora::Lora { path: PathBuf::from(path), strength: values.get(1).copied().unwrap_or(strength) });
+    }
+    Ok((model, clip))
+}
+
+fn apply_loras(gen: &mut pipeline::Generator, args: &Args) -> Result<()> {
+    let (model, clip) = parse_loras(args)?;
+    gen.set_loras(&model)?;
+    gen.set_text_encoder_loras(&clip)
 }
 
 const KREA_DIT: &str = "Stable-diffusion/kroma-v0.3.1-turbo-opd-W8A8.safetensors";
@@ -179,7 +196,7 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     gen.ensure_vae(&args.model(&args.vae, QWEN_VAE))?;
     gen.ensure_anima(&dit)?;
     gen.ensure_qwen3(&te)?;
-    gen.set_loras(&parse_loras(args)?)?;
+    apply_loras(&mut gen, args)?;
     let n = 16 * (args.height / 8) * (args.width / 8);
     for i in 0..args.count {
         let seed = args.seed + i as u64;
@@ -218,7 +235,7 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     gen.ensure_moss(&dit)?;
     gen.ensure_qwen35(&te)?;
     gen.ensure_flux2_vae(&vae)?;
-    gen.set_loras(&parse_loras(args)?)?;
+    apply_loras(&mut gen, args)?;
     let n = 128 * (args.height / 16) * (args.width / 16);
     for i in 0..args.count {
         let seed = args.seed + i as u64;
@@ -328,7 +345,7 @@ fn main() -> Result<()> {
 
     let t_start = Instant::now();
     let mut gen = pipeline::Generator::load(&load)?;
-    gen.set_loras(&parse_loras(&args)?)?;
+    apply_loras(&mut gen, &args)?;
     let prompts: Vec<String> = match &args.prompt_file {
         Some(p) => std::fs::read_to_string(p)
             .with_context(|| format!("reading {}", p.display()))?

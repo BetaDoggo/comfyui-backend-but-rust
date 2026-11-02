@@ -77,14 +77,14 @@ still to do, in priority order. Run it today beside a normal ComfyUI backend.
 
 ## LoRAs
 
-All three models take LoRAs, from SwarmUI or with `--lora path[:strength]` (repeatable, applied in order):
+All three models take LoRAs, from SwarmUI or with `--lora path[:strength[:clip_strength]]` (repeatable, applied in order; the clip strength defaults to the strength):
 
 ```bash
 target/release/diffusion.exe --moss --lora moss-dmdv1.safetensors --steps 8 --cfg 1 -p "a stone lighthouse on a sea cliff at dawn, no people" -o lighthouse.png
 ```
 
-They are baked, as ComfyUI does for quantized weights: each patched int8 weight is dequantized to bf16, the patches are
-added in bf16, and it is requantized with new row scales and stochastic rounding seeded by the module's name. Sampling
+They are baked, as ComfyUI does for quantized weights: each patched int8 weight is dequantized to bf16 (float32 in a text
+encoder), the patches are added in that dtype, and it is requantized with new row scales and stochastic rounding seeded by the module's name. Sampling
 then runs the same int8 kernels, so a LoRA costs no time per step. Only tensors whose patches changed are rewritten, and
 removing a LoRA puts the file's bytes back. Prompts are encoded again after a change, because their contexts come out of
 the diffusion model.
@@ -106,8 +106,37 @@ without a LoRA. MOSS Image's error in one model step is the same either way (3.2
 path magnifies it, as Turbo trajectories do on Krea 2. Check this with `tools/lora_ref.py` and `tools/lora_cmp.py`.
 
 Like ComfyUI, keys that match nothing in the model are logged and ignored, so a LoRA for another model changes nothing.
-Plain LoRA, `diff` and `set` patches work. These are refused with an error: LoHa, LoKr, GLoRA, OFT, DoRA, LoCon mid
-weights, reshaped patches, MOSS Image control LoRAs, LoRA hooks, and LoRAs with text encoder keys.
+
+### LoRA formats
+
+Every format in ComfyUI's `comfy.weight_adapter` and `load_lora` reads on all three models, with all its key styles:
+
+* Plain LoRA in each naming (`lora_up`/`lora_down`, `lora_A`/`lora_B`, the diffusers, Mochi, transformers and `.default` forms), `alpha`, and LoCon mid weights
+* DoRA on any adapter, LoHa, LoKr, GLoRA, OFT, BOFT
+* `diff`, `diff_b`, `w_norm`, `b_norm` and `set_weight`; when a file patches a weight twice the last wins, as in ComfyUI
+* Text encoder patches, with `lora_te_`, `text_encoders.<encoder>.transformer.model.` and `text_encoders.transformer.model.` keys, at their own clip strength
+* MOSS Image control adapters, whose extra inputs are zeros because control images aren't supported yet
+
+`tools/lora_formats.py` writes one file with every format on real modules, to compare through `tools/lora_ref.py` and
+`tools/lora_cmp.py`. The results against ComfyUI, on all three models, with the files' values random:
+
+| Format | Patched weights compared with ComfyUI |
+|---|---|
+| Plain, `alpha`, LoCon mid, LoHa, LoKr, GLoRA, `diff`, `set`, `w_norm` | identical |
+| Tucker LoHa | under 1e-8 |
+| DoRA | within 2e-4, from the norm's rounding |
+| Text encoder patches on Krea 2 and MOSS Image | float weights identical; about 0.0001% of int8 values off by 1 |
+
+Differences to know about:
+
+* **ComfyUI fails on OFT, BOFT and Tucker LoKr here.** On these int8 models its adapters log an error and skip the module, the first two
+  because they mix float32 and bf16, the last in `torch.kron`. These apply them instead, so a file using them gives a different image from ComfyUI. OFT and BOFT were
+  compared with ComfyUI's adapters run by hand in float32, and agree to 1.6% of the change. Tucker LoKr has no reference result.
+* LoHa and LoKr multiply out to a full weight on the host, so a large file bakes slowly: 13 full-size patches on Krea 2 took 73 s, against 11 s for 228 plain ones.
+* Anima's text encoder keeps bf16 weights where ComfyUI computes in float32, so patched weights there are rounded to bf16.
+* Refused with an error: reshaped patches, which widen a model's inputs; text encoder patches to the vision tower, `embed_tokens` or
+  norm weights this engine doesn't store as patchable; control images; different LoRAs on the positive and negative text encoders;
+  and LoRA hooks. Files for ComfyUI custom nodes, such as `anima_ref_kv`, match no key and change nothing, as in ComfyUI.
 
 ## Samplers
 

@@ -29,6 +29,7 @@ pub struct TextEncoder {
     st: SafeTensors,
     ws: WeightSet,
     tok: Tokenizer,
+    lora: crate::lora::State,
 }
 
 pub struct Cond {
@@ -112,7 +113,12 @@ impl TextEncoder {
         let p = plan(&layouts, vram_budget, 2);
         let ws = WeightSet::load("text encoder", &st, layouts, p, threads)?;
         let _ = s0;
-        Ok(TextEncoder { st, ws, tok: Tokenizer::new()? })
+        Ok(TextEncoder { st, ws, tok: Tokenizer::new()?, lora: Default::default() })
+    }
+
+    /// Bake `loras` into the encoder. Returns true if any weight changed.
+    pub fn apply_loras(&mut self, loras: &[crate::lora::Lora], s0: &Stream) -> Result<bool> {
+        crate::lora::apply(crate::lora::Arch::TextEncoder { comfy: "qwen3vl_4b" }, &self.st, PRE, vec![crate::offload::Store::Set(&mut self.ws)], &mut self.lora, loras, s0)
     }
 
     pub fn tokenize(&self, prompt: &str) -> Result<Vec<u32>> {

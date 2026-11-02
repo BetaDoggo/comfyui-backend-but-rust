@@ -2,19 +2,19 @@
 
 A ComfyUI-API-compatible server that SwarmUI can use as a normal **"ComfyUI API By URL"** backend,
 fronting a native Rust generation engine. It ships with two engines: **native**, which really generates Krea 2
-Turbo, Anima and MOSS Image text-to-image with the Rust + CUDA pipelines in the parent repository, and the **mock engine**,
-which returns placeholder images/video/audio of the correct shapes for every other model family.
+Turbo, Anima and MOSS Image images and MiniMax H3 video with the Rust + CUDA pipelines in the parent repository, and the
+**mock engine**, which returns placeholder images/video/audio of the correct shapes for every other model family.
 
 ```
 crates/
   engine-api/     the contract: Engine trait + typed request structs (no web deps)
   comfy-server/   HTTP + websocket server that speaks ComfyUI's protocol, validates and runs graphs
-  native-engine/   the real engine: Krea 2, Anima and MOSS Image int8 text-to-image (optional, `--features native`)
+  native-engine/   the real engine (optional, `--features native`)
 docs/
   INPUT_MAPPING.md   what SwarmUI sends for Krea 2 / Anima / MiniMax H3 / MOSS Image / Qwen Image 2.1, and what the engine receives
   COMPATIBILITY.md   every Swarm parameter probed live, and the node classes served through the generic custom_node route
 tools/            scripts that (re)generate the node catalog, third-party schemas and COMPATIBILITY.md from live SwarmUI / ComfyUI
-reference/        (gitignored) SwarmUI + ComfyUI clones used as the protocol reference
+reference/        (gitignored, local) SwarmUI + ComfyUI clones used as the protocol reference
 ```
 
 ## Run
@@ -23,7 +23,7 @@ reference/        (gitignored) SwarmUI + ComfyUI clones used as the protocol ref
 cargo run --release -p comfy-server -- --models-root "C:/path/to/SwarmUI/Models"
 ```
 
-Flags: `--listen 127.0.0.1 --port 8188 --models-root <dir> (repeatable) --output-dir --input-dir --temp-dir --ffmpeg ffmpeg --mock-step-ms 40 --mock-native-only --advertise-todo-nodes`.
+Flags: `--engine mock --listen 127.0.0.1 --port 8188 --models-root <dir> (repeatable) --output-dir --input-dir --temp-dir --ffmpeg ffmpeg --mock-step-ms 40 --mock-native-only --advertise-todo-nodes`.
 Set `RUST_LOG=debug` for per-node logs. The mock engine logs every typed request it receives at `info`.
 
 Point `--models-root` at the **same** folder SwarmUI uses, so model names match. The server searches
@@ -33,7 +33,7 @@ both ComfyUI and SwarmUI folder names (`diffusion_models`/`unet`/`Stable-Diffusi
 ffmpeg (on PATH, or `--ffmpeg`) is needed for mp4/webm/mov video output (MiniMax H3), mp3/flac/ogg audio,
 and video inputs. PNG/JPEG/GIF/WAV are handled natively.
 
-## Run Krea 2 for real
+## Run the native engine
 
 The native engine needs the parent repository's build requirements (CUDA 13, MSVC Build Tools, CUTLASS and
 flash-attention checkouts). The first build takes about 10 minutes, so it's behind a feature and the default
@@ -48,45 +48,36 @@ in SwarmUI. Extra arguments go to the server, so `--models-root` can add a secon
 
 Extra flags: `--reserve-vram 512` (MB left for the desktop and other apps) and `--max-side 2048`.
 
-In SwarmUI, select the W8A8 checkpoint and set **CFG Scale 1** and **Steps 8**. These work: size up to
-`--max-side` squared in pixels (multiples of 16), seed, Variation Seed, Batch Size, Sigma Shift, cancelling,
-Model Attention Backend (`int8`, or `flash` for ComfyUI's numerics), Free VRAM. The server accepts the model from
-`Stable-Diffusion/` as well as `diffusion_models/`, and a generation is pixel-identical to the `diffusion` CLI for the
-same seed. There are no live previews.
+The checkpoint's keys pick the family, and one family is loaded at a time. Switching took 4 s to Anima, 9 s to Krea 2 and
+about 3 s to MOSS Image with the files cached. There are no live previews.
 
-Every sampler and scheduler works on all three families, at any CFG with a negative prompt, along with Sampler Sigma Min,
-Sigma Max and Rho. Only the `ltxv-image` scheduler is refused. See the [README](../README.md#samplers).
+| | Krea 2 | Anima | MOSS Image | MiniMax H3 |
+|---|---|---|---|---|
+| Select | The W8A8 checkpoint | An int8 ConvRot checkpoint | A fused int8 ConvRot checkpoint | The `w6a8` checkpoint and the `_comfyui` turbo LoRA |
+| Turbo settings | CFG 1, Steps 8 | CFG 1, Steps 8 | Steps 8, CFG 1 with a DMD LoRA; otherwise Steps 20, CFG 4 | CFG 1, Steps 4 with the LoRA |
+| Seed, Sigma Shift, cancelling, Free VRAM | Yes | Yes | Yes | Yes |
+| Batch Size | Yes | Yes | Yes | Not tested |
+| Variation Seed | Yes | Yes | Not tested | Refused |
+| Model Attention Backend | `int8`, `flash` | `int8`, `flash` | `int8`, `flash` | Not tested |
+| `(word:1.2)` and `<weight>` | Refused; `(word:1.2)` stays plain text | Yes | Refused; `(word:1.2)` stays plain text | Not tested |
+| Prompt Images | Yes, with `index` and `index_timestep_zero` reference latents | Not supported | Refused | Refused |
 
-Krea 2 takes Prompt Images, and Enable Reference Latents with `index` and `index_timestep_zero`; see the
-[README](../README.md#krea-2-reference-images).
+These work on every family: all samplers and schedulers except `ltxv-image`, any CFG with a negative prompt, Sampler Sigma
+Min, Sigma Max and Rho, and LoRAs. See [Usage](../docs/USAGE.md) and [Models](../docs/MODELS.md).
 
-Everything else is refused with an error in SwarmUI rather than silently ignored: `<weight>` and other per-step or per-chunk prompt syntax,
-init images and refiners, ControlNet, regions, VAE tiling, Seamless Tileable, and
-non-W8A8 Krea 2 files.
+Anything else is refused with an error in SwarmUI rather than silently ignored, including `<break>`, `<alternate>`,
+`<fromto>`, LoRA hooks, init images, refiners, ControlNet, regions, Seamless Tileable, and VAE tiling. H3 only
+accepts VAE tile sizes of 256 / 64.
 
-**Anima** runs from the same `--engine native` server. The checkpoint's keys pick the family, and one family is
-loaded at a time, so switching took 4 s to Anima and 9 s to Krea 2 with the files cached. Select an int8 ConvRot Anima checkpoint with
-Steps 8 and CFG Scale 1 for turbo models. These work: any CFG with a negative
-prompt, `(word:1.2)` and `<weight>`, seed, Variation Seed, Batch Size, Sigma Shift, Model Attention Backend, cancelling and
-Free VRAM. LLLite ControlNets, `<break>`, `<alternate>`, `<fromto>`, init images and
-VAE tiling are refused with an error.
-
-**MOSS Image** runs from the same server. Select an int8 ConvRot MOSS Image checkpoint; SwarmUI adds
-`qwen3.5_9b_int8_convrot.safetensors` and the Flux 2 VAE itself. Tested through SwarmUI at 1024x1024 and 832x1216: `euler` and `er_sde` with
-`simple`, CFG 1 and CFG 4 with a negative prompt, seed, Batch Size and Sigma Shift. Prompt Images, `<weight>`,
-`<break>`, `<alternate>`, `<fromto>` and init images are refused with an error. A 20-step CFG 4 image took 11.5 s through SwarmUI,
-and switching from Krea 2 or Anima took about 3 s extra.
-
-**LoRAs** work on all three, from the LoRA parameter or `<lora:name:weight>`, stacked, at any strength. The first image
-after a change bakes them into the weights (about 3 s on Krea 2, 1 s on the others, with the files cached), and sampling
-stays as fast as without. Tested through SwarmUI: repeats, strength changes, stacks, removal (the base image comes back
-pixel-identical), and baked blocks moving to RAM and back. Every LoRA format ComfyUI reads works, text encoder patches included;
-LoRA hooks are refused with an error. MiniMax H3 runs text to video with audio. See the [README](../README.md#loras).
+**LoRAs** come from the LoRA parameter or `<lora:name:weight>`, stacked, at any strength. The first image after a change
+bakes them into the weights (about 3 s on Krea 2, 1 s on Anima and MOSS Image, 11 s on H3, with the files cached), and sampling
+stays as fast as without. Tested through SwarmUI on the image models: repeats, strength changes, stacks, removal (the base
+image comes back pixel-identical), and baked blocks moving to RAM and back.
 
 **Alongside ComfyUI.** Add this server next to SwarmUI's normal ComfyUI backend. In a live test with both running,
 SwarmUI sent every Krea 2 job here and Anima to ComfyUI, keeping each model on the backend that had it loaded.
-Nothing guarantees where the first Krea 2 job goes when both are idle. Set **Exact Backend ID** in a preset to pin
-Krea 2 to this backend. The two share the GPU: the native engine re-plans DiT residency from live free VRAM for each request.
+Nothing guarantees where the first job goes when both are idle. Set **Exact Backend ID** in a preset to pin a model to
+this backend. The two share the GPU: the native engine re-plans DiT residency from live free VRAM for each request.
 
 ## Connect SwarmUI
 
@@ -125,8 +116,8 @@ base64 decoding, output encoding, queue/history/websocket protocol) is already h
 [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md) walks through adding a new model family: capturing what SwarmUI
 sends, the generic route versus native nodes, the engine-side work, and tests.
 
-[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) shows, for every SwarmUI parameter, whether it is handled natively or
-through `custom_node`. Each generic-route node class is tagged with what native support would take: server-only
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) shows, for every SwarmUI parameter, whether the server handles it natively or
+through `custom_node`. That doesn't mean the native engine can generate it; [STATUS](../docs/STATUS.md) covers that. Each generic-route node class is tagged with what native support would take: server-only
 work, a new patch/metadata field, a new `Engine` operation, or a new model architecture.
 
 ## Idle memory

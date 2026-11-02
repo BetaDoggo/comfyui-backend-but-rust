@@ -1,6 +1,6 @@
 # Technical overview
 
-This project is a native image generation backend for SwarmUI. SwarmUI thinks it is talking to ComfyUI, but the
+This project is a native image and video generation backend for SwarmUI. SwarmUI thinks it is talking to ComfyUI, but the
 requests are served by a Rust server, and the model math runs in Rust and CUDA with no Python or PyTorch.
 
 ComfyUI is the reference for behaviour, not a runtime dependency: its API, model definitions and numerics are what this
@@ -86,6 +86,7 @@ the baked weights match ComfyUI's bit for bit. Sampling then runs the normal int
 | Krea 2 Turbo | `src/dit.rs`, int8 W8A8 | Qwen3-VL-4B, `src/te.rs` | Qwen-Image (Wan 2.1), `src/vae.rs` |
 | Anima | `src/anima.rs`, int8 ConvRot | Qwen3 0.6B, `src/qwen3.rs` | Qwen-Image (Wan 2.1), `src/vae.rs` |
 | MOSS Image | `src/moss.rs`, int8 ConvRot | Qwen3.5 9B, `src/qwen35.rs` | Flux 2, `src/flux2vae.rs` |
+| MiniMax H3 | `src/h3.rs`, w6a8 | Qwen3-VL 32B, `src/h3te.rs` | Video and audio, `src/h3vae.rs` |
 
 Each model is written directly against its checkpoint, with no general layer or graph abstraction. That is what allows
 operations to be fused and work to be cached. For example, Anima's cross-attention k and v are computed once per prompt,
@@ -118,11 +119,77 @@ isn't in `ref/ComfyUI`'s version and the node decides the tokens.
 
 Noise is reimplemented in [`src/sampling.rs`](../src/sampling.rs): `mt19937` for torch's CPU generator and Philox for its
 CUDA generator, so seeds give the same noise as ComfyUI. Images are close but not identical, because rounding differs
-at some steps. The README gives the measured PSNR for each model.
+at some steps. [Models](MODELS.md) gives the measured PSNR for each one.
+
+## How each stage maps to ComfyUI
+
+* **Text encoder** (`src/te.rs`): Qwen3-VL-4B language model, Krea2 template, hidden states
+  entering layers 2, 5, …, 35 (layer 35 itself never runs), system prefix stripped exactly like
+  `Krea2TEModel.encode_token_weights`. ComfyUI builds text encoders with `full_precision_mm`, so the
+  int8 weights are used weight-only with fp32 activations; this does the same, computing
+  `x·((q·s)H)ᵀ` as `(xH)·(q·s)ᵀ` (Hadamard-rotate the activation instead of the weight). The int8
+  embedding rows are rounded to bf16 like ComfyUI's quantized embedding.
+* **DiT** (`src/dit.rs`): 28 single-stream blocks with W8A8 int8 ConvRot linears. Activations are
+  Hadamard-rotated (256-wide groups) and quantized per row in one fused kernel that also applies the
+  RMSNorm + AdaLN modulation / sigmoid gate / SwiGLU prologue, rounding to bf16 at the same points
+  where ComfyUI materializes bf16 tensors. GEMMs use comfy-kitchen's CUTLASS int8 kernel with the
+  dequant (and gated residual) fused in the epilogue. q|k|v|gate and gate|up are fused into single
+  GEMMs. Attention is FlashAttention-2 (bf16) reading q/k/v in place from the fused projection.
+  The text-fusion adapter is timestep-independent, so it runs once per prompt instead of every step.
+* **VAE** (`src/vae.rs`): for one frame every causal 3D conv equals a 2D conv with the kernel's last
+  temporal slice, so the decoder runs as NHWC CUTLASS implicit-GEMM 2D convolutions.
+* **Sampling** (`src/sampling.rs`, `src/samplers.rs`): torch-compatible `mt19937` + Box-Muller noise, and
+  ComfyUI's samplers and schedulers on the host.
+
+## System-memory offloading
+
+[`src/offload.rs`](../src/offload.rs) is comparable to ComfyUI's DynamicVRAM, but planned statically:
+
+1. Every block is packed once into a contiguous image in the exact device layout the kernels read.
+2. From free VRAM minus the activation peak (largest of DiT step / VAE decode) and `--reserve-vram`,
+   the planner keeps blocks `0..R` resident and leaves the rest in **page-locked RAM**.
+3. Streamed blocks go through a ring of VRAM slots on a dedicated copy stream. A slot is refilled
+   as soon as the compute stream releases it (CUDA events), so the PCIe copy of a block overlaps the
+   compute of earlier ones; the compute stream only waits if a copy is genuinely late.
+
+On this machine 16 of 28 blocks stay resident at 1024² and 12 stream (5.2 GB/step at ~26 GB/s).
+Streaming *all* 28 blocks still costs only ~5% per step, because a block's copy (~17 ms) is shorter
+than its compute (~24 ms). The text encoder and text-fusion adapter stream the same way. Planning
+stays conservative on purpose: oversubscribing VRAM makes Windows fall back to shared system memory,
+which doubles step time.
+
+### MiniMax H3
+
+Offloading is the lazy kind in [`src/offload.rs`](../src/offload.rs): nothing is read at load, reader threads fill up to four pinned staging buffers ahead of compute, taken only when a unit needs one and returned when the set parks. Pages read once leave the process right after, which took a H3 run's peak working set from 52 GB to 32 GB.
+Weights stay in packed 6-bit form in VRAM and decode to int8 before each GEMM, which leaves room for 30 of the 50 blocks at 512x512. Streamed blocks are spread evenly among the resident ones, so each copy overlaps compute instead of queueing behind the last; at 5 frames that took a step from 0.33 s to 0.24 s, and copies no longer hold it up.
+Splitting weights to keep them in L2 gained 2 to 3%, so it isn't used: the int8 GEMM already runs close to what this GPU can do.
+LoRA-baked blocks keep a pinned host copy, about 15 GB, and go straight to VRAM: this machine copies 18 GB/s in RAM but 28 GB/s from pinned memory to VRAM, so a pass through staging cost about 200 ms a step.
+If pinning fails they fall back to pageable memory and staging. The blocks leave VRAM before the video decode and come back for the next clip, re-planned for its size.
+The text encoder and refiner only hold VRAM while they run. The video decoder holds 2.4 GB of pinned RAM between clips, and takes no VRAM while sampling.
+
+## Source layout
+
+```
+build.rs            nvcc build of csrc/ (works around vcvars by passing a clean MSVC env)
+csrc/kernels.cu     fused prologue+ConvRot+int8-quantize, QK-norm+RoPE, small attention, VAE ops
+csrc/gemm.cu        cuBLASLt bf16/fp32 GEMM, CUTLASS conv2d, int8 GEMM wrappers
+csrc/attn.cu        FlashAttention-2 forward wrapper (only the needed variants instantiated)
+csrc/attn_int8.cu   optional INT8 attention wrapper
+csrc/h3.cu          MiniMax H3 kernels
+csrc/wddm.cu        VRAM queries under Windows
+csrc/vendor/        comfy-kitchen CUTLASS int8 GEMM + Sage INT8 attention (Apache-2.0)
+src/                Rust: loader, offload engine, tokenizer, text encoder, DiT, VAE, LoRA baking, CLI
+web/index.html      the Krea 2 web UI
+tools/              ComfyUI reference dump / comparison / benchmark scripts
+```
+
+The CUTLASS and flash-attention checkouts default to `ref/comfy-kitchen/third_party/*` (override with
+`CUTLASS_DIR` / `FLASH_ATTN_DIR`). Object files are cached by content hash.
 
 ## Further reading
 
-* [README](../README.md): usage, timings and parity results for each model
+* [Models](MODELS.md): timings and parity results for each model
+* [Usage](USAGE.md): the command line, LoRAs and samplers
 * [Swarm backend README](../swarm%20backend/README.md): running the server and what SwarmUI can use today
 * [Input mapping](../swarm%20backend/docs/INPUT_MAPPING.md): what SwarmUI sends and what the engine receives
 * [Adding models](../swarm%20backend/docs/ADDING_MODELS.md): how to add a model family

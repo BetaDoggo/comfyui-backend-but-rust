@@ -21,22 +21,16 @@ So start by finding out which nodes SwarmUI emits for the model.
 ## Step 1: capture what SwarmUI sends
 
 1. **Make a fake model file** with the right architecture ID, so SwarmUI picks the right class without real
-   weights. Add a line to `scratch/make_fake_models.py`, using the `ID` from `T2IModelClassSorter.cs`:
-
-   ```python
-   "diffusion_models/newmodel_test.safetensors": "new-model-id",
-   ```
+   weights. It's a `.safetensors` file whose header holds only `__metadata__` with `modelspec.architecture` set to the `ID`
+   from `T2IModelClassSorter.cs`. Put it in a throwaway models folder, never in your real one.
 
    Also add the text encoder and VAE files SwarmUI asks for by name. These are in the model's branch of
-   `WorkflowGeneratorModelSupport.cs`, e.g. `qwen3vl_4b.safetensors` for Krea 2. Then run
-   `python scratch/make_fake_models.py reference/SwarmUI/Models`.
+   `WorkflowGeneratorModelSupport.cs`, e.g. `qwen3vl_4b.safetensors` for Krea 2.
 2. **Start comfy-server with `--mock-native-only`.** That way `/object_info` shows exactly what's native,
    and anything else fails validation with a `missing_node_type` error naming the node. Then start SwarmUI
    pointed at it (see the README).
-3. **Capture the workflow.** Add a case to a `scratch/cases_*.py` module, e.g.
-   `CASES = {'newmodel_t2i': dict(K2, model='newmodel_test.safetensors')}`, and run
-   `python scratch/capture.py scratch/cases_newmodel.py`. It saves the graph SwarmUI generates (via its
-   `ComfyGetGeneratedWorkflow` API) and then runs it live. Capture each mode the model supports: text-to-image,
+3. **Capture the workflow.** Call SwarmUI's `ComfyGetGeneratedWorkflow` API to get the graph it generates, then run
+   that generation for real. Capture each mode the model supports: text-to-image,
    prompt images, init image, video length, and so on.
 
 ## Step 2: triage the nodes
@@ -118,8 +112,7 @@ After making a node native:
 2. Teach the mock engine: give the new `EmptyLatentKind` a shape in
    [`mock_engine.rs`](../crates/comfy-server/src/mock_engine.rs), plus any new `LatentOp` or `Engine` method.
    The integration tests run on the mock.
-3. Regenerate the catalog and the compatibility doc (`sh scratch/regen.sh`, or the steps at the end of
-   COMPATIBILITY.md).
+3. Regenerate the catalog and the compatibility doc, using the steps at the end of COMPATIBILITY.md.
 
 ## Step 4: the engine side
 
@@ -138,11 +131,13 @@ Whichever route the nodes take, this part is always engine work:
 * **VAE.** Return RGBA from `vae_decode` if the VAE has alpha. For video, return frames as
   `PixelData::U8` to keep memory down.
 * **Warmup.** `warmup` is what SwarmUI's "load model" button and first-use preload call.
+* **The native engine.** Add the pipeline under `src/`, and detect the family from the checkpoint's keys in
+  [`native-engine`](../crates/native-engine/src/lib.rs). Refuse whatever the pipeline can't honour.
 
 ## Step 5: tests and docs
 
 1. **Fixtures.** Copy each captured workflow into `crates/comfy-server/tests/fixtures/<model>_<mode>.json`.
-   `python scratch/make_fixture.py <capture>:<fixture>` swaps the media for placeholders and maps the model names to the test suite's files.
+   Swap the media for placeholders and map the model names to the test suite's files.
 2. **Tests** in [`swarm_compat.rs`](../crates/comfy-server/tests/swarm_compat.rs):
    * A smoke test runs the fixture end to end, like `moss_image_text_to_image`:
      `run_like_swarm(&s, fixture(..))`, then assert success and the output size and channels.
@@ -155,6 +150,8 @@ Whichever route the nodes take, this part is always engine work:
    half-size placeholder latent and MOSS reusing the Krea 2 template.
 4. **INPUT_MAPPING.md.** Add a column to the op table and a section in the same shape as the existing
    ones: detected class, files, graph, the param → request table, and the engine-side work.
+5. **STATUS.md.** Add the model to [STATUS](../../docs/STATUS.md), and to [Models](../../docs/MODELS.md) once it really
+   generates. Mark it Working only after testing real output.
 
 ## A model SwarmUI doesn't know yet
 

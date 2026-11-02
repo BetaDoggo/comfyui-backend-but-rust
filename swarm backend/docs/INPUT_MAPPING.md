@@ -1,6 +1,7 @@
 # Engine input mapping: Krea 2, Anima, MiniMax H3, MOSS Image, Qwen Image 2.1
 
-What SwarmUI actually sends for each model, and what the Rust engine has to accept as a result.
+What SwarmUI actually sends for each model, and what the Rust engine has to accept as a result. This is the contract, not
+a status report: the native engine does only part of it, and [STATUS](../../docs/STATUS.md) says which part.
 
 Everything here was traced from SwarmUI's `WorkflowGenerator*.cs` / `WGNodeData.cs` and the Swarm
 Python nodes (`ExtraNodes/SwarmComfyCommon`), cloned 2026-10-29 (SwarmUI `e7f38c3`, ComfyUI `fd7639f`).
@@ -36,8 +37,8 @@ The server turns every node into one of two things:
   resolved server-side into data that rides on the handles (`ModelHandle.patches`, `CondEntry.meta`,
   `Latent.pixel`). The engine sees the finished recipe when it samples.
 
-So the engine only ever has to implement **9 operations**, and they're the same for every model. The rest
-are optional. Their default implementations return "unsupported", which SwarmUI shows as an error only when
+So the engine only ever has to implement the **11 required `Engine` methods**, and they're the same for every model. The
+rest are optional. Their default implementations return "unsupported", which SwarmUI shows as an error only when
 someone uses that feature:
 
 * `vae_encode_audio`, `audio_silence`: Video Audio Input, Audio Silent Prefix/Suffix.

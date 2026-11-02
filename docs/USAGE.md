@@ -1,0 +1,147 @@
+# Usage
+
+How to run the command line and the small web UI, and how LoRAs and samplers behave. Timings are from one machine: an
+RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../README.md). For each model, see
+[Models](MODELS.md).
+
+## Command line flags
+
+`target/release/diffusion.exe` runs Krea 2 unless you pick another family.
+
+| flag | meaning |
+| --- | --- |
+| `--width/--height` | multiples of 16 (default 1024×1024) |
+| `--steps`, `--shift`, `--seed` | sampler settings; the seed gives the **same noise as ComfyUI's KSampler** |
+| `--sampler`, `--scheduler`, `--cfg`, `--negative` | any ComfyUI sampler and scheduler, on any model |
+| `--image`, `--ref-image`, `--ref-method` | Krea 2 reference images, see [Krea 2 reference images](MODELS.md#reference-images) |
+| `--prompt-file f.txt`, `-n N` | many prompts / seeds with the models loaded once |
+| `--attention flash` | bf16 FlashAttention-2 like ComfyUI's default (closest numerics, ~15% slower per step); the default is `int8`, comfy-kitchen's SageAttention-style INT8 attention |
+| `--reserve-vram MB` | VRAM left untouched for the desktop (default 512) |
+| `--resident-blocks N`, `--slots N` | override the automatic VRAM residency plan |
+| `--anima`, `--moss`, `--h3` | pick the model family; the default is Krea 2 |
+| `--frames N` | H3 video length, snapped up to the 17k + 5 grid (default 5) |
+| `--swarm-template` | MOSS Image: encode with the Krea 2 template, as SwarmUI does |
+| `--lora path[:strength[:clip_strength]]` | repeatable, see [LoRAs](#loras) |
+| `--models`, `--dit`, `--te`, `--vae` | model folder, or individual files |
+| `--dump f.safetensors`, `--ref-noise ref.safetensors` | parity debugging against `tools/ref_dump.py` |
+
+Set `PROFILE=1` to print the time of each stage per step and per decoded tile. Stages are timed with events on the compute
+stream, so the run keeps its overlap and its output.
+
+## Web UI
+
+Krea 2 only.
+
+```bash
+target/release/diffusion.exe --serve 127.0.0.1:7860
+```
+
+```bash
+target/release/diffusion.exe --serve 127.0.0.1:7860
+```
+
+Then open http://127.0.0.1:7860. Models load once and stay in memory; requests queue on the GPU.
+The page has prompt, a side-length slider with aspect-ratio buttons (pixel count ≈ side², multiples of 16), steps, image count, seed (random or fixed), live step
+progress and a history strip. Images are also saved to `--out-dir` (default `outputs/`).
+The side length goes up to 2048 (`--max-side`, default 2048); `--width/--height` set the default
+size. Planning VRAM for 2048² keeps fewer DiT blocks resident (9 instead of 16 on a 12 GB card),
+which costs ~3% at 1024²; a 2048² image takes ~26 s. JSON API: `POST /api/generate`
+`{prompt, seed?, width?, height?, steps?}` → `{id}`, `GET /api/job/<id>`, `GET /api/image/<id>.png`.
+
+## LoRAs
+
+Every model takes LoRAs, from SwarmUI or with `--lora path[:strength[:clip_strength]]` (repeatable, applied in order; the clip strength defaults to the strength):
+
+```bash
+target/release/diffusion.exe --moss --lora moss-dmdv1.safetensors --steps 8 --cfg 1 -p "a stone lighthouse on a sea cliff at dawn, no people" -o lighthouse.png
+```
+
+They are baked, as ComfyUI does for quantized weights: each patched int8 weight is dequantized to bf16 (float32 in a text
+encoder), the patches are added in that dtype, and it is requantized with new row scales and stochastic rounding seeded by the module's name. Sampling
+then runs the same int8 kernels, so a LoRA costs no time per step. Only tensors whose patches changed are rewritten, and
+removing a LoRA puts the file's bytes back. Prompts are encoded again after a change, because their contexts come out of
+the diffusion model.
+
+Compared with ComfyUI under DynamicVRAM, which SwarmUI's `main.py` uses, on the same LoRAs at 1024x1024:
+
+| | Krea 2 (2 LoRAs, 12 GB model) | Anima (Turbo LoRA) | MOSS Image (DMD LoRA) |
+|---|---|---|---|
+| Bake, files cached | 2.7 to 3.5 s | 0.4 to 0.7 s | 1.2 to 1.7 s |
+| ComfyUI's first run minus a later run (includes loading the model) | about 27 s | about 2.4 s | about 12 s |
+| Sampling with the LoRA | 615 ms/step | 128 ms/step | 289 ms/step |
+| ComfyUI, later runs | 1102 ms/step | 223 ms/step | 309 ms/step |
+| Baked weights | identical | identical | identical |
+| Image PSNR with LoRA / same settings without | 31.6 dB / not measured | 21.2 / 25.6 dB | 22.3 / 40.3 dB |
+
+"Identical" means every value of the bf16 weight, the row scales and the int8 weight. That was checked on three Krea 2
+modules, four Anima modules, and all 168 MOSS Image weights by fingerprint. What still differs is what already differed
+without a LoRA. MOSS Image's error in one model step is the same either way (3.2% and 2.8%), and the DMD LoRA's short
+path magnifies it, as Turbo trajectories do on Krea 2. Check this with `tools/lora_ref.py` and `tools/lora_cmp.py`.
+
+Like ComfyUI, keys that match nothing in the model are logged and ignored, so a LoRA for another model changes nothing.
+
+### LoRA formats
+
+Every format in ComfyUI's `comfy.weight_adapter` and `load_lora` reads on Krea 2, Anima and MOSS Image, with all its key styles:
+
+* Plain LoRA in each naming (`lora_up`/`lora_down`, `lora_A`/`lora_B`, the diffusers, Mochi, transformers and `.default` forms), `alpha`, and LoCon mid weights
+* DoRA on any adapter, LoHa, LoKr, GLoRA, OFT, BOFT
+* `diff`, `diff_b`, `w_norm`, `b_norm` and `set_weight`; when a file patches a weight twice the last wins, as in ComfyUI
+* Text encoder patches, with `lora_te_`, `text_encoders.<encoder>.transformer.model.` and `text_encoders.transformer.model.` keys, at their own clip strength
+* MOSS Image control adapters, whose extra inputs are zeros because control images aren't supported yet
+
+`tools/lora_formats.py` writes one file with every format on real modules, to compare through `tools/lora_ref.py` and
+`tools/lora_cmp.py`. The results against ComfyUI, on Krea 2, Anima and MOSS Image, with the files' values random:
+
+| Format | Patched weights compared with ComfyUI |
+|---|---|
+| Plain, `alpha`, LoCon mid, LoHa, LoKr, GLoRA, `diff`, `set`, `w_norm` | identical |
+| Tucker LoHa | under 1e-8 |
+| DoRA | within 2e-4, from the norm's rounding |
+| Text encoder patches on Krea 2 and MOSS Image | float weights identical; about 0.0001% of int8 values off by 1 |
+
+Differences to know about:
+
+* **ComfyUI fails on OFT, BOFT and Tucker LoKr here.** On these int8 models its adapters log an error and skip the module, the first two
+  because they mix float32 and bf16, the last in `torch.kron`. These apply them instead, so a file using them gives a different image from ComfyUI. OFT and BOFT were
+  compared with ComfyUI's adapters run by hand in float32, and agree to 1.6% of the change. Tucker LoKr has no reference result.
+* LoHa and LoKr multiply out to a full weight on the host, so a large file bakes slowly: 13 full-size patches on Krea 2 took 73 s, against 11 s for 228 plain ones.
+* Anima's text encoder keeps bf16 weights where ComfyUI computes in float32, so patched weights there are rounded to bf16.
+* Refused with an error: reshaped patches, which widen a model's inputs; text encoder patches to the vision tower, `embed_tokens` or
+  norm weights this engine doesn't store as patchable; control images; different LoRAs on the positive and negative text encoders;
+  and LoRA hooks. Files for ComfyUI custom nodes, such as `anima_ref_kv`, match no key and change nothing, as in ComfyUI.
+
+## Samplers
+
+All 45 ComfyUI samplers and all 9 ComfyUI schedulers run on every model, plus SwarmUI's `turbo`, `align_your_steps`,
+`flux2`, `ideogram4`, `ideogram4turbo` and `ltxv` (`ltxv-image` is refused), its Sigma Min, Sigma Max and Rho overrides,
+and any CFG with a negative prompt, now including Krea 2:
+
+```bash
+target/release/diffusion.exe --anima --sampler dpmpp_2m_sde_gpu --scheduler karras --steps 12 --cfg 4 --negative "lowres" -p "no humans, scenery, mountain lake"
+```
+
+They are ports of ComfyUI's code in f32 ([`src/samplers.rs`](../src/samplers.rs)), running on the host between model evaluations.
+Evaluations cost what they did: Anima at 122 ms and Krea 2 at 574 ms at 1024x1024, with the latent's transfers included.
+The Brownian samplers reimplement `torchsde.BrownianTree` and `numpy.random.SeedSequence`, for the CPU and GPU variants.
+
+`tools/sampler_ref.py` runs ComfyUI's own samplers on an analytic mock model, and `tests/samplers_match_comfy.rs` replays that:
+
+| Check | Result |
+|---|---|
+| 1105 schedules (5 model samplings, 7 step counts) | worst relative error 1.7e-6 |
+| 45 samplers in 5 setups (225 runs), same sigmas passed to the model in the same order | worst relative error 8.1e-6, most about 1e-7 |
+| Brownian increments at full latent size, CPU and GPU | equal to rounding |
+
+So the gap to ComfyUI on a real model is the gap the model already has. Stochastic and high CFG paths magnify it: on
+Anima, `dpmpp_2m_sde_gpu` with `beta` at CFG 4 is 11 dB from ComfyUI, and also 12 dB from this engine under the other
+attention backend. `dpmpp_2m_sde` with `karras` is 24 dB.
+
+Differences to know about:
+
+* `dpm_adaptive` picks its steps from the whole batch in ComfyUI, and from each image here, so its batches can differ.
+* `dpm_fast` and `dpm_adaptive` stop at the last non-zero sigma, as in ComfyUI, so they can leave visible noise.
+* Combinations ComfyUI runs badly run badly here too: `turbo` and `align_your_steps` use sigmas above 1 on these models.
+* The Brownian samplers (`dpmpp_sde`, `dpmpp_2m_sde`, `dpmpp_3m_sde` and their variants) generate their noise on the CPU, even
+  the `_gpu` ones. An 8-step Anima image at 1024x1024 took 2.4 s with `dpmpp_2m_sde` and 2.0 s with its `_gpu` variant, against
+  1.3 s with `euler`.

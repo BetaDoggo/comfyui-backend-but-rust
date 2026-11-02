@@ -4,7 +4,9 @@
 
 This covers every parameter SwarmUI exposes, every prompt-syntax feature, and every ComfyUI node class SwarmUI's workflow generator can emit, all checked against this backend.
 
-It was measured, not guessed. `tools/probe_swarm_params.py` drove a live SwarmUI that was pointed at comfy-server. For each parameter it generated the workflow with and without that parameter, for each of the five supported models, and diffed the two. Each case that changed the workflow was then run end to end through SwarmUI on the mock engine (the **Ran** column).
+**This page is about the server, not real generation.** "Works" means the workflow validates and ran on the mock engine. For what the native engine really generates, see [STATUS](../../docs/STATUS.md).
+
+It was measured, not guessed. `tools/probe_swarm_params.py` drove a live SwarmUI that was pointed at comfy-server. For each parameter it generated the workflow with and without that parameter, for each of the five target models, and diffed the two. Each case that changed the workflow was then run end to end through SwarmUI on the mock engine (the **Ran** column).
 
 **241 parameters probed:** 132 work natively, 27 work through the generic `custom_node` route, 0 are blocked, and the rest never reach the backend for these models (handled inside SwarmUI, or they only act together with another parameter).
 
@@ -577,12 +579,12 @@ Wildcards, `<random>`, `<repeat>`, `<preset>`, `<var>`/`<setvar>`, `<macro>`/`<s
 
 ## Regenerating
 
-Run these from the repo root, with `reference/SwarmUI` and `reference/ComfyUI` cloned.
+Run these from `swarm backend/`, with SwarmUI and ComfyUI cloned to `reference/SwarmUI` and `reference/ComfyUI`, both gitignored.
 
 1. Start a stock ComfyUI on CPU with SwarmUI's extra nodes, and save its `/object_info`:
    `python main.py --cpu --port 8199 --extra-model-paths-config <yaml with custom_nodes: .../ComfyUIBackend/ExtraNodes>`
 2. Save comfy-server's own `/object_info` twice: started with `--mock-native-only` (ours.json), and without it (full.json, which adds the generic-route nodes).
 3. Run `python tools/swarm_inventory.py real.json ours.json inventory.json`, which scans SwarmUI's generator source.
 4. Run `python tools/third_party_schemas.py`, then `python tools/gen_todo_nodes.py real.json inventory.json` to write `todo_nodes.json`. It fails if SwarmUI can emit a node that is neither implemented nor classified in `tools/todo_catalog.py`.
-5. Restart comfy-server (full mock), start SwarmUI with the fake models from `scratch/make_fake_models.py`, then run `python tools/probe_swarm_params.py ours.json tools/data/param_probe.json --run --generic full.json`.
+5. Restart comfy-server (full mock), start SwarmUI with fake model files (see [ADDING_MODELS.md](ADDING_MODELS.md)) and its session id in `scratch/session`, then run `python tools/probe_swarm_params.py ours.json tools/data/param_probe.json --run --generic full.json`.
 6. Run `python tools/gen_todo_nodes.py real.json inventory.json tools/data/param_probe.json`, then `python tools/gen_compat_doc.py`.

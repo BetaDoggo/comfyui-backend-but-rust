@@ -10,14 +10,15 @@
 //! A lazy set ([`WeightSet::lazy`]) keeps no pinned copy of the model: units are read from the file's
 //! mapping when they are about to be used, by reader threads that fill a few pinned staging buffers
 //! ahead of compute. Clean file pages can be dropped without touching the pagefile, so a model larger
-//! than free RAM costs reads, not paging. Units rewritten by a LoRA keep a pageable host image.
+//! than free RAM costs reads, not paging. Units rewritten by a LoRA keep a pinned host image and go
+//! straight to VRAM: a copy through staging would cross the memory bus twice, and it is the slow part.
 
 use crate::cuda::{memcpy_d2d, memcpy_h2d, DevBuf, Event, PinnedBuf, Stream};
 use crate::st::{f32_bytes, Dt, SafeTensors};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -216,10 +217,30 @@ const STAGING: usize = 4;
 
 type Staged = (usize, u64, Result<PinnedBuf>);
 
+/// A unit held in RAM, pinned unless there is no room for that.
+enum Image {
+    Pinned(PinnedBuf),
+    Plain(Vec<u8>),
+}
+
+impl Image {
+    fn new(size: usize) -> Self {
+        PinnedBuf::alloc(size).map_or_else(|_| Image::Plain(vec![0; size]), Image::Pinned)
+    }
+
+    fn bytes(&mut self) -> &mut [u8] {
+        match self {
+            Image::Pinned(p) => p.as_mut_slice(),
+            Image::Plain(v) => v,
+        }
+    }
+}
+
 /// What a lazy set adds: the readers and what they have staged.
 struct Lazy {
     st: Arc<SafeTensors>,
-    images: Arc<Vec<RwLock<Option<Vec<u8>>>>>,
+    images: Arc<Vec<RwLock<Option<Image>>>>,
+    keep: Arc<AtomicBool>,
     want: mpsc::Sender<(usize, u64)>,
     done: mpsc::Receiver<Staged>,
     free: mpsc::Sender<(PinnedBuf, Option<Event>)>,
@@ -383,10 +404,11 @@ impl WeightSet {
         for _ in 0..STAGING {
             free.send((PinnedBuf::alloc(max_size)?, None))?;
         }
-        let images: Arc<Vec<RwLock<Option<Vec<u8>>>>> = Arc::new((0..n).map(|_| RwLock::new(None)).collect());
+        let images: Arc<Vec<RwLock<Option<Image>>>> = Arc::new((0..n).map(|_| RwLock::new(None)).collect());
         let (want_rx, free_rx) = (Arc::new(Mutex::new(want_rx)), Arc::new(Mutex::new(free_rx)));
+        let keep = Arc::new(AtomicBool::new(false));
         for _ in 0..threads.clamp(1, 3) {
-            let (want_rx, free_rx, done_tx, st, layouts, images) = (want_rx.clone(), free_rx.clone(), done_tx.clone(), st.clone(), layouts.clone(), images.clone());
+            let (want_rx, free_rx, done_tx, st, layouts, images, keep) = (want_rx.clone(), free_rx.clone(), done_tx.clone(), st.clone(), layouts.clone(), images.clone(), keep.clone());
             std::thread::spawn(move || loop {
                 let Ok((unit, generation)) = want_rx.lock().unwrap().recv() else { break };
                 let Ok((mut buf, event)) = free_rx.lock().unwrap().recv() else { break };
@@ -395,9 +417,17 @@ impl WeightSet {
                         e.sync()?;
                     }
                     let size = layouts[unit].size;
-                    match &*images[unit].read().unwrap() {
-                        Some(img) => buf.as_mut_slice()[..size].copy_from_slice(img),
-                        None => layouts[unit].pack(&st, &mut buf.as_mut_slice()[..size])?,
+                    let mut held = images[unit].write().unwrap();
+                    match &mut *held {
+                        Some(img) => buf.as_mut_slice()[..size].copy_from_slice(&img.bytes()[..size]),
+                        None => {
+                            layouts[unit].pack(&st, &mut buf.as_mut_slice()[..size])?;
+                            if keep.load(Ordering::Relaxed) {
+                                let mut img = Image::new(size);
+                                img.bytes()[..size].copy_from_slice(&buf.as_mut_slice()[..size]);
+                                *held = Some(img);
+                            }
+                        }
                     }
                     Ok(())
                 })();
@@ -408,7 +438,7 @@ impl WeightSet {
         }
         let total: usize = layouts.iter().map(|l| l.size).sum();
         eprintln!("[{name}] {n} units, {:.2} GB: {} resident, {} streamed via {} slots, read on use", total as f64 / 1e9, plan.resident, streamed.len(), slots.len());
-        let lazy = Lazy { st, images, want, done, free, staged: HashMap::new(), asked: HashSet::new(), filled: vec![false; n], generation: 0 };
+        let lazy = Lazy { st, images, keep, want, done, free, staged: HashMap::new(), asked: HashSet::new(), filled: vec![false; n], generation: 0 };
         Ok(WeightSet { name: name.to_string(), layouts, stores, rewritten: vec![false; n], streamed, slot_of: HashMap::new(), next_rank: 0, rr: 0, slots, copy: Stream::new()?, lazy: Some(lazy), copied_bytes: 0 })
     }
 
@@ -439,6 +469,21 @@ impl WeightSet {
         self.restart_ring()
     }
 
+    /// Keep what is read in host memory, so a lazy set that returns needs no second trip to the file.
+    pub fn keep_images(&self) {
+        if let Some(l) = &self.lazy {
+            l.keep.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// `unit`'s image, if it can go to VRAM as it is.
+    fn pinned(&self, unit: usize) -> Option<*mut u8> {
+        match &*self.lazy.as_ref()?.images[unit].read().unwrap() {
+            Some(Image::Pinned(p)) => Some(p.ptr()),
+            _ => None,
+        }
+    }
+
     /// True when `unit`'s data will have to come from the host.
     fn needs_data(&self, unit: usize) -> bool {
         let Some(l) = &self.lazy else { return false };
@@ -450,7 +495,7 @@ impl WeightSet {
         let n = self.len();
         for j in 0..n.min(STAGING - 1) {
             let v = (unit + j) % n;
-            if self.needs_data(v) {
+            if self.needs_data(v) && self.pinned(v).is_none() {
                 let l = self.lazy.as_mut().unwrap();
                 if l.asked.insert(v) {
                     l.want.send((v, l.generation))?;
@@ -463,6 +508,15 @@ impl WeightSet {
     /// Copy `unit` from its staging buffer to `dst` on the copy stream. Blocks until it is read.
     fn fill(&mut self, unit: usize, dst: *mut c_void) -> Result<Event> {
         let size = self.layouts[unit].size;
+        // what the readers were asked for is on its way through staging, whatever became of its image
+        let direct = if self.lazy.as_ref().unwrap().asked.contains(&unit) { None } else { self.pinned(unit) };
+        if let Some(p) = direct {
+            memcpy_h2d(dst, p, size, &self.copy)?;
+            let done = Event::new()?;
+            done.record(&self.copy)?;
+            self.copied_bytes += size;
+            return Ok(done);
+        }
         let l = self.lazy.as_mut().unwrap();
         if l.asked.insert(unit) {
             l.want.send((unit, l.generation))?;
@@ -586,11 +640,11 @@ impl WeightSet {
         if let Some(l) = &self.lazy {
             let mut image = l.images[unit].write().unwrap();
             if image.is_none() {
-                let mut b = vec![0u8; self.layouts[unit].size];
-                self.layouts[unit].pack(&l.st, &mut b)?;
+                let mut b = Image::new(self.layouts[unit].size);
+                self.layouts[unit].pack(&l.st, &mut b.bytes()[..self.layouts[unit].size])?;
                 *image = Some(b);
             }
-            src.download(0, &mut image.as_mut().unwrap()[off..off + len], st)?;
+            src.download(0, &mut image.as_mut().unwrap().bytes()[off..off + len], st)?;
             if let (Some(d), true) = (&self.stores[unit].dev, l.filled[unit]) {
                 memcpy_d2d(d.at(off), src.ptr(), len, st)?;
             }

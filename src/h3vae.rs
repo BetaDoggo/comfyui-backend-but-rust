@@ -4,7 +4,7 @@
 
 use crate::cuda::{DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_BF16, PM, PRO_LAYERNORM, PRO_PLAIN, PRO_RMS, PRO_SWIGLU};
-use crate::offload::{plan, Layout, WeightSet};
+use crate::offload::{plan, Layout, Plan, WeightSet};
 use crate::st::{f32_bytes, SafeTensors};
 use anyhow::Result;
 use half::{bf16, f16};
@@ -186,14 +186,16 @@ pub struct VideoDecoder {
     std: Vec<f32>,
     post: Vec<f32>,
     post_bias: Vec<f32>,
+    threads: usize,
+    prof: crate::prof::Prof,
 }
 
 impl VideoDecoder {
-    pub fn load(path: &std::path::Path, budget: usize, threads: usize, st0: &Stream) -> Result<Self> {
+    /// The layers take no VRAM until [`Self::place`]. They are read from the file once, then held in RAM.
+    pub fn load(path: &std::path::Path, threads: usize, st0: &Stream) -> Result<Self> {
         let st = Arc::new(SafeTensors::open(path)?);
-        let ls = layouts(&st)?;
-        let p = plan(&ls, budget, 2);
-        let ws = WeightSet::lazy("h3 vae", st.clone(), ls, p, threads)?;
+        let ws = WeightSet::lazy("h3 vae", st.clone(), layouts(&st)?, Plan { resident: 0, slots: 0 }, threads)?;
+        ws.keep_images();
         let mut gl = Layout::new();
         for (key, n) in [("emb_w", "decoder.x_embedder.weight"), ("emb_b", "decoder.x_embedder.bias"), ("proj_w", "decoder.proj_out.weight"), ("proj_b", "decoder.proj_out.bias"), ("regs", "decoder.register_tokens"), ("no_b", "decoder.norm_out.bias")] {
             gl.bf16(&st, key, &[n.to_string()])?;
@@ -204,7 +206,17 @@ impl VideoDecoder {
         let globals = DevBuf::alloc(gl.size)?;
         globals.upload(0, &host, st0)?;
         st0.sync()?;
-        Ok(VideoDecoder { ws, globals, gl, mean: st.f32_vec("latents_mean", false)?, std: st.f32_vec("latents_std", false)?, post: st.f32_vec("post_quant_conv.weight", false)?, post_bias: st.f32_vec("post_quant_conv.bias", false)? })
+        Ok(VideoDecoder { ws, globals, gl, mean: st.f32_vec("latents_mean", false)?, std: st.f32_vec("latents_std", false)?, post: st.f32_vec("post_quant_conv.weight", false)?, post_bias: st.f32_vec("post_quant_conv.bias", false)?, threads, prof: crate::prof::Prof::new() })
+    }
+
+    /// Give the layers `budget` bytes of VRAM.
+    pub fn place(&mut self, budget: usize) -> Result<()> {
+        self.ws.replan(plan(&self.ws.layouts, budget, 2))
+    }
+
+    /// Take the layers out of VRAM, for the diffusion model.
+    pub fn park(&mut self) -> Result<()> {
+        self.ws.replan(Plan { resident: 0, slots: 0 })
     }
 
     fn g(&self, key: &str) -> PM {
@@ -213,6 +225,8 @@ impl VideoDecoder {
 
     /// Raw decoder output of latents [24, t, h, w].
     fn pixels(&mut self, z: &Clip, st: &Stream) -> Result<Clip> {
+        self.prof.mark("start", st)?;
+        let t0 = std::time::Instant::now();
         let (t, h, w) = (z.t, z.h, z.w);
         let n = t * h * w;
         let l = n + SUFFIX;
@@ -244,6 +258,8 @@ impl VideoDecoder {
         let table = rope(t, h, w);
         let rd = DevBuf::alloc_async(table.len() * 4, st)?;
         rd.upload(0, &f32_bytes(&table), st)?;
+        self.prof.host("prep", t0);
+        self.prof.mark("embed", st)?;
 
         let m = l as i32;
         let a8 = DevBuf::alloc_async(l * FF, st)?;
@@ -257,48 +273,72 @@ impl VideoDecoder {
         let (rs, hs) = (QKV as i64, (3 * DH) as i64);
         for b in 0..LAYERS {
             let base = self.ws.acquire(b, st)?;
+            self.prof.mark("stream", st)?;
             let lay = self.ws.layouts[b].clone();
             let wp = |key: &str| off(base, lay.off(key));
             k!(gpu_quant_rows(DT_BF16, PRO_RMS, xp, di, null(), 0, 0, wp("n1"), EPS, null(), null(), a8.ptr(), asc.ptr(), m, D as i32, 1, s(st)))?;
+            self.prof.mark("quant", st)?;
             k!(gpu_int8_gemm(a8.ptr(), wp("w_qkv"), asc.ptr(), wp("s_qkv"), wp("b_qkv"), q, l as i64, QKV as i64, di, DT_BF16, s(st)))?;
+            self.prof.mark("gemm", st)?;
             k!(gpu_rope_bf16(q, rs, hs, null(), EPS, rd.ptr(), m, HEADS as i32, DH as i32, PAIRS as i32, s(st)))?;
             k!(gpu_rope_bf16(off(q, DH * 2), rs, hs, null(), EPS, rd.ptr(), m, HEADS as i32, DH as i32, PAIRS as i32, s(st)))?;
+            self.prof.mark("rope", st)?;
             let (kp, vp) = (off(q, DH * 2), off(q, 2 * DH * 2));
             k!(gpu_int8_attn_d(q, kp, vp, attn.ptr(), ws.ptr(), 1, m, m, HEADS as i32, HEADS as i32, DH as i32, l as i64 * rs, rs, hs, l as i64 * rs, rs, hs, l as i64 * rs, rs, hs, (l * D) as i64, di,
                 DH as i64, 1.0 / (DH as f32).sqrt(), s(st)))?;
+            self.prof.mark("attn", st)?;
             k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), di, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m, D as i32, 1, s(st)))?;
+            self.prof.mark("quant", st)?;
             k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_o"), asc.ptr(), wp("s_o"), wp("b_o"), wp("s1"), xp, xp, l as i64, di, di, DT_BF16, s(st)))?;
+            self.prof.mark("gemm", st)?;
             k!(gpu_quant_rows(DT_BF16, PRO_RMS, xp, di, null(), 0, 0, wp("n2"), EPS, null(), null(), a8.ptr(), asc.ptr(), m, D as i32, 1, s(st)))?;
+            self.prof.mark("quant", st)?;
             k!(gpu_int8_gemm(a8.ptr(), wp("w_w1"), asc.ptr(), wp("s_w1"), wp("b_w1"), hid.ptr(), l as i64, (2 * FF) as i64, di, DT_BF16, s(st)))?;
+            self.prof.mark("gemm", st)?;
             k!(gpu_quant_rows(DT_BF16, PRO_SWIGLU, hid.ptr(), (2 * FF) as i64, null(), 0, FF as i64, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m, FF as i32, 1, s(st)))?;
+            self.prof.mark("quant", st)?;
             k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_w2"), asc.ptr(), wp("s_w2"), wp("b_w2"), wp("s2"), xp, xp, l as i64, di, FF as i64, DT_BF16, s(st)))?;
+            self.prof.mark("gemm", st)?;
             self.ws.release(b, st)?;
         }
         k!(gpu_prologue_rows(DT_BF16, PRO_LAYERNORM, xp, di, null(), 0, 0, self.g("no_w"), EPS, null(), null(), attn.ptr(), di, n as i32, D as i32, s(st)))?;
         k!(gpu_add_gated_bf16(attn.ptr(), di, self.g("no_b"), 0, null(), n as i32, D as i32, s(st)))?;
         let outb = DevBuf::alloc_async(n * OUT * 2, st)?;
         k!(gpu_gemm(attn.ptr(), di, self.g("proj_w"), di, outb.ptr(), OUT as i64, self.g("proj_b"), n as i64, OUT as i64, di, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
+        self.prof.mark("head", st)?;
+        let t0 = std::time::Instant::now();
         let mut raw = vec![0u8; n * OUT * 2];
         outb.download(0, &mut raw, st)?;
         let mut o = Clip::new(3, t * RATIO_T, h * RATIO, w * RATIO);
         let val = |i: usize| bf16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]).to_f32();
-        for f in 0..t {
-            for y in 0..h {
-                for x in 0..w {
-                    let tok = ((f * h + y) * w + x) * OUT;
-                    for c in 0..3 {
-                        for pt in 0..RATIO_T {
+        // one plane per channel and frame, a share of them per thread
+        let (pw, frames) = (o.h * o.w, o.t);
+        let mut planes: Vec<(usize, &mut [f32])> = o.data.chunks_mut(pw).enumerate().collect();
+        let share = planes.len().div_ceil(self.threads.max(1));
+        std::thread::scope(|sc| {
+            for part in planes.chunks_mut(share) {
+                let val = &val;
+                sc.spawn(move || {
+                    for (i, plane) in part.iter_mut() {
+                        let (c, ft) = (*i / frames, *i % frames);
+                        let (f, pt) = (ft / RATIO_T, ft % RATIO_T);
+                        for y in 0..h {
                             for py in 0..RATIO {
-                                for px in 0..RATIO {
-                                    let at = o.at(c, f * RATIO_T + pt, y * RATIO + py, x * RATIO + px);
-                                    o.data[at] = val(tok + (((c * RATIO_T + pt) * RATIO + py) * RATIO + px));
+                                for x in 0..w {
+                                    let tok = ((f * h + y) * w + x) * OUT + (((c * RATIO_T + pt) * RATIO + py) * RATIO);
+                                    let row = (y * RATIO + py) * RATIO * w + x * RATIO;
+                                    for px in 0..RATIO {
+                                        plane[row + px] = val(tok + px);
+                                    }
                                 }
                             }
                         }
                     }
-                }
+                });
             }
-        }
+        });
+        self.prof.host("unpatch", t0);
+        self.prof.report("tile", st)?;
         Ok(o)
     }
 
@@ -430,21 +470,35 @@ const UPS: [(usize, usize); 7] = [(5, 9), (5, 9), (2, 4), (2, 4), (2, 4), (2, 4)
 const KERNELS: [usize; 3] = [3, 7, 11];
 const DILATIONS: [usize; 3] = [1, 3, 5];
 
-/// Audio latents [32, 2, t] -> stereo samples [2, 800 t], in -1..1.
-pub fn decode_audio(path: &std::path::Path, latent: &[f32], t: usize, st: &Stream) -> Result<Vec<f32>> {
-    let f = SafeTensors::open(path)?;
-    let mut gl = Layout::new();
-    for name in f.tensors.keys() {
-        if name.starts_with("decoder.") || name.starts_with("dec_in_proj.") {
-            gl.raw(&f, name, std::slice::from_ref(name))?;
+/// The audio decoder's weights, held in RAM between clips.
+pub struct AudioDecoder {
+    gl: Layout,
+    host: Vec<u8>,
+    mean: Vec<f32>,
+    std: Vec<f32>,
+}
+
+impl AudioDecoder {
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        let f = SafeTensors::open(path)?;
+        let mut gl = Layout::new();
+        for name in f.tensors.keys() {
+            if name.starts_with("decoder.") || name.starts_with("dec_in_proj.") {
+                gl.raw(&f, name, std::slice::from_ref(name))?;
+            }
         }
+        let mut host = vec![0u8; gl.size];
+        gl.pack(&f, &mut host)?;
+        Ok(AudioDecoder { gl, host, mean: f.f32_vec("latents_mean", false)?, std: f.f32_vec("latents_std", false)? })
     }
-    let mut host = vec![0u8; gl.size];
-    gl.pack(&f, &mut host)?;
+}
+
+/// Audio latents [32, 2, t] -> stereo samples [2, 800 t], in -1..1.
+pub fn decode_audio(dec: &AudioDecoder, latent: &[f32], t: usize, st: &Stream) -> Result<Vec<f32>> {
+    let (gl, mean, std) = (&dec.gl, &dec.mean, &dec.std);
     let w = DevBuf::alloc_async(gl.size, st)?;
-    w.upload(0, &host, st)?;
+    w.upload(0, &dec.host, st)?;
     let g = |n: &str| w.at(gl.off(n));
-    let (mean, std) = (f.f32_vec("latents_mean", false)?, f.f32_vec("latents_std", false)?);
     let mut z = vec![0f32; 2 * 32 * t];
     for b in 0..2 {
         for c in 0..32 {

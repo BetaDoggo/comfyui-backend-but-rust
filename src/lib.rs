@@ -13,6 +13,7 @@ mod lora_adapters;
 pub mod moss;
 pub mod offload;
 pub mod pipeline;
+pub mod prof;
 pub mod qwen3;
 pub mod qwen35;
 pub mod samplers;

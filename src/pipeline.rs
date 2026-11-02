@@ -246,6 +246,8 @@ pub struct Generator {
     h3: Option<H3Model>,
     h3_te: Option<(PathBuf, h3te::TextEncoder)>,
     h3_tokenizer: Option<tokenizer::Tokenizer>,
+    h3_vae: Option<(PathBuf, h3vae::VideoDecoder)>,
+    h3_audio: Option<(PathBuf, h3vae::AudioDecoder)>,
     /// Latest encoded token ids, most recent last.
     h3_contexts: Vec<(Vec<u32>, DevBuf)>,
     vae: Option<(PathBuf, vae::Vae)>,
@@ -335,7 +337,7 @@ impl Generator {
         let (_, total) = cuda::mem_info()?;
         eprintln!("GPU memory: {} MB free (device-wide) / {} MB total", cuda::device_free()? / MB, total / MB);
         Ok(Generator { st: st0, te: None, dit: None, anima: None, qwen3: None, tokenizers: None, contexts: Vec::new(), moss: None, qwen35: None,
-            moss_tokenizer: None, moss_contexts: Vec::new(), h3: None, h3_te: None, h3_tokenizer: None, h3_contexts: Vec::new(), vae: None, flux2: None, cached: None, cached_negative: None, vision: None, vision_cache: Vec::new(),
+            moss_tokenizer: None, moss_contexts: Vec::new(), h3: None, h3_te: None, h3_tokenizer: None, h3_vae: None, h3_audio: None, h3_contexts: Vec::new(), vae: None, flux2: None, cached: None, cached_negative: None, vision: None, vision_cache: Vec::new(),
             max_pixels: o.max_pixels,
             max_width: o.max_width, max_height: o.max_height, reserve: o.reserve_vram_mb * MB,
             resident_blocks: o.resident_blocks, slots: o.slots, threads: o.threads, attn_variant: o.attn_variant,
@@ -437,6 +439,8 @@ impl Generator {
         self.h3_contexts.clear();
         self.h3 = None;
         self.h3_te = None;
+        self.h3_vae = None;
+        self.h3_audio = None;
         self.flux2 = None;
         cuda::trim_pool()
     }
@@ -588,17 +592,33 @@ impl Generator {
     /// Decode the audio of a clip, [32, 2, t] latents to stereo samples.
     pub fn decode_h3_audio(&mut self, path: &Path, latent: &[f32], t: usize) -> Result<Vec<f32>> {
         self.park_h3()?;
-        h3vae::decode_audio(path, latent, t, &self.st)
+        if self.h3_audio.as_ref().is_none_or(|(p, _)| p != path) {
+            self.h3_audio = None;
+            self.h3_audio = Some((path.to_path_buf(), h3vae::AudioDecoder::load(path)?));
+        }
+        h3vae::decode_audio(&self.h3_audio.as_ref().unwrap().1, latent, t, &self.st)
     }
 
     /// Decode the video of a clip. Without the diffusion model in VRAM, the decoder's layers stay
     /// resident rather than crossing the bus once per tile.
     pub fn decode_h3(&mut self, path: &Path, latent: &[f32], sh: h3::Shape, frames: usize) -> Result<h3vae::Clip> {
+        let t0 = Instant::now();
         self.park_h3()?;
+        let parked = t0.elapsed().as_secs_f64();
         let budget = cuda::device_free()?.saturating_sub(self.reserve + (3 << 30));
-        let mut v = h3vae::VideoDecoder::load(path, budget, self.threads, &self.st)?;
+        if self.h3_vae.as_ref().is_none_or(|(p, _)| p != path) {
+            self.h3_vae = None;
+            self.h3_vae = Some((path.to_path_buf(), h3vae::VideoDecoder::load(path, self.threads, &self.st)?));
+        }
+        let v = &mut self.h3_vae.as_mut().unwrap().1;
+        v.place(budget)?;
+        let loaded = t0.elapsed().as_secs_f64();
         let out = v.decode(&latent[..sh.video_len()], sh.t, sh.h, sh.w, frames, &self.st)?;
         self.st.sync()?;
+        v.park()?;
+        if std::env::var_os("PROFILE").is_some() {
+            eprintln!("[prof] decode: park {:.0} ms, load {:.0} ms, tiles and blends {:.0} ms", parked * 1e3, (loaded - parked) * 1e3, (t0.elapsed().as_secs_f64() - loaded) * 1e3);
+        }
         Ok(out)
     }
 
@@ -1036,6 +1056,8 @@ impl Generator {
         self.h3_contexts.clear();
         self.h3 = None;
         self.h3_te = None;
+        self.h3_vae = None;
+        self.h3_audio = None;
         self.flux2 = None;
         self.vae = None;
         cuda::trim_pool()

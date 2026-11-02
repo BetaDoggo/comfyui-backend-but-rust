@@ -207,6 +207,7 @@ pub struct Dit {
     pub attn_variant: i32,
     /// video, audio
     pub shifts: (f32, f32),
+    pub prof: crate::prof::Prof,
 }
 
 impl Dit {
@@ -224,7 +225,7 @@ impl Dit {
         let blocks = WeightSet::lazy("h3 blocks", st.clone(), layouts, Plan { resident: 0, slots: 0 }, threads)?;
         let ref_layouts = (0..REFINER).map(|i| refiner_layout(st, i)).collect::<Result<Vec<_>>>()?;
         let refiner = WeightSet::lazy("h3 refiner", st.clone(), ref_layouts, Plan { resident: 0, slots: 0 }, threads)?;
-        Ok(Dit { globals, gl, blocks, refiner, table: st.f32_vec("adaln_t_table", false)?, inv_freq: st.f32_vec("rope.inv_freq", false)?, int8_attn: true, attn_variant: 0, shifts: (SHIFT_VIDEO as f32, SHIFT_AUDIO as f32) })
+        Ok(Dit { globals, gl, blocks, refiner, table: st.f32_vec("adaln_t_table", false)?, inv_freq: st.f32_vec("rope.inv_freq", false)?, int8_attn: true, attn_variant: 0, shifts: (SHIFT_VIDEO as f32, SHIFT_AUDIO as f32), prof: crate::prof::Prof::new() })
     }
 
     /// Give the blocks `budget` bytes of VRAM (what they hold now counts).
@@ -332,6 +333,8 @@ impl Dit {
     #[allow(clippy::too_many_arguments)]
     pub fn predict(&mut self, x_in: &DevBuf, sh: &Shape, ctx: &DevBuf, text: usize, rope: &DevBuf, sigma: f32, den: &DevBuf, st: &Stream,
         mut probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<()> {
+        self.prof.mark("start", st)?;
+        let t0 = std::time::Instant::now();
         let (vn, an) = (sh.video_len(), sh.audio_len());
         let mut raw = vec![0u8; (vn + an) * 4];
         x_in.download(0, &mut raw, st)?;
@@ -369,6 +372,7 @@ impl Dit {
             }
         }
 
+        self.prof.host("unpack", t0);
         let (al, l) = (text + ar, text + ar + vr);
         let fi = F as i64;
         let (t_v, t_a) = (1.0 - sigma_v, 1.0 - sigma_a);
@@ -387,6 +391,7 @@ impl Dit {
         k!(gpu_gemm(off(up.ptr(), rows.len() * 4), ACH as i64, self.g("aud_w"), ACH as i64, fbuf.ptr(), fi, self.g("aud_b"), ar as i64, fi, ACH as i64, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
         k!(gpu_f32_to_bf16(fbuf.ptr(), off(x.ptr(), text * F * 2), (ar * F) as i64, s(st)))?;
         crate::cuda::memcpy_d2d(x.ptr(), ctx.ptr(), text * F * 2, st)?;
+        self.prof.mark("embed", st)?;
 
         let a8 = DevBuf::alloc_async(l * FFN, st)?;
         let asc = DevBuf::alloc_async(l * 4, st)?;
@@ -408,7 +413,9 @@ impl Dit {
         for b in 0..self.blocks.len() {
             k!(gpu_gemm(cd.ptr(), 8, self.g(&format!("a{b}_w")), 8, modf.ptr(), MODS as i64, self.g(&format!("a{b}_b")), 2, MODS as i64, 8, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
             k!(gpu_f32_to_bf16(modf.ptr(), modb.ptr(), (2 * MODS) as i64, s(st)))?;
+            self.prof.mark("mod", st)?;
             let base = self.blocks.acquire(b, st)?;
+            self.prof.mark("stream", st)?;
             let lay = self.blocks.layouts[b].clone();
             let wp = |key: &str| off(base, lay.off(key));
             let vecs = |seg: &(usize, usize, usize, usize), j: usize| off(modb.ptr(), ((seg.2 * 3 + seg.3) * 6 + j) * F * 2);
@@ -422,11 +429,16 @@ impl Dit {
                 k!(gpu_quant_rows(DT_BF16, PRO_ADALN, off(xp, seg.0 * F * 2), fi, null(), 0, 0, null(), EPS, fold(i, 0), vecs(seg, 0), off(a8.ptr(), seg.0 * F), off(asc.ptr(), seg.0 * 4),
                     seg.1 as i32, F as i32, 1, s(st)))?;
             }
+            self.prof.mark("quant", st)?;
             decode("qkv", QKV, F)?;
+            self.prof.mark("w6", st)?;
             k!(gpu_int8_gemm(a8.ptr(), wdec.ptr(), asc.ptr(), wp("c_qkv"), null(), q, l as i64, QKV as i64, fi, DT_BF16, s(st)))?;
+            self.prof.mark("gemm", st)?;
             k!(gpu_rope_bf16(q, QKV as i64, HD as i64, wp("qn"), EPS, rope.ptr(), l as i32, H as i32, HD as i32, ROPE_PAIRS as i32, s(st)))?;
             k!(gpu_rope_bf16(off(q, INNER * 2), QKV as i64, HD as i64, wp("kn"), EPS, rope.ptr(), l as i32, H as i32, HD as i32, ROPE_PAIRS as i32, s(st)))?;
+            self.prof.mark("rope", st)?;
             self.attention(q, attn.ptr(), ws.ptr(), l, st)?;
+            self.prof.mark("attn", st)?;
             if b == 0 {
                 if let Some(p) = probe.as_mut() {
                     p("b0.out_proj.in", &attn, l * INNER * 2);
@@ -434,23 +446,32 @@ impl Dit {
                 }
             }
             k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), INNER as i64, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), l as i32, INNER as i32, 1, s(st)))?;
+            self.prof.mark("quant", st)?;
             decode("o", F, INNER)?;
+            self.prof.mark("w6", st)?;
             for seg in &segs {
                 let xs = off(xp, seg.0 * F * 2);
                 k!(gpu_int8_gemm_residual(off(a8.ptr(), seg.0 * INNER), wdec.ptr(), off(asc.ptr(), seg.0 * 4), wp("c_o"), null(), vecs(seg, 2), xs, xs, seg.1 as i64, fi, INNER as i64, DT_BF16, s(st)))?;
             }
+            self.prof.mark("gemm", st)?;
             for (i, seg) in segs.iter().enumerate() {
                 k!(gpu_quant_rows(DT_BF16, PRO_ADALN, off(xp, seg.0 * F * 2), fi, null(), 0, 0, null(), EPS, fold(i, 1), vecs(seg, 3), off(a8.ptr(), seg.0 * F), off(asc.ptr(), seg.0 * 4),
                     seg.1 as i32, F as i32, 1, s(st)))?;
             }
+            self.prof.mark("quant", st)?;
             decode("up", 2 * FFN, F)?;
+            self.prof.mark("w6", st)?;
             k!(gpu_int8_gemm(a8.ptr(), wdec.ptr(), asc.ptr(), wp("c_up"), null(), hid.ptr(), l as i64, (2 * FFN) as i64, fi, DT_BF16, s(st)))?;
+            self.prof.mark("gemm", st)?;
             k!(gpu_quant_rows(DT_BF16, PRO_SWIGLU, hid.ptr(), (2 * FFN) as i64, null(), 0, FFN as i64, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), l as i32, FFN as i32, 1, s(st)))?;
+            self.prof.mark("quant", st)?;
             decode("d", F, FFN)?;
+            self.prof.mark("w6", st)?;
             for seg in &segs {
                 let xs = off(xp, seg.0 * F * 2);
                 k!(gpu_int8_gemm_residual(off(a8.ptr(), seg.0 * FFN), wdec.ptr(), off(asc.ptr(), seg.0 * 4), wp("c_d"), null(), vecs(seg, 5), xs, xs, seg.1 as i64, fi, FFN as i64, DT_BF16, s(st)))?;
             }
+            self.prof.mark("gemm", st)?;
             self.blocks.release(b, st)?;
             if matches!(b, 0 | 1 | 49) {
                 if let Some(p) = probe.as_mut() {
@@ -477,6 +498,8 @@ impl Dit {
         k!(gpu_int8_gemm(a8.ptr(), wdec.ptr(), asc.ptr(), self.g("vo_c"), self.g("vo_b"), vout.ptr(), vr as i64, PATCH as i64, fi, DT_F32, s(st)))?;
         k!(gpu_gemm(fbuf.ptr(), fi, self.g("ao_w"), fi, off(vout.ptr(), vr * PATCH * 4), ACH as i64, self.g("ao_b"), ar as i64, ACH as i64, fi, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
 
+        self.prof.mark("head", st)?;
+        let t0 = std::time::Instant::now();
         let mut raw = vec![0u8; (vr * PATCH + ar * ACH) * 4];
         vout.download(0, &mut raw, st)?;
         let out: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
@@ -509,6 +532,8 @@ impl Dit {
                 }
             }
         }
+        self.prof.host("pack", t0);
+        self.prof.report("step", st)?;
         den.upload(0, &f32_bytes(&d), st)
     }
 }

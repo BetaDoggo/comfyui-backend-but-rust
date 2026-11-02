@@ -30,9 +30,9 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | MOSS Image | MOSS Image LoRAs | Baked like ComfyUI, including fused q/k/v slices. All 168 weights identical. Tested through SwarmUI with the DMD LoRA; the edit LoRA applies but has no image input yet. |
 | P1 | Krea 2 | Variation Seed | Direct workflow test; output changes as expected. Not compared with ComfyUI. |
 | P1 | Krea 2 | Sigma Shift | ModelSamplingFlux. Direct workflow test. |
-| P1 | MiniMax H3 | H3 text to video with audio | Through real SwarmUI and the CLI: w6a8 DiT, nvfp4 text encoder, turbo LoRA, video and audio decoders, mp4 through ffmpeg. 512x512, 5 and 22 frames, 0.65 to 0.82 s/step against 1.59 in ComfyUI. Same picture at 21 dB; both are 1.2% from an exact refiner run. Audio not judged by ear. |
+| P1 | MiniMax H3 | H3 text to video with audio | Through real SwarmUI and the CLI: w6a8 DiT, nvfp4 text encoder, turbo LoRA, video and audio decoders, mp4 through ffmpeg. 512x512, 5 and 22 frames, 0.32 to 0.53 s/step against 1.59 in ComfyUI; a warm repeat takes 2.8 to 3.7 s. Same picture at 21 dB; both are 1.2% from an exact refiner run. Audio not judged by ear. |
 | P1 | MiniMax H3 | H3 Variation Seed | Refused with an error. SwarmUI slerps each stream's noise. |
-| P1 | Engine core | Lazy offloading | H3 reads weights on use through a few pinned staging buffers, ahead of compute. Other models still pin everything at load. |
+| P1 | Engine core | Lazy offloading | H3 reads weights on use through a few pinned staging buffers, ahead of compute; LoRA-baked blocks stay pinned and skip staging. Other models still pin everything at load. |
 | P1 | MOSS Image | MOSS engine | Int8 ConvRot checkpoint through real SwarmUI: 550 to 573 ms/step at CFG 4, against 601 in ComfyUI, VAE 268 ms against 530 or more. Same picture at about 34 dB, not pixel-identical. |
 | P1 | Anima | Anima prompt weights | (word:1.2) and <weight> scale the T5 tokens, as ComfyUI does. Token ids match ComfyUI. |
 | P1 | Anima | Anima Batch Size, Sigma Shift and CFG | Generated through real SwarmUI. Output not compared with ComfyUI at CFG above 1. |

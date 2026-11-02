@@ -226,20 +226,22 @@ Warm files, 512x512, 4 steps, turbo LoRA, on this machine:
 | Stage | ComfyUI, 5 frames | Here, 5 frames | Here, 22 frames |
 |---|---|---|---|
 | Text encoding | 13.1 s | 2.2 s | 2.3 s |
-| Per step, warm | 1.59 s | 0.65 s | 0.82 s |
-| Sampling, first run | 36 to 41 s | 5.4 s, with text encoding | 6.0 s, with text encoding |
-| Video decode | 28.3 s | about 2.5 s | 2.2 s |
-| Audio decode | 3.6 s | 0.2 s | 0.3 s |
+| Per step, warm | 1.59 s | 0.32 s | 0.53 s |
 
-Through real SwarmUI with everything warm, a repeat generation took 4.6 s at 5 frames and 5.3 s at 22, because the bake and the encoded prompt are kept.
+Through real SwarmUI with everything warm, a repeat generation took 2.8 s at 5 frames and 3.7 s at 22, because the bake, the encoded prompt and both decoders are kept.
+That covers sampling, video decode and audio decode. ComfyUI took 28.3 s for video decode and 3.6 s for audio decode alone.
+The first video decode reads 2.4 GB from the file, about 23 s on this drive.
 
 Baking the LoRA adds about 11 s when it changes, and text encoding from a cold disk takes about 140 s on both engines, as the drive reads at about 100 MB/s.
 ComfyUI's text encoding took 151 s cold. Runs longer than 22 frames and sizes above 512x512 haven't been tested.
 
 Offloading is the lazy kind in [`src/offload.rs`](src/offload.rs): nothing is read at load, reader threads fill four pinned staging buffers ahead of compute, and file pages stay evictable.
-Weights stay in packed 6-bit form in VRAM and decode to int8 before each GEMM, which leaves room for 23 of the 50 blocks at 512x512.
-LoRA-baked blocks keep a host copy in ordinary pageable memory, about 15 GB. The blocks leave VRAM before the video decode and come back for the next clip, re-planned for its size.
-The text encoder and refiner only hold VRAM while they run.
+Weights stay in packed 6-bit form in VRAM and decode to int8 before each GEMM, which leaves room for 30 of the 50 blocks at 512x512.
+LoRA-baked blocks keep a pinned host copy, about 15 GB, and go straight to VRAM: this machine copies 18 GB/s in RAM but 28 GB/s from pinned memory to VRAM, so a pass through staging cost about 200 ms a step.
+If pinning fails they fall back to pageable memory and staging. The blocks leave VRAM before the video decode and come back for the next clip, re-planned for its size.
+The text encoder and refiner only hold VRAM while they run. The video decoder holds 2.4 GB of pinned RAM between clips, and takes no VRAM while sampling.
+
+`PROFILE=1` prints the time of each stage per step and per decoded tile. Stages are timed with events on the compute stream, so the run keeps its overlap and its output.
 
 Compared with ComfyUI on the same noise, the context is within 8.6e-4, and the first step within 3.4% on video and 13% on audio. Frames come to 21 dB with the same composition.
 That gap is rounding: both engines are about 1.2% from an exact float32 run of the token refiner (`tools/h3_refiner_check.py`), and differ by 1.5% from each other because their int8 activations round differently.

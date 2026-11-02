@@ -1,10 +1,9 @@
 """Run ComfyUI's MOSS Image pipeline headlessly and dump intermediate tensors for parity tests.
 
 usage: python moss_ref.py <out_dir> [prompt] [--seed N] [--size W H] [--steps N] [--cfg X] [--shift X]
-                          [--negative TEXT] [--repeat N] [--swarm-template]
+                          [--negative TEXT] [--repeat N]
 
 --repeat runs the sampler that many times; the timings of the later runs are the warm baseline.
---swarm-template encodes with the Krea 2 template, which SwarmUI sends for MOSS Image.
 """
 import argparse
 import os
@@ -24,7 +23,6 @@ ap.add_argument("--cfg", type=float, default=4.0)
 ap.add_argument("--shift", type=float, default=5.0)
 ap.add_argument("--negative", default="blurry, low quality")
 ap.add_argument("--repeat", type=int, default=1)
-ap.add_argument("--swarm-template", action="store_true")
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
 
@@ -42,7 +40,6 @@ import comfy.samplers
 DIT = os.path.join(os.environ["MODELS_ROOT"], r"Stable-diffusion\moss_image_sft_int8_convrot_attn.safetensors")
 TE = os.path.join(os.environ["MODELS_ROOT"], r"clip\qwen3.5_9b_int8_convrot.safetensors")
 VAE = os.path.join(os.environ["MODELS_ROOT"], r"VAE\flux2-vae.safetensors")
-KREA2_TEMPLATE = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
 
 os.makedirs(args.out, exist_ok=True)
 dump = {}
@@ -54,7 +51,6 @@ def put(name, t):
 
 t0 = time.perf_counter()
 clip = comfy.sd.load_clip(ckpt_paths=[TE], clip_type=comfy.sd.CLIPType.MOSS_IMAGE)
-extra = {"llama_template": KREA2_TEMPLATE} if args.swarm_template else {}
 te = clip.cond_stage_model.qwen35_9b.transformer
 te_hooks = []
 
@@ -72,7 +68,7 @@ te_hooks.append(te.model.layers[0].register_forward_hook(te_hook("te_layer0")))
 te_hooks.append(te.model.layers[3].register_forward_hook(te_hook("te_layer3")))
 te_hooks.append(te.model.layers[31].register_forward_hook(te_hook("te_layer31")))
 
-tokens = clip.tokenize(args.prompt, **extra)
+tokens = clip.tokenize(args.prompt)
 key = next(iter(tokens))
 put("ids", torch.tensor([t[0] for t in tokens[key][0]], dtype=torch.int64))
 t1 = time.perf_counter()
@@ -82,9 +78,9 @@ print("cond", cond[0][0].shape, cond[0][0].dtype, f"encode {time.perf_counter() 
 for h in te_hooks:
     h.remove()
 t1 = time.perf_counter()
-cond = clip.encode_from_tokens_scheduled(clip.tokenize(args.prompt, **extra))
+cond = clip.encode_from_tokens_scheduled(clip.tokenize(args.prompt))
 print(f"encode again {time.perf_counter() - t1:.3f}s")
-neg_tokens = clip.tokenize(args.negative, **extra)
+neg_tokens = clip.tokenize(args.negative)
 put("neg_ids", torch.tensor([t[0] for t in neg_tokens[key][0]], dtype=torch.int64))
 neg = clip.encode_from_tokens_scheduled(neg_tokens)
 put("neg_cond", neg[0][0])

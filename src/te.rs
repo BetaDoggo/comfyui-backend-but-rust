@@ -39,6 +39,26 @@ pub struct Cond {
     pub token_ids: Vec<u32>,
 }
 
+impl Cond {
+    /// Conditionings joined along the tokens, as SwarmTextEncodeAdvanced joins `<break>` chunks.
+    pub fn concat(mut conds: Vec<Cond>, st: &Stream) -> Result<Cond> {
+        if conds.len() == 1 {
+            return Ok(conds.pop().unwrap());
+        }
+        let row = TAPS.len() * D * 2;
+        let len: usize = conds.iter().map(|c| c.len).sum();
+        let ctx = DevBuf::alloc_async(len * row, st)?;
+        let (mut at, mut token_ids) = (0, Vec::new());
+        for c in &conds {
+            memcpy_d2d(off(ctx.ptr(), at * row), c.ctx.ptr(), c.len * row, st)?;
+            at += c.len;
+            token_ids.extend_from_slice(&c.token_ids);
+        }
+        st.sync()?;
+        Ok(Cond { ctx, len, token_ids })
+    }
+}
+
 /// The prompt SwarmTextEncodeAdvanced builds for `count` images. Its `input_image_N` replacement
 /// never reaches the tokens, because the node tokenizes each prompt leaf apart from that step, so
 /// the text stays and every image follows the prompt.
@@ -126,11 +146,12 @@ impl TextEncoder {
     }
 
     pub fn encode(&mut self, prompt: &str, st: &Stream) -> Result<Cond> {
-        self.encode_with_images(prompt, &[], st)
+        self.encode_with_images(prompt, &[], 1.0, st)
     }
 
     /// `images` go in place of the prompt's first `<|image_pad|>` tokens; add them with [`image_prompt`].
-    pub fn encode_with_images(&mut self, prompt: &str, images: &[&Embeds], st: &Stream) -> Result<Cond> {
+    /// `scale` multiplies the conditioning.
+    pub fn encode_with_images(&mut self, prompt: &str, images: &[&Embeds], scale: f32, st: &Stream) -> Result<Cond> {
         let ids = self.tokenize(prompt)?;
         let pads: Vec<usize> = ids.iter().enumerate().filter(|(_, &t)| t == IMAGE_PAD).map(|(i, _)| i).take(images.len()).collect();
         // the image tokens' places, in the sequence with the images in it
@@ -252,6 +273,10 @@ impl TextEncoder {
         }
         let len = l - template_end;
         let row = TAPS.len() * D;
+        if scale != 1.0 {
+            let (p, c) = ([taps.ptr() as crate::ffi::P], [scale]);
+            k!(gpu_lincomb(taps.ptr(), (l * row) as i64, 1, p.as_ptr(), c.as_ptr(), s(st)))?;
+        }
         let ctx = DevBuf::alloc_async(len * row * 2, st)?;
         k!(gpu_f32_to_bf16(off(taps.ptr(), template_end * row * 4), ctx.ptr(), (len * row) as i64, s(st)))?;
         Ok(Cond { ctx, len, token_ids: ids })

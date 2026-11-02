@@ -11,7 +11,7 @@ fn make_engine(cfg: &Config) -> anyhow::Result<Arc<dyn Engine>> {
         #[cfg(feature = "native")]
         "native" => {
             // Serves Krea 2, Anima and MOSS Image; the checkpoint picks which.
-            let options = native_engine::NativeOptions { reserve_vram_mb: cfg.reserve_vram, max_side: cfg.max_side, ..Default::default() };
+            let options = native_engine::NativeOptions { reserve_vram_mb: cfg.reserve_vram, max_side: cfg.max_side, live_previews: cfg.live_previews, ..Default::default() };
             Ok(Arc::new(native_engine::NativeEngine::new(&options)?))
         }
         #[cfg(not(feature = "native"))]

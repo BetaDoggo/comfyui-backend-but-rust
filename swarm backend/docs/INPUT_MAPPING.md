@@ -276,7 +276,7 @@ audio flow shifts; Qwen3-VL 32B encoding with multimodal refs; keyframe conditio
 
 | SwarmUI param | Arrives as | Engine sees |
 |---|---|---|
-| Prompt / Negative | `SwarmTextEncodeAdvanced` (same branch as Krea 2) | `Swarm` mode with **`llama_template: Some("krea2")`**. SwarmUI reuses the Krea 2 template here (its code has a TODO about it), while the encoder file is Qwen3.5 9B |
+| Prompt / Negative | `SwarmTextEncodeAdvanced` (same branch as Krea 2) | `Swarm` mode with **`llama_template: Some("krea2")`**, but `SwarmTextEncodeAdvanced` only uses a template with images. Without them the model's own `<\|im_start\|>user\n{}<\|im_end\|>\n<\|im_start\|>assistant\n<think>\n` wraps the prompt, untrimmed. `tools/swarm_prompt_ref.py` records the tokens |
 | Width / Height | `EmptyFlux2LatentImage` | `EmptyLatentKind::Flux2{w,h}` → `[B,128,H/16,W/16]` |
 | Sampler / Scheduler | | defaults **`euler` / `simple`** |
 | Sigma Shift (only if set) | `ModelSamplingAuraFlow{shift}` | `ModelPatch::SamplingAuraFlow` |

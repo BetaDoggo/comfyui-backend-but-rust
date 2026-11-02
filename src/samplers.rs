@@ -769,6 +769,93 @@ fn deis_coeffs(sigmas: &[f32], max_order: usize) -> Vec<V> {
     }).collect()
 }
 
+/// `sampler_cfg_function`: replaces the CFG mix. A model has one, the last set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CfgFunction {
+    /// `RescaleCFG`, in its flow branch.
+    Rescale { multiplier: f32 },
+    /// `RenormCFG`.
+    Renorm { cfg_trunc: f32, renorm_cfg: f32 },
+}
+
+/// ComfyUI's guidance patches, each in the place `sampling_function` gives it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CfgTweaks {
+    /// `TCFG`: before the mix.
+    pub tangential: bool,
+    pub function: Option<CfgFunction>,
+    /// `CFGZeroStar`: after the mix.
+    pub zero_star: bool,
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum()
+}
+
+fn std(v: &[f32]) -> f32 {
+    let mean = v.iter().map(|x| *x as f64).sum::<f64>() / v.len() as f64;
+    (v.iter().map(|x| (*x as f64 - mean).powi(2)).sum::<f64>() / (v.len() - 1) as f64).sqrt() as f32
+}
+
+/// `score_tangential_damping`: `uncond` along the first right singular vector of `[uncond, cond]`.
+fn tangential_damping(cond: &[f32], uncond: &[f32]) -> V {
+    let (uu, uc, cc) = (dot(uncond, uncond), dot(uncond, cond), dot(cond, cond));
+    let largest = (uu + cc) / 2.0 + (((uu - cc) / 2.0).powi(2) + uc * uc).sqrt();
+    // eigenvector of [[uu, uc], [uc, cc]]; the singular vector is the rows mixed by it
+    let (a, b) = if uc != 0.0 { (largest - cc, uc) } else if uu >= cc { (1.0, 0.0) } else { (0.0, 1.0) };
+    let v1: Vec<f64> = uncond.iter().zip(cond).map(|(u, c)| a * *u as f64 + b * *c as f64).collect();
+    let norm = v1.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm == 0.0 {
+        return vec![0.0; uncond.len()];
+    }
+    let along: f64 = uncond.iter().zip(&v1).map(|(u, v)| *u as f64 * v).sum::<f64>() / (norm * norm);
+    v1.iter().map(|v| (along * v) as f32).collect()
+}
+
+impl CfgTweaks {
+    pub fn any(&self) -> bool {
+        *self != Self::default()
+    }
+
+    /// `sampling_function` after the model: the guided prediction of one image and the uncond the
+    /// sampler sees. Without an uncond evaluation ComfyUI's is zero, and TCFG skips itself.
+    pub fn guide(&self, x: &[f32], cond: &[f32], uncond: Option<V>, scale: f32, sigma: f32) -> (V, V) {
+        let evaluated = uncond.is_some();
+        let mut uncond = uncond.unwrap_or_else(|| vec![0.0; cond.len()]);
+        if self.tangential && evaluated {
+            let score = |p: &[f32]| lc(&[(x, 1.0), (p, -1.0)]);
+            uncond = lc(&[(x, 1.0), (&tangential_damping(&score(cond), &score(&uncond)), -1.0)]);
+        }
+        let mixed = || lc(&[(&uncond, 1.0 - scale), (cond, scale)]);
+        let mut out = match self.function {
+            None => mixed(),
+            Some(CfgFunction::Rescale { multiplier }) => {
+                let cfg = mixed();
+                let ratio = std(cond) / std(&cfg).max(1e-8);
+                lc(&[(&cfg, multiplier * ratio), (&cfg, 1.0 - multiplier)])
+            }
+            Some(CfgFunction::Renorm { cfg_trunc, renorm_cfg }) if sigma < cfg_trunc => {
+                let mut half = mixed();
+                if renorm_cfg > 0.0 {
+                    let limit = dot(cond, cond).sqrt() as f32 * renorm_cfg;
+                    let norm = dot(&half, &half).sqrt() as f32;
+                    if norm >= limit {
+                        half = lc(&[(&half, limit / norm)]);
+                    }
+                }
+                half
+            }
+            Some(CfgFunction::Renorm { .. }) => cond.to_vec(),
+        };
+        if self.zero_star {
+            let (c, u) = (lc(&[(x, 1.0), (cond, -1.0)]), lc(&[(x, 1.0), (&uncond, -1.0)]));
+            let alpha = (dot(&c, &u) / (dot(&u, &u) + 1e-8)) as f32;
+            out = lc(&[(&out, 1.0), (&uncond, alpha - 1.0 + scale * (1.0 - alpha))]);
+        }
+        (out, uncond)
+    }
+}
+
 /// What a sampler wants from the uncond prediction of an evaluation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Uncond {

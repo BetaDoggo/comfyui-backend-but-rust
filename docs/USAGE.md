@@ -20,7 +20,6 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--resident-blocks N`, `--slots N` | override the automatic VRAM residency plan |
 | `--anima`, `--moss`, `--h3` | pick the model family; the default is Krea 2 |
 | `--frames N` | H3 video length, snapped up to the 17k + 5 grid (default 5) |
-| `--swarm-template` | MOSS Image: encode with the Krea 2 template, as SwarmUI does |
 | `--lora path[:strength[:clip_strength]]` | repeatable, see [LoRAs](#loras) |
 | `--models`, `--dit`, `--te`, `--vae` | model folder, or individual files |
 | `--dump f.safetensors`, `--ref-noise ref.safetensors` | parity debugging against `tools/ref_dump.py` |

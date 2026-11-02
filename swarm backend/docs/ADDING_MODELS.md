@@ -147,7 +147,7 @@ Whichever route the nodes take, this part is always engine work:
 3. **Parameter probe.** Add the model to `MODELS` in `tools/probe_swarm_params.py`, and to `MODELS` /
    `MODEL_NAMES` in `tools/gen_compat_doc.py`. Re-run the probe so COMPATIBILITY.md covers every SwarmUI
    parameter for the new model. This is how model-specific quirks surface, such as Qwen Image 2.1's
-   half-size placeholder latent and MOSS reusing the Krea 2 template.
+   half-size placeholder latent and MOSS being sent a Krea 2 template it only uses with images.
 4. **INPUT_MAPPING.md.** Add a column to the op table and a section in the same shape as the existing
    ones: detected class, files, graph, the param → request table, and the engine-side work.
 5. **STATUS.md.** Add the model to [STATUS](../../docs/STATUS.md), and to [Models](../../docs/MODELS.md) once it really

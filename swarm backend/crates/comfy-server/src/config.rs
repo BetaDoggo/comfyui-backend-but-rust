@@ -42,6 +42,10 @@ pub struct Config {
     #[arg(long, default_value_t = 2048)]
     pub max_side: usize,
 
+    /// native engine: send latent previews while sampling. Off by default.
+    #[arg(long, default_value_t = false)]
+    pub live_previews: bool,
+
     /// Mock engine only: artificial delay per sampling step, so progress/previews are visible.
     #[arg(long, default_value_t = 40)]
     pub mock_step_ms: u64,
@@ -76,6 +80,7 @@ impl Config {
             engine: "mock".into(),
             reserve_vram: 512,
             max_side: 2048,
+            live_previews: false,
             mock_step_ms: 0,
             mock_native_only: false,
             max_history: 100,

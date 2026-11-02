@@ -3,6 +3,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use diffusion::samplers::ModelSampling;
+use diffusion::pipeline::Prompt;
 use diffusion::{pipeline, serve, st};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -97,9 +98,6 @@ struct Args {
     /// MiniMax H3: frames at 24 fps, snapped up to the model's 17k + 5 grid
     #[arg(long, default_value_t = 5)]
     frames: usize,
-    /// MOSS Image: encode with the Krea 2 template, as SwarmUI does
-    #[arg(long)]
-    swarm_template: bool,
     /// Negative prompt (used when --cfg isn't 1, and by the cfg_pp samplers)
     #[arg(long, default_value = "")]
     negative: String,
@@ -212,8 +210,8 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             None => diffusion::sampling::torch_randn(seed, n),
         };
         let r = pipeline::AnimaRequest {
-            positive: diffusion::tokenizer::token_weights(&args.prompt, 1.0),
-            negative: diffusion::tokenizer::token_weights(&args.negative, 1.0),
+            positive: Prompt::new(diffusion::tokenizer::token_weights(&args.prompt, 1.0)),
+            negative: Prompt::new(diffusion::tokenizer::token_weights(&args.negative, 1.0)),
             width: args.width,
             height: args.height,
             sampling: args.sampling("er_sde", ModelSampling::Flow { shift }, seed, (args.width / 8, args.height / 8))?,
@@ -221,7 +219,7 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         };
         let mut dump = pipeline::Dump::new();
         let t0 = Instant::now();
-        let (latent, _) = gen.sample_anima(&r, |_, _| true, args.dump.as_ref().map(|_| &mut dump))?;
+        let (latent, _) = gen.sample_anima(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
         let rgb = gen.decode_latent(&latent, args.width, args.height)?;
         eprintln!("image done in {:.2}s", t0.elapsed().as_secs_f64());
         let path = out_path(&args.out, i, args.count);
@@ -251,9 +249,8 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             None => diffusion::sampling::torch_randn(seed, n),
         };
         let r = pipeline::MossRequest {
-            positive: args.prompt.clone(),
-            negative: args.negative.clone(),
-            template: args.swarm_template.then(|| diffusion::te::TEMPLATE.to_string()),
+            positive: Prompt::text(args.prompt.trim()),
+            negative: Prompt::text(args.negative.trim()),
             width: args.width,
             height: args.height,
             sampling: args.sampling("euler", ModelSampling::Flow { shift }, seed, (args.width / 16, args.height / 16))?,
@@ -261,7 +258,7 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         };
         let mut dump = pipeline::Dump::new();
         let t0 = Instant::now();
-        let (latent, _) = gen.sample_moss(&r, |_, _| true, args.dump.as_ref().map(|_| &mut dump))?;
+        let (latent, _) = gen.sample_moss(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
         let t1 = Instant::now();
         let rgb = gen.decode_moss(&latent, args.width, args.height)?;
         eprintln!("VAE decode {:.0} ms, image done in {:.2}s", t1.elapsed().as_secs_f64() * 1e3, t0.elapsed().as_secs_f64());
@@ -307,10 +304,10 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         None => diffusion::sampling::torch_randn_streams(args.seed, &[shape.video_len(), shape.audio_len()]).concat(),
     };
     let sampling = args.sampling("res_multistep", ModelSampling::Flow { shift: h3::SHIFT_VIDEO }, args.seed, (args.width / 16, args.height / 16))?;
-    let r = pipeline::H3Request { prompt: args.prompt.clone(), negative: args.negative.clone(), shape, sampling, shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO), noise };
+    let r = pipeline::H3Request { prompt: Prompt::text(&args.prompt), negative: Prompt::text(&args.negative), shape, sampling, shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO), noise };
     let mut dump = pipeline::Dump::new();
     let t0 = Instant::now();
-    let (latent, _) = gen.sample_h3(&r, |_, _| true, args.dump.as_ref().map(|_| &mut dump))?;
+    let (latent, _) = gen.sample_h3(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
     eprintln!("sampled in {:.2}s", t0.elapsed().as_secs_f64());
     dump.insert("samples".into(), ("F32".into(), vec![latent.len()], st::f32_bytes(&latent).to_vec()));
     if let Some(d) = &args.dump {
@@ -495,8 +492,8 @@ fn main() -> Result<()> {
     }).collect::<Result<Vec<_>>>()?;
     for (img_i, (prompt, seed_off)) in jobs.into_iter().enumerate() {
         let req = pipeline::Request {
-            prompt,
-            negative: args.negative.clone(),
+            prompt: Prompt::text(&prompt),
+            negative: Prompt::text(&args.negative),
             seed: args.seed + seed_off,
             width: args.width,
             height: args.height,
@@ -511,7 +508,7 @@ fn main() -> Result<()> {
         if let Some(r) = references.first() {
             dump.insert("ref0".into(), ("F32".into(), vec![16, r.height, r.width], st::f32_bytes(&r.latent).to_vec()));
         }
-        let (rgb, _) = gen.generate(&req, |_, _| true, args.dump.as_ref().map(|_| &mut dump))?;
+        let (rgb, _) = gen.generate(&req, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
         let path = out_path(&args.out, img_i, n_jobs);
         std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
             .with_context(|| format!("writing {}", path.display()))?;

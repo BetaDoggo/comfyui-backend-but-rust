@@ -46,10 +46,10 @@ cargo run --release -p comfy-server --features native -- --engine native --model
 On Windows, [`start-backend.bat`](start-backend.bat) does this for the folder in `MODELS_ROOT`, and prints what to enter
 in SwarmUI. Extra arguments go to the server, so `--models-root` can add a second folder.
 
-Extra flags: `--reserve-vram 512` (MB left for the desktop and other apps) and `--max-side 2048`.
+Extra flags: `--reserve-vram 512` (MB left for the desktop and other apps), `--max-side 2048` and `--live-previews` (off by default).
 
 The checkpoint's keys pick the family, and one family is loaded at a time. Switching took 4 s to Anima, 9 s to Krea 2 and
-about 3 s to MOSS Image with the files cached. There are no live previews.
+about 3 s to MOSS Image with the files cached.
 
 | | Krea 2 | Anima | MOSS Image | MiniMax H3 |
 |---|---|---|---|---|
@@ -57,15 +57,18 @@ about 3 s to MOSS Image with the files cached. There are no live previews.
 | Turbo settings | CFG 1, Steps 8 | CFG 1, Steps 8 | Steps 8, CFG 1 with a DMD LoRA; otherwise Steps 20, CFG 4 | CFG 1, Steps 4 with the LoRA |
 | Seed, Sigma Shift, cancelling, Free VRAM | Yes | Yes | Yes | Yes |
 | Batch Size | Yes | Yes | Yes | Not tested |
-| Variation Seed | Yes | Yes | Not tested | Refused |
+| Variation Seed | Yes | Yes | Not tested | Yes |
 | Model Attention Backend | `int8`, `flash` | `int8`, `flash` | `int8`, `flash` | Not tested |
-| `(word:1.2)` and `<weight>` | Refused; `(word:1.2)` stays plain text | Yes | Refused; `(word:1.2)` stays plain text | Not tested |
+| `<weight>` | Refused | Yes | Yes | Yes |
+| `(word:1.2)` | Plain text | Yes | Plain text | Plain text |
+| `<break>` | Yes, not with Prompt Images | Refused | Yes | Refused |
+| Rescale CFG, Renorm CFG, CFG Zero Star, TCFG | Yes | Yes | Yes | Refused |
 | Prompt Images | Yes, with `index` and `index_timestep_zero` reference latents | Not supported | Refused | Refused |
 
 These work on every family: all samplers and schedulers except `ltxv-image`, any CFG with a negative prompt, Sampler Sigma
-Min, Sigma Max and Rho, and LoRAs. See [Usage](../docs/USAGE.md) and [Models](../docs/MODELS.md).
+Min, Sigma Max and Rho, LoRAs, live previews with `--live-previews`, Conditioning Multiplier, Negative Conditioning Multiplier and Zero Negative. See [Usage](../docs/USAGE.md) and [Models](../docs/MODELS.md).
 
-Anything else is refused with an error in SwarmUI rather than silently ignored, including `<break>`, `<alternate>`,
+Anything else is refused with an error in SwarmUI rather than silently ignored, including `<alternate>`,
 `<fromto>`, LoRA hooks, init images, refiners, ControlNet, regions, Seamless Tileable, and VAE tiling. H3 only
 accepts VAE tile sizes of 256 / 64.
 

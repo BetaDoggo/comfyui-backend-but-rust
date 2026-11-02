@@ -48,6 +48,13 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Engine core | Schedulers: normal, karras, sgm_uniform, beta | All 9 ComfyUI schedulers plus turbo, align_your_steps, flux2 and ideogram4. Within 2e-6 of ComfyUI on 1105 schedules. ltxv-image is refused. |
 | P2 | Engine core | Sigma overrides | Sigma Min, Sigma Max and Rho for karras and exponential, as SwarmKSampler does. Run once through the server API. |
 | P2 | Krea 2 | Prompt Images | Vision tower and DeepStack, up to several images, on both prompts. Tokens match SwarmUI's text node, 40.8 dB from ComfyUI, tested through SwarmUI. A 1024 image costs 3.9 s against 130 ms at 384. |
+| P1 | Engine core | Live previews | Off unless the server gets `--live-previews`. All four families, through the ComfyUI latent-to-RGB factors, honouring Swarm's preview modes. Direct workflow test: previews arrive and the final image is pixel-identical without them. Not looked at in SwarmUI's page. H3 shows the first frame only, where ComfyUI can animate. |
+| P1 | Engine core | Conditioning Multiplier, Negative Conditioning Multiplier, Zero Negative | All four families in the engine. Direct workflow tests on Krea 2, MOSS Image and Anima; H3 not run. Krea 2 and MOSS Image match ComfyUI's picture at 23 to 26 dB, as their plain images do. Zero Negative's mottled texture at CFG above 1 is in ComfyUI too. |
+| P1 | Krea 2 | <break> | Chunks encoded apart and joined. 27.9 dB from ComfyUI at 768, direct workflow test. Refused with Prompt Images. |
+| P1 | MOSS Image | MOSS Image <weight> and <break> | Tokens and weights match SwarmTextEncodeAdvanced's own code. 25.9 and 31.6 dB from ComfyUI at 768, direct workflow test. Prompts now use the model's template, as SwarmUI does without images. |
+| P1 | MiniMax H3 | H3 <weight> | Tokens and weights match SwarmTextEncodeAdvanced's own code. Direct workflow test, output changes as expected. Not compared with ComfyUI on a real run. |
+| P1 | MiniMax H3 | H3 Variation Seed | Noise matches swarm_fixed_noise on a small latent. Direct workflow test. Not compared with ComfyUI on a real run. |
+| P2 | Guidance and speed | CFG tweaks | Rescale, Renorm, CFG Zero Star and TCFG on Krea 2, Anima and MOSS Image, against ComfyUI's own code on random tensors, within 2e-5. Sample of real output by direct workflow test, not compared with ComfyUI. Refused on H3. |
 | P2 | Krea 2 | Reference latents | index and index_timestep_zero, tested through SwarmUI. 1% from ComfyUI on the first evaluation; images 25 dB, about what int8 and flash differ by here (27 and 19 dB). No Krea 2 edit LoRA installed, so base model only. |
 
 ## Doing
@@ -63,7 +70,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | Priority | Area | Item | Notes |
 |---|---|---|---|
 | P0 | Server | Graph validation and execution | 163 native nodes with stock schemas. Exercised with real workflows only for Krea 2 text-to-image. |
-| P0 | Server | Swarm prompt syntax parsing | <break>, <weight>, <alternate>, <fromto>, <embed> and LoRA hooks parse. Anima honours <weight>. Krea 2 and MOSS Image refuse all of them, and Anima refuses the rest. |
+| P0 | Server | Swarm prompt syntax parsing | <break>, <weight>, <alternate>, <fromto>, <embed> and LoRA hooks parse. See the rows for each family and the Todo rows for what is refused. |
 | P0 | Image workflows | Init image and Creativity | Graph runs on the mock. Needs the VAE encoder and partial sampling. |
 | P0 | Image workflows | Refiner and upscale | Both latent and model upscale paths reach the engine API. |
 | P0 | LoRA and control | LoRAs on non-quantised models | Loader, patches and hooks reach the engine. No non-quantised model runs yet; int8 LoRAs work. The LoRA formats are done in src/lora.rs. |
@@ -85,7 +92,6 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P2 | LoRA and control | GLIGEN | Boxes reach the engine. |
 | P2 | LoRA and control | IP-Adapter | Generic route only. |
 | P2 | Masks and detection | Remove Background | Needs a background removal model. |
-| P2 | Guidance and speed | CFG tweaks | Rescale, Renorm, CFG Zero Star, TCFG. Need the CFG work first. |
 | P2 | Guidance and speed | Attention guidance | SAG, PAG and NAG. |
 | P2 | Guidance and speed | FreeU | UNet models only. |
 | P2 | Video and audio | Video generation workflow | Frames, swap, extend, boomerang, trim and end image, on the mock. |
@@ -101,10 +107,9 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 |---|---|---|---|
 | P0 | Engine core | Move Krea 2 behind a shared engine crate | Share the CUDA runtime, kernels, offloading and sampler between model families instead of hard-coding Krea 2. |
 | P0 | Engine core | Latent operations | Add, multiply, blend, batch, repeat and upscale. Needed by init images, refiners and regions. |
-| P1 | Engine core | Live previews | Latent-to-RGB preview during sampling. Swarm shows none for the native engine today. |
 | P1 | Engine core | Hardware beyond this card | Everything targets sm_120 on Windows. Other GPUs and Linux are untested. |
 | P1 | Krea 2 | Prompt weights | <weight> through SwarmAttnTokenWeights, inside attention. |
-| P1 | Krea 2 | <break>, <alternate> and <fromto> | Per-chunk and per-step conditioning. |
+| P1 | Krea 2 | <alternate> and <fromto> | Per-step conditioning. |
 | P1 | Krea 2 | Non-W8A8 Krea 2 files | fp8 and other formats are refused. |
 | P1 | Qwen Image 2.1 | Qwen Image 2.1 engine | Installed. Qwen3-VL 8B text encoder, RGBA VAE, 2x placeholder latent. |
 | P1 | SD family | SD1 and SDXL engine | SD1 checkpoint installed. CLIP, UNet and classic VAE, and all-in-one checkpoints. Would widen coverage most. |
@@ -113,7 +118,6 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Anima | Close the ComfyUI output gap | LLM adapter output differs by 1.7%, cause unknown. Same picture at about 25 dB PSNR. |
 | P1 | Anima | Anima <break>, <alternate> and <fromto> | Per-chunk and per-step conditioning. |
 | P1 | MiniMax H3 | H3 first and last frame, references | Needs the video and audio encoders and the 32B vision tower. The turbo LoRA is trained for these modes. |
-| P1 | MiniMax H3 | H3 Variation Seed | Refused with an error. SwarmUI slerps each stream's noise. |
 | P1 | MiniMax H3 | H3 long clips | Longer than 22 frames and above 512x512 untested. Sparse attention isn't ported; its source is in comfy-kitchen. |
 | P1 | MOSS Image | MOSS Image reference images | Prompt Images and edit LoRAs need Qwen3.5's vision encoder, the VAE encoder and reference tokens. |
 | P1 | MOSS Image | Other MOSS Image checkpoint formats | bf16 and unfused q/k/v files are refused. Only fused int8 ConvRot runs. |

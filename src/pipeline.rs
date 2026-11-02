@@ -1,10 +1,11 @@
 //! Loaded models + one text-to-image generation, shared by the CLI and the web server.
 
 use crate::cuda::{self, DevBuf, Event, Stream};
-use crate::samplers::{self, Eval, ModelSampling, Uncond};
+use crate::samplers::{self, CfgTweaks, Eval, ModelSampling, Uncond};
 use crate::vision::{self, PromptImage};
 use crate::{anima, dit, ffi, flux2vae, h3, h3te, h3vae, lora, moss, offload, qwen3, qwen35, sampling, st, te, tokenizer, vae};
 use anyhow::{bail, Context, Result};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,13 +44,102 @@ pub struct Sampling {
     /// This image's place in its batch: the sampler noise is one tensor for the whole batch.
     pub batch_index: usize,
     pub batch_size: usize,
+    pub tweaks: CfgTweaks,
+}
+
+/// A prompt as ComfyUI's conditioning is built from it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Prompt {
+    /// `<break>` chunks, encoded apart and joined. Each is (text, weight) segments.
+    pub chunks: Vec<Vec<(String, f32)>>,
+    /// `ConditioningMultiply` and `ConditioningZeroOut`, on the text encoder's output.
+    pub scale: f32,
+}
+
+impl Prompt {
+    pub fn new(segments: Vec<(String, f32)>) -> Self {
+        Prompt { chunks: vec![segments], scale: 1.0 }
+    }
+
+    pub fn text(text: &str) -> Self {
+        Self::new(vec![(text.to_string(), 1.0)])
+    }
+
+    /// For the models whose prompts can't take `<break>`.
+    fn segments(&self) -> Result<&[(String, f32)]> {
+        match self.chunks.as_slice() {
+            [segments] => Ok(segments),
+            _ => bail!("this model takes one prompt chunk"),
+        }
+    }
+}
+
+/// One step of a run: `denoised` is the latest prediction of the image.
+pub struct Step<'a> {
+    pub index: usize,
+    pub total: usize,
+    pub denoised: &'a [f32],
+}
+
+/// Multiply the rows of an f32 [rows, width] buffer, each by its factor.
+fn scale_rows(b: &DevBuf, width: usize, factors: &[f32], st: &Stream) -> Result<()> {
+    if factors.iter().all(|f| *f == 1.0) {
+        return Ok(());
+    }
+    let mut bytes = vec![0u8; factors.len() * width * 4];
+    b.download(0, &mut bytes, st)?;
+    for (row, f) in bytes.chunks_exact_mut(width * 4).zip(factors) {
+        for v in row.chunks_exact_mut(4) {
+            v.copy_from_slice(&(f32::from_le_bytes([v[0], v[1], v[2], v[3]]) * f).to_le_bytes());
+        }
+    }
+    b.upload(0, &bytes, st)
+}
+
+/// A Krea 2 prompt's conditioning: its chunks encoded apart and joined along the tokens.
+fn krea_cond(te: &mut te::TextEncoder, prompt: &Prompt, images: &[&vision::Embeds], st: &Stream) -> Result<te::Cond> {
+    let conds = prompt.chunks.iter().map(|segments| {
+        let text: String = segments.iter().map(|(t, _)| t.as_str()).collect();
+        let text = if images.is_empty() { text } else { te::image_prompt(&text, images.len()) };
+        te.encode_with_images(&text, images, prompt.scale, st)
+    }).collect::<Result<Vec<_>>>()?;
+    te::Cond::concat(conds, st)
+}
+
+/// Token ids and per-token factors of a MOSS Image chunk: SwarmTextEncodeAdvanced tokenizes each
+/// segment apart and puts them inside the template.
+pub fn moss_tokens(t: &tokenizer::Tokenizer, segments: &[(String, f32)]) -> Result<(Vec<u32>, Vec<f32>)> {
+    let (head, tail) = qwen35::TEMPLATE.split_once("{}").context("template")?;
+    let mut ids = t.encode(head)?;
+    let mut factors = vec![1.0; ids.len()];
+    for (text, weight) in segments {
+        ids.extend(t.encode(text)?);
+        factors.resize(ids.len(), *weight);
+    }
+    ids.extend(t.encode(tail)?);
+    factors.resize(ids.len(), 1.0);
+    Ok((ids, factors))
+}
+
+/// The same for MiniMax H3, which has no template.
+pub fn h3_tokens(t: &tokenizer::Tokenizer, segments: &[(String, f32)]) -> Result<(Vec<u32>, Vec<f32>)> {
+    let (mut ids, mut factors) = (Vec::new(), Vec::new());
+    for (text, weight) in segments {
+        ids.extend(t.encode(text)?);
+        factors.resize(ids.len(), *weight);
+    }
+    if ids.is_empty() {
+        ids.push(151643);
+        factors.push(1.0);
+    }
+    Ok((ids, factors))
 }
 
 impl Sampling {
     /// One image at `cfg` with the given sampler and scheduler.
     pub fn new(sampler: &str, scheduler: &str, model_sampling: ModelSampling, steps: usize, cfg: f64, seed: u64, latent: (usize, usize)) -> Result<Self> {
         let sigmas = samplers::sigmas(model_sampling, sampler, scheduler, steps, latent, None)?;
-        Ok(Sampling { sampler: sampler.to_string(), model_sampling, sigmas, cfg, seed, batch_index: 0, batch_size: 1 })
+        Ok(Sampling { sampler: sampler.to_string(), model_sampling, sigmas, cfg, seed, batch_index: 0, batch_size: 1, tweaks: CfgTweaks::default() })
     }
 
     /// True when the negative prompt has to be encoded.
@@ -59,9 +149,9 @@ impl Sampling {
 }
 
 pub struct Request {
-    pub prompt: String,
+    pub prompt: Prompt,
     /// Only encoded when the sampling uses it.
-    pub negative: String,
+    pub negative: Prompt,
     pub seed: u64,
     pub width: usize,
     pub height: usize,
@@ -88,7 +178,7 @@ pub struct Reference {
 /// A prompt as the text encoder saw it.
 #[derive(PartialEq)]
 struct PromptKey {
-    text: String,
+    prompt: Prompt,
     images: Vec<PromptImage>,
 }
 
@@ -124,10 +214,10 @@ struct DitModel {
 }
 
 pub struct AnimaRequest {
-    /// (text, weight) segments, see [`tokenizer::token_weights`]
-    pub positive: Vec<(String, f32)>,
+    /// One chunk of segments, see [`tokenizer::token_weights`]
+    pub positive: Prompt,
     /// Only encoded when the sampling uses it.
-    pub negative: Vec<(String, f32)>,
+    pub negative: Prompt,
     pub width: usize,
     pub height: usize,
     pub sampling: Sampling,
@@ -142,11 +232,9 @@ struct AnimaModel {
 }
 
 pub struct MossRequest {
-    pub positive: String,
+    pub positive: Prompt,
     /// Only encoded when the sampling uses it.
-    pub negative: String,
-    /// `{}` marks the prompt; None is ComfyUI's own (the prompt is trimmed and the think block left open).
-    pub template: Option<String>,
+    pub negative: Prompt,
     pub width: usize,
     pub height: usize,
     pub sampling: Sampling,
@@ -161,9 +249,9 @@ struct MossModel {
 }
 
 pub struct H3Request {
-    pub prompt: String,
+    pub prompt: Prompt,
     /// Only encoded when the sampling uses it.
-    pub negative: String,
+    pub negative: Prompt,
     pub shape: h3::Shape,
     pub sampling: Sampling,
     /// video, audio
@@ -182,7 +270,7 @@ struct H3Model {
 /// One run of a sampler. `model(x, out, sigma, negative, evaluation)` writes a denoised latent, and
 /// is called twice per evaluation under CFG, always positive first.
 fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
-    model: &mut dyn FnMut(&DevBuf, &DevBuf, f32, bool, usize) -> Result<()>, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<Vec<f32>> {
+    model: &mut dyn FnMut(&DevBuf, &DevBuf, f32, bool, usize) -> Result<()>, progress: &mut dyn FnMut(Step) -> bool) -> Result<Vec<f32>> {
     let threads = unsafe { ffi::gpu_randn_threads() };
     if threads <= 0 {
         bail!("could not read the GPU's core count");
@@ -194,6 +282,7 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
     let guided = (s.cfg - 1.0).abs() > 1e-6;
     let mut evals = 0;
     let mut sample_ms = 0.0;
+    let latest = RefCell::new(Vec::new());
     let mut eval = |v: &[f32], sigma: f32, mode: Uncond| -> Result<Eval> {
         e0.record(st)?;
         x.upload(0, &st::f32_bytes(v), st)?;
@@ -201,16 +290,24 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
         let negative = guided || mode == Uncond::Force;
         if negative {
             model(&x, &und, sigma, true, evals)?;
-            let (p, c) = ([und.ptr() as ffi::P, den.ptr() as ffi::P], [1.0 - cfg, cfg]);
-            ffi::k!(gpu_lincomb(den.ptr(), n as i64, 2, p.as_ptr(), c.as_ptr(), ffi::s(st)))?;
+            if !s.tweaks.any() {
+                let (p, c) = ([und.ptr() as ffi::P, den.ptr() as ffi::P], [1.0 - cfg, cfg]);
+                ffi::k!(gpu_lincomb(den.ptr(), n as i64, 2, p.as_ptr(), c.as_ptr(), ffi::s(st)))?;
+            }
         }
         let read = |b: &DevBuf| -> Result<Vec<f32>> {
             let mut bytes = vec![0u8; n * 4];
             b.download(0, &mut bytes, st)?;
             Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
         };
-        let denoised = read(&den)?;
-        let uncond = if negative && mode != Uncond::Skip { Some(read(&und)?) } else { None };
+        let (denoised, uncond) = if s.tweaks.any() {
+            let raw = if negative { Some(read(&und)?) } else { None };
+            let (d, u) = s.tweaks.guide(v, &read(&den)?, raw, cfg, sigma);
+            (d, (negative && mode != Uncond::Skip).then_some(u))
+        } else {
+            (read(&den)?, if negative && mode != Uncond::Skip { Some(read(&und)?) } else { None })
+        };
+        latest.borrow_mut().clone_from(&denoised);
         e1.record(st)?;
         e1.sync()?;
         let ms = e1.elapsed_ms(&e0)? as f64;
@@ -219,7 +316,7 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
         eprintln!("evaluation {evals} sigma {sigma:.4}: {ms:.0} ms");
         Ok(Eval { denoised, uncond })
     };
-    let mut step = |i: usize, total: usize| if progress(i, total) { Ok(()) } else { Err(Cancelled.into()) };
+    let mut step = |index: usize, total: usize| if progress(Step { index, total, denoised: &latest.borrow() }) { Ok(()) } else { Err(Cancelled.into()) };
     let batch = samplers::Batch { index: s.batch_index, size: s.batch_size, threads: threads as usize };
     let out = samplers::sample(&s.sampler, s.model_sampling, &s.sigmas, noise, s.seed, batch, &mut eval, &mut step)?;
     stats.sample_ms = sample_ms;
@@ -227,7 +324,8 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
     Ok(out)
 }
 
-type AnimaPrompt = Vec<(String, f32)>;
+/// Token ids and per-token factors, one pair per `<break>` chunk.
+type TokenKey = Vec<(Vec<u32>, Vec<f32>)>;
 
 pub struct Generator {
     st: Stream,
@@ -237,19 +335,19 @@ pub struct Generator {
     qwen3: Option<(PathBuf, qwen3::TextEncoder)>,
     tokenizers: Option<(tokenizer::Tokenizer, tokenizer::T5Tokenizer)>,
     /// Latest encoded prompts, most recent last.
-    contexts: Vec<(AnimaPrompt, anima::Context)>,
+    contexts: Vec<(Prompt, anima::Context)>,
     moss: Option<MossModel>,
     qwen35: Option<(PathBuf, qwen35::TextEncoder)>,
     moss_tokenizer: Option<tokenizer::Tokenizer>,
-    /// Latest encoded token ids, most recent last.
-    moss_contexts: Vec<(Vec<u32>, moss::Context)>,
+    /// Latest encoded tokens, most recent last.
+    moss_contexts: Vec<(TokenKey, moss::Context)>,
     h3: Option<H3Model>,
     h3_te: Option<(PathBuf, h3te::TextEncoder)>,
     h3_tokenizer: Option<tokenizer::Tokenizer>,
     h3_vae: Option<(PathBuf, h3vae::VideoDecoder)>,
     h3_audio: Option<(PathBuf, h3vae::AudioDecoder)>,
-    /// Latest encoded token ids, most recent last.
-    h3_contexts: Vec<(Vec<u32>, DevBuf)>,
+    /// Latest encoded tokens with their length, most recent last.
+    h3_contexts: Vec<(TokenKey, usize, DevBuf)>,
     vae: Option<(PathBuf, vae::Vae)>,
     flux2: Option<(PathBuf, flux2vae::Vae)>,
     cached: Option<(PromptKey, te::Cond, DevBuf)>,
@@ -544,20 +642,24 @@ impl Generator {
         Ok(())
     }
 
-    /// The refined context of `prompt`, as its place in the cache and its length.
-    fn h3_context(&mut self, prompt: &str, dump: Option<&mut Dump>) -> Result<(usize, usize)> {
+    /// Move the refined context of `prompt` to the end of the cache, encoding it if needed, and
+    /// return its key.
+    fn h3_context(&mut self, prompt: &Prompt, dump: Option<&mut Dump>) -> Result<TokenKey> {
         let tok = self.h3_tokenizer.as_ref().context("no H3 tokenizer")?;
-        let mut ids = tok.encode(prompt)?;
-        if ids.is_empty() {
-            ids.push(151643);
+        let (ids, mut factors) = h3_tokens(tok, prompt.segments()?)?;
+        factors.iter_mut().for_each(|f| *f *= prompt.scale);
+        let key = vec![(ids, factors)];
+        if let Some(i) = self.h3_contexts.iter().position(|(k, ..)| *k == key) {
+            let hit = self.h3_contexts.remove(i);
+            self.h3_contexts.push(hit);
+            return Ok(key);
         }
-        if let Some(i) = self.h3_contexts.iter().position(|(k, _)| *k == ids) {
-            return Ok((i, ids.len()));
-        }
+        let (ids, factors) = &key[0];
         let t0 = Instant::now();
         let st = &self.st;
         let (_, te) = self.h3_te.as_mut().context("no H3 text encoder")?;
-        let cond = te.encode(&ids, st)?;
+        let cond = te.encode(ids, st)?;
+        scale_rows(&cond, h3te::D, factors, st)?;
         if let Some(d) = dump {
             let mut b = vec![0u8; ids.len() * h3te::D * 4];
             cond.download(0, &mut b, st)?;
@@ -571,8 +673,8 @@ impl Generator {
             self.h3_contexts.remove(0);
         }
         let len = ids.len();
-        self.h3_contexts.push((ids, ctx));
-        Ok((self.h3_contexts.len() - 1, len))
+        self.h3_contexts.push((key.clone(), len, ctx));
+        Ok(key)
     }
 
     /// The stream the models run on.
@@ -623,22 +725,25 @@ impl Generator {
     }
 
     /// Sample a clip; returns the pack of latents, video then audio.
-    pub fn sample_h3(&mut self, r: &H3Request, mut progress: impl FnMut(usize, usize) -> bool, mut dump: Option<&mut Dump>) -> Result<(Vec<f32>, Stats)> {
+    pub fn sample_h3(&mut self, r: &H3Request, mut progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>) -> Result<(Vec<f32>, Stats)> {
         let t0 = Instant::now();
         let mut stats = Stats::default();
         let shifts = (r.shifts.0 as f32, r.shifts.1 as f32);
         self.h3.as_mut().context("no H3 model")?.dit.shifts = shifts;
-        let (pos, text) = self.h3_context(&r.prompt, dump.as_deref_mut())?;
-        if let Some(d) = dump.as_deref_mut() {
-            let bytes = text * 5376 * 2;
-            let mut v = vec![0u8; bytes];
-            self.h3_contexts[pos].1.download(0, &mut v, &self.st)?;
-            d.insert("ctx".into(), ("BF16".into(), vec![bytes / 2], v));
-        }
-        let neg = if r.sampling.uses_negative() { Some(self.h3_context(&r.negative, None)?) } else { None };
+        let neg_key = if r.sampling.uses_negative() { Some(self.h3_context(&r.negative, None)?) } else { None };
+        let pos_key = self.h3_context(&r.prompt, dump.as_deref_mut())?;
         stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;
         let st = &self.st;
         let contexts = &self.h3_contexts;
+        let find = |key: &TokenKey| contexts.iter().find(|(k, ..)| k == key).map(|(_, len, ctx)| (ctx, *len)).unwrap();
+        let (pos, text) = find(&pos_key);
+        let neg = neg_key.as_ref().map(find);
+        if let Some(d) = dump.as_deref_mut() {
+            let bytes = text * 5376 * 2;
+            let mut v = vec![0u8; bytes];
+            pos.download(0, &mut v, st)?;
+            d.insert("ctx".into(), ("BF16".into(), vec![bytes / 2], v));
+        }
         let m = self.h3.as_mut().context("no H3 model")?;
         // what is left after the activations goes to the blocks, re-planned for this shape
         st.sync()?;
@@ -661,8 +766,8 @@ impl Generator {
                 }
             };
             match (negative, neg, &rope_neg) {
-                (true, Some((i, l)), Some(rn)) => dit.predict(x, &r.shape, &contexts[i].1, l, rn, sigma, den, st, None)?,
-                _ => dit.predict(x, &r.shape, &contexts[pos].1, text, &rope, sigma, den, st, Some(&mut keep))?,
+                (true, Some((c, l)), Some(rn)) => dit.predict(x, &r.shape, c, l, rn, sigma, den, st, None)?,
+                _ => dit.predict(x, &r.shape, pos, text, &rope, sigma, den, st, Some(&mut keep))?,
             }
             if let (0, false, Some(d)) = (e, negative, first.as_mut()) {
                 let mut b = vec![0u8; n * 4];
@@ -714,19 +819,19 @@ impl Generator {
         Ok(())
     }
 
-    /// Token ids of a MOSS Image prompt, as ComfyUI's tokenizer builds them.
-    fn moss_ids(&self, prompt: &str, template: Option<&str>) -> Result<Vec<u32>> {
+    /// The tokens of a MOSS Image prompt, one pair per chunk.
+    fn moss_key(&self, prompt: &Prompt) -> Result<TokenKey> {
         let t = self.moss_tokenizer.as_ref().context("no text encoder loaded")?;
-        let text = match template {
-            Some(tpl) => tpl.replacen("{}", prompt, 1),
-            None => qwen35::TEMPLATE.replacen("{}", prompt.trim(), 1),
-        };
-        t.encode(&text)
+        prompt.chunks.iter().map(|segments| {
+            let (ids, mut factors) = moss_tokens(t, segments)?;
+            factors.iter_mut().for_each(|f| *f *= prompt.scale);
+            Ok((ids, factors))
+        }).collect()
     }
 
-    /// Move the context of `ids` to the end of the cache, encoding it if needed.
-    fn moss_context(&mut self, ids: &[u32], dump: Option<&mut Dump>) -> Result<()> {
-        if let Some(i) = self.moss_contexts.iter().position(|(p, _)| p == ids) {
+    /// Move the context of `key` to the end of the cache, encoding it if needed. `dump` sees the first chunk.
+    fn moss_context(&mut self, key: &TokenKey, mut dump: Option<&mut Dump>) -> Result<()> {
+        if let Some(i) = self.moss_contexts.iter().position(|(p, _)| p == key) {
             let hit = self.moss_contexts.remove(i);
             self.moss_contexts.push(hit);
             return Ok(());
@@ -735,30 +840,41 @@ impl Generator {
         let m = self.moss.as_mut().context("no diffusion model loaded")?;
         let te = &mut self.qwen35.as_mut().context("no text encoder loaded")?.1;
         let t0 = Instant::now();
-        let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
-        let mut probe = |name: &str, b: &DevBuf, bytes: usize| {
-            let mut v = vec![0u8; bytes];
-            b.download(0, &mut v, st).unwrap();
-            probes.push((name.to_string(), v));
-        };
-        let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if dump.is_some() { Some(&mut probe) } else { None };
-        let hidden = te.encode(ids, st, probe_ref)?;
-        let ctx = m.dit.encode_context(&hidden, ids.len(), st)?;
-        st.sync()?;
-        eprintln!("text: {} tokens in {:.0} ms", ids.len(), t0.elapsed().as_secs_f64() * 1e3);
-        if let Some(d) = dump {
-            d.insert("ids".into(), ("I64".into(), vec![ids.len()], ids.iter().flat_map(|&t| (t as i64).to_le_bytes()).collect()));
-            for (name, v) in probes {
-                d.insert(name, ("F32".into(), vec![ids.len(), qwen35::D], v));
+        let total: usize = key.iter().map(|(ids, _)| ids.len()).sum();
+        let hidden = DevBuf::alloc_async(total * qwen35::D * 4, st)?;
+        let mut at = 0;
+        for (chunk, (ids, factors)) in key.iter().enumerate() {
+            let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut probe = |name: &str, b: &DevBuf, bytes: usize| {
+                let mut v = vec![0u8; bytes];
+                b.download(0, &mut v, st).unwrap();
+                probes.push((name.to_string(), v));
+            };
+            let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if chunk == 0 && dump.is_some() { Some(&mut probe) } else { None };
+            let h = te.encode(ids, st, probe_ref)?;
+            scale_rows(&h, qwen35::D, factors, st)?;
+            cuda::memcpy_d2d(ffi::off(hidden.ptr(), at * qwen35::D * 4), h.ptr(), ids.len() * qwen35::D * 4, st)?;
+            at += ids.len();
+            st.sync()?;
+            if let (0, Some(d)) = (chunk, dump.as_deref_mut()) {
+                d.insert("ids".into(), ("I64".into(), vec![ids.len()], ids.iter().flat_map(|&t| (t as i64).to_le_bytes()).collect()));
+                for (name, v) in probes {
+                    d.insert(name, ("F32".into(), vec![ids.len(), qwen35::D], v));
+                }
             }
+        }
+        let ctx = m.dit.encode_context(&hidden, total, st)?;
+        st.sync()?;
+        eprintln!("text: {total} tokens in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        if let Some(d) = dump {
             let mut b = vec![0u8; hidden.size()];
             hidden.download(0, &mut b, st)?;
-            d.insert("cond".into(), ("F32".into(), vec![ids.len(), qwen35::D], b));
+            d.insert("cond".into(), ("F32".into(), vec![total, qwen35::D], b));
             let mut b = vec![0u8; ctx.ctx.size()];
             ctx.ctx.download(0, &mut b, st)?;
-            d.insert("text_embedder_out".into(), ("BF16".into(), vec![ids.len(), 3072], b));
+            d.insert("text_embedder_out".into(), ("BF16".into(), vec![total, 3072], b));
         }
-        self.moss_contexts.push((ids.to_vec(), ctx));
+        self.moss_contexts.push((key.clone(), ctx));
         if self.moss_contexts.len() > ANIMA_CONTEXTS {
             self.moss_contexts.remove(0);
         }
@@ -766,7 +882,7 @@ impl Generator {
     }
 
     /// One MOSS Image latent, sampled as ComfyUI's KSampler does.
-    pub fn sample_moss(&mut self, r: &MossRequest, mut progress: impl FnMut(usize, usize) -> bool, mut dump: Option<&mut Dump>)
+    pub fn sample_moss(&mut self, r: &MossRequest, mut progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
         -> Result<(Vec<f32>, Stats)> {
         if r.width % 16 != 0 || r.height % 16 != 0 || r.width == 0 || r.height == 0 {
             bail!("width and height must be positive multiples of 16");
@@ -786,19 +902,19 @@ impl Generator {
         let mut stats = Stats::default();
         let t0 = Instant::now();
         let guided = r.sampling.uses_negative();
-        let pos_ids = self.moss_ids(&r.positive, r.template.as_deref())?;
-        let neg_ids = self.moss_ids(&r.negative, r.template.as_deref())?;
+        let pos_key = self.moss_key(&r.positive)?;
+        let neg_key = self.moss_key(&r.negative)?;
         if guided {
-            self.moss_context(&neg_ids, None)?;
+            self.moss_context(&neg_key, None)?;
         }
-        self.moss_context(&pos_ids, dump.as_deref_mut())?;
+        self.moss_context(&pos_key, dump.as_deref_mut())?;
         stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;
 
         let st = &self.st;
         let m = self.moss.as_mut().unwrap();
-        let find = |p: &[u32]| self.moss_contexts.iter().find(|(k, _)| k == p).map(|(_, c)| c).unwrap();
-        let pos = find(&pos_ids);
-        let neg = guided.then(|| find(&neg_ids));
+        let find = |p: &TokenKey| self.moss_contexts.iter().find(|(k, _)| k == p).map(|(_, c)| c).unwrap();
+        let pos = find(&pos_key);
+        let neg = guided.then(|| find(&neg_key));
         let rope = m.dit.rope(lh, lw, pos.len, st)?;
         let neg_rope = neg.map(|c| m.dit.rope(lh, lw, c.len, st)).transpose()?;
         let copied0 = m.dit.blocks.copied_bytes;
@@ -859,7 +975,7 @@ impl Generator {
     }
 
     /// Move `prompt`'s context to the end of the cache, encoding it if needed.
-    fn anima_context(&mut self, prompt: &[(String, f32)], dump: Option<&mut Dump>) -> Result<()> {
+    fn anima_context(&mut self, prompt: &Prompt, dump: Option<&mut Dump>) -> Result<()> {
         if let Some(i) = self.contexts.iter().position(|(p, _)| p == prompt) {
             let hit = self.contexts.remove(i);
             self.contexts.push(hit);
@@ -870,8 +986,9 @@ impl Generator {
         let te = &mut self.qwen3.as_mut().context("no text encoder loaded")?.1;
         let (tq, tt) = self.tokenizers.as_ref().context("no text encoder loaded")?;
         let t0 = Instant::now();
-        let (qids, tids, weights) = tokenizer::anima_tokens(tq, tt, prompt)?;
+        let (qids, tids, weights) = tokenizer::anima_tokens(tq, tt, prompt.segments()?)?;
         let hidden = te.encode(&qids, st)?;
+        scale_rows(&hidden, qwen3::D, &vec![prompt.scale; qids.len()], st)?;
         let ctx = m.dit.encode_context(&m.st, &hidden, qids.len(), &tids, &weights, st)?;
         st.sync()?;
         eprintln!("text: {} Qwen3 / {} T5 tokens in {:.0} ms", qids.len(), tids.len(), t0.elapsed().as_secs_f64() * 1e3);
@@ -886,7 +1003,7 @@ impl Generator {
             ctx.ctx.download(0, &mut b, st)?;
             d.insert("dit_in_ctx".into(), ("BF16".into(), vec![ctx.len, anima::CTX], b));
         }
-        self.contexts.push((prompt.to_vec(), ctx));
+        self.contexts.push((prompt.clone(), ctx));
         if self.contexts.len() > ANIMA_CONTEXTS {
             self.contexts.remove(0);
         }
@@ -894,7 +1011,7 @@ impl Generator {
     }
 
     /// One Anima latent, sampled as ComfyUI's KSampler does.
-    pub fn sample_anima(&mut self, r: &AnimaRequest, mut progress: impl FnMut(usize, usize) -> bool, mut dump: Option<&mut Dump>)
+    pub fn sample_anima(&mut self, r: &AnimaRequest, mut progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
         -> Result<(Vec<f32>, Stats)> {
         if r.width % 16 != 0 || r.height % 16 != 0 || r.width == 0 || r.height == 0 {
             bail!("width and height must be positive multiples of 16");
@@ -922,7 +1039,7 @@ impl Generator {
 
         let st = &self.st;
         let m = self.anima.as_mut().unwrap();
-        let find = |p: &[(String, f32)]| self.contexts.iter().find(|(k, _)| k == p).map(|(_, c)| c).unwrap();
+        let find = |p: &Prompt| self.contexts.iter().find(|(k, _)| k == p).map(|(_, c)| c).unwrap();
         let pos = find(&r.positive);
         let neg = guided.then(|| find(&r.negative));
         let rope = m.dit.rope(lh / 2, lw / 2, st)?;
@@ -1092,7 +1209,7 @@ impl Generator {
 
     /// Generate one image; returns RGB8 pixels. `progress(step, steps)` is called after each step
     /// and stops the run with [`Cancelled`] by returning false.
-    pub fn generate(&mut self, r: &Request, progress: impl FnMut(usize, usize) -> bool, mut dump: Option<&mut Dump>)
+    pub fn generate(&mut self, r: &Request, progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
         -> Result<(Vec<u8>, Stats)> {
         let t_img = Instant::now();
         let (latent, mut stats) = self.denoise(r, progress, dump.as_deref_mut())?;
@@ -1109,7 +1226,7 @@ impl Generator {
     }
 
     /// Text encoding and denoising only; returns the final latent ([16, H/8, W/8] f32) on the host.
-    pub fn sample_latent(&mut self, r: &Request, progress: impl FnMut(usize, usize) -> bool) -> Result<(Vec<f32>, Stats)> {
+    pub fn sample_latent(&mut self, r: &Request, progress: impl FnMut(Step) -> bool) -> Result<(Vec<f32>, Stats)> {
         self.denoise(r, progress, None)
     }
 
@@ -1193,7 +1310,7 @@ impl Generator {
         self.decode(&d, lh, lw)
     }
 
-    fn denoise(&mut self, r: &Request, mut progress: impl FnMut(usize, usize) -> bool, mut dump: Option<&mut Dump>)
+    fn denoise(&mut self, r: &Request, mut progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
         -> Result<(Vec<f32>, Stats)> {
         if r.width % 16 != 0 || r.height % 16 != 0 || r.width == 0 || r.height == 0 {
             bail!("width and height must be positive multiples of 16");
@@ -1222,23 +1339,21 @@ impl Generator {
         // text encoding (reused while the prompt is unchanged)
         let t0 = Instant::now();
         let refs: Vec<&vision::Embeds> = pos_vision.iter().map(|e| &**e).collect();
-        let key = PromptKey { text: r.prompt.clone(), images: r.images.clone() };
+        let key = PromptKey { prompt: r.prompt.clone(), images: r.images.clone() };
         if self.cached.as_ref().map_or(true, |(p, _, _)| *p != key) {
             drop(self.cached.take());
-            let text = if refs.is_empty() { r.prompt.clone() } else { te::image_prompt(&r.prompt, refs.len()) };
-            let cond = te.encode_with_images(&text, &refs, st)?;
+            let cond = krea_cond(te, &r.prompt, &refs, st)?;
             let ctx = m.dit.encode_context(&cond.ctx, cond.len, st)?;
             st.sync()?;
             eprintln!("text: {} tokens ({} conditioning) in {:.0} ms", cond.token_ids.len(), cond.len,
                 t0.elapsed().as_secs_f64() * 1e3);
             self.cached = Some((key, cond, ctx));
         }
-        let key = PromptKey { text: r.negative.clone(), images: r.negative_images.clone() };
+        let key = PromptKey { prompt: r.negative.clone(), images: r.negative_images.clone() };
         if guided && self.cached_negative.as_ref().map_or(true, |(p, _, _)| *p != key) {
             drop(self.cached_negative.take());
             let refs: Vec<&vision::Embeds> = neg_vision.iter().map(|e| &**e).collect();
-            let text = if refs.is_empty() { r.negative.clone() } else { te::image_prompt(&r.negative, refs.len()) };
-            let cond = te.encode_with_images(&text, &refs, st)?;
+            let cond = krea_cond(te, &r.negative, &refs, st)?;
             let ctx = m.dit.encode_context(&cond.ctx, cond.len, st)?;
             st.sync()?;
             self.cached_negative = Some((key, cond, ctx));

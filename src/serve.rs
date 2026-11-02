@@ -8,7 +8,7 @@
 //!   GET  /api/image/<id>.png  the result
 
 use crate::samplers::ModelSampling;
-use crate::pipeline::{encode_png, Generator, LoadOptions, Request, Sampling, Stats};
+use crate::pipeline::{encode_png, Generator, LoadOptions, Prompt, Request, Sampling, Stats};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -119,13 +119,13 @@ pub fn run(load: LoadOptions, opts: ServeOptions) -> Result<()> {
                     j.state = "running";
                     let ms = ModelSampling::Flux { shift };
                     let sampling = Sampling::new("euler", "simple", ms, j.steps, 1.0, j.seed, (j.width / 8, j.height / 8)).unwrap();
-                    Request { prompt: j.prompt.clone(), negative: String::new(), seed: j.seed, width: j.width, height: j.height, sampling, noise: None, images: Vec::new(), negative_images: Vec::new(), references: Vec::new(), timestep_zero: false }
+                    Request { prompt: Prompt::text(&j.prompt), negative: Prompt::text(""), seed: j.seed, width: j.width, height: j.height, sampling, noise: None, images: Vec::new(), negative_images: Vec::new(), references: Vec::new(), timestep_zero: false }
                 };
                 let st2 = state.clone();
                 let result = gen
-                    .generate(&req, |step, _| {
+                    .generate(&req, |step| {
                         if let Some(j) = st2.lock().unwrap().jobs.iter_mut().find(|j| j.id == id) {
-                            j.step = step;
+                            j.step = step.index;
                         }
                         true
                     }, None)

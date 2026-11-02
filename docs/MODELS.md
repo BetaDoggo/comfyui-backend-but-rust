@@ -134,8 +134,6 @@ layers run as the plain delta-rule recursion on the GPU), and the image embedder
 differs by 0.5%, because torch's bf16 GEMM isn't exact at those sizes. The same seed gives the same picture at about
 34 dB PSNR with int8 attention and 33 dB with flash.
 
-`--swarm-template` encodes with the Krea 2 template, which SwarmUI sends for this model.
-
 ## MiniMax H3
 
 H3 runs text to video with audio, from SwarmUI or with `--h3` on the CLI: the `w6a8` checkpoint, the nvfp4 text encoder, and the turbo LoRA in its ComfyUI form.
@@ -167,6 +165,6 @@ The audio hasn't been listened to or judged by ear. `tools/h3_ref.py` and `tools
 
 The LoRA's diffusers file, `minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors`, matches no key here or in ComfyUI. Use the `_comfyui` file.
 
-SwarmUI's Sigma Shift, CFG, every sampler and LoRAs work. These are refused with an error: Variation Seed, first and last frame or reference conditioning, single-frame generation, and VAE tile sizes other than 256 / 64.
+SwarmUI's Sigma Shift, CFG, every sampler and LoRAs work. These are refused with an error: Rescale CFG, Renorm CFG, CFG Zero Star and TCFG, `<break>`, first and last frame or reference conditioning, single-frame generation, and VAE tile sizes other than 256 / 64.
 
 Not done: the video and audio encoders, sparse attention for long clips, and the web UI.

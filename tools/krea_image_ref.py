@@ -24,6 +24,9 @@ ap.add_argument("--seed", type=int, default=42)
 ap.add_argument("--size", type=int, nargs=2, default=[768, 768])
 ap.add_argument("--steps", type=int, default=8)
 ap.add_argument("--cfg", type=float, default=1.0)
+ap.add_argument("--negative", default="")
+ap.add_argument("--zero-negative", action="store_true", help="ConditioningZeroOut on the negative")
+ap.add_argument("--multiplier", type=float, default=1.0, help="ConditioningMultiply on the positive")
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
 
@@ -106,8 +109,12 @@ def token_ids(tokens):
 positive = text_encode(args.prompt)
 put("ids", token_ids(last_tokens[0]))
 put("cond", positive[0][0])
-negative = text_encode("")
+negative = text_encode(args.negative)
 put("neg_ids", token_ids(last_tokens[-1]))
+if args.multiplier != 1.0:
+    positive = [[t[0] * args.multiplier, t[1]] for t in positive]
+if args.zero_negative:
+    negative = [[torch.zeros_like(t[0]), t[1]] for t in negative]
 put("neg_cond", negative[0][0])
 
 vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(VAE))

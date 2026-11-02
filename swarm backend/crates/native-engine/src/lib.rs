@@ -14,12 +14,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use diffusion::h3;
-use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, LoadOptions, MossRequest, Reference, Request, Sampling};
-use diffusion::samplers::{self, ModelSampling, SigmaRange};
+use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, LoadOptions, MossRequest, Prompt, Reference, Request, Sampling, Step};
+use diffusion::preview;
+use diffusion::samplers::{self, CfgFunction, CfgTweaks, ModelSampling, SigmaRange};
 use diffusion::lora::{self, Lora};
 use diffusion::tokenizer::token_weights;
 use diffusion::vision::PromptImage;
-use swarm_engine_api::prompt::PromptLeafKind;
+use swarm_engine_api::prompt::{PromptLeaf, PromptLeafKind};
 use swarm_engine_api::*;
 
 /// Attention backends, default first. SwarmUI's "pytorch attention" maps to the first entry.
@@ -55,26 +56,27 @@ pub struct NativeOptions {
     /// Largest side (pixels, at 1:1) of a generation.
     pub max_side: usize,
     pub threads: usize,
+    /// Send latent previews while sampling.
+    pub live_previews: bool,
 }
 
 impl Default for NativeOptions {
     fn default() -> Self {
-        Self { reserve_vram_mb: 512, max_side: 2048, threads: 6 }
+        Self { reserve_vram_mb: 512, max_side: 2048, threads: 6, live_previews: false }
     }
 }
 
 pub struct NativeEngine {
     gen: Mutex<Generator>,
+    live_previews: bool,
 }
 
 /// The prompt to encode, or why this conditioning can't be used. Only checked when a prompt is
 /// really needed: at CFG 1 the negative is never read.
 struct DeferredCond {
     text_encoder: PathBuf,
-    /// (text, weight) segments; Krea 2 and MOSS Image have exactly one, of weight 1.
-    prompt: Result<Vec<(String, f32)>, String>,
-    /// MOSS Image: the chat template, None for ComfyUI's own.
-    template: Option<String>,
+    /// `<break>` chunks of (text, weight) segments; a Krea 2 chunk is one segment of weight 1.
+    prompt: Result<Vec<Vec<(String, f32)>>, String>,
     /// Krea 2: prompt images for the vision tower.
     images: Vec<PromptImage>,
     /// `LoraLoader`'s clip half.
@@ -146,36 +148,42 @@ fn is_qwen3_600m(file: &ModelFile) -> bool {
     read_header(&file.path).is_ok_and(|h| h["model.layers.0.input_layernorm.weight"]["shape"][0] == 1024)
 }
 
-/// A prompt's (text, weight) segments, or why it needs something the pipeline doesn't have.
-fn prompt_segments(p: &ParsedPrompt, steps: u32, family: Family) -> Result<Vec<(String, f32)>, String> {
+/// A prompt's `<break>` chunks of (text, weight) segments, or why it needs something the pipeline
+/// doesn't have.
+fn prompt_chunks(p: &ParsedPrompt, steps: u32, family: Family) -> Result<Vec<Vec<(String, f32)>>, String> {
     if p.has_steps() {
         return Err("<alternate> and <fromto> prompts".into());
     }
     let chunks = p.chunks(0, steps.max(1));
-    if chunks.len() != 1 {
+    if chunks.len() != 1 && matches!(family, Family::Anima | Family::H3) {
         return Err("<break> in prompts".into());
     }
+    chunks.iter().map(|leaves| chunk_segments(leaves, family)).collect()
+}
+
+fn chunk_segments(leaves: &[PromptLeaf], family: Family) -> Result<Vec<(String, f32)>, String> {
     let mut text = String::new();
     let mut segments = Vec::new();
-    for leaf in &chunks[0] {
-        if family != Family::Anima && leaf.weight != 1.0 {
+    for leaf in leaves {
+        if family == Family::Krea2 && leaf.weight != 1.0 {
             return Err("prompt weights (<weight>)".into());
         }
         match &leaf.kind {
             PromptLeafKind::Text(t) if family == Family::Anima => segments.extend(token_weights(t, leaf.weight as f32)),
-            PromptLeafKind::Text(t) => text.push_str(t),
+            PromptLeafKind::Text(t) if family == Family::Krea2 => text.push_str(t),
+            PromptLeafKind::Text(t) => segments.push((t.clone(), leaf.weight as f32)),
             PromptLeafKind::Embed(_) => return Err("embeddings in prompts".into()),
             PromptLeafKind::LoraHook(_) => return Err("LoRA hooks in prompts".into()),
             PromptLeafKind::Break => unreachable!("chunks() splits on breaks"),
         }
     }
-    if family != Family::Anima {
+    if family == Family::Krea2 {
         segments.push((text, 1.0));
     }
     Ok(segments)
 }
 
-fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<(String, f32)>, String> {
+fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<Vec<(String, f32)>>, String> {
     for p in &req.text_encoder.patches {
         match p {
             TextEncoderPatch::Lora { .. } => {}
@@ -185,8 +193,10 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<(String
     }
     match &req.mode {
         // Qwen tokenizers run with weights disabled, Anima's T5 tokens take ComfyUI's emphasis.
-        TextEncodeMode::Plain { text } if family != Family::Anima => Ok(vec![(text.clone(), 1.0)]),
-        TextEncodeMode::Plain { text } => Ok(token_weights(text, 1.0)),
+        TextEncodeMode::Plain { text } if family == Family::Anima => Ok(vec![token_weights(text, 1.0)]),
+        // MOSSImageTokenizer trims a plain prompt; SwarmTextEncodeAdvanced's leaves skip that.
+        TextEncodeMode::Plain { text } if family == Family::Moss => Ok(vec![vec![(text.trim().to_string(), 1.0)]]),
+        TextEncodeMode::Plain { text } => Ok(vec![vec![(text.clone(), 1.0)]]),
         TextEncodeMode::Swarm(s) => {
             if s.images.is_some() && family != Family::Krea2 {
                 return Err("Prompt Images".into());
@@ -200,10 +210,15 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<(String
             if s.guidance.is_some() {
                 return Err("Flux Guidance Scale".into());
             }
+            // The node only uses the template with images, and Krea 2's is the one its encoder has.
             if !matches!(s.llama_template.as_deref(), None | Some("krea2")) {
                 return Err(format!("prompt template {:?}", s.llama_template));
             }
-            prompt_segments(&s.prompt, s.steps, family)
+            let chunks = prompt_chunks(&s.prompt, s.steps, family)?;
+            if chunks.len() != 1 && s.images.is_some() {
+                return Err("<break> with Prompt Images".into());
+            }
+            Ok(chunks)
         }
     }
 }
@@ -223,15 +238,13 @@ fn prompt_images(b: &ImageBatch) -> Vec<PromptImage> {
 
 /// The one plain prompt of a conditioning: anything regional or image-based is refused, except
 /// that Krea 2 reads reference latents with [`reference_latents`].
-fn single_prompt(c: &Conditioning, family: Family) -> EngineResult<(&DeferredCond, &[(String, f32)])> {
+fn single_prompt(c: &Conditioning, family: Family) -> EngineResult<(&DeferredCond, Prompt)> {
     let [e] = c.entries.as_slice() else {
         return Err(unsupported("regional prompts (more than one conditioning entry)"));
     };
     let m = &e.meta;
     let plain = m.start_percent == 0.0
         && m.end_percent == 1.0
-        && m.multiplier == 1.0
-        && !m.zeroed
         && m.mask.is_none()
         && (family == Family::Krea2 || m.reference_latents.is_empty())
         && m.gligen.is_empty()
@@ -243,8 +256,8 @@ fn single_prompt(c: &Conditioning, family: Family) -> EngineResult<(&DeferredCon
         return Err(unsupported("conditioning features (regions, references, ControlNet, style models, ...)"));
     }
     let cond = e.embedding.downcast_ref::<DeferredCond>().ok_or_else(|| unsupported("conditioning from another text encoder"))?;
-    let segments = cond.prompt.as_deref().map_err(|e| unsupported(e.clone()))?;
-    Ok((cond, segments))
+    let chunks = cond.prompt.clone().map_err(unsupported)?;
+    Ok((cond, Prompt { chunks, scale: if m.zeroed { 0.0 } else { m.multiplier as f32 } }))
 }
 
 /// A Krea 2 conditioning's reference latents, and whether they use `index_timestep_zero`. Without a
@@ -291,6 +304,7 @@ struct ModelSettings {
     loras: Vec<Lora>,
     /// MiniMax H3's audio flow shift.
     audio_shift: f64,
+    tweaks: CfgTweaks,
 }
 
 fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
@@ -301,7 +315,7 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::H3 => ModelSampling::Flow { shift: h3::SHIFT_VIDEO },
     };
     // H3's attention sink rows make int8's per-channel V scale lossy
-    let mut s = ModelSettings { model_sampling, int8_attention: family != Family::H3, loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO };
+    let mut s = ModelSettings { model_sampling, int8_attention: family != Family::H3, loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default() };
     for p in &model.patches {
         match p {
             ModelPatch::SamplingFlux { max_shift, base_shift, width, height } if family == Family::Krea2 => {
@@ -321,6 +335,15 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
                     b => return Err(unsupported(format!("attention backend {b}"))),
                 }
             }
+            // H3's latent packs two streams, which ComfyUI's patches read as nested tensors.
+            ModelPatch::RescaleCfg { multiplier } if family != Family::H3 => {
+                s.tweaks.function = Some(CfgFunction::Rescale { multiplier: *multiplier as f32 })
+            }
+            ModelPatch::RenormCfg { cfg_trunc, renorm_cfg } if family != Family::H3 => {
+                s.tweaks.function = Some(CfgFunction::Renorm { cfg_trunc: *cfg_trunc as f32, renorm_cfg: *renorm_cfg as f32 })
+            }
+            ModelPatch::CfgZeroStar if family != Family::H3 => s.tweaks.zero_star = true,
+            ModelPatch::Tcfg if family != Family::H3 => s.tweaks.tangential = true,
             // Weighted prompts are refused in encode_text; with none this patch has no effect.
             ModelPatch::AttnTokenWeights { .. } | ModelPatch::Compile { .. } => {}
             ModelPatch::Lora { file, strength } => s.loras.push(Lora { path: file.path.clone(), strength: *strength }),
@@ -365,7 +388,28 @@ fn sampling(req: &SampleRequest, settings: &ModelSettings, (batch, lh, lw): (usi
         seed: req.noise_seed,
         batch_index: index,
         batch_size: batch,
+        tweaks: settings.tweaks,
     })
+}
+
+/// Whether SwarmKSampler's `previews` shows image `index` of `batch`.
+fn shows_preview(mode: PreviewMode, index: usize, batch: usize) -> bool {
+    match mode {
+        PreviewMode::None => false,
+        PreviewMode::One => index == 0,
+        PreviewMode::Second => index == 1 % batch,
+        PreviewMode::Default | PreviewMode::Iterate | PreviewMode::Animate => true,
+    }
+}
+
+/// Sends a step's progress within the whole batch, and its preview. False once cancelled.
+fn report(mode: PreviewMode, progress: &mut dyn ProgressSink, (index, batch): (usize, usize), step: Step, image: impl FnOnce(&[f32]) -> (Vec<u8>, usize, usize)) -> bool {
+    progress.progress((index * step.total + step.index) as u32, (batch * step.total) as u32);
+    if shows_preview(mode, index, batch) {
+        let (rgb, h, w) = image(step.denoised);
+        progress.preview(PreviewImage::Rgb(ImageBatch::from_u8(1, h as u32, w as u32, 3, rgb)));
+    }
+    !progress.interrupted()
 }
 
 impl NativeEngine {
@@ -384,7 +428,12 @@ impl NativeEngine {
             attn_variant: 0,
             int8_attn: true,
         };
-        Ok(Self { gen: Mutex::new(Generator::new(&load)?) })
+        Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews })
+    }
+
+    /// SwarmUI always asks for previews, so the server's option decides.
+    fn preview_mode(&self, req: &SampleRequest) -> PreviewMode {
+        if self.live_previews { req.previews } else { PreviewMode::None }
     }
 
     fn gen(&self) -> std::sync::MutexGuard<'_, Generator> {
@@ -407,6 +456,7 @@ impl NativeEngine {
     fn sample_anima(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, progress: &mut dyn ProgressSink)
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
+        let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, positive) = single_prompt(&req.positive, Family::Anima)?;
         let text_encoder = &cond.text_encoder;
@@ -416,7 +466,7 @@ impl NativeEngine {
             check_text_encoder_loras(cond, c)?;
             p
         } else {
-            &[]
+            Prompt::new(Vec::new())
         };
         let mut gen = self.gen();
         gen.ensure_anima(&file.path).map_err(internal)?;
@@ -427,18 +477,15 @@ impl NativeEngine {
         let mut data = Vec::with_capacity(batch * 16 * lh * lw);
         for i in 0..batch {
             let r = AnimaRequest {
-                positive: positive.to_vec(),
-                negative: negative.to_vec(),
+                positive: positive.clone(),
+                negative: negative.clone(),
                 width: lw * 8,
                 height: lh * 8,
                 sampling: sampling(req, settings, shape, i)?,
                 noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, 16, lh, lw),
             };
             let (latent, stats) = gen
-                .sample_anima(&r, |step, steps| {
-                    progress.progress((i * steps + step) as u32, (batch * steps) as u32);
-                    !progress.interrupted()
-                }, None)
+                .sample_anima(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::wan21(x0, lh, lw), lh, lw)), None)
                 .map_err(internal)?;
             tracing::info!("anima: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
             data.extend_from_slice(&latent);
@@ -448,6 +495,7 @@ impl NativeEngine {
 
     /// A text-to-video clip: returns the video and audio latents.
     fn sample_h3(&self, req: &SampleRequest, settings: &ModelSettings, progress: &mut dyn ProgressSink) -> EngineResult<Latent> {
+        let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let LatentSamples::AudioVideo { video, audio } = &req.latent.samples else {
             return Err(unsupported("MiniMax H3 needs its joint audio/video latent"));
@@ -458,29 +506,23 @@ impl NativeEngine {
         if t < 2 || lh % 2 != 0 || lw % 2 != 0 {
             return Err(unsupported("MiniMax H3 needs at least 2 video frames and a width and height in multiples of 32"));
         }
-        if req.variation.is_some() {
-            return Err(unsupported("Variation Seed on MiniMax H3"));
-        }
         if req.positive.entries.iter().any(|e| !e.meta.minimax_keyframes.is_empty()) {
             return Err(unsupported("first and last frame conditioning on MiniMax H3 (no VAE encoder yet)"));
         }
-        let (cond, positive) = single_prompt(&req.positive, Family::H3)?;
+        let (cond, prompt) = single_prompt(&req.positive, Family::H3)?;
         let shape = h3::Shape { t, h: lh, w: lw, audio_t };
         let sampling = sampling(req, settings, (1, lh, lw), 0)?;
-        let negative = if sampling.uses_negative() { single_prompt(&req.negative, Family::H3)?.1[0].0.clone() } else { String::new() };
+        let negative = if sampling.uses_negative() { single_prompt(&req.negative, Family::H3)?.1 } else { Prompt::new(Vec::new()) };
         let ModelSampling::Flow { shift } = settings.model_sampling else { unreachable!("H3 is a flow model") };
         let mut gen = self.gen();
         gen.ensure_h3(&file.path).map_err(internal)?;
         gen.ensure_h3_te(&cond.text_encoder).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
-        let noise = diffusion::sampling::torch_randn_streams(req.noise_seed, &[shape.video_len(), shape.audio_len()]).concat();
-        let r = H3Request { prompt: positive[0].0.clone(), negative, shape, sampling, shifts: (shift, settings.audio_shift), noise };
+        let noise = noise::h3_noise(req.noise_seed, req.variation, (24, t, lh, lw), shape.audio_len());
+        let r = H3Request { prompt, negative, shape, sampling, shifts: (shift, settings.audio_shift), noise };
         let (mut latent, stats) = gen
-            .sample_h3(&r, |step, steps| {
-                progress.progress(step as u32, steps as u32);
-                !progress.interrupted()
-            }, None)
+            .sample_h3(&r, |step| report(mode, progress, (0, 1), step, |x0| (preview::h3(x0, t, lh, lw), lh, lw)), None)
             .map_err(internal)?;
         tracing::info!("h3: text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
         let audio_data = latent.split_off(shape.video_len());
@@ -520,14 +562,15 @@ impl NativeEngine {
     fn sample_moss(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, progress: &mut dyn ProgressSink)
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
+        let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, positive) = single_prompt(&req.positive, Family::Moss)?;
         let negative = if sampling(req, settings, shape, 0)?.uses_negative() {
             let (c, p) = single_prompt(&req.negative, Family::Moss)?;
             check_text_encoder_loras(cond, c)?;
-            p[0].0.clone()
+            p
         } else {
-            String::new()
+            Prompt::text("")
         };
         let mut gen = self.gen();
         gen.ensure_moss(&file.path).map_err(internal)?;
@@ -538,19 +581,15 @@ impl NativeEngine {
         let mut data = Vec::with_capacity(batch * diffusion::moss::CH * lh * lw);
         for i in 0..batch {
             let r = MossRequest {
-                positive: positive[0].0.clone(),
+                positive: positive.clone(),
                 negative: negative.clone(),
-                template: cond.template.clone(),
                 width: lw * 16,
                 height: lh * 16,
                 sampling: sampling(req, settings, shape, i)?,
                 noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, diffusion::moss::CH, lh, lw),
             };
             let (latent, stats) = gen
-                .sample_moss(&r, |step, steps| {
-                    progress.progress((i * steps + step) as u32, (batch * steps) as u32);
-                    !progress.interrupted()
-                }, None)
+                .sample_moss(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::flux2(x0, lh, lw), lh * 2, lw * 2)), None)
                 .map_err(internal)?;
             tracing::info!("moss: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
             data.extend_from_slice(&latent);
@@ -642,11 +681,6 @@ impl Engine for NativeEngine {
             MINIMAX_ENCODER => Family::H3,
             _ => Family::Krea2,
         };
-        // SwarmUI sends the Krea 2 template for MOSS Image as well.
-        let template = match &req.mode {
-            TextEncodeMode::Swarm(s) if s.llama_template.as_deref() == Some("krea2") => Some(diffusion::te::TEMPLATE.to_string()),
-            _ => None,
-        };
         let images = match &req.mode {
             TextEncodeMode::Swarm(s) if family == Family::Krea2 => s.images.as_ref().map(prompt_images).unwrap_or_default(),
             _ => Vec::new(),
@@ -655,7 +689,7 @@ impl Engine for NativeEngine {
             TextEncoderPatch::Lora { file, strength } => Some(Lora { path: file.path.clone(), strength: *strength }),
             _ => None,
         }).collect();
-        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), template, images, loras };
+        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), images, loras };
         Ok(Conditioning::single(Opaque::new(cond), CondMeta::default()))
     }
 
@@ -719,7 +753,7 @@ impl Engine for NativeEngine {
             return finish(self.sample_moss(req, (batch, lh, lw), &settings, progress)?);
         }
         let (cond, prompt) = single_prompt(&req.positive, family)?;
-        let (text_encoder, prompt) = (&cond.text_encoder, &prompt[0].0);
+        let text_encoder = &cond.text_encoder;
         let (references, timestep_zero) = reference_latents(&req.positive)?;
         let (width, height) = (lw * 8, lh * 8);
         let shape = (batch, lh, lw);
@@ -729,11 +763,12 @@ impl Engine for NativeEngine {
             if !reference_latents(&req.negative)?.0.is_empty() {
                 return Err(unsupported("reference latents on the negative prompt"));
             }
-            (p[0].0.clone(), c.images.clone())
+            (p, c.images.clone())
         } else {
-            (String::new(), Vec::new())
+            (Prompt::text(""), Vec::new())
         };
 
+        let mode = self.preview_mode(req);
         let mut gen = self.gen();
         gen.ensure_dit(&file.path).map_err(internal)?;
         gen.ensure_te(text_encoder).map_err(internal)?;
@@ -744,14 +779,11 @@ impl Engine for NativeEngine {
         let mut data = Vec::with_capacity(batch * 16 * lh * lw);
         for i in 0..batch {
             let image = noise::swarm_noise(req.noise_seed, req.variation, i as u64, 16, lh, lw);
-            let r = Request { prompt: prompt.to_string(), negative: negative.clone(), seed: req.noise_seed, width, height,
+            let r = Request { prompt: prompt.clone(), negative: negative.clone(), seed: req.noise_seed, width, height,
                 sampling: sampling(req, &settings, shape, i)?, noise: Some(image), images: cond.images.clone(),
                 negative_images: negative_images.clone(), references: references.clone(), timestep_zero };
             let (latent, stats) = gen
-                .sample_latent(&r, |step, steps| {
-                    progress.progress((i * steps + step) as u32, (batch * steps) as u32);
-                    !progress.interrupted()
-                })
+                .sample_latent(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::wan21(x0, lh, lw), lh, lw)))
                 .map_err(internal)?;
             tracing::info!("native: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
             data.extend_from_slice(&latent);
@@ -890,30 +922,50 @@ mod tests {
     fn plain_prompts_keep_comfy_literal_parentheses() {
         // Qwen3-VL tokenizes with weights disabled, so `(x:1.2)` stays in the text.
         let p = ParsedPrompt::parse("a (red:1.2) fox");
-        assert_eq!(prompt_segments(&p, 8, Family::Krea2).unwrap(), [("a (red:1.2) fox".to_string(), 1.0)]);
+        assert_eq!(prompt_chunks(&p, 8, Family::Krea2).unwrap(), [[("a (red:1.2) fox".to_string(), 1.0)]]);
     }
 
     #[test]
     fn prompt_syntax_the_pipeline_cant_honor_is_refused() {
-        for p in ["a <weight[1.3]:fox>", "a<break>b", "<alternate:a, b>", "<fromto[0.5]:a, b>", "<embed:x>"] {
-            assert!(prompt_segments(&ParsedPrompt::parse(p), 8, Family::Krea2).is_err(), "{p}");
+        for p in ["a <weight[1.3]:fox>", "<alternate:a, b>", "<fromto[0.5]:a, b>", "<embed:x>"] {
+            assert!(prompt_chunks(&ParsedPrompt::parse(p), 8, Family::Krea2).is_err(), "{p}");
+        }
+        for family in [Family::Anima, Family::H3] {
+            assert!(prompt_chunks(&ParsedPrompt::parse("a<break>b"), 8, family).is_err());
         }
     }
 
     #[test]
     fn anima_takes_weights_from_both_syntaxes() {
-        let segments = prompt_segments(&ParsedPrompt::parse("lake, <weight[1.3]:pine> (sky:1.2)"), 8, Family::Anima).unwrap();
-        let weight = |t: &str| segments.iter().find(|(s, _)| s.contains(t)).unwrap().1;
+        let chunks = prompt_chunks(&ParsedPrompt::parse("lake, <weight[1.3]:pine> (sky:1.2)"), 8, Family::Anima).unwrap();
+        let weight = |t: &str| chunks[0].iter().find(|(s, _)| s.contains(t)).unwrap().1;
         assert!((weight("pine") - 1.3).abs() < 1e-6);
         assert!((weight("sky") - 1.2).abs() < 1e-6);
         assert_eq!(weight("lake"), 1.0);
     }
 
     #[test]
-    fn moss_prompts_are_one_literal_segment() {
-        let p = ParsedPrompt::parse("a (red:1.2) lake");
-        assert_eq!(prompt_segments(&p, 8, Family::Moss).unwrap(), [("a (red:1.2) lake".to_string(), 1.0)]);
-        assert!(prompt_segments(&ParsedPrompt::parse("a <weight[1.3]:lake>"), 8, Family::Moss).is_err());
+    fn moss_and_h3_weight_segments_and_keep_emphasis_literal() {
+        for family in [Family::Moss, Family::H3] {
+            let chunks = prompt_chunks(&ParsedPrompt::parse("a (red:1.2) <weight[1.5]:lake>"), 8, family).unwrap();
+            assert_eq!(chunks, [[("a (red:1.2) ".to_string(), 1.0), ("lake".to_string(), 1.5)]]);
+        }
+    }
+
+    #[test]
+    fn breaks_become_chunks_on_krea2_and_moss() {
+        for family in [Family::Krea2, Family::Moss] {
+            let chunks = prompt_chunks(&ParsedPrompt::parse("a<break>b"), 8, family).unwrap();
+            assert_eq!(chunks, [[("a".to_string(), 1.0)], [("b".to_string(), 1.0)]]);
+        }
+    }
+
+    #[test]
+    fn preview_modes_pick_images_like_swarm() {
+        assert!(!shows_preview(PreviewMode::None, 0, 1));
+        assert!(shows_preview(PreviewMode::One, 0, 2) && !shows_preview(PreviewMode::One, 1, 2));
+        assert!(shows_preview(PreviewMode::Second, 1, 2) && shows_preview(PreviewMode::Second, 0, 1));
+        assert!(shows_preview(PreviewMode::Default, 1, 2));
     }
 
     #[test]

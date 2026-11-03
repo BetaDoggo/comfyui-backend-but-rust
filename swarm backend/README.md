@@ -10,6 +10,7 @@ crates/
   engine-api/     the contract: Engine trait + typed request structs (no web deps)
   comfy-server/   HTTP + websocket server that speaks ComfyUI's protocol, validates and runs graphs
   native-engine/   the real engine (optional, `--features native`)
+swarm-extension/  comfy-rust backend: SwarmUI extension that starts the server
 docs/
   INPUT_MAPPING.md   what SwarmUI sends for Krea 2 / Anima / MiniMax H3 / MOSS Image / Qwen Image 2.1, and what the engine receives
   COMPATIBILITY.md   every Swarm parameter probed live, and the node classes served through the generic custom_node route
@@ -46,7 +47,8 @@ cargo run --release -p comfy-server --features native -- --engine native --model
 On Windows, [`start-backend.bat`](start-backend.bat) does this for the folder in `MODELS_ROOT`, and prints what to enter
 in SwarmUI. Extra arguments go to the server, so `--models-root` can add a second folder.
 
-Extra flags: `--reserve-vram 512` (MB left for the desktop and other apps), `--max-side 2048` and `--live-previews` (off by default).
+Extra flags: `--reserve-vram 512` (MB left for the desktop and other apps), `--max-side 2048`, `--live-previews` (off by default)
+and `--extra-model-paths-config <file>` (a ComfyUI `extra_model_paths` YAML, repeatable, searched before `--models-root`).
 
 The checkpoint's keys pick the family, and one family is loaded at a time. Switching took 4 s to Anima, 9 s to Krea 2 and
 about 3 s to MOSS Image with the files cached.
@@ -81,6 +83,27 @@ image comes back pixel-identical), and baked blocks moving to RAM and back.
 SwarmUI sent every Krea 2 job here and Anima to ComfyUI, keeping each model on the backend that had it loaded.
 Nothing guarantees where the first job goes when both are idle. Set **Exact Backend ID** in a preset to pin a model to
 this backend. The two share the GPU: the native engine re-plans DiT residency from live free VRAM for each request.
+
+## Let SwarmUI start it
+
+The comfy-rust backend extension in [`swarm-extension/`](swarm-extension) adds a **comfy-rust Self-Starting** backend type,
+meant to be started, stopped and restarted by SwarmUI like its own ComfyUI self-start. This hasn't been run inside SwarmUI
+yet. It passes the `comfy-auto-model.yaml` that SwarmUI writes for ComfyUI, so
+every model root and folder setting in SwarmUI applies, and changing them reloads the backend. The stock ComfyUI
+Self-Starting type can't be used, because it always runs ComfyUI's Python and pip setup.
+
+1. Build the server with `--features native`. SwarmUI doesn't build it, so rebuild after pulling changes.
+2. Stop SwarmUI, then link the extension into it. Run this in `cmd`, from the SwarmUI folder:
+
+   ```bat
+   mklink /J src\Extensions\ComfyRustBackend "C:\path\to\repo\swarm backend\swarm-extension"
+   ```
+
+3. Start SwarmUI, which builds the extension. It rebuilds it when this repository's commit changes.
+4. Server → Backends → **comfy-rust Self-Starting** → set Start Script to the full path of [`selfstart.bat`](selfstart.bat).
+
+ExtraArgs takes server flags such as `--ffmpeg <path>`, and Enable Previews is off by default. SwarmUI picks the port.
+Running the server by hand with `start-backend.bat` still works, through ComfyUI API By URL.
 
 ## Connect SwarmUI
 

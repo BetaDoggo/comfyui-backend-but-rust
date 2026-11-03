@@ -78,6 +78,27 @@ Set `MODELS_ROOT`, run [`swarm backend/start-backend.bat`](swarm%20backend/start
 `http://127.0.0.1:8188` as a "ComfyUI API By URL" backend. Keep a real ComfyUI backend next to it, because anything else
 is refused or reaches a mock engine. See the [SwarmUI backend guide](swarm%20backend/README.md).
 
+To have SwarmUI start and stop the server itself, use the comfy-rust backend extension instead. It uses SwarmUI's own model
+folders, so `MODELS_ROOT` isn't needed. This hasn't been run inside SwarmUI yet.
+
+1. Build the server from `swarm backend/`, with the CUDA toolkit's `bin` folder on `PATH`. SwarmUI doesn't build it, so
+   repeat this after pulling changes:
+
+   ```bash
+   cargo build --release -p comfy-server --features native
+   ```
+
+2. Stop SwarmUI, then link the extension into it. Run this in `cmd` from the SwarmUI folder, with your own repository path:
+
+   ```bat
+   mklink /J src\Extensions\ComfyRustBackend "C:\path\to\repo\swarm backend\swarm-extension"
+   ```
+
+3. Start SwarmUI, which builds the extension.
+4. In Server, Backends, add **comfy-rust Self-Starting** and set Start Script to the full path of
+   [`swarm backend/selfstart.bat`](swarm%20backend/selfstart.bat). For MiniMax H3, add `--ffmpeg <path>` to ExtraArgs if
+   ffmpeg isn't on `PATH`.
+
 ## Documentation
 
 For users:

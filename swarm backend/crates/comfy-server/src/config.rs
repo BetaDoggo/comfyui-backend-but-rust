@@ -17,6 +17,11 @@ pub struct Config {
     #[arg(long = "models-root", default_value = "data/models")]
     pub models_roots: Vec<PathBuf>,
 
+    /// ComfyUI `extra_model_paths` YAML, such as the one SwarmUI writes for its self-started
+    /// ComfyUI. Searched before `--models-root`. Repeatable.
+    #[arg(long = "extra-model-paths-config")]
+    pub extra_model_paths: Vec<PathBuf>,
+
     #[arg(long, default_value = "data/output")]
     pub output_dir: PathBuf,
 
@@ -73,6 +78,7 @@ impl Config {
             listen: "127.0.0.1".into(),
             port: 0,
             models_roots: vec![root.join("models")],
+            extra_model_paths: Vec::new(),
             output_dir: root.join("output"),
             input_dir: root.join("input"),
             temp_dir: root.join("temp"),

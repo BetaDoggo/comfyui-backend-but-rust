@@ -28,6 +28,7 @@ tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 base64 = "0.22"
+serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

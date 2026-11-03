@@ -23,7 +23,7 @@ impl ServerEnv {
             std::fs::create_dir_all(d)?;
         }
         Ok(Self {
-            models: ModelPaths::new(cfg.models_roots.clone()),
+            models: ModelPaths::with_configs(cfg.models_roots.clone(), &cfg.extra_model_paths)?,
             output_dir: cfg.output_dir.clone(),
             input_dir: cfg.input_dir.clone(),
             temp_dir: cfg.temp_dir.clone(),

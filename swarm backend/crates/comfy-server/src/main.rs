@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -23,6 +24,7 @@ fn make_engine(cfg: &Config) -> anyhow::Result<Arc<dyn Engine>> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,comfy_server=info".into()))
         .init();
     let cfg = Config::parse();
@@ -31,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (addr, handle) = comfy_server::spawn(&cfg, engine).await?;
     tracing::info!("comfy-server listening on http://{addr} ({} engine)", cfg.engine);
-    tracing::info!("model roots: {:?}", cfg.models_roots);
+    tracing::info!("model roots: {:?}, model path files: {:?}", cfg.models_roots, cfg.extra_model_paths);
     tracing::info!("in SwarmUI: Server -> Backends -> add 'ComfyUI API By URL' with address http://{addr}");
     handle.await?;
     Ok(())

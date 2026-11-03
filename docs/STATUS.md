@@ -70,6 +70,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | Priority | Area | Item | Notes |
 |---|---|---|---|
 | P0 | Server | Graph validation and execution | 163 native nodes with stock schemas. Exercised with real workflows only for Krea 2 text-to-image. |
+| P1 | Server | Self-starting SwarmUI backend | The comfy-rust backend extension compiles against SwarmUI's DLL. `selfstart.bat` started the native server, and it listed every model from SwarmUI's real model paths file. Not yet run inside SwarmUI, so starting, stopping and reloading from SwarmUI are untested. |
 | P0 | Server | Swarm prompt syntax parsing | <break>, <weight>, <alternate>, <fromto>, <embed> and LoRA hooks parse. See the rows for each family and the Todo rows for what is refused. |
 | P0 | Image workflows | Init image and Creativity | Graph runs on the mock. Needs the VAE encoder and partial sampling. |
 | P0 | Image workflows | Refiner and upscale | Both latent and model upscale paths reach the engine API. |

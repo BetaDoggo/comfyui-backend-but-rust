@@ -51,6 +51,11 @@ const MODEL_FILES: &[&str] = &[
     "style_models/redux_test.safetensors",
     "model_patches/patch_test.safetensors",
     "yolov8/face_yolov8m.pt",
+    "diffusion_models/Pixal3D/pixal3d_int8_convrot.safetensors",
+    "clip_vision/dino_v3_L_naf_fp32.safetensors",
+    "VAE/Pixal3D/trellis_2_shape_vae_bf16.safetensors",
+    "VAE/Pixal3D/trellis_2_texture_vae_bf16.safetensors",
+    "background_removal/birefnet.safetensors",
 ];
 
 struct TestServer {
@@ -1346,3 +1351,83 @@ async fn mask_threshold_with_min_above_max_matches_torch() {
     let img = image::load_from_memory(&r.outputs[0].bytes).unwrap().to_luma8();
     assert!(img.pixels().all(|p| p[0] == 255));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pixal3d_image_to_3d_saves_a_glb() {
+    let s = TestServer::start(0).await;
+    // an opaque disc on a transparent square, the way the extension sends a cut-out photo
+    let rgba: Vec<u8> = (0..64 * 64)
+        .flat_map(|i| {
+            let (x, y) = ((i % 64) as f32 - 31.5, (i / 64) as f32 - 31.5);
+            [200, 120, 40, if x * x + y * y < 400.0 { 255 } else { 0 }]
+        })
+        .collect();
+    let png = encode::png8(&ImageBatch::from_u8(1, 64, 64, 4, rgba), 0).unwrap();
+    let workflow = json!({
+        "1": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": base64::engine::general_purpose::STANDARD.encode(png) } },
+        "2": { "class_type": "Pixal3DImageTo3D", "inputs": {
+            "image": ["1", 0], "mask": ["1", 1],
+            "unet_name": "Pixal3D/pixal3d_int8_convrot.safetensors", "clip_vision_name": "dino_v3_L_naf_fp32.safetensors",
+            "shape_vae_name": "Pixal3D/trellis_2_shape_vae_bf16.safetensors", "texture_vae_name": "Pixal3D/trellis_2_texture_vae_bf16.safetensors",
+            "seed": 7, "filename_prefix": "3d/pixal3d"
+        } }
+    });
+    let r = run_like_swarm(&s, workflow, |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history_entry());
+    let saved = &r.history_entry()["outputs"]["2"]["3d"][0];
+    assert_eq!(saved["type"], "output");
+    assert_eq!(saved["subfolder"], "3d");
+    let url = s.url(&format!("view?filename={}&subfolder=3d&type=output", saved["filename"].as_str().unwrap()));
+    let resp = s.http.get(url).send().await.unwrap();
+    assert_eq!(resp.headers()["content-type"], "model/gltf-binary");
+    let bytes = resp.bytes().await.unwrap();
+    assert_eq!(&bytes[..4], b"glTF");
+
+    // the node's schema, as the extension reads it
+    let info = s.get("object_info/Pixal3DImageTo3D").await;
+    let required = &info["Pixal3DImageTo3D"]["input"]["required"];
+    assert!(required["unet_name"][0].as_array().unwrap().contains(&json!("Pixal3D/pixal3d_int8_convrot.safetensors")));
+    assert_eq!(required["resolution"][1]["step"], 128);
+    assert!(info["Pixal3DImageTo3D"]["input"]["optional"]["mask"].is_array());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_removal_nodes_make_a_mask() {
+    let s = TestServer::start(0).await;
+    // an opaque image: the mask has to come from the model
+    let png = encode::png8(&ImageBatch::from_u8(1, 32, 32, 3, vec![90; 32 * 32 * 3]), 0).unwrap();
+    let workflow = json!({
+        "1": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": base64::engine::general_purpose::STANDARD.encode(png) } },
+        "2": { "class_type": "LoadBackgroundRemovalModel", "inputs": { "bg_removal_name": "birefnet.safetensors" } },
+        "3": { "class_type": "RemoveBackground", "inputs": { "bg_removal_model": ["2", 0], "image": ["1", 0] } },
+        "4": { "class_type": "MaskToImage", "inputs": { "mask": ["3", 0] } },
+        "5": { "class_type": "SwarmSaveImageWS", "inputs": { "images": ["4", 0] } },
+    });
+    let r = run_like_swarm(&s, workflow, |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history_entry());
+    let img = image::load_from_memory(&r.outputs[0].bytes).unwrap().to_luma8();
+    assert_eq!((img.get_pixel(16, 16)[0], img.get_pixel(0, 0)[0]), (255, 0));
+
+    // the loader lists the folder like ComfyUI's
+    let info = s.get("object_info/LoadBackgroundRemovalModel").await;
+    assert!(info["LoadBackgroundRemovalModel"]["input"]["required"]["bg_removal_name"][0].as_array().unwrap().contains(&json!("birefnet.safetensors")));
+    let info = s.get("object_info/RemoveBackground").await;
+    assert_eq!(info["RemoveBackground"]["output"][0], "MASK");
+
+    // and its mask drives Pixal3D
+    let png = encode::png8(&ImageBatch::from_u8(1, 64, 64, 3, vec![200; 64 * 64 * 3]), 0).unwrap();
+    let workflow = json!({
+        "1": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": base64::engine::general_purpose::STANDARD.encode(png) } },
+        "2": { "class_type": "LoadBackgroundRemovalModel", "inputs": { "bg_removal_name": "birefnet.safetensors" } },
+        "3": { "class_type": "RemoveBackground", "inputs": { "bg_removal_model": ["2", 0], "image": ["1", 0] } },
+        "4": { "class_type": "Pixal3DImageTo3D", "inputs": {
+            "image": ["1", 0], "mask": ["3", 0],
+            "unet_name": "Pixal3D/pixal3d_int8_convrot.safetensors", "clip_vision_name": "dino_v3_L_naf_fp32.safetensors",
+            "shape_vae_name": "Pixal3D/trellis_2_shape_vae_bf16.safetensors", "texture_vae_name": "Pixal3D/trellis_2_texture_vae_bf16.safetensors",
+            "seed": 7, "filename_prefix": "3d/pixal3d"
+        } }
+    });
+    let r = run_like_swarm(&s, workflow, |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history_entry());
+}
+

@@ -53,7 +53,7 @@ GPU_API int gpu_blas_init(size_t workspace_bytes) {
 
 // Row-major D[M,N] = alpha * A[M,K] . op(B) (+ bias[N]) (+ beta * D)
 //   transb = 1: B is [N,K] (a Linear weight), transb = 0: B is [K,N].
-// A, B bf16 or f32 (in_dt, fp32 is computed without TF32); D bf16 or f32 (out_dt); bias in the output dtype.
+// A, B bf16, f16 or f32 (in_dt, fp32 is computed without TF32); D likewise (out_dt); bias in the output dtype.
 GPU_API int gpu_gemm(const void* A, int64_t lda, const void* B, int64_t ldb, void* D, int64_t ldd, const void* bias,
                        int64_t M, int64_t N, int64_t K, int transb, int in_dt, int out_dt, float alpha, float beta,
                        void* stream) {
@@ -65,8 +65,9 @@ GPU_API int gpu_gemm(const void* A, int64_t lda, const void* B, int64_t ldb, voi
         std::lock_guard<std::mutex> lock(g_mu);
         auto it = g_plans.find(key);
         if (it == g_plans.end()) {
-            const cudaDataType_t dt = out_dt == DT_F32 ? CUDA_R_32F : CUDA_R_16BF;
-            const cudaDataType_t it = in_dt == DT_F32 ? CUDA_R_32F : CUDA_R_16BF;
+            auto cuda_dt = [](int d) { return d == DT_F32 ? CUDA_R_32F : d == DT_F16 ? CUDA_R_16F : CUDA_R_16BF; };
+            const cudaDataType_t dt = cuda_dt(out_dt);
+            const cudaDataType_t it = cuda_dt(in_dt);
             cublasLtMatmulDescCreate(&plan.desc, in_dt == DT_F32 ? CUBLAS_COMPUTE_32F_PEDANTIC : CUBLAS_COMPUTE_32F,
                                      CUDA_R_32F);
             cublasOperation_t ta = transb ? CUBLAS_OP_T : CUBLAS_OP_N, tb = CUBLAS_OP_N;

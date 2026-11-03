@@ -64,6 +64,9 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | Engine core | Route each model to its engine | One backend now serves Krea 2, Anima, MOSS Image and MiniMax H3, picked from the checkpoint's keys. Still inside native-engine; other families need a real router. |
 | P0 | Engine core | Dynamic VRAM offloading | Live residency works and adapted to ComfyUI's memory. Open: 16 to 11 drop at 1024, one 867 ms/step run after ComfyUI. |
 | P1 | Krea 2 | Model Attention Backend | int8 and flash, per request. flash not yet run through the server. |
+| P1 | Pixal3D | Image to 3D | Real meshes from the CLI and through comfy-server's `Pixal3DImageTo3D` node: 40 s at 1024, 110 s at 1536. Each stage compared with ComfyUI. Not yet run through SwarmUI. |
+| P1 | Pixal3D | Background removal (BiRefNet) | Cut-outs from the CLI and through comfy-server's stock `LoadBackgroundRemovalModel` and `RemoveBackground` nodes, compared with ComfyUI. An opaque image went on through them to a mesh over HTTP. Not yet run through SwarmUI, and SwarmUI's own Remove Background parameter (`SwarmRemBg`, rembg) is still refused. |
+| P1 | Pixal3D | SwarmUI tab (the Pixal3D extension) | Compiles against SwarmUI. The tab and its viewer ran in a browser with the server calls stubbed, including the background removal choice, and the ComfyUI node ran headless on ComfyUI's code. Not yet run in SwarmUI. |
 
 ## Plumbing
 

@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use diffusion::h3;
 use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, LoadOptions, MossRequest, Prompt, Reference, Request, Sampling, Step};
+use diffusion::pixal3d;
 use diffusion::preview;
 use diffusion::samplers::{self, CfgFunction, CfgTweaks, ModelSampling, SigmaRange};
 use diffusion::lora::{self, Lora};
@@ -69,6 +70,7 @@ impl Default for NativeOptions {
 pub struct NativeEngine {
     gen: Mutex<Generator>,
     live_previews: bool,
+    threads: usize,
 }
 
 /// The prompt to encode, or why this conditioning can't be used. Only checked when a prompt is
@@ -428,7 +430,7 @@ impl NativeEngine {
             attn_variant: 0,
             int8_attn: true,
         };
-        Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews })
+        Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads })
     }
 
     /// SwarmUI always asks for previews, so the server's option decides.
@@ -596,6 +598,41 @@ impl NativeEngine {
         }
         Ok(data)
     }
+}
+
+/// Checks that each Pixal3D file is what its slot needs, before anything is unloaded for it.
+fn check_pixal3d(req: &ImageTo3DRequest) -> EngineResult<()> {
+    let has = |f: &ModelFile, what: &str, test: fn(&dyn Fn(&str) -> bool) -> bool| -> EngineResult<()> {
+        let h = read_header(&f.path).map_err(|e| unsupported(format!("{}: not a readable safetensors file ({e})", f.name)))?;
+        if test(&|k| h.get(k).is_some()) { Ok(()) } else { Err(unsupported(format!("{}: not {what}", f.name))) }
+    };
+    has(&req.diffusion_model, "a Pixal3D diffusion model", |h| diffusion::trellis::is_pixal3d(h))?;
+    has(&req.clip_vision, "DINOv3 ViT-L with NAF weights (dino_v3_L_naf)", |h| diffusion::dino3::is_dino3_naf(h))?;
+    has(&req.shape_vae, "the Trellis 2 shape VAE", |h| diffusion::trellis_vae::is_shape_vae(h))?;
+    has(&req.texture_vae, "the Trellis 2 texture VAE", |h| diffusion::trellis_vae::is_texture_vae(h))?;
+    if req.diffusion_model.path.to_string_lossy().contains("multiview") {
+        return Err(unsupported("Pixal3D's multi-view checkpoint (this node takes one view)"));
+    }
+    Ok(())
+}
+
+/// The first image as f32 RGB and its object mask: the given one (resized views aren't supported), else alpha.
+fn pixal3d_inputs(req: &ImageTo3DRequest) -> EngineResult<(Vec<f32>, Vec<f32>, usize, usize)> {
+    let img = &req.image;
+    let (w, h) = (img.width as usize, img.height as usize);
+    let frame = img.frame_f32(0);
+    let c = img.channels as usize;
+    if c < 3 {
+        return Err(unsupported("a greyscale image for Pixal3D"));
+    }
+    let rgb: Vec<f32> = frame.chunks_exact(c).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let mask = match &req.mask {
+        Some(m) if (m.width as usize, m.height as usize) == (w, h) => m.data[..w * h].to_vec(),
+        Some(m) => return Err(unsupported(format!("a {}x{} mask on a {w}x{h} image", m.width, m.height))),
+        None if c == 4 => frame.chunks_exact(4).map(|p| p[3]).collect(),
+        None => return Err(EngineError::InvalidInput("Pixal3D needs the object cut out: an image with transparency, or a mask".into())),
+    };
+    Ok((rgb, mask, w, h))
 }
 
 /// True for MiniMax H3's video or audio VAE, which load when they decode.
@@ -897,6 +934,70 @@ impl Engine for NativeEngine {
         if let Err(e) = self.gen().idle() {
             tracing::warn!("native: releasing VRAM failed: {e:#}");
         }
+    }
+
+    fn background_mask(&self, model: &AddonHandle, images: &ImageBatch) -> EngineResult<Mask> {
+        let file = &model.source;
+        let header = read_header(&file.path).map_err(|e| unsupported(format!("{}: not a readable safetensors file ({e})", file.name)))?;
+        if !diffusion::birefnet::is_birefnet(|k| header.get(k).is_some()) {
+            return Err(unsupported(format!("{}: not a BiRefNet background removal model", file.name)));
+        }
+        let c = images.channels as usize;
+        if c < 3 {
+            return Err(unsupported("background removal of a greyscale image"));
+        }
+        let frames: Vec<Vec<f32>> =
+            (0..images.count).map(|f| images.frame_f32(f).chunks_exact(c).flat_map(|p| [p[0], p[1], p[2]]).collect()).collect();
+        // the model takes what the GPU has free: the image models go, and load again when next used
+        let mut gen = self.gen();
+        gen.unload().map_err(internal)?;
+        let masks = diffusion::birefnet::remove_backgrounds(&file.path, &frames, images.width as usize, images.height as usize).map_err(internal)?;
+        drop(gen);
+        Ok(Mask { count: images.count, height: images.height, width: images.width, data: Arc::new(masks.concat()) })
+    }
+
+    fn image_to_3d(&self, req: &ImageTo3DRequest, progress: &mut dyn ProgressSink) -> EngineResult<Vec<u8>> {
+        check_pixal3d(req)?;
+        let (rgb, mask, w, h) = pixal3d_inputs(req)?;
+        if !(1024..=2048).contains(&req.resolution) || req.resolution % 128 != 0 {
+            return Err(EngineError::InvalidInput("resolution must be 1024 to 2048 in steps of 128".into()));
+        }
+        let mut p = pixal3d::Params::example(req.seed);
+        p.fov = req.fov;
+        p.resolution = req.resolution as usize;
+        (p.structure.steps, p.shape.steps, p.refine.steps, p.texture.steps) =
+            (req.structure_steps as usize, req.shape_steps as usize, req.refine_steps as usize, req.texture_steps as usize);
+        (p.structure.cfg, p.shape.cfg, p.refine.cfg) = (req.cfg, req.cfg, req.cfg);
+        p.texture_enabled = req.texture;
+        p.max_faces = req.max_faces as usize;
+        let paths = pixal3d::Paths {
+            dit: req.diffusion_model.path.clone(),
+            dino: req.clip_vision.path.clone(),
+            shape_vae: req.shape_vae.path.clone(),
+            texture_vae: req.texture_vae.path.clone(),
+        };
+        // the pipeline needs the whole GPU: the image models go, and load again when next used
+        let mut gen = self.gen();
+        gen.unload().map_err(internal)?;
+        let stages = if req.texture { 6 } else { 4 };
+        let mut stage_index = 0;
+        let mut last = String::new();
+        let mut report = |stage: &str, i: usize, n: usize| -> anyhow::Result<()> {
+            if stage != last {
+                if !last.is_empty() {
+                    stage_index += 1;
+                }
+                last = stage.to_string();
+                tracing::info!("pixal3d: {stage}");
+            }
+            // one bar across the stages, each stage an equal share
+            let frac = (stage_index.min(stages - 1) as f64 + i as f64 / n.max(1) as f64) / stages as f64;
+            progress.progress((frac * 1000.0) as u32, 1000);
+            if progress.interrupted() { Err(Cancelled.into()) } else { Ok(()) }
+        };
+        let mesh = pixal3d::run(&paths, &rgb, &mask, w, h, &p, self.threads, &mut report).map_err(internal)?;
+        drop(gen);
+        Ok(pixal3d::glb(&mesh))
     }
 
     fn free_memory(&self, unload_models: bool, free_memory: bool) {

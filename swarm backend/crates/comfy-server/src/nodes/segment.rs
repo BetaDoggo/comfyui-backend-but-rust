@@ -137,6 +137,20 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
     );
     r.add(
         env,
+        |_| {
+            NodeSchema::new("RemoveBackground", "Remove Background", "image/background removal")
+                .describe("Generates a foreground mask to remove the background from an image using a background removal model.")
+                .input(link("bg_removal_model", "BACKGROUND_REMOVAL").tooltip("Background removal model used to generate the mask"))
+                .input(link("image", "IMAGE").tooltip("Input image to remove the background from"))
+                .output("MASK", "MASK")
+        },
+        |i, ctx| {
+            let model = i.addon("bg_removal_model", AddonKind::BackgroundRemoval)?;
+            Ok(NodeOutput::one(Value::Mask(ctx.engine.background_mask(model, i.image("image")?)?)))
+        },
+    );
+    r.add(
+        env,
         |_| NodeSchema::new("SwarmSam2BBoxFromJson", "SwarmSam2BBoxFromJson", "SAM2").input(string("bbox_json", "", false).no_default().force_input()).output("BBOX", "bboxes"),
         |i, _| {
             let coords: Vec<f64> = serde_json::from_str(i.string("bbox_json")?).map_err(|e| input_err(format!("bbox_json: {e}")))?;

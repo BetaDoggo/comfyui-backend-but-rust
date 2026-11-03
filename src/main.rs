@@ -122,6 +122,43 @@ struct Args {
     /// Krea 2: how reference latents are used, "index" or "index_timestep_zero"
     #[arg(long, default_value = "index")]
     ref_method: String,
+    /// Pixal3D: an RGBA PNG whose alpha masks the object, turned into a vertex-coloured mesh written to --output (GLB)
+    #[arg(long)]
+    pixal3d: Option<PathBuf>,
+    /// Pixal3D: horizontal field of view of the photo, in degrees
+    #[arg(long, default_value_t = 49.13)]
+    fov: f64,
+    /// Pixal3D: voxel resolution of the refined shape, 1024 to 2048 in steps of 128
+    #[arg(long, default_value_t = 1536)]
+    resolution: usize,
+    /// Pixal3D: skip the texture stage (grey mesh)
+    #[arg(long)]
+    no_texture: bool,
+    /// Pixal3D: simplify the mesh to at most this many triangles, 0 to keep the full one
+    #[arg(long, default_value_t = 700_000)]
+    max_faces: usize,
+    /// Pixal3D: the DINOv3 + NAF file (--vae is the shape VAE)
+    #[arg(long)]
+    clip_vision: Option<PathBuf>,
+    /// Pixal3D: the texture VAE
+    #[arg(long)]
+    texture_vae: Option<PathBuf>,
+    /// Pixal3D: compare every stage with a dump of tools/pixal3d_ref.py instead of generating
+    #[arg(long)]
+    pixal3d_check: Option<PathBuf>,
+    /// Pixal3D: seeds of the structure, shape, refine and texture samplers, comma separated (default: --seed for
+    /// the first three, --seed + 1 for the texture)
+    #[arg(long)]
+    pixal3d_seeds: Option<String>,
+    /// Background removal: write the PNG with its background made transparent to --output (needs the BiRefNet file)
+    #[arg(long)]
+    remove_background: Option<PathBuf>,
+    /// BiRefNet checkpoint for --remove-background, and for --pixal3d on an image without transparency
+    #[arg(long)]
+    birefnet: Option<PathBuf>,
+    /// BiRefNet: compare every stage with a dump of tools/birefnet_ref.py instead of running
+    #[arg(long)]
+    birefnet_check: Option<PathBuf>,
 }
 
 /// RGB f32 [height, width, 3], 0 to 1.
@@ -179,6 +216,11 @@ const ANIMA_TE: &str = "clip/qwen_3_600m.safetensors";
 const MOSS_DIT: &str = "Stable-diffusion/moss_image_sft_int8_convrot_attn.safetensors";
 const MOSS_TE: &str = "clip/qwen3.5_9b_int8_convrot.safetensors";
 const MOSS_VAE: &str = "VAE/flux2-vae.safetensors";
+const BIREFNET: &str = "background_removal/birefnet.safetensors";
+const PIXAL_DIT: &str = "diffusion_models/Pixal3D/pixal3d_int8_convrot.safetensors";
+const PIXAL_DINO: &str = "clip_vision/dino_v3_L_naf_fp32.safetensors";
+const PIXAL_SHAPE_VAE: &str = "VAE/Pixal3D/trellis_2_shape_vae_bf16.safetensors";
+const PIXAL_TEX_VAE: &str = "VAE/Pixal3D/trellis_2_texture_vae_bf16.safetensors";
 
 impl Args {
     fn sampling(&self, default: &str, ms: ModelSampling, seed: u64, latent: (usize, usize)) -> Result<pipeline::Sampling> {
@@ -413,8 +455,114 @@ fn out_path(base: &Path, i: usize, count: usize) -> PathBuf {
     base.with_file_name(format!("{stem}_{i}.{ext}"))
 }
 
+fn read_rgba(path: &Path) -> Result<(Vec<u8>, usize, usize)> {
+    let mut decoder = png::Decoder::new(std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?);
+    decoder.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::ALPHA);
+    let mut reader = decoder.read_info()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf)?;
+    let channels = info.color_type.samples();
+    let rgba = buf[..info.buffer_size()]
+        .chunks_exact(channels)
+        .flat_map(|px| match channels {
+            4 => [px[0], px[1], px[2], px[3]],
+            3 => [px[0], px[1], px[2], 255],
+            2 => [px[0], px[0], px[0], px[1]],
+            _ => [px[0], px[0], px[0], 255],
+        })
+        .collect();
+    Ok((rgba, info.width as usize, info.height as usize))
+}
+
+/// An RGBA image whose alpha is BiRefNet's foreground mask.
+fn cut_out(model: &Path, rgba: &[u8], w: usize, h: usize) -> Result<Vec<u8>> {
+    let (rgb, _) = diffusion::pixal3d::split_rgba(rgba);
+    let mask = diffusion::birefnet::remove_background(model, &rgb, w, h)?;
+    Ok(rgba.chunks_exact(4).zip(&mask).flat_map(|(px, m)| [px[0], px[1], px[2], (m * 255.0).round() as u8]).collect())
+}
+
+fn write_rgba_png(path: &Path, rgba: &[u8], w: usize, h: usize) -> Result<()> {
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(path)?), w as u32, h as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()?.write_image_data(rgba)?;
+    Ok(())
+}
+
+fn run_remove_background(args: &Args, image: &Path) -> Result<()> {
+    diffusion::cuda::init(0)?;
+    let model = args.model(&args.birefnet, BIREFNET);
+    if let Some(r) = &args.birefnet_check {
+        return diffusion::birefnet::check(&model, r);
+    }
+    let (rgba, w, h) = read_rgba(image)?;
+    let out = if args.out.extension().is_some_and(|e| e == "png") { args.out.clone() } else { args.out.with_extension("png") };
+    write_rgba_png(&out, &cut_out(&model, &rgba, w, h)?, w, h)?;
+    eprintln!("saved {}", out.display());
+    Ok(())
+}
+
+fn run_pixal3d(args: &Args, image: &Path) -> Result<()> {
+    diffusion::cuda::init(0)?;
+    let paths = diffusion::pixal3d::Paths {
+        dit: args.model(&args.dit, PIXAL_DIT),
+        dino: args.model(&args.clip_vision, PIXAL_DINO),
+        shape_vae: args.model(&args.vae, PIXAL_SHAPE_VAE),
+        texture_vae: args.model(&args.texture_vae, PIXAL_TEX_VAE),
+    };
+    let (rgba, w, h) = read_rgba(image)?;
+    if let Some(r) = &args.pixal3d_check {
+        return diffusion::pixal3d::check(&paths, &rgba, w, h, r, args.threads);
+    }
+    let mut p = diffusion::pixal3d::Params::example(args.seed);
+    p.fov = args.fov;
+    p.resolution = args.resolution;
+    p.texture_enabled = !args.no_texture;
+    p.max_faces = args.max_faces;
+    if let Some(seeds) = &args.pixal3d_seeds {
+        let v = seeds.split(',').map(|s| s.trim().parse::<u64>()).collect::<Result<Vec<_>, _>>()?;
+        let [a, b, c, d] = v[..] else { bail!("--pixal3d-seeds takes four seeds") };
+        (p.structure.seed, p.shape.seed, p.refine.seed, p.texture.seed) = (a, b, c, d);
+    }
+    let mut last = String::new();
+    let mut progress = |stage: &str, i: usize, n: usize| -> Result<()> {
+        if stage != last {
+            eprintln!("[pixal3d] {stage}");
+            last = stage.to_string();
+        }
+        let _ = (i, n);
+        Ok(())
+    };
+    let mut rgba = rgba;
+    if rgba.chunks_exact(4).all(|px| px[3] == 255) {
+        // nothing to mask with: cut the object out first, as the example workflow's RemoveBackground does
+        let model = args.model(&args.birefnet, BIREFNET);
+        if !model.exists() {
+            bail!("{} has no transparency: give --pixal3d an RGBA PNG, or --birefnet the background removal model ({} not found)", image.display(), model.display());
+        }
+        eprintln!("[pixal3d] removing the background with {}", model.display());
+        rgba = cut_out(&model, &rgba, w, h)?;
+    }
+    let (rgb, mask) = diffusion::pixal3d::split_rgba(&rgba);
+    let mesh = diffusion::pixal3d::run(&paths, &rgb, &mask, w, h, &p, args.threads, &mut progress)?;
+    let out = if args.out.extension().is_some_and(|e| e == "glb") { args.out.clone() } else { args.out.with_extension("glb") };
+    std::fs::write(&out, diffusion::pixal3d::glb(&mesh))?;
+    eprintln!("saved {}", out.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(image) = &args.pixal3d {
+        return run_pixal3d(&args, image);
+    }
+    if let Some(image) = &args.remove_background {
+        return run_remove_background(&args, image);
+    }
+    if args.birefnet_check.is_some() {
+        diffusion::cuda::init(0)?;
+        return diffusion::birefnet::check(&args.model(&args.birefnet, BIREFNET), args.birefnet_check.as_ref().unwrap());
+    }
     let int8_attn = match args.attention.as_deref().unwrap_or(if args.h3 { "flash" } else { "int8" }) {
         "flash" => false,
         "int8" | "sage" => true,

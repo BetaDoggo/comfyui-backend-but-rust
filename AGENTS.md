@@ -27,6 +27,7 @@ Rules and context for people and coding agents. The [README](README.md) covers s
 | `swarm backend/crates/comfy-server` | ComfyUI protocol, node graph, mock engine |
 | `swarm backend/crates/native-engine` | `Engine` on top of the `diffusion` library |
 | `swarm backend/swarm-extension` | comfy-rust backend: SwarmUI extension that starts the server |
+| `swarm backend/pixal3d-extension` | Pixal3D tab: SwarmUI extension, meant to become its own repository |
 | `tools/` | Comparisons with real ComfyUI |
 | `swarm backend/tools/` | Node catalog and COMPATIBILITY.md generators |
 | `ref/`, `swarm backend/reference/`, `swarm backend/scratch/` | Local and gitignored; may not exist |

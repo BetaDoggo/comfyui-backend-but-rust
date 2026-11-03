@@ -16,7 +16,7 @@ const EVENT_RAW_BMP: u32 = 10;
 /// Saves `images` as `{prefix}_{counter:05}_.png` in `dir`, ComfyUI style. Returns the `ui` entries.
 /// ComfyUI's `get_save_image_path`: the target folder, subfolder, file stem and next free counter
 /// for `prefix` under `dir`.
-fn output_slot(dir: &std::path::Path, prefix: &str) -> Result<(std::path::PathBuf, String, String, u32), NodeError> {
+pub(super) fn output_slot(dir: &std::path::Path, prefix: &str) -> Result<(std::path::PathBuf, String, String, u32), NodeError> {
     let prefix = prefix.replace('\\', "/");
     let (subfolder, stem) = match prefix.rsplit_once('/') {
         Some((s, f)) => (s.to_string(), f.to_string()),

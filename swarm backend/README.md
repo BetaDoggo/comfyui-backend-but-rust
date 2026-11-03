@@ -146,6 +146,17 @@ sends, the generic route versus native nodes, the engine-side work, and tests.
 through `custom_node`. That doesn't mean the native engine can generate it; [STATUS](../docs/STATUS.md) covers that. Each generic-route node class is tagged with what native support would take: server-only
 work, a new patch/metadata field, a new `Engine` operation, or a new model architecture.
 
+## Image to 3D
+
+The `Pixal3DImageTo3D` node runs Pixal3D's whole example workflow as one engine call (`Engine::image_to_3d`) and saves a
+GLB under `output/3d/`, reported as `{"3d": [...]}` in the history like ComfyUI's `SaveGLB`. `/view` serves it as
+`model/gltf-binary`. It isn't a stock ComfyUI node: the [Pixal3D extension](pixal3d-extension/README.md) sends it from
+its own SwarmUI tab, and brings a Python version for ComfyUI backends. The mock engine answers it with a tetrahedron.
+
+An image without transparency is cut out first by ComfyUI's own `LoadBackgroundRemovalModel` and `RemoveBackground` nodes
+(`Engine::background_mask`), which read BiRefNet from the `background_removal` model folder and give the foreground mask
+to the node's `mask` input. The mock engine's mask is an ellipse.
+
 ## Idle memory
 
 After 5 minutes with no work the engine moves diffusion blocks to RAM, so other applications get the VRAM.

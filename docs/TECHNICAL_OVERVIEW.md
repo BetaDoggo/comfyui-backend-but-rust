@@ -87,6 +87,7 @@ the baked weights match ComfyUI's bit for bit. Sampling then runs the normal int
 | Anima | `src/anima.rs`, int8 ConvRot | Qwen3 0.6B, `src/qwen3.rs` | Qwen-Image (Wan 2.1), `src/vae.rs` |
 | MOSS Image | `src/moss.rs`, int8 ConvRot | Qwen3.5 9B, `src/qwen35.rs` | Flux 2, `src/flux2vae.rs` |
 | MiniMax H3 | `src/h3.rs`, w6a8 | Qwen3-VL 32B, `src/h3te.rs` | Video and audio, `src/h3vae.rs` |
+| Pixal3D | `src/trellis.rs`, int8 ConvRot | DINOv3 ViT-L and NAF, `src/dino3.rs` | Sparse convolution shape and texture decoders, `src/trellis_vae.rs` |
 
 Each model is written directly against its checkpoint, with no general layer or graph abstraction. That is what allows
 operations to be fused and work to be cached. For example, Anima's cross-attention k and v are computed once per prompt,
@@ -158,6 +159,20 @@ than its compute (~24 ms). The text encoder and text-fusion adapter stream the s
 stays conservative on purpose: oversubscribing VRAM makes Windows fall back to shared system memory,
 which doubles step time.
 
+### Pixal3D
+
+[`src/pixal3d.rs`](../src/pixal3d.rs) runs the example workflow's stages one after another and keeps only one in VRAM at
+a time: DINOv3, then each of the four flow sub-models (about 1.4 GB each), the NAF map a stage needs, and the decoders.
+The flow models are transformers over the occupied voxels, so the sparse part is only the token set and the 3D RoPE.
+The decoders' submanifold convolutions gather each voxel's 27 neighbours, found through a GPU hash of the coordinates,
+into rows for one f16 GEMM against the kernel, in chunks. The dense structure decoder is the same convolution over a full
+grid. Mesh extraction, painting and simplification run on the CPU.
+
+[`src/birefnet.rs`](../src/birefnet.rs) cuts the object out of an opaque image first. It is written for ComfyUI's BiRefNet
+checkpoint: a Swin-L backbone whose window attention is one kernel per (window, head), run at 1024 and at 512, and a
+decoder whose deformable convolutions gather bilinear samples into columns for one GEMM. Convolutions are im2col plus
+a float32 GEMM in chunks, with BatchNorm folded into the weights when they load.
+
 ### MiniMax H3
 
 Offloading is the lazy kind in [`src/offload.rs`](../src/offload.rs): nothing is read at load, reader threads fill up to four pinned staging buffers ahead of compute, taken only when a unit needs one and returned when the set parks. Pages read once leave the process right after, which took a H3 run's peak working set from 52 GB to 32 GB.
@@ -176,6 +191,8 @@ csrc/gemm.cu        cuBLASLt bf16/fp32 GEMM, CUTLASS conv2d, int8 GEMM wrappers
 csrc/attn.cu        FlashAttention-2 forward wrapper (only the needed variants instantiated)
 csrc/attn_int8.cu   optional INT8 attention wrapper
 csrc/h3.cu          MiniMax H3 kernels
+csrc/trellis.cu     Pixal3D: per-head QK norm, voxel hashing and sparse-conv gathers, NAF attention, feature sampling
+csrc/birefnet.cu    BiRefNet: im2col, deformable-conv columns, Swin window gather and attention, bilinear resize
 csrc/wddm.cu        VRAM queries under Windows
 csrc/vendor/        comfy-kitchen CUTLASS int8 GEMM + Sage INT8 attention (Apache-2.0)
 src/                Rust: loader, offload engine, tokenizer, text encoder, DiT, VAE, LoRA baking, CLI

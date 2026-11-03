@@ -11,7 +11,7 @@
 A Rust and CUDA backend that speaks ComfyUI's API and replaces the ComfyUI features SwarmUI uses most, so SwarmUI can
 generate without Python or ComfyUI. The goal is speed first.
 
-It really generates with four model families, from specific quantized checkpoints only:
+It really generates with four image and video model families and one image-to-3D model, from specific quantized checkpoints only:
 
 | Family | Generates | 1024x1024 sampling here | ComfyUI |
 |---|---|---|---|
@@ -19,6 +19,7 @@ It really generates with four model families, from specific quantized checkpoint
 | Anima | Text to image | 115 ms/step | 199 ms/step |
 | MOSS Image | Text to image | 550 to 573 ms/step at CFG 4 | 601 ms/step |
 | MiniMax H3 | Text to video with audio | 0.24 s/step, 5 frames at 512x512 | 1.59 s/step |
+| Pixal3D | Image to a vertex-coloured 3D mesh (GLB), cutting the object out first with BiRefNet | 40 s per mesh at resolution 1024, 110 s at 1536 | not timed |
 
 All of them take LoRAs and every ComfyUI sampler and scheduler. Init images, inpainting, ControlNet, refiners and every
 other model family don't work yet. The server accepts far more of SwarmUI's features than that, but they only reach a
@@ -55,6 +56,12 @@ Put your models in one folder, keeping these subfolders, and point `MODELS_ROOT`
 | Anima | `animaInt8Mxfp8_turboV11Int8.safetensors` | `qwen_3_600m.safetensors` | `qwen_image_vae.safetensors` |
 | MOSS Image | `moss_image_sft_int8_convrot_attn.safetensors` | `qwen3.5_9b_int8_convrot.safetensors` | `flux2-vae.safetensors` |
 | MiniMax H3 | `minimax_h3_fl2va_pruned_w6a8.safetensors` | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `MiniMaxH3/minimax_h3_video_vae_int8_convrot.safetensors`, `MiniMaxH3/minimax_h3_audio_vae_fp32.safetensors` |
+
+Pixal3D uses other folders: `diffusion_models/Pixal3D/pixal3d_int8_convrot.safetensors`, `clip_vision/dino_v3_L_naf_fp32.safetensors`,
+and `VAE/Pixal3D/trellis_2_shape_vae_bf16.safetensors` with `trellis_2_texture_vae_bf16.safetensors`, all from
+[Comfy-Org/Pixal3D](https://huggingface.co/Comfy-Org/Pixal3D). An image without a transparent background is cut out
+first by BiRefNet, `background_removal/birefnet.safetensors` from [Comfy-Org/BiRefNet](https://huggingface.co/Comfy-Org/BiRefNet).
+In SwarmUI it runs from its own tab, the [Pixal3D extension](swarm%20backend/pixal3d-extension/README.md).
 
 ### Generate from the command line
 

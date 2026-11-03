@@ -403,3 +403,38 @@ pub struct AudioSilenceRequest {
     pub prefix_seconds: f64,
     pub suffix_seconds: f64,
 }
+
+// ---------------------------------------------------------------- 3D ---
+
+/// `Pixal3DImageTo3D` (the node of the Pixal3D SwarmUI extension): an image and its object mask to a
+/// vertex-coloured mesh, following ComfyUI's Pixal3D example workflow from `ImageCropToMask` to `PaintMesh`.
+#[derive(Clone, Debug)]
+pub struct ImageTo3DRequest {
+    /// `diffusion_models`: the Pixal3D checkpoint (all four sub-models)
+    pub diffusion_model: ModelFile,
+    /// `clip_vision`: DINOv3 ViT-L with the NAF weights
+    pub clip_vision: ModelFile,
+    pub shape_vae: ModelFile,
+    pub texture_vae: ModelFile,
+    /// The first image of the batch is used.
+    pub image: ImageBatch,
+    /// The object's mask, either polarity (`LoadImage`'s is 1 - alpha; the crop tells them apart like
+    /// `ImageCropToMask`). Without one the image's alpha is used.
+    pub mask: Option<Mask>,
+    /// Seed of the structure, shape and refine samplers; the texture sampler takes `seed + 1`.
+    pub seed: u64,
+    /// Horizontal field of view of the photo, degrees.
+    pub fov: f64,
+    /// Voxel resolution of the refined shape: 1024 to 2048 in steps of 128.
+    pub resolution: u32,
+    pub structure_steps: u32,
+    pub shape_steps: u32,
+    pub refine_steps: u32,
+    pub texture_steps: u32,
+    /// CFG of the three geometry samplers (the texture sampler runs at 1).
+    pub cfg: f64,
+    /// Run the texture stage; without it the mesh is grey.
+    pub texture: bool,
+    /// Simplify the mesh to at most this many triangles; 0 keeps the full one.
+    pub max_faces: u32,
+}

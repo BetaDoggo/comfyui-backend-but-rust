@@ -31,6 +31,7 @@ fn subfolders(folder: ModelFolder) -> &'static [&'static str] {
         ModelFolder::Yolov8 => &["yolov8"],
         ModelFolder::IpAdapter => &["ipadapter"],
         ModelFolder::TensorRt => &["tensorrt"],
+        ModelFolder::BackgroundRemoval => &["background_removal"],
     }
 }
 
@@ -55,6 +56,7 @@ fn config_folders(key: &str) -> &'static [ModelFolder] {
         "yolov8" => &[ModelFolder::Yolov8],
         "ipadapter" => &[ModelFolder::IpAdapter],
         "tensorrt" => &[ModelFolder::TensorRt],
+        "background_removal" => &[ModelFolder::BackgroundRemoval],
         _ => &[],
     }
 }
@@ -67,6 +69,10 @@ fn read_config(path: &Path) -> std::io::Result<Vec<(ModelFolder, PathBuf)>> {
     let mut out = Vec::new();
     for section in sections.values() {
         let base = section.get("base_path").and_then(|v| v.as_str()).map_or(here.clone(), |b| here.join(b));
+        // SwarmUI doesn't know the `background_removal` folder, so its file has no key for it: look next to the others.
+        if section.contains_key("base_path") && !section.contains_key("background_removal") {
+            out.push((ModelFolder::BackgroundRemoval, base.join("background_removal")));
+        }
         for (key, value) in section {
             for line in value.as_str().unwrap_or("").lines().map(str::trim).filter(|l| !l.is_empty()) {
                 out.extend(config_folders(key).iter().map(|f| (*f, base.join(line))));
@@ -176,6 +182,8 @@ mod tests {
             std::fs::create_dir_all(root.join(dir)).unwrap();
             std::fs::write(root.join(dir).join(file), b"").unwrap();
         }
+        std::fs::create_dir_all(root.join("one/background_removal")).unwrap();
+        std::fs::write(root.join("one/background_removal/birefnet.safetensors"), b"").unwrap();
         let (one, two) = (root.join("one"), root.join("two"));
         // Laid out as ComfyUISelfStartBackend.EnsureComfyFile writes it, Windows paths included.
         let yaml = format!(
@@ -191,6 +199,7 @@ mod tests {
         assert_eq!(paths.list(ModelFolder::DiffusionModels), ["a.safetensors", "b.safetensors"]);
         assert_eq!(paths.list(ModelFolder::TextEncoders), ["te.safetensors"]);
         assert!(paths.list(ModelFolder::Vae).is_empty());
+        assert_eq!(paths.list(ModelFolder::BackgroundRemoval), ["birefnet.safetensors"]);
         assert_eq!(paths.resolve(ModelFolder::Checkpoints, "b.safetensors").unwrap().path, two.join("Custom SD/b.safetensors"));
         std::fs::remove_dir_all(root).unwrap();
     }

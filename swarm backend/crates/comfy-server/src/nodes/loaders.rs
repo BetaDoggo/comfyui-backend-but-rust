@@ -234,7 +234,7 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
     );
 
     // Add-on models: one loader per ComfyUI type, each yielding an `AddonHandle` for the nodes that use it.
-    let addons: [(&'static str, &'static str, &'static str, ModelFolder, AddonKind); 7] = [
+    let addons: [(&'static str, &'static str, &'static str, ModelFolder, AddonKind); 8] = [
         ("GLIGENLoader", "Load GLIGEN Model", "gligen_name", ModelFolder::Gligen, AddonKind::Gligen),
         ("UpscaleModelLoader", "Load Upscale Model", "model_name", ModelFolder::UpscaleModels, AddonKind::UpscaleModel),
         ("LatentUpscaleModelLoader", "Load Latent Upscale Model", "model_name", ModelFolder::LatentUpscaleModels, AddonKind::LatentUpscaleModel),
@@ -242,6 +242,7 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
         ("ControlNetLoader", "Load ControlNet Model", "control_net_name", ModelFolder::ControlNet, AddonKind::ControlNet),
         ("StyleModelLoader", "Load Style Model", "style_model_name", ModelFolder::StyleModels, AddonKind::StyleModel),
         ("ModelPatchLoader", "Load Model Patch", "name", ModelFolder::ModelPatches, AddonKind::ModelPatch),
+        ("LoadBackgroundRemovalModel", "Load Background Removal Model", "bg_removal_name", ModelFolder::BackgroundRemoval, AddonKind::BackgroundRemoval),
     ];
     for (class, display, input, folder, kind) in addons {
         r.add_cacheable(

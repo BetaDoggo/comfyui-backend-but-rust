@@ -420,6 +420,20 @@ impl Engine for MockEngine {
         Ok(ImageBatch::from_f32(rgba.count, rgba.height, rgba.width, 4, data))
     }
 
+    fn background_mask(&self, model: &AddonHandle, images: &ImageBatch) -> EngineResult<Mask> {
+        tracing::info!("[mock] background_mask {} on {images:?}", model.source.name);
+        // A filled ellipse in the middle.
+        let (w, h) = (images.width as usize, images.height as usize);
+        let plane: Vec<f32> = (0..w * h)
+            .map(|p| {
+                let (x, y) = ((p % w) as f32 / w as f32 - 0.5, (p / w) as f32 / h as f32 - 0.5);
+                if x * x + y * y < 0.16 { 1.0 } else { 0.0 }
+            })
+            .collect();
+        let data = (0..images.count).flat_map(|_| plane.clone()).collect();
+        Ok(Mask { count: images.count, height: images.height, width: images.width, data: Arc::new(data) })
+    }
+
     fn model_sigmas(&self, req: &ScheduleRequest) -> EngineResult<Sigmas> {
         // A flow-model style linear schedule from 1 to 0.
         let (steps, skip) = match req {
@@ -555,6 +569,20 @@ impl Engine for MockEngine {
         Ok(ClipVisionOutput { model: req.model.clone(), data: Opaque::new(key) })
     }
 
+    fn image_to_3d(&self, req: &ImageTo3DRequest, progress: &mut dyn ProgressSink) -> EngineResult<Vec<u8>> {
+        tracing::info!("[mock] image_to_3d {} {:?} seed {} res {}", req.diffusion_model.name, req.image, req.seed, req.resolution);
+        if req.mask.is_none() && !req.image.has_alpha() {
+            return Err(EngineError::InvalidInput("Pixal3D needs the object cut out: an image with transparency, or a mask".into()));
+        }
+        progress.progress(1, 1);
+        // a tetrahedron coloured by the image's mean colour
+        let px = req.image.frame_f32(0);
+        let c = req.image.channels as usize;
+        let n = (px.len() / c).max(1) as f32;
+        let mean: [f32; 3] = std::array::from_fn(|k| px.chunks(c).map(|p| p[k.min(c - 1)]).sum::<f32>() / n);
+        Ok(tetrahedron_glb(mean))
+    }
+
     fn upscale_image(&self, req: &UpscaleImageRequest) -> EngineResult<ImageBatch> {
         // ESRGAN-style models are named by their factor ("4x_...", "2x_...").
         let name = &req.model.source.name;
@@ -681,4 +709,33 @@ impl Engine for MockEngine {
     fn free_memory(&self, unload_models: bool, free_memory: bool) {
         tracing::info!("[mock] free_memory unload_models={unload_models} free_memory={free_memory}");
     }
+}
+
+/// The smallest useful mesh output: a binary glTF tetrahedron with one vertex colour.
+pub fn tetrahedron_glb(color: [f32; 3]) -> Vec<u8> {
+    let pos: [[f32; 3]; 4] = [[0.5, 0.5, 0.5], [-0.5, -0.5, 0.5], [-0.5, 0.5, -0.5], [0.5, -0.5, -0.5]];
+    let idx: [u32; 12] = [0, 1, 2, 0, 3, 1, 0, 2, 3, 1, 3, 2];
+    let mut bin: Vec<u8> = pos.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+    bin.extend((0..4).flat_map(|_| color).flat_map(|v| v.to_le_bytes()));
+    bin.extend(idx.iter().flat_map(|v| v.to_le_bytes()));
+    let json = format!(
+        r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0,"COLOR_0":1}},"indices":2}}]}}],"buffers":[{{"byteLength":{}}}],"bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":48}},{{"buffer":0,"byteOffset":48,"byteLength":48}},{{"buffer":0,"byteOffset":96,"byteLength":48}}],"accessors":[{{"bufferView":0,"componentType":5126,"count":4,"type":"VEC3","min":[-0.5,-0.5,-0.5],"max":[0.5,0.5,0.5]}},{{"bufferView":1,"componentType":5126,"count":4,"type":"VEC3"}},{{"bufferView":2,"componentType":5125,"count":12,"type":"SCALAR"}}]}}"#,
+        bin.len()
+    );
+    let mut jb = json.into_bytes();
+    while jb.len() % 4 != 0 {
+        jb.push(b' ');
+    }
+    let total = 12 + 8 + jb.len() + 8 + bin.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"glTF");
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&(jb.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"JSON");
+    out.extend(jb);
+    out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"BIN ");
+    out.extend(bin);
+    out
 }

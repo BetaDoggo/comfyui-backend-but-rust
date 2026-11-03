@@ -8,8 +8,14 @@
 // Row prologue -> optional ConvRot rotation -> per-row int8 quantization.
 // Produces the A operand (+ per-row scales) of the fused int8 GEMM.
 // ---------------------------------------------------------------------------------------------
+// LN_MOD: LayerNorm then addcmul(shift, n, 1 + scale) (Trellis 2), one rounding after the norm and one after the
+// addcmul. LN_AFFINE: LayerNorm with weight and bias, rounded once; LN_AFFINE_SILU then rounds silu of that.
 enum { PRO_PLAIN = 0, PRO_RMS = 1, PRO_GATE = 2, PRO_SWIGLU = 3, PRO_LAYERNORM = 4, PRO_SILU = 5, PRO_GELU = 6, PRO_ADALN = 7,
-       PRO_SITU = 8 };
+       PRO_SITU = 8, PRO_LN_MOD = 9, PRO_LN_AFFINE = 10, PRO_GELU_TANH = 11, PRO_LN_AFFINE_SILU = 12 };
+
+template <int PRO> __device__ __forceinline__ constexpr bool is_ln() {
+    return PRO == PRO_LAYERNORM || PRO == PRO_LN_MOD || PRO == PRO_LN_AFFINE || PRO == PRO_LN_AFFINE_SILU;
+}
 
 struct QuantParams {
     const void* x;       // PLAIN/RMS: input row; GATE: attention output; SWIGLU: [gate | up] row
@@ -26,7 +32,17 @@ struct QuantParams {
     int K;
     int rotate;
     float* out_f;        // if set: write the (rotated) fp32 row here instead of quantizing
+    const float* norm_b; // LN_AFFINE bias
 };
+
+// One normalized element after the prologue's norm, for the LayerNorm variants.
+template <typename T, int PRO>
+__device__ __forceinline__ float ln_finish(float n, int c, const QuantParams& p, float ms, float sh) {
+    if (PRO == PRO_LN_MOD) return rnd<T>(fmaf(rnd<T>(n), rnd<T>(1.f + ms), sh));
+    if (PRO == PRO_LN_AFFINE) return rnd<T>(fmaf(n, p.norm_w[c], p.norm_b[c]));
+    if (PRO == PRO_LN_AFFINE_SILU) return rnd<T>(silu_f(rnd<T>(fmaf(n, p.norm_w[c], p.norm_b[c]))));
+    return n;
+}
 
 template <typename T> __device__ __forceinline__ float finite_max();
 template <> __device__ __forceinline__ float finite_max<float>() { return FLT_MAX; }
@@ -96,7 +112,7 @@ __global__ void __launch_bounds__(1024) quant_rows_kernel(QuantParams p) {
             if (PRO == PRO_RMS || PRO == PRO_ADALN) {
 #pragma unroll
                 for (int j = 0; j < 8; ++j) ss += v[gi][j] * v[gi][j];
-            } else if (PRO == PRO_LAYERNORM) {
+            } else if (is_ln<PRO>()) {
 #pragma unroll
                 for (int j = 0; j < 8; ++j) ss += v[gi][j];
             } else if (PRO == PRO_SILU) {
@@ -105,10 +121,13 @@ __global__ void __launch_bounds__(1024) quant_rows_kernel(QuantParams p) {
             } else if (PRO == PRO_GELU) {
 #pragma unroll
                 for (int j = 0; j < 8; ++j) v[gi][j] = rnd<T>(gelu_f(v[gi][j]));
+            } else if (PRO == PRO_GELU_TANH) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) v[gi][j] = rnd<T>(gelu_tanh_f(v[gi][j]));
             }
         }
     }
-    if (PRO == PRO_LAYERNORM) {
+    if (is_ln<PRO>()) {
         const float mean = block_sum(ss, red) / (float)K;
         ss = 0.f;
 #pragma unroll
@@ -121,7 +140,7 @@ __global__ void __launch_bounds__(1024) quant_rows_kernel(QuantParams p) {
             }
         }
     }
-    if (PRO == PRO_RMS || PRO == PRO_LAYERNORM || PRO == PRO_ADALN) {
+    if (PRO == PRO_RMS || is_ln<PRO>() || PRO == PRO_ADALN) {
         ss = block_sum(ss, red);
         const float rstd = rsqrtf(ss / (float)K + p.eps);
         const T* ms = (const T*)p.mod_scale;
@@ -141,6 +160,10 @@ __global__ void __launch_bounds__(1024) quant_rows_kernel(QuantParams p) {
                 float n = v[gi][j] * rstd;
                 if (PRO == PRO_ADALN) {  // one rounding, like the fused rms_adaln
                     v[gi][j] = rnd<T>(n * (1.f + msv[j]) + shv[j]);
+                    continue;
+                }
+                if (PRO != PRO_LAYERNORM && PRO != PRO_RMS) {
+                    v[gi][j] = ln_finish<T, PRO>(n, c + j, p, ms ? msv[j] : 0.f, ms ? shv[j] : 0.f);
                     continue;
                 }
                 if (p.norm_w) n *= p.norm_w[c + j];
@@ -251,12 +274,30 @@ GPU_API int gpu_quant_rows(int dtype, int prologue, const void* x, int64_t x_str
         case PRO_GELU: return launch_quant<T, PRO_GELU>(p, M, st);     \
         case PRO_ADALN: return launch_quant<T, PRO_ADALN>(p, M, st);   \
         case PRO_SITU: return launch_quant<T, PRO_SITU>(p, M, st);     \
+        case PRO_LN_MOD: return launch_quant<T, PRO_LN_MOD>(p, M, st); \
+        case PRO_LN_AFFINE: return launch_quant<T, PRO_LN_AFFINE>(p, M, st); \
+        case PRO_GELU_TANH: return launch_quant<T, PRO_GELU_TANH>(p, M, st); \
         default: return -3;                                            \
     }
     if (dtype == DT_BF16) { QDISPATCH(bf16) }
     if (dtype == DT_F32) { QDISPATCH(float) }
 #undef QDISPATCH
     return -4;
+}
+
+// gpu_quant_rows with a LayerNorm bias, for PRO_LN_AFFINE.
+GPU_API int gpu_quant_rows_b(int dtype, int prologue, const void* x, int64_t x_stride, const float* norm_w, const float* norm_b,
+                               float eps, const void* mod_scale, const void* mod_shift, int8_t* q, float* scales, int M, int K,
+                               int rotate, void* stream) {
+    if ((K % 256) != 0) return -1;
+    QuantParams p{x, x_stride, nullptr, 0, 0, norm_w, eps, mod_scale, mod_shift, q, scales, K, rotate, nullptr, norm_b};
+    cudaStream_t st = (cudaStream_t)stream;
+    if (dtype != DT_BF16) return -4;
+    switch (prologue) {
+        case PRO_LN_MOD: return launch_quant<bf16, PRO_LN_MOD>(p, M, st);
+        case PRO_LN_AFFINE: return launch_quant<bf16, PRO_LN_AFFINE>(p, M, st);
+        default: return -3;
+    }
 }
 
 // Same prologues + ConvRot rotation, fp32 output (weight-only int8 path: x_rot @ (q*s)^T).
@@ -299,9 +340,9 @@ __global__ void prologue_rows_kernel(QuantParams p, T* out, int64_t out_stride) 
     const int64_t m = blockIdx.x;
     const T* x = (const T*)p.x + m * p.x_stride;
     T* o = out + m * out_stride;
-    if (PRO == PRO_RMS || PRO == PRO_LAYERNORM || PRO == PRO_ADALN) {
+    if (PRO == PRO_RMS || is_ln<PRO>() || PRO == PRO_ADALN) {
         float mean = 0.f;
-        if (PRO == PRO_LAYERNORM) {
+        if (is_ln<PRO>()) {
             for (int k = threadIdx.x; k < K; k += blockDim.x) mean += ldf(x, k);
             mean = block_sum(mean, red) / (float)K;
         }
@@ -318,6 +359,10 @@ __global__ void prologue_rows_kernel(QuantParams p, T* out, int64_t out_stride) 
             float n = (ldf(x, k) - mean) * rstd;
             if (PRO == PRO_ADALN) {
                 stf(o, k, n * (1.f + ldf(ms, k)) + ldf(sh, k));
+                continue;
+            }
+            if (PRO != PRO_LAYERNORM && PRO != PRO_RMS) {
+                stf(o, k, ln_finish<T, PRO>(n, k, p, ms ? ldf(ms, k) : 0.f, ms ? ldf(sh, k) : 0.f));
                 continue;
             }
             if (p.norm_w) n *= p.norm_w[k];
@@ -344,6 +389,8 @@ __global__ void prologue_rows_kernel(QuantParams p, T* out, int64_t out_stride) 
         for (int k = threadIdx.x; k < K; k += blockDim.x) stf(o, k, silu_f(ldf(x, k)));
     } else if (PRO == PRO_GELU) {
         for (int k = threadIdx.x; k < K; k += blockDim.x) stf(o, k, gelu_f(ldf(x, k)));
+    } else if (PRO == PRO_GELU_TANH) {
+        for (int k = threadIdx.x; k < K; k += blockDim.x) stf(o, k, gelu_tanh_f(ldf(x, k)));
     } else if (PRO == PRO_SITU) {
         // the eager op chain: every intermediate tensor is rounded
         for (int k = threadIdx.x; k < K; k += blockDim.x) {
@@ -382,6 +429,34 @@ GPU_API int gpu_prologue_rows(int dtype, int prologue, const void* x, int64_t x_
     else if (dtype == DT_F32) { PDISPATCH(float) }
     else return -4;
 #undef PDISPATCH
+    KCHECK();
+    return 0;
+}
+
+// gpu_prologue_rows for the LayerNorm variants with a bias, and the plain ones, in bf16, f16 or f32.
+GPU_API int gpu_prologue_rows_b(int dtype, int prologue, const void* x, int64_t x_stride, const float* norm_w,
+                                  const float* norm_b, float eps, const void* mod_scale, const void* mod_shift, void* out,
+                                  int64_t out_stride, int M, int K, void* stream) {
+    QuantParams p{x, x_stride, nullptr, 0, 0, norm_w, eps, mod_scale, mod_shift, nullptr, nullptr, K, 0, nullptr, norm_b};
+    cudaStream_t st = (cudaStream_t)stream;
+    const int threads = K >= 2048 ? 512 : K >= 256 ? 256 : 64;
+#define BDISPATCH(T)                                                                                       \
+    switch (prologue) {                                                                                    \
+        case PRO_PLAIN: prologue_rows_kernel<T, PRO_PLAIN><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break;   \
+        case PRO_LAYERNORM: prologue_rows_kernel<T, PRO_LAYERNORM><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break; \
+        case PRO_LN_MOD: prologue_rows_kernel<T, PRO_LN_MOD><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break; \
+        case PRO_LN_AFFINE: prologue_rows_kernel<T, PRO_LN_AFFINE><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break; \
+        case PRO_LN_AFFINE_SILU: prologue_rows_kernel<T, PRO_LN_AFFINE_SILU><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break; \
+        case PRO_SILU: prologue_rows_kernel<T, PRO_SILU><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break;     \
+        case PRO_GELU: prologue_rows_kernel<T, PRO_GELU><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break;     \
+        case PRO_GELU_TANH: prologue_rows_kernel<T, PRO_GELU_TANH><<<M, threads, 0, st>>>(p, (T*)out, out_stride); break; \
+        default: return -3;                                                                                \
+    }
+    if (dtype == DT_BF16) { BDISPATCH(bf16) }
+    else if (dtype == DT_F16) { BDISPATCH(half) }
+    else if (dtype == DT_F32) { BDISPATCH(float) }
+    else return -4;
+#undef BDISPATCH
     KCHECK();
     return 0;
 }

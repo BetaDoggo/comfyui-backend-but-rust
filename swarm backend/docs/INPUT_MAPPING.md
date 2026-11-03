@@ -403,3 +403,21 @@ when `progress.interrupted()` turns true (SwarmUI's cancel button → `POST /int
 * **Upstream SwarmUI bug:** the EasyCache step checks the *TeaCache* mode for its "base gen only" and
   "video only" restrictions (`WorkflowGeneratorSteps.cs`, EasyCache block). With TeaCache off, EasyCache
   is applied to every stage, including image models, whatever EasyCache Mode says.
+
+## 10. Pixal3D (the extension's tab)
+
+SwarmUI's own generator never sends this: the [Pixal3D extension](../pixal3d-extension/README.md) builds a two-node graph
+(four with background removal) from its tab and runs it on a ComfyUI-type backend it claims, outside SwarmUI's image
+pipeline.
+
+| Node | Inputs | Engine |
+|---|---|---|
+| `SwarmLoadImageB64` | the tab's image | IMAGE (RGB) and MASK (1 - alpha) |
+| `LoadBackgroundRemovalModel`, `RemoveBackground` | only for an image without transparency: `bg_removal_name` from `background_removal/`, then the image | `AddonHandle` (`BACKGROUND_REMOVAL`), then `Engine::background_mask`: the foreground mask, which becomes `Pixal3DImageTo3D`'s `mask` |
+| `Pixal3DImageTo3D` | `image`, `mask`, the four model files, `seed`, `fov`, `resolution`, the four stages' steps, `cfg`, `texture`, `max_faces`, `filename_prefix` | `ImageTo3DRequest` to `Engine::image_to_3d`, which returns GLB bytes |
+
+The engine detects the mask's polarity like `ImageCropToMask`, and refuses images without a usable mask, the multi-view
+checkpoint, and resolutions off the 1024 to 2048 grid of 128. `RemoveBackground` refuses anything but a BiRefNet
+checkpoint. The extension then reads `history/<id>` for the saved file,
+fetches it through `/view` and saves it in the SwarmUI user's output folder.
+

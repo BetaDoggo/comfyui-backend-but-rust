@@ -1,0 +1,48 @@
+<div class="pixal3d-root">
+    <div class="pixal3d-side">
+        <div class="pixal3d-drop" id="pixal3d_drop" title="Drop an image here, or click to choose one">
+            <img id="pixal3d_image_preview" class="pixal3d-image-preview" alt="" style="display:none" />
+            <span id="pixal3d_drop_hint" class="pixal3d-hint">Drop an image of an object here, paste one with Ctrl+V, or click to choose one.<br/>A transparent background is used as the object's mask; without one, the object is cut out first with BiRefNet.</span>
+            <input type="file" id="pixal3d_file" accept="image/*" style="display:none" />
+        </div>
+        <div id="pixal3d_image_note" class="pixal3d-note"></div>
+        <div class="pixal3d-fields">
+            <label>Seed <input type="number" id="pixal3d_seed" value="-1" title="-1 for a random seed" /></label>
+            <label>Field of view <input type="number" id="pixal3d_fov" value="49.13" min="1" max="170" step="0.01" title="Horizontal field of view of the photo, in degrees" /></label>
+            <label>Resolution <select id="pixal3d_resolution" title="Voxel resolution of the refined shape: higher is finer and slower">
+                <option>1024</option><option>1152</option><option>1280</option><option>1408</option><option selected>1536</option><option>1664</option><option>1792</option><option>1920</option><option>2048</option>
+            </select></label>
+            <label>Max triangles <input type="number" id="pixal3d_max_faces" value="700000" min="0" step="10000" title="Simplify the mesh to at most this many triangles; 0 keeps every one" /></label>
+            <label class="pixal3d-check"><input type="checkbox" id="pixal3d_texture" checked /> Texture</label>
+            <label class="pixal3d-check" title="Cut the object out with a BiRefNet model. On by default for images without a transparent background"><input type="checkbox" id="pixal3d_remove_background" /> Remove background</label>
+            <details class="pixal3d-advanced">
+                <summary>Advanced</summary>
+                <label>CFG <input type="number" id="pixal3d_cfg" value="7.5" min="1" max="30" step="0.1" title="CFG of the geometry samplers; the texture sampler runs at 1" /></label>
+                <label>Structure steps <input type="number" id="pixal3d_structure_steps" value="12" min="1" max="200" /></label>
+                <label>Shape steps <input type="number" id="pixal3d_shape_steps" value="20" min="1" max="200" /></label>
+                <label>Refine steps <input type="number" id="pixal3d_refine_steps" value="12" min="1" max="200" /></label>
+                <label>Texture steps <input type="number" id="pixal3d_texture_steps" value="12" min="1" max="200" /></label>
+                <label>Diffusion model <select id="pixal3d_unet_name"></select></label>
+                <label>DINOv3 <select id="pixal3d_clip_vision_name"></select></label>
+                <label>Shape VAE <select id="pixal3d_shape_vae_name"></select></label>
+                <label>Texture VAE <select id="pixal3d_texture_vae_name"></select></label>
+                <label>Background removal <select id="pixal3d_bg_removal_name" title="A BiRefNet model from the background_removal folder"></select></label>
+                <button class="basic-button" id="pixal3d_refresh_models">Refresh models</button>
+            </details>
+        </div>
+        <div class="pixal3d-buttons">
+            <button class="basic-button pixal3d-generate" id="pixal3d_generate">Generate 3D</button>
+            <button class="basic-button" id="pixal3d_cancel" style="display:none">Cancel</button>
+        </div>
+        <div class="pixal3d-progress"><div class="pixal3d-progress-bar" id="pixal3d_progress_bar"></div></div>
+        <div id="pixal3d_status" class="pixal3d-status"></div>
+    </div>
+    <div class="pixal3d-main">
+        <canvas id="pixal3d_canvas" class="pixal3d-canvas"></canvas>
+        <div class="pixal3d-viewer-bar">
+            <span id="pixal3d_model_info" class="pixal3d-hint">No model yet. Drag to orbit, scroll to zoom, right-drag to pan.</span>
+            <a id="pixal3d_download" class="basic-button" style="display:none" download>Download GLB</a>
+        </div>
+        <div id="pixal3d_history" class="pixal3d-history"></div>
+    </div>
+</div>

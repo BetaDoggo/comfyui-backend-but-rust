@@ -128,6 +128,12 @@ pub trait Engine: Send + Sync + 'static {
         Err(EngineError::Unsupported("background removal (SwarmRemBg)".into()))
     }
 
+    /// `RemoveBackground`: the foreground mask (1 on the object) of each image, from a background removal model (an
+    /// [`AddonKind::BackgroundRemoval`](crate::AddonKind) handle). Default: unsupported.
+    fn background_mask(&self, _model: &AddonHandle, _images: &ImageBatch) -> EngineResult<Mask> {
+        Err(EngineError::Unsupported("background removal (RemoveBackground)".into()))
+    }
+
     /// `BasicScheduler` / `SDTurboScheduler`: a model-dependent sigma schedule (see
     /// [`ScheduleRequest`]). Default: unsupported.
     fn model_sigmas(&self, req: &ScheduleRequest) -> EngineResult<Sigmas> {
@@ -145,6 +151,11 @@ pub trait Engine: Send + Sync + 'static {
     /// See [`ClipVisionEncodeRequest`]. Default: unsupported.
     fn clip_vision_encode(&self, _req: &ClipVisionEncodeRequest) -> EngineResult<ClipVisionOutput> {
         Err(EngineError::Unsupported("CLIP-Vision encoding (CLIPVisionEncode)".into()))
+    }
+
+    /// See [`ImageTo3DRequest`]: the mesh as a binary glTF (`.glb`) file. Default: unsupported.
+    fn image_to_3d(&self, _req: &ImageTo3DRequest, _progress: &mut dyn ProgressSink) -> EngineResult<Vec<u8>> {
+        Err(EngineError::Unsupported("image to 3D (Pixal3DImageTo3D)".into()))
     }
 
     /// See [`UpscaleImageRequest`]. Default: unsupported.

@@ -19,6 +19,7 @@ pub enum Dt {
     I8,
     F8,
     U8,
+    I32,
     I64,
 }
 
@@ -28,6 +29,7 @@ impl Dt {
             Dt::F32 => 4,
             Dt::F16 | Dt::BF16 => 2,
             Dt::I8 | Dt::U8 | Dt::F8 => 1,
+            Dt::I32 => 4,
             Dt::I64 => 8,
         }
     }
@@ -71,6 +73,7 @@ impl SafeTensors {
                 "I8" => Dt::I8,
                 "U8" => Dt::U8,
                 "F8_E4M3" => Dt::F8,
+                "I32" => Dt::I32,
                 "I64" => Dt::I64,
                 d => bail!("unsupported dtype {d} for {k}"),
             };

@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <AssemblyName>Pixal3DExtension</AssemblyName>
+  </PropertyGroup>
+
+  <Import Project="..\..\SwarmUI.extension.props" />
+
+</Project>

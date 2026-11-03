@@ -23,6 +23,11 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--lora path[:strength[:clip_strength]]` | repeatable, see [LoRAs](#loras) |
 | `--models`, `--dit`, `--te`, `--vae` | model folder, or individual files |
 | `--dump f.safetensors`, `--ref-noise ref.safetensors` | parity debugging against `tools/ref_dump.py` |
+| `--pixal3d image.png` | Pixal3D: a GLB of the object in the PNG (its alpha is the mask; an opaque image is cut out with BiRefNet first), written to `-o`; see [Pixal3D](MODELS.md#pixal3d) |
+| `--remove-background image.png`, `--birefnet model.safetensors` | BiRefNet: the PNG with its background made transparent, written to `-o`; `--birefnet` is also the model `--pixal3d` cuts out with (default `background_removal/birefnet.safetensors`) |
+| `--birefnet-check ref.safetensors` | BiRefNet: the stage-by-stage comparison with `tools/birefnet_ref.py` |
+| `--fov`, `--resolution`, `--max-faces`, `--no-texture`, `--pixal3d-seeds a,b,c,d` | Pixal3D: the photo's field of view, the refine stage's voxel resolution, the triangle limit, a grey mesh, and the four samplers' seeds |
+| `--clip-vision`, `--texture-vae`, `--pixal3d-check ref.safetensors` | Pixal3D's DINOv3 and texture VAE files (`--dit` and `--vae` are its diffusion model and shape VAE), and the stage-by-stage comparison with `tools/pixal3d_ref.py` |
 
 Set `PROFILE=1` to print the time of each stage per step and per decoded tile. Stages are timed with events on the compute
 stream, so the run keeps its overlap and its output.

@@ -236,6 +236,7 @@ fn mime_for(name: &str) -> &'static str {
         "flac" => "audio/flac",
         "ogg" | "opus" => "audio/ogg",
         "json" => "application/json",
+        "glb" => "model/gltf-binary",
         _ => "application/octet-stream",
     }
 }

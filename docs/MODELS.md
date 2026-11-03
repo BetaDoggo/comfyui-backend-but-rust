@@ -9,6 +9,7 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | Anima | Images | `er_sde`, `simple` | int8 ConvRot only |
 | MOSS Image | Images | `euler`, `simple` | int8 ConvRot with fused q/k/v only |
 | MiniMax H3 | Video with audio | `res_multistep`, `simple` | `w6a8` only |
+| Pixal3D | A 3D mesh from one image | the example workflow's four `euler` samplers | int8 ConvRot (`pixal3d_int8_convrot`) only |
 
 ## Krea 2
 
@@ -168,3 +169,79 @@ The LoRA's diffusers file, `minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetenso
 SwarmUI's Sigma Shift, CFG, every sampler and LoRAs work. These are refused with an error: Rescale CFG, Renorm CFG, CFG Zero Star and TCFG, `<break>`, first and last frame or reference conditioning, single-frame generation, and VAE tile sizes other than 256 / 64.
 
 Not done: the video and audio encoders, sparse attention for long clips, and the web UI.
+
+## Pixal3D
+
+Pixal3D turns one cut-out photo into a vertex-coloured mesh: `--pixal3d object.png` on the CLI, or the
+[Pixal3D extension's](../swarm%20backend/pixal3d-extension/README.md) tab in SwarmUI, through the `Pixal3DImageTo3D` node.
+It follows Comfy-Org's example workflow node for node: `ImageCropToMask` (pad 1.1), `Pixal3DConditioning` (DINOv3 at 512
+and 1024, three NAF maps), the structure, shape and refine samplers with their CFG Override, Rescale CFG and shift
+patches, the texture sampler, the shape and texture decodes and `PaintMesh`. The example's background removal and MoGe
+field-of-view estimate aren't part of it: the image's alpha is the mask, and the field of view is a parameter (49.13 by
+default).
+
+```bash
+target/release/diffusion.exe --pixal3d teapot.png --resolution 1536 -o teapot.glb
+```
+
+Warm files, on this machine, with the example's steps:
+
+| Resolution | Tokens in the refine stage | Refine | Texture | Whole mesh |
+|---|---|---|---|---|
+| 1024 | 10,851 | 13.1 s | 7.2 s | 40 s |
+| 1536 | 26,000 to 28,500 | 56 to 67 s | 30 to 36 s | 110 to 128 s |
+
+ComfyUI wasn't timed. On 12 GB it needs `comfy_aimdo`: without it, the same workflow ran out of VRAM.
+
+Compared stage by stage with ComfyUI on its own inputs (`tools/pixal3d_ref.py` dumps them, `--pixal3d-check` compares):
+
+| Stage | Difference |
+|---|---|
+| `ImageCropToMask` composite | identical |
+| DINOv3 tokens (float32) | 1.6e-4 relative |
+| NAF maps (float16) | 3e-4 relative |
+| Projected features | 1.6e-3 relative |
+| First evaluation of each sub-model, cond and uncond | 0.6 to 1.0% relative, cosine 0.99995 or better |
+| Structure decode | the same voxels |
+| Shape decode | 99.99% of the final voxels shared; on those, vertices within 6e-6 and colours within 7e-4 relative |
+
+The float16 decoders flip a few subdivision logits that sit at zero (2 voxels in 25,706 at the upsample), so the final
+voxel sets differ slightly. ComfyUI varies more than that between its own runs: its structure stage gave 2206 and then
+2200 voxels from the same seed, depending on how it batched CFG.
+
+The full mesh at 1536 has about 16 million triangles. Vertex clustering simplifies it to `--max-faces` (700,000 by
+default, the number the example decimates to; 0 keeps everything). Like ComfyUI's GLB it has no normals and a
+double-sided material: the dual grid doesn't say which side of a face is inside, and windings are made consistent only
+where the mesh is manifold. Attention is bf16 FlashAttention-2, which dominates the refine stage. The engine refuses the
+multi-view checkpoint, and uses only the first image of a batch.
+
+Not done: multi-view, the field-of-view estimate, UV unwrapping and texture baking, and the bf16 checkpoint.
+
+### Background removal (BiRefNet)
+
+An opaque image is cut out first, as the example workflow's `RemoveBackground` does: `--pixal3d` runs BiRefNet when
+the PNG has no transparency, and comfy-server has the stock `LoadBackgroundRemovalModel` and `RemoveBackground` nodes.
+The model is Comfy-Org's `birefnet.safetensors` in `background_removal/` (float16 weights; the only architecture
+ComfyUI's loader knows, and the only one this engine accepts). Its Swin-L backbone runs on the image at 1024 and at 512,
+and a decoder of deformable convolutions makes the mask, which is resized back to the image's size.
+
+```bash
+target/release/diffusion.exe --remove-background teapot.png -o teapot_cut.png
+```
+
+Everything runs in float32 with the weights widened and every BatchNorm folded into the convolution before it. On the
+teapot (1024x1024) the model takes 0.86 s to load and 0.46 s to run, and a workflow of the two nodes took 1.5 to 2.0 s
+through the server, image decoding and saving included. Against ComfyUI, which ran the float16 weights, on that image and on a 1280x960
+copy (so the resizes before and after are checked too):
+
+| Stage | Difference |
+|---|---|
+| Input after the resize and rounding to 8 bits | 6e-8 relative at 1024, 7e-6 at 1280x960 |
+| Backbone outputs, each of the 8 | 9e-4 to 5e-3 relative, cosine 0.99998 or better |
+| Squeeze block | 7e-4 relative at 1024, 1.3e-3 at 1280x960 |
+| Mask logits | 4.7e-3 to 4.9e-3 relative |
+| Final mask | at most 1.7e-3 (1024) and 1.8e-3 (1280x960) from ComfyUI's, 1e-6 to 2e-6 on average |
+
+The differences are the size of float16 rounding in ComfyUI. The image is always resized to 1024x1024, so a mask of an
+image with another aspect ratio comes from a squashed copy, as in ComfyUI. Not tested: other BiRefNet variants, and
+SwarmUI's own Remove Background parameter, which sends `SwarmRemBg` (rembg's U2-Net) and is still refused.

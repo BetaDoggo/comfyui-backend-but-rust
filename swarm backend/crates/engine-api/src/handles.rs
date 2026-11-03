@@ -71,10 +71,12 @@ pub enum ModelFolder {
     IpAdapter,
     /// `tensorrt` (TensorRT engines, `TensorRTLoader`).
     TensorRt,
+    /// `background_removal` (BiRefNet, `LoadBackgroundRemovalModel`).
+    BackgroundRemoval,
 }
 
 impl ModelFolder {
-    pub const ALL: [ModelFolder; 16] = [
+    pub const ALL: [ModelFolder; 17] = [
         ModelFolder::Checkpoints,
         ModelFolder::DiffusionModels,
         ModelFolder::TextEncoders,
@@ -91,6 +93,7 @@ impl ModelFolder {
         ModelFolder::Yolov8,
         ModelFolder::IpAdapter,
         ModelFolder::TensorRt,
+        ModelFolder::BackgroundRemoval,
     ];
 
     /// The folder key ComfyUI uses in `folder_paths` (and `/models/{folder}`).
@@ -112,6 +115,7 @@ impl ModelFolder {
             ModelFolder::Yolov8 => "yolov8",
             ModelFolder::IpAdapter => "ipadapter",
             ModelFolder::TensorRt => "tensorrt",
+            ModelFolder::BackgroundRemoval => "background_removal",
         }
     }
 
@@ -218,6 +222,8 @@ pub enum AddonKind {
     StyleModel,
     /// `ModelPatchLoader` (`model_patches/`: DiffSynth / LLLite control patches).
     ModelPatch,
+    /// `LoadBackgroundRemovalModel` (`background_removal/`: BiRefNet).
+    BackgroundRemoval,
 }
 
 impl AddonKind {
@@ -231,6 +237,7 @@ impl AddonKind {
             AddonKind::ControlNet => "CONTROL_NET",
             AddonKind::StyleModel => "STYLE_MODEL",
             AddonKind::ModelPatch => "MODEL_PATCH",
+            AddonKind::BackgroundRemoval => "BACKGROUND_REMOVAL",
         }
     }
 }

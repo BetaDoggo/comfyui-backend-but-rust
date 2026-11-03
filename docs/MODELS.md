@@ -259,7 +259,11 @@ The audio hasn't been listened to or judged by ear. `tools/h3_ref.py` and `tools
 
 The LoRA's diffusers file, `minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors`, matches no key here or in ComfyUI. Use the `_comfyui` file.
 
-SwarmUI's Sigma Shift, CFG, every sampler and LoRAs work. These are refused with an error: Rescale CFG, Renorm CFG, CFG Zero Star and TCFG, `<break>`, first and last frame or reference conditioning, single-frame generation, and VAE tile sizes other than 256 / 64.
+SwarmUI's Sigma Shift, CFG, every sampler and LoRAs work. These are refused with an error: Rescale CFG, Renorm CFG, CFG Zero Star and TCFG, `<break>`, first and last frame or reference conditioning, and VAE tile sizes other than 256 / 64.
+
+Single image mode (1 frame) samples one latent frame and decodes it as ComfyUI does: a chunk of five copies through the
+video decoder, keeping the first real frame. A 768x512 still at 20 steps and CFG 5 took about 1 s per step once warm, through
+`comfy-server` over HTTP; not compared with ComfyUI's picture, and not run through SwarmUI itself.
 
 Not done: the video and audio encoders, sparse attention for long clips, and the web UI.
 

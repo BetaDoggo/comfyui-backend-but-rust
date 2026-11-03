@@ -651,8 +651,8 @@ impl NativeEngine {
         let (&[1, 24, t, lh, lw], &[1, 32, 2, audio_t]) = (video.shape.as_slice(), audio.shape.as_slice()) else {
             return Err(unsupported(format!("MiniMax H3 latents of shape {:?} and {:?}", video.shape, audio.shape)));
         };
-        if t < 2 || lh % 2 != 0 || lw % 2 != 0 {
-            return Err(unsupported("MiniMax H3 needs at least 2 video frames and a width and height in multiples of 32"));
+        if t < 1 || lh % 2 != 0 || lw % 2 != 0 {
+            return Err(unsupported("MiniMax H3 needs at least 1 video frame and a width and height in multiples of 32"));
         }
         if req.positive.entries.iter().any(|e| !e.meta.minimax_keyframes.is_empty()) {
             return Err(unsupported("first and last frame conditioning on MiniMax H3 (no VAE encoder yet)"));
@@ -692,7 +692,8 @@ impl NativeEngine {
         if !is_h3_vae(file) {
             return Err(unsupported("this VAE on a MiniMax H3 latent"));
         }
-        let frames = (lt - 2) / 5 * 17 + 5;
+        // one latent is a still (single image mode); otherwise the clip's length on the 17k + 5 grid
+        let frames = if lt == 1 { 1 } else { (lt.max(2) - 2) / 5 * 17 + 5 };
         let shape = h3::Shape { t: lt, h: lh, w: lw, audio_t: 0 };
         let clip = self.gen().decode_h3(&file.path, &latent.data, shape, frames).map_err(internal)?;
         let (h, w) = (clip.h, clip.w);

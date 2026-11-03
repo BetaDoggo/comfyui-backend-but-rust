@@ -394,6 +394,26 @@ impl VideoDecoder {
                 *v = *v * self.std[c] + self.mean[c];
             }
         }
+        if t == 1 {
+            // A still decodes badly alone: like ComfyUI, decode a chunk of copies and keep its first real frame.
+            let mut copies = Clip::new(C, CHUNK_TOKENS, h, w);
+            for c in 0..C {
+                let src = z.at(c, 0, 0, 0);
+                for f in 0..CHUNK_TOKENS {
+                    let dst = copies.at(c, f, 0, 0);
+                    copies.data[dst..dst + h * w].copy_from_slice(&z.data[src..src + h * w]);
+                }
+            }
+            let dec = self.tiled(&copies, st)?;
+            let mut out = dec.crop((PRE_PADDING, 1), (0, dec.h), (0, dec.w));
+            for c in 0..3 {
+                let a = out.at(c, 0, 0, 0);
+                for v in &mut out.data[a..a + out.h * out.w] {
+                    *v = (*v * STD[c] + MEAN[c]).clamp(0.0, 1.0);
+                }
+            }
+            return Ok(out);
+        }
         let (pad, chunks) = temporal_chunks(t);
         let total = t + pad;
         let mut padded = Clip::new(C, total, h, w);

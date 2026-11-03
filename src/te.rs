@@ -182,13 +182,8 @@ impl TextEncoder {
 
     /// Bake `loras` into the encoder. Returns true if any weight changed.
     pub fn apply_loras(&mut self, loras: &[crate::lora::Lora], s0: &Stream) -> Result<bool> {
-        if self.spec != KREA2 {
-            if loras.is_empty() {
-                return Ok(false);
-            }
-            anyhow::bail!("LoRAs on this text encoder");
-        }
-        crate::lora::apply(crate::lora::Arch::TextEncoder { comfy: "qwen3vl_4b" }, &self.st, self.spec.pre, vec![crate::offload::Store::Set(&mut self.ws)], &mut self.lora, loras, s0)
+        let comfy = if self.spec == QWEN21 { "qwen3vl_8b" } else { "qwen3vl_4b" };
+        crate::lora::apply(crate::lora::Arch::TextEncoder { comfy }, &self.st, self.spec.pre, vec![crate::offload::Store::Set(&mut self.ws)], &mut self.lora, loras, s0)
     }
 
     pub fn tokenize(&self, prompt: &str) -> Result<Vec<u32>> {

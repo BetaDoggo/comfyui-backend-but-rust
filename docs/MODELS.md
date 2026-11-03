@@ -30,8 +30,8 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | Batch size | Yes | Yes | Yes | Not tested | - | - |
 | Variation seed | Yes | Not tested | Not tested | Not tested | Yes | - |
 | Live previews | Yes | Yes | Yes | Not tested | First frame only | - |
-| LoRAs | Yes | Yes | Yes | Refused | Yes (the turbo LoRA's ComfyUI file) | - |
-| Text encoder LoRAs | Yes | Yes | Yes | Refused | Not tested | - |
+| LoRAs | Yes | Yes | Yes | Yes | Yes (the turbo LoRA's ComfyUI file) | - |
+| Text encoder LoRAs | Yes | Yes | Yes | Not tested (the code is shared with Krea 2) | Not tested | - |
 | Prompt Images and reference images | Yes | Refused | Refused | Yes (one and two tested) | Refused | The input itself |
 | Prompt weights | Refused | Yes | Yes | Refused | Yes | - |
 | `<break>` | Yes | Refused | Yes | Refused | Refused | - |
@@ -171,7 +171,7 @@ differs by 0.5%, because torch's bf16 GEMM isn't exact at those sizes. The same 
 
 Runs int8 ConvRot Qwen Image 2.1 checkpoints with the Qwen3-VL 8B text encoder and its RGBA VAE (64 channels at 1/16, so
 the image can have alpha). Every sampler and scheduler works. The model is a CFG 1 model: at CFG 1.5 the picture turns
-oversharp, and at 3 it breaks into stripes, exactly as in ComfyUI. LoRAs, init images and partial sampling are refused.
+oversharp, and at 3 it breaks into stripes, exactly as in ComfyUI. Init images and partial sampling are refused.
 
 ```bash
 target/release/diffusion.exe --qwen21 -p "no people, a stone lighthouse on a rocky coast at sunset, calm sea" --steps 8 -o lighthouse.png
@@ -207,6 +207,15 @@ In one step at 1024x1024 the int8 GEMMs take 241 ms (gate and up 110, down 57, q
 | VAE round trip of a picture | 39.01 dB from the original, ComfyUI's 38.98 dB; ours against theirs 54.5 dB |
 | 512x512 text to image, 4 steps | latent 3.8e-2 relative, picture 36.6 dB |
 | 768x768 edit, 4 steps | latent 1.2e-2 relative, picture 46.1 dB |
+
+**LoRAs.** They are baked into the int8 weights as ComfyUI does (dequantize, patch in bf16, requantize with stochastic
+rounding seeded by the module name), for the DiT and for the 8B text encoder. Tested with `qwen-image-2.1-fix-1.0`, a
+rank 32 DoRA on 22 blocks' attention and MLP weights (132 weights): block 5's four modules match ComfyUI's baked weights
+to 0.05% of values differing (the requantized int8 codes differ in 0.003% by one step), and the picture at 768x768 and 8
+steps is 45.1 dB from ComfyUI's. The first generation with it takes 23 s to bake, then it costs nothing, and switching the
+LoRA off restores the weights in 1.3 s with a picture identical to one made before it was loaded (checked through
+`comfy-server`). That bake was 63 s before the DoRA arithmetic ran on every core. The maintainer reports that it and the other LoRA formats work through SwarmUI; I only ran the DoRA above, through
+`comfy-server` and the CLI. A LoRA with text encoder keys wasn't tried.
 
 **Transparent references.** SwarmUI's image loader (`SwarmLoadImageB64`) drops the alpha channel, here and in ComfyUI, so a
 reference with a transparent background reaches the model as an opaque picture of whatever colour is stored under the

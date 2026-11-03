@@ -33,6 +33,8 @@ ap.add_argument("--shift", type=float, default=None, help="mu of the flux time s
 ap.add_argument("--vae-only", action="store_true")
 ap.add_argument("--keep-alpha", action="store_true", help="VAE-encode the images with their alpha, as QwenImage21 does, not just RGB")
 ap.add_argument("--no-cache", action="store_true")
+ap.add_argument("--lora", action="append", default=[], help="path[:strength], applied to the DiT through ComfyUI's DynamicVRAM path, as main.py does")
+ap.add_argument("--capture", action="append", default=[], help="a patched module such as diffusion_model.transformer_blocks.3.attn.to_q.weight: dump its weight as ComfyUI requantizes it")
 ap.add_argument("--repeat", type=int, default=1)
 ap.add_argument("--trace-block", type=int, action="append", default=[], help="dump what goes in and out of the parts of this block (needs --no-cache)")
 args, _ = ap.parse_known_args()
@@ -48,7 +50,10 @@ from safetensors.torch import save_file
 import comfy.options
 comfy.options.enable_args_parsing()
 import comfy.cli_args  # noqa
+import comfy.memory_management
 import comfy.model_management
+import comfy.model_patcher
+import comfy.quant_ops
 import comfy.sample
 import comfy.samplers
 import comfy.sd
@@ -63,6 +68,25 @@ VAE = os.path.join(MODELS, r"VAE\QwenImage\qwen_image_2.1_vae_bf16.safetensors")
 
 os.makedirs(args.out, exist_ok=True)
 dump = {}
+
+if args.lora:
+    # LoRAs go through DynamicVRAM as in main.py; without it ComfyUI takes the legacy path, which seeds the rounding differently
+    assert comfy_aimdo.control.init_devices((d.index, int(comfy.cli_args.args.vram_headroom * 1024 ** 3)) for d in comfy.model_management.get_all_torch_devices())
+    comfy.memory_management.aimdo_enabled = True
+    comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
+    seeds = {comfy.utils.string_to_seed(m): m for m in args.capture}
+    requantize = comfy.quant_ops.QuantizedTensor.requantize_from_float
+
+    def capture(self, tensor, **kw):
+        y = requantize(self, tensor, **kw)
+        m = seeds.get(kw.get("stochastic_rounding"))
+        if m is not None and f"{m}.q" not in dump:
+            dump[f"{m}.float"] = tensor.detach().cpu().float()
+            dump[f"{m}.q"] = y._qdata.detach().cpu().clone()
+            dump[f"{m}.scale"] = y._params.scale.detach().cpu().clone()
+        return y
+
+    comfy.quant_ops.QuantizedTensor.requantize_from_float = capture
 
 
 def put(name, t):
@@ -168,6 +192,10 @@ for r in refs:
     negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [r]}, append=True)
 
 model = comfy.sd.load_diffusion_model(DIT)
+for entry in args.lora:
+    path, _, s = entry.rpartition(":") if entry.rsplit(":", 1)[-1].replace(".", "").replace("-", "").isdigit() else (entry, "", "1")
+    model, _ = comfy.sd.load_lora_for_models(model, clip, comfy.utils.load_torch_file(path, safe_load=True), float(s), 0.0)
+    print("lora", path, s, len(model.patches), "patched weights")
 if args.no_cache:
     model = model.clone()
     model.model_options["transformer_options"]["qwen_image21_cache"] = {"device": "off", "dtype": "default"}

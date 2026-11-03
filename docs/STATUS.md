@@ -27,7 +27,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | Krea 2 | LoRAs | Baked into the int8 ConvRot weights like ComfyUI. Weights bit-identical on the modules checked, 31.6 dB image, about 3 s to bake 12 GB. Tested through SwarmUI. |
 | P0 | Anima | Anima engine | Int8 turbo checkpoint through real SwarmUI: 115 ms/step, 1.14 s per image at 1024, against 199 ms/step in ComfyUI. Same picture as ComfyUI at about 25 dB, not pixel-identical. |
 | P0 | Anima | Anima LoRAs | Baked into the int8 ConvRot weights like ComfyUI, and cached contexts and modulation are dropped. Weights bit-identical on the modules checked. Tested through SwarmUI. |
-| P0 | LoRA and control | LoRA formats | Every ComfyUI format on all three models: LoCon, DoRA, LoHa, LoKr, GLoRA, OFT, BOFT, diff, set, MOSS control adapters. Compared with ComfyUI on real modules, identical or within 2e-4 where ComfyUI can compute them. |
+| P0 | LoRA and control | LoRA formats | Every ComfyUI format on Krea 2, Anima and MOSS Image (and Qwen Image 2.1, per the maintainer's SwarmUI test): LoCon, DoRA, LoHa, LoKr, GLoRA, OFT, BOFT, diff, set, MOSS control adapters. Compared with ComfyUI on real modules, identical or within 2e-4 where ComfyUI can compute them. |
 | P0 | LoRA and control | Text encoder LoRAs | Baked in float32 at the clip strength. Weights match ComfyUI on Krea 2 and MOSS Image. Run through the server on Anima, not through SwarmUI. |
 | P0 | MOSS Image | MOSS Image LoRAs | Baked like ComfyUI, including fused q/k/v slices. All 168 weights identical. Tested through SwarmUI with the DMD LoRA; the edit LoRA applies but has no image input yet. |
 | P0 | Engine core | Sampler: euler for all flow models | Every flow model now samples on the host, Krea 2 included. Real images on all three. |
@@ -42,6 +42,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Engine core | Lazy offloading | H3 reads weights on use through a few pinned staging buffers, ahead of compute; LoRA-baked blocks stay pinned and skip staging. Other models still pin everything at load. |
 | P1 | Qwen Image 2.1 | Qwen Image 2.1 engine | Text to image with alpha, CFG and negatives, through `comfy-server` over HTTP and the CLI: 0.36 s/step at 1024x1024 against ComfyUI's 0.46, picture 36.6 dB from ComfyUI's at 4 steps. Not run through SwarmUI itself. |
 | P1 | Qwen Image 2.1 | Qwen Image 2.1 edits | Reference images through the vision tower, the VAE encoder and a cached prefix: 46.1 dB from ComfyUI at 768x768, a two-picture edit through the server. 0.22 s/step at 768x768 with one reference. Not run through SwarmUI itself. |
+| P1 | Qwen Image 2.1 | Qwen Image 2.1 LoRAs | Baked into the int8 weights like ComfyUI. A rank 32 DoRA on 22 blocks: baked weights within 0.05% of values of ComfyUI's, picture 45.1 dB at 768x768, 23 s to bake once, removed again in 1.3 s with an identical picture. Checked here through `comfy-server` over HTTP and the CLI; the maintainer reports it and the other LoRA formats work through SwarmUI, which I didn't repeat. Text encoder LoRAs untested. |
 | P1 | MOSS Image | MOSS engine | Int8 ConvRot checkpoint through real SwarmUI: 550 to 573 ms/step at CFG 4, against 601 in ComfyUI, VAE 268 ms against 530 or more. Same picture at about 34 dB, not pixel-identical. |
 | P1 | Anima | Anima prompt weights | (word:1.2) and <weight> scale the T5 tokens, as ComfyUI does. Token ids match ComfyUI. |
 | P1 | Anima | Anima Batch Size, Sigma Shift and CFG | Generated through real SwarmUI. Output not compared with ComfyUI at CFG above 1. |
@@ -117,7 +118,6 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Krea 2 | Prompt weights | <weight> through SwarmAttnTokenWeights, inside attention. |
 | P1 | Krea 2 | <alternate> and <fromto> | Per-step conditioning. |
 | P1 | Krea 2 | Non-W8A8 Krea 2 files | fp8 and other formats are refused. |
-| P1 | Qwen Image 2.1 | Qwen Image 2.1 LoRAs | Refused. |
 | P1 | Qwen Image 2.1 | Qwen Image 2.1 init images and refiners | Refused with the other partial sampling. The VAE encoder exists. |
 | P1 | SD family | SD1 and SDXL engine | SD1 checkpoint installed. CLIP, UNet and classic VAE, and all-in-one checkpoints. Would widen coverage most. |
 | P1 | LoRA and control | LoRA hooks | Refused with an error. |

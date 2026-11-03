@@ -2,6 +2,8 @@
 
 usage: python lora_cmp.py <ref_dir> <ours_dir> [ours.png]
 
+ref_dir is from tools/lora_ref.py or tools/qwen21_ref.py.
+
 ours_dir is $LORA_DUMP of a diffusion run: create an empty `<stem>.want` there for each module without
 `diffusion_model.` or `<encoder>.transformer.model.`.
 """
@@ -13,7 +15,9 @@ import torch
 from PIL import Image
 from safetensors.torch import load_file
 
-ref = load_file(os.path.join(sys.argv[1], "ref.safetensors"))
+# tools/qwen21_ref.py names its files dump.safetensors and image.png
+names = ("dump.safetensors", "image.png") if os.path.exists(os.path.join(sys.argv[1], "dump.safetensors")) else ("ref.safetensors", "ref.png")
+ref = load_file(os.path.join(sys.argv[1], names[0]))
 for key in sorted(k for k in ref if k.endswith(".q")):
     m = key[:-2]
     stem = m.split(".transformer.model.")[-1].removeprefix("diffusion_model.")
@@ -33,7 +37,7 @@ for key in sorted(k for k in ref if k.endswith(".q")):
     print(f"  q: {(dq != 0).float().mean() * 100:.4f}% differ, max {dq.max()}")
 
 if len(sys.argv) > 3:
-    a = np.asarray(Image.open(os.path.join(sys.argv[1], "ref.png")).convert("RGB")).astype(np.float64)
+    a = np.asarray(Image.open(os.path.join(sys.argv[1], names[1])).convert("RGB")).astype(np.float64)
     b = np.asarray(Image.open(sys.argv[3]).convert("RGB")).astype(np.float64)
     mse = ((a - b) ** 2).mean()
     print(f"image: PSNR {10 * np.log10(255 ** 2 / mse) if mse else float('inf'):.2f} dB, mean abs {np.abs(a - b).mean():.3f}")

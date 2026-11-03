@@ -37,6 +37,7 @@ pub enum Arch {
     Anima,
     Moss,
     H3,
+    Qwen21,
     /// `comfy` names the encoder inside ComfyUI's text encoder model, as in `qwen3vl_4b`.
     TextEncoder { comfy: &'static str },
 }
@@ -745,6 +746,14 @@ mod tests {
         assert_eq!(m["transformer.transformer_blocks.0.attn.to_gate"].tensor, "blocks.0.attn.gate.weight");
         assert_eq!(m["diffusion_model.blocks.0.attn.gate"].tensor, "blocks.0.attn.gate.weight");
         assert_eq!(m["lycoris_text_fusion_projector"].tensor, "txtfusion.projector.weight");
+    }
+
+    #[test]
+    fn qwen21_takes_diffusers_names_as_stored() {
+        let m = key_map(Arch::Qwen21, &[("transformer_blocks.3.attn.to_out.0.weight".to_string(), 4096), ("transformer_blocks.3.img_mlp.gate_up.weight".to_string(), 24576)]);
+        assert_eq!(m["diffusion_model.transformer_blocks.3.attn.to_out.0"].tensor, "transformer_blocks.3.attn.to_out.0.weight");
+        assert_eq!(m["lora_unet_transformer_blocks_3_img_mlp_gate_up"].rows, None);
+        assert_eq!(Arch::Qwen21.module("transformer_blocks.3.attn.to_out.0"), "diffusion_model.transformer_blocks.3.attn.to_out.0");
     }
 
     #[test]

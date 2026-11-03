@@ -1,6 +1,6 @@
 //! [`Engine`] implementation on the diffusion library: text-to-image for int8 ConvRot checkpoints of
 //! Krea 2, Anima, MOSS Image and Qwen Image 2.1 and text-to-video with audio for MiniMax H3, with every ComfyUI
-//! sampler and scheduler, any CFG and LoRAs (not on Qwen Image 2.1), plus the prompt images and reference
+//! sampler and scheduler, any CFG and LoRAs, plus the prompt images and reference
 //! latents of Krea 2 and of Qwen Image 2.1's edits. Each
 //! file's architecture is read from its keys, so one backend serves them all.
 //!
@@ -598,13 +598,7 @@ impl NativeEngine {
         let (batch, lh, lw) = shape;
         let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
-        if !settings.loras.is_empty() {
-            return Err(unsupported("LoRAs on Qwen Image 2.1"));
-        }
         let (cond, positive) = single_prompt(&req.positive, Family::Qwen21)?;
-        if !cond.loras.is_empty() {
-            return Err(unsupported("LoRAs on Qwen Image 2.1's text encoder"));
-        }
         let references = reference_latents(&req.positive, Family::Qwen21)?.0;
         let first = sampling(req, settings, shape, 0)?;
         let (negative, negative_images) = if first.uses_negative() {
@@ -622,6 +616,8 @@ impl NativeEngine {
         gen.ensure_qwen21(&file.path).map_err(internal)?;
         gen.ensure_te(&cond.text_encoder).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
+        gen.set_loras(&settings.loras).map_err(internal)?;
+        gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
         let (width, height) = (lw * diffusion::vae21::SCALE, lh * diffusion::vae21::SCALE);
         let mut data = Vec::with_capacity(batch * diffusion::qwen21::CH * lh * lw);
         for i in 0..batch {

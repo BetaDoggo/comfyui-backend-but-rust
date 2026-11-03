@@ -332,9 +332,7 @@ fn run_qwen21(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     gen.ensure_qwen21(&dit)?;
     gen.ensure_te(&te)?;
     gen.ensure_vae21(&vae)?;
-    if !args.lora.is_empty() {
-        bail!("LoRAs on Qwen Image 2.1");
-    }
+    apply_loras(&mut gen, args)?;
     // each image is shown to the text encoder over white, and goes into the sequence as a reference latent
     let mut images = Vec::new();
     let mut references = Vec::new();

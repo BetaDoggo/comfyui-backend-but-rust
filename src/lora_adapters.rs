@@ -298,26 +298,26 @@ pub fn boft(blocks: &Tensor, rescale: Option<&Tensor>, alpha: f32, strength: f32
 pub fn dora(scale: &Tensor, w: &Tensor, diff: &[f32], alpha: f32, strength: f32, work: Work) -> Result<Vec<f32>> {
     let rb = work.round;
     let (rows, cols) = (w.rows(), w.shape[1]);
-    let calc: Vec<f32> = w.data.iter().zip(diff).map(|(a, d)| rb(a + rb(alpha * d))).collect();
+    let mut calc = vec![0.0f32; w.data.len()];
+    par_items(&mut calc, 1, |i, o| o[0] = rb(w.data[i] + rb(alpha * diff[i])));
     let by_row = scale.rows() == rows;
     ensure!(scale.data.len() == if by_row { rows } else { cols }, "a dora_scale of shape {:?} for a weight of {:?}", scale.shape, w.shape);
     let mut factor = vec![0.0f32; scale.data.len()];
     if by_row {
-        for (i, row) in w.data.chunks_exact(cols).enumerate() {
-            factor[i] = row.iter().map(|x| x * x).sum();
-        }
+        // each row is summed in order by one thread, as one sum would be
+        par_items(&mut factor, 1, |i, o| o[0] = w.data[i * cols..(i + 1) * cols].iter().map(|x| x * x).sum());
     } else {
         for row in calc.chunks_exact(cols) {
             row.iter().zip(&mut factor).for_each(|(x, n)| *n += x * x);
         }
     }
     factor.iter_mut().zip(&scale.data).for_each(|(n, s)| *n = rb(s / rb(rb(n.sqrt()) + work.eps)));
-    let scaled = calc.iter().enumerate().map(|(i, x)| rb(x * factor[if by_row { i / cols } else { i % cols }]));
-    Ok(if strength != 1.0 {
-        scaled.zip(&w.data).map(|(x, o)| rb(o + rb(strength * rb(x - o)))).collect()
-    } else {
-        scaled.collect()
-    })
+    let mut out = vec![0.0f32; calc.len()];
+    par_items(&mut out, 1, |i, o| {
+        let x = rb(calc[i] * factor[if by_row { i / cols } else { i % cols }]);
+        o[0] = if strength != 1.0 { rb(w.data[i] + rb(strength * rb(x - w.data[i]))) } else { x };
+    });
+    Ok(out)
 }
 
 #[cfg(test)]

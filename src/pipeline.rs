@@ -267,6 +267,9 @@ struct Qwen21Model {
     path: PathBuf,
     dit: qwen21::Dit,
     st: st::SafeTensors,
+    /// the file's key prefix
+    prefix: &'static str,
+    lora: lora::State,
 }
 
 /// A prompt as Qwen Image 2.1's text encoder saw it.
@@ -694,7 +697,7 @@ impl Generator {
         dit.attn_variant = self.attn_variant;
         dit.int8_attn = self.int8_attn;
         eprintln!("Qwen Image 2.1 ready in {:.1}s", t0.elapsed().as_secs_f64());
-        self.qwen21 = Some(Qwen21Model { path: path.to_path_buf(), dit, st: dst });
+        self.qwen21 = Some(Qwen21Model { path: path.to_path_buf(), dit, st: dst, prefix: pre, lora: lora::State::default() });
         Ok(())
     }
 
@@ -1408,9 +1411,10 @@ impl Generator {
                 m.dit.clear_mods();
                 self.moss_contexts.clear();
             }
-        } else if self.qwen21.is_some() {
-            if !loras.is_empty() {
-                bail!("LoRAs on Qwen Image 2.1");
+        } else if let Some(m) = &mut self.qwen21 {
+            // the contexts hold `txt_in`'s output
+            if lora::apply(lora::Arch::Qwen21, &m.st, m.prefix, m.dit.stores(), &mut m.lora, loras, st)? {
+                self.qwen21_contexts.clear();
             }
         } else if !loras.is_empty() {
             bail!("no diffusion model loaded");
@@ -1427,6 +1431,7 @@ impl Generator {
             if te.apply_loras(&loras, st)? {
                 self.cached = None;
                 self.cached_negative = None;
+                self.qwen21_contexts.clear();
             }
         } else if let Some((_, te)) = &mut self.qwen3 {
             if te.apply_loras(&loras, st)? {

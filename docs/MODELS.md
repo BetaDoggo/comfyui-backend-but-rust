@@ -11,6 +11,38 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | MiniMax H3 | Video with audio | `res_multistep`, `simple` | `w6a8` only |
 | Pixal3D | A 3D mesh from one image | the example workflow's four `euler` samplers | int8 ConvRot (`pixal3d_int8_convrot`) only |
 
+## Support matrix
+
+What each family does through this backend. **Yes** means it produced real output; the sections below and
+[STATUS](STATUS.md) say how it was tested and against what. **Refused** means the engine returns an error that SwarmUI
+shows, and never drops the setting. **Not tested** means the code accepts it but nothing has run it on that family.
+
+| | Krea 2 Turbo | Anima | MOSS Image | Qwen Image 2.1 | MiniMax H3 | Pixal3D |
+|---|---|---|---|---|---|---|
+| Makes | Images | Images | Images | Images with alpha | Video with audio | A mesh from one image |
+| Checkpoint | W8A8 int8 | int8 ConvRot | int8 ConvRot, fused q/k/v | int8 ConvRot | `w6a8` | int8 ConvRot |
+| Other file formats (bf16, fp8, ...) | Refused | Refused | Refused | Refused | Refused | Refused |
+| Run through SwarmUI itself | Yes | Yes | Yes | Yes | Yes | Yes |
+| Every sampler and scheduler | Yes | Yes | Yes | Yes | Yes | Fixed to the example's four `euler` |
+| CFG and negative prompts | Yes | Yes | Yes | Yes | Yes | - |
+| Rescale, Renorm, Zero Star, TCFG | Yes | Yes | Yes | Not tested | Refused | - |
+| Conditioning multipliers, Zero Negative | Yes | Yes | Yes | Not tested | Not tested | - |
+| Batch size | Yes | Yes | Yes | Not tested | - | - |
+| Variation seed | Yes | Not tested | Not tested | Not tested | Yes | - |
+| Live previews | Yes | Yes | Yes | Not tested | First frame only | - |
+| LoRAs | Yes | Yes | Yes | Refused | Yes (the turbo LoRA's ComfyUI file) | - |
+| Text encoder LoRAs | Yes | Yes | Yes | Refused | Not tested | - |
+| Prompt Images and reference images | Yes | Refused | Refused | Yes (one and two tested) | Refused | The input itself |
+| Prompt weights | Refused | Yes | Yes | Refused | Yes | - |
+| `<break>` | Yes | Refused | Yes | Refused | Refused | - |
+| `<alternate>`, `<fromto>` | Refused | Refused | Refused | Refused | Refused | - |
+| Init images, refiners, inpainting (partial sampling) | Refused | Refused | Refused | Refused | Refused | - |
+| VAE tiling, Seamless Tileable | Refused | Refused | Refused | Refused | Only the 256 / 64 tile | - |
+| Background removal | - | - | - | - | - | Yes (BiRefNet) |
+
+ControlNet, regions, IP-Adapter, style models, GLIGEN, LoRA hooks and embeddings are refused on every family. Anima
+takes both `(word:1.2)` and `<weight>`; Qwen Image 2.1's encoder reads `(word:1.2)` as plain text.
+
 ## Krea 2
 
 A standalone reimplementation of ComfyUI's **Krea-2 Turbo** text-to-image workflow

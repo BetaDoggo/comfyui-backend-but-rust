@@ -159,6 +159,12 @@ struct Args {
     /// BiRefNet: compare every stage with a dump of tools/birefnet_ref.py instead of running
     #[arg(long)]
     birefnet_check: Option<PathBuf>,
+    /// Run Qwen Image 2.1 (--dit, --te and --vae then default to its files, --shift to its 0.69 at 1024x1024)
+    #[arg(long)]
+    qwen21: bool,
+    /// Qwen Image 2.1: compare the VAE with a dump of tools/qwen21_ref.py --vae-only instead of generating
+    #[arg(long)]
+    qwen21_vae_check: Option<PathBuf>,
 }
 
 /// RGB f32 [height, width, 3], 0 to 1.
@@ -216,6 +222,9 @@ const ANIMA_TE: &str = "clip/qwen_3_600m.safetensors";
 const MOSS_DIT: &str = "Stable-diffusion/moss_image_sft_int8_convrot_attn.safetensors";
 const MOSS_TE: &str = "clip/qwen3.5_9b_int8_convrot.safetensors";
 const MOSS_VAE: &str = "VAE/flux2-vae.safetensors";
+const QWEN21_DIT: &str = "Stable-diffusion/rayQwen21_v1Int8Convrot.safetensors";
+const QWEN21_TE: &str = "clip/qwen3vl_8b_int8_convrot.safetensors";
+const QWEN21_VAE: &str = "VAE/QwenImage/qwen_image_2.1_vae_bf16.safetensors";
 const BIREFNET: &str = "background_removal/birefnet.safetensors";
 const PIXAL_DIT: &str = "diffusion_models/Pixal3D/pixal3d_int8_convrot.safetensors";
 const PIXAL_DINO: &str = "clip_vision/dino_v3_L_naf_fp32.safetensors";
@@ -307,6 +316,64 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         let path = out_path(&args.out, i, args.count);
         std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
             .with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("[{i}] saved {} (seed {seed})", path.display());
+        if let Some(d) = &args.dump {
+            write_safetensors(d, &dump)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_qwen21(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
+    let (dit, te, vae) = (args.model(&args.dit, QWEN21_DIT), args.model(&args.te, QWEN21_TE), args.model(&args.vae, QWEN21_VAE));
+    // ComfyUI's value for 1024x1024, whatever the size
+    let shift = if args.shift == 1.15 { 0.69 } else { args.shift };
+    let mut gen = pipeline::Generator::new(&load)?;
+    gen.ensure_qwen21(&dit)?;
+    gen.ensure_te(&te)?;
+    gen.ensure_vae21(&vae)?;
+    if !args.lora.is_empty() {
+        bail!("LoRAs on Qwen Image 2.1");
+    }
+    // each image is shown to the text encoder over white, and goes into the sequence as a reference latent
+    let mut images = Vec::new();
+    let mut references = Vec::new();
+    for p in args.image.iter().chain(&args.ref_image) {
+        let (rgba, w, h) = read_rgba(p)?;
+        let f: Vec<f32> = rgba.iter().map(|v| *v as f32 / 255.0).collect();
+        images.push(diffusion::vision::PromptImage {
+            width: w,
+            height: h,
+            rgb: f.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]].map(|c| c * px[3] + 1.0 - px[3])).collect(),
+        });
+        references.push(gen.encode_image21(&f, w, h)?);
+    }
+    let n = 64 * (args.height / 16) * (args.width / 16);
+    for i in 0..args.count {
+        let seed = args.seed + i as u64;
+        let noise = match &args.ref_noise {
+            Some(p) => st::SafeTensors::open(p)?.f32_vec("noise", false)?,
+            None => diffusion::sampling::torch_randn(seed, n),
+        };
+        let r = pipeline::Qwen21Request {
+            positive: Prompt::text(args.prompt.trim()),
+            negative: Prompt::text(args.negative.trim()),
+            width: args.width,
+            height: args.height,
+            sampling: args.sampling("euler", ModelSampling::Flux { shift }, seed, (args.width / 16, args.height / 16))?,
+            noise,
+            images: images.clone(),
+            negative_images: images.clone(),
+            references: references.clone(),
+        };
+        let mut dump = pipeline::Dump::new();
+        let t0 = Instant::now();
+        let (latent, _) = gen.sample_qwen21(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
+        let t1 = Instant::now();
+        let rgba = gen.decode_qwen21(&latent, args.width, args.height)?;
+        eprintln!("VAE decode {:.0} ms, image done in {:.2}s", t1.elapsed().as_secs_f64() * 1e3, t0.elapsed().as_secs_f64());
+        let path = out_path(&args.out, i, args.count);
+        write_rgba_png(&path, &rgba, args.width, args.height)?;
         eprintln!("[{i}] saved {} (seed {seed})", path.display());
         if let Some(d) = &args.dump {
             write_safetensors(d, &dump)?;
@@ -559,6 +626,9 @@ fn main() -> Result<()> {
     if let Some(image) = &args.remove_background {
         return run_remove_background(&args, image);
     }
+    if let Some(reference) = &args.qwen21_vae_check {
+        return diffusion::vae21::check(&args.model(&args.vae, QWEN21_VAE), reference);
+    }
     if args.birefnet_check.is_some() {
         diffusion::cuda::init(0)?;
         return diffusion::birefnet::check(&args.model(&args.birefnet, BIREFNET), args.birefnet_check.as_ref().unwrap());
@@ -595,6 +665,9 @@ fn main() -> Result<()> {
     }
     if args.moss {
         return run_moss(&args, load);
+    }
+    if args.qwen21 {
+        return run_qwen21(&args, load);
     }
     if let Some(addr) = &args.serve {
         return serve::run(load, serve::ServeOptions {

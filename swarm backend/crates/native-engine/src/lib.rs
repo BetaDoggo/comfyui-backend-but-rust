@@ -1,6 +1,7 @@
 //! [`Engine`] implementation on the diffusion library: text-to-image for int8 ConvRot checkpoints of
-//! Krea 2, Anima and MOSS Image and text-to-video with audio for MiniMax H3, with every ComfyUI
-//! sampler and scheduler, any CFG and LoRAs, plus Krea 2's prompt images and reference latents. Each
+//! Krea 2, Anima, MOSS Image and Qwen Image 2.1 and text-to-video with audio for MiniMax H3, with every ComfyUI
+//! sampler and scheduler, any CFG and LoRAs (not on Qwen Image 2.1), plus the prompt images and reference
+//! latents of Krea 2 and of Qwen Image 2.1's edits. Each
 //! file's architecture is read from its keys, so one backend serves them all.
 //!
 //! Text encoding is deferred to `sample`, so the negative prompt SwarmUI always sends costs nothing
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use diffusion::h3;
-use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, LoadOptions, MossRequest, Prompt, Reference, Request, Sampling, Step};
+use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Request, Sampling, Step};
 use diffusion::pixal3d;
 use diffusion::preview;
 use diffusion::samplers::{self, CfgFunction, CfgTweaks, ModelSampling, SigmaRange};
@@ -30,10 +31,15 @@ const ATTENTION: [&str; 2] = ["int8", "flash"];
 const KREA2_SHIFT: f64 = 1.15;
 const ANIMA_SHIFT: f64 = 3.0;
 const MOSS_SHIFT: f64 = 5.0;
+/// ComfyUI's Qwen Image 2.1 `shift`: its mu at 1024x1024.
+const QWEN21_SHIFT: f64 = 0.69;
 /// [`TextEncoderHandle::encoder_type`] of Anima's Qwen3 0.6B; SwarmUI's own type is the generic
 /// `stable_diffusion`.
 const ANIMA_ENCODER: &str = "anima";
 const MOSS_ENCODER: &str = "moss_image";
+/// [`TextEncoderHandle::encoder_type`] of Qwen Image 2.1's Qwen3-VL 8B; SwarmUI's own type is `qwen_image`, which Qwen
+/// Image 1 shares.
+const QWEN21_ENCODER: &str = "qwen_image_2.1";
 const MINIMAX_ENCODER: &str = "minimax";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,12 +48,27 @@ enum Family {
     Anima,
     Moss,
     H3,
+    Qwen21,
 }
 
 impl Family {
     /// (latent channels, pixels per latent)
     fn latent(self) -> (usize, usize) {
-        if self == Family::Moss { (diffusion::moss::CH, 16) } else { (16, 8) }
+        match self {
+            Family::Moss => (diffusion::moss::CH, 16),
+            Family::Qwen21 => (diffusion::qwen21::CH, diffusion::vae21::SCALE),
+            _ => (16, 8),
+        }
+    }
+
+    /// The families whose text encoders take the prompt as one piece, with images.
+    fn one_piece(self) -> bool {
+        matches!(self, Family::Krea2 | Family::Qwen21)
+    }
+
+    /// The families that read reference latents.
+    fn references(self) -> bool {
+        matches!(self, Family::Krea2 | Family::Qwen21)
     }
 }
 
@@ -117,6 +138,12 @@ fn read_header(path: &Path) -> anyhow::Result<serde_json::Value> {
 /// The file's architecture. Refuses other models and formats before any weights are touched.
 fn check_dit(file: &ModelFile) -> EngineResult<Family> {
     let h = read_header(&file.path).map_err(|e| unsupported(format!("{}: not a readable safetensors file ({e})", file.name)))?;
+    if let Some(p) = diffusion::qwen21::key_prefix(|k| h.get(k).is_some()) {
+        if h.get(format!("{p}transformer_blocks.0.img_mlp.gate_up.weight_scale")).is_none() {
+            return Err(unsupported(format!("{}: this backend only runs int8 ConvRot Qwen Image 2.1 checkpoints", file.name)));
+        }
+        return Ok(Family::Qwen21);
+    }
     if let Some(p) = diffusion::anima::key_prefix(|k| h.get(k).is_some()) {
         if h.get(format!("{p}blocks.0.mlp.layer1.weight_scale")).is_none() {
             return Err(unsupported(format!("{}: this backend only runs int8 ConvRot Anima checkpoints", file.name)));
@@ -137,12 +164,27 @@ fn check_dit(file: &ModelFile) -> EngineResult<Family> {
     }
     // The keys SwarmUI's `isKrea2` tests.
     if ["txtfusion.projector.weight", "blocks.0.attn.gate.weight", "blocks.0.mod.lin"].iter().any(|k| h.get(k).is_none()) {
-        return Err(unsupported(format!("{}: this backend only runs Krea 2, Anima, MOSS Image and MiniMax H3 models", file.name)));
+        return Err(unsupported(format!("{}: this backend only runs Krea 2, Anima, MOSS Image, Qwen Image 2.1 and MiniMax H3 models", file.name)));
     }
     if h.get("blocks.0.attn.gate.weight_scale").is_none() {
         return Err(unsupported(format!("{}: this backend only runs W8A8 (ConvRot int8) Krea 2 checkpoints", file.name)));
     }
     Ok(Family::Krea2)
+}
+
+/// Qwen Image 2.1's `CLIPLoader` type is Qwen Image 1's `qwen_image`; this tells the Qwen3-VL 8B by its shape and its
+/// vision tower.
+fn is_qwen3vl_8b(file: &ModelFile) -> bool {
+    read_header(&file.path).is_ok_and(|h| {
+        h["model.layers.0.input_layernorm.weight"]["shape"][0] == 4096 && h.get("model.visual.deepstack_merger_list.0.linear_fc1.weight").is_some()
+    })
+}
+
+/// Qwen Image 2.1's VAE: the Wan 2.2 layout with a one-frame kernel.
+fn is_qwen21_vae(file: &ModelFile) -> bool {
+    read_header(&file.path).is_ok_and(|h| {
+        h.get("decoder.upsamples.0.upsamples.0.residual.2.weight").is_some() && h["decoder.head.2.weight"]["shape"].as_array().is_some_and(|s| s.len() == 5 && s[2] == 1)
+    })
 }
 
 /// Anima's `CLIPLoader` type is the generic `stable_diffusion`; this tells its encoder by shape.
@@ -157,7 +199,7 @@ fn prompt_chunks(p: &ParsedPrompt, steps: u32, family: Family) -> Result<Vec<Vec
         return Err("<alternate> and <fromto> prompts".into());
     }
     let chunks = p.chunks(0, steps.max(1));
-    if chunks.len() != 1 && matches!(family, Family::Anima | Family::H3) {
+    if chunks.len() != 1 && matches!(family, Family::Anima | Family::H3 | Family::Qwen21) {
         return Err("<break> in prompts".into());
     }
     chunks.iter().map(|leaves| chunk_segments(leaves, family)).collect()
@@ -167,19 +209,19 @@ fn chunk_segments(leaves: &[PromptLeaf], family: Family) -> Result<Vec<(String, 
     let mut text = String::new();
     let mut segments = Vec::new();
     for leaf in leaves {
-        if family == Family::Krea2 && leaf.weight != 1.0 {
+        if family.one_piece() && leaf.weight != 1.0 {
             return Err("prompt weights (<weight>)".into());
         }
         match &leaf.kind {
             PromptLeafKind::Text(t) if family == Family::Anima => segments.extend(token_weights(t, leaf.weight as f32)),
-            PromptLeafKind::Text(t) if family == Family::Krea2 => text.push_str(t),
+            PromptLeafKind::Text(t) if family.one_piece() => text.push_str(t),
             PromptLeafKind::Text(t) => segments.push((t.clone(), leaf.weight as f32)),
             PromptLeafKind::Embed(_) => return Err("embeddings in prompts".into()),
             PromptLeafKind::LoraHook(_) => return Err("LoRA hooks in prompts".into()),
             PromptLeafKind::Break => unreachable!("chunks() splits on breaks"),
         }
     }
-    if family == Family::Krea2 {
+    if family.one_piece() {
         segments.push((text, 1.0));
     }
     Ok(segments)
@@ -200,7 +242,7 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<Vec<(St
         TextEncodeMode::Plain { text } if family == Family::Moss => Ok(vec![vec![(text.trim().to_string(), 1.0)]]),
         TextEncodeMode::Plain { text } => Ok(vec![vec![(text.clone(), 1.0)]]),
         TextEncodeMode::Swarm(s) => {
-            if s.images.is_some() && family != Family::Krea2 {
+            if s.images.is_some() && !family.one_piece() {
                 return Err("Prompt Images".into());
             }
             if s.minimax_refs.is_some() || s.clip_vision.is_some() {
@@ -212,8 +254,9 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<Vec<(St
             if s.guidance.is_some() {
                 return Err("Flux Guidance Scale".into());
             }
-            // The node only uses the template with images, and Krea 2's is the one its encoder has.
-            if !matches!(s.llama_template.as_deref(), None | Some("krea2")) {
+            // The node only uses the template with images, and Krea 2's is the one its encoder has. Qwen Image 2.1
+            // builds its own.
+            if !matches!(s.llama_template.as_deref(), None) && !(family == Family::Krea2 && s.llama_template.as_deref() == Some("krea2")) {
                 return Err(format!("prompt template {:?}", s.llama_template));
             }
             let chunks = prompt_chunks(&s.prompt, s.steps, family)?;
@@ -248,7 +291,7 @@ fn single_prompt(c: &Conditioning, family: Family) -> EngineResult<(&DeferredCon
     let plain = m.start_percent == 0.0
         && m.end_percent == 1.0
         && m.mask.is_none()
-        && (family == Family::Krea2 || m.reference_latents.is_empty())
+        && (family.references() || m.reference_latents.is_empty())
         && m.gligen.is_empty()
         && m.inpaint.is_none()
         && m.embedding_ops.is_empty()
@@ -262,11 +305,12 @@ fn single_prompt(c: &Conditioning, family: Family) -> EngineResult<(&DeferredCon
     Ok((cond, Prompt { chunks, scale: if m.zeroed { 0.0 } else { m.multiplier as f32 } }))
 }
 
-/// A Krea 2 conditioning's reference latents, and whether they use `index_timestep_zero`. Without a
-/// method ComfyUI's model ignores them.
-fn reference_latents(c: &Conditioning) -> EngineResult<(Vec<Reference>, bool)> {
+/// A conditioning's reference latents of `channels` channels, and whether they use `index_timestep_zero`. Krea 2's model
+/// ignores them without a method; Qwen Image 2.1's has none.
+fn reference_latents(c: &Conditioning, family: Family) -> EngineResult<(Vec<Reference>, bool)> {
     let [e] = c.entries.as_slice() else { return Ok((Vec::new(), false)) };
     let timestep_zero = match e.meta.reference_latents_method.as_deref() {
+        _ if family == Family::Qwen21 => false,
         None => return Ok((Vec::new(), false)),
         Some("index") => false,
         Some("index_timestep_zero") => true,
@@ -277,7 +321,10 @@ fn reference_latents(c: &Conditioning) -> EngineResult<(Vec<Reference>, bool)> {
         let LatentSamples::Single(t) = &l.samples else {
             return Err(unsupported("audio/video reference latents"));
         };
-        let &[1, 16, height, width] = t.shape.as_slice() else {
+        let &[1, channels, height, width] = t.shape.as_slice() else {
+            return Err(unsupported(format!("reference latent of shape {:?}", t.shape)));
+        };
+        if channels != family.latent().0 {
             return Err(unsupported(format!("reference latent of shape {:?}", t.shape)));
         };
         let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("a reference latent this engine didn't encode"))?;
@@ -312,6 +359,7 @@ struct ModelSettings {
 fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
     let model_sampling = match family {
         Family::Krea2 => ModelSampling::Flux { shift: KREA2_SHIFT },
+        Family::Qwen21 => ModelSampling::Flux { shift: QWEN21_SHIFT },
         Family::Anima => ModelSampling::Flow { shift: ANIMA_SHIFT },
         Family::Moss => ModelSampling::Flow { shift: MOSS_SHIFT },
         Family::H3 => ModelSampling::Flow { shift: h3::SHIFT_VIDEO },
@@ -320,7 +368,7 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
     let mut s = ModelSettings { model_sampling, int8_attention: family != Family::H3, loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default() };
     for p in &model.patches {
         match p {
-            ModelPatch::SamplingFlux { max_shift, base_shift, width, height } if family == Family::Krea2 => {
+            ModelPatch::SamplingFlux { max_shift, base_shift, width, height } if matches!(family, Family::Krea2 | Family::Qwen21) => {
                 s.model_sampling = ModelSampling::Flux { shift: flux_shift(*max_shift, *base_shift, *width, *height) }
             }
             ModelPatch::SamplingAuraFlow { shift, sampling } if family != Family::Krea2 && sampling == "flow" => {
@@ -450,6 +498,7 @@ impl NativeEngine {
             Family::Anima => (self.gen().ensure_anima(&file.path), "anima"),
             Family::Moss => (self.gen().ensure_moss(&file.path), "moss-image"),
             Family::H3 => (self.gen().ensure_h3(&file.path), "minimax-h3"),
+            Family::Qwen21 => (self.gen().ensure_qwen21(&file.path), "qwen-image-2.1"),
         };
         family.map_err(internal)?;
         Ok(ModelHandle::new(Some(file.clone()), Some(name.into()), Opaque::none()))
@@ -490,6 +539,107 @@ impl NativeEngine {
                 .sample_anima(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::wan21(x0, lh, lw), lh, lw)), None)
                 .map_err(internal)?;
             tracing::info!("anima: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
+            data.extend_from_slice(&latent);
+        }
+        Ok(data)
+    }
+
+    /// Qwen Image 2.1's VAE on `pixels`, RGB or RGBA: the encoder pads RGB with opaque alpha, like ComfyUI.
+    fn encode_qwen21(&self, file: &ModelFile, pixels: &ImageBatch) -> EngineResult<Latent> {
+        let c = pixels.channels as usize;
+        if c < 3 {
+            return Err(unsupported("VAE encoding of a greyscale image"));
+        }
+        let (w, h) = (pixels.width as usize, pixels.height as usize);
+        let mut gen = self.gen();
+        gen.ensure_vae21(&file.path).map_err(internal)?;
+        let (mut data, mut size) = (Vec::new(), (0, 0));
+        for i in 0..pixels.count {
+            let rgba: Vec<f32> = pixels.frame_f32(i).chunks_exact(c).flat_map(|px| [px[0], px[1], px[2], if c == 4 { px[3] } else { 1.0 }]).collect();
+            let r = gen.encode_image21(&rgba, w, h).map_err(internal)?;
+            data.extend_from_slice(&r.latent);
+            size = (r.height, r.width);
+        }
+        let (lh, lw) = size;
+        let tensor = LatentTensor {
+            format: LatentFormat::QwenImage21,
+            shape: vec![pixels.count as usize, diffusion::qwen21::CH, lh, lw],
+            data: Opaque::new(HostLatent { data }),
+        };
+        let scale = diffusion::vae21::SCALE as u32;
+        Ok(Latent::single(tensor, PixelInfo::image(lw as u32 * scale, lh as u32 * scale, pixels.count)))
+    }
+
+    /// Qwen Image 2.1's RGBA VAE: the latent `[batch, 64, lh, lw]` to `[batch, 16lh, 16lw, 4]`.
+    fn decode_qwen21(&self, file: &ModelFile, batch: usize, channels: usize, (lh, lw): (usize, usize), latent: &[f32], progress: &mut dyn ProgressSink)
+        -> EngineResult<ImageBatch> {
+        if channels != diffusion::qwen21::CH {
+            return Err(unsupported(format!("this VAE on a {channels}-channel latent")));
+        }
+        let scale = diffusion::vae21::SCALE;
+        let (width, height) = (lw * scale, lh * scale);
+        let mut gen = self.gen();
+        gen.ensure_vae21(&file.path).map_err(internal)?;
+        let mut rgba = Vec::with_capacity(batch * height * width * 4);
+        for (i, image) in latent.chunks_exact(channels * lh * lw).enumerate() {
+            if progress.interrupted() {
+                return Err(EngineError::Interrupted);
+            }
+            rgba.extend_from_slice(&gen.decode_qwen21(image, width, height).map_err(internal)?);
+            progress.progress(i as u32 + 1, batch as u32);
+        }
+        Ok(ImageBatch::from_u8(batch as u32, height as u32, width as u32, 4, rgba))
+    }
+
+    /// Qwen Image 2.1: text to image and edits. Prompt images go through the vision tower and, as the reference latents
+    /// of the prompts, into the sequence.
+    fn sample_qwen21(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, progress: &mut dyn ProgressSink)
+        -> EngineResult<Vec<f32>> {
+        let (batch, lh, lw) = shape;
+        let mode = self.preview_mode(req);
+        let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
+        if !settings.loras.is_empty() {
+            return Err(unsupported("LoRAs on Qwen Image 2.1"));
+        }
+        let (cond, positive) = single_prompt(&req.positive, Family::Qwen21)?;
+        if !cond.loras.is_empty() {
+            return Err(unsupported("LoRAs on Qwen Image 2.1's text encoder"));
+        }
+        let references = reference_latents(&req.positive, Family::Qwen21)?.0;
+        let first = sampling(req, settings, shape, 0)?;
+        let (negative, negative_images) = if first.uses_negative() {
+            let (c, p) = single_prompt(&req.negative, Family::Qwen21)?;
+            check_text_encoder_loras(cond, c)?;
+            let theirs = reference_latents(&req.negative, Family::Qwen21)?.0;
+            if theirs.len() != references.len() || theirs.iter().zip(&references).any(|(a, b)| a.latent != b.latent) {
+                return Err(unsupported("different reference latents on the positive and negative prompts"));
+            }
+            (p, c.images.clone())
+        } else {
+            (Prompt::text(""), Vec::new())
+        };
+        let mut gen = self.gen();
+        gen.ensure_qwen21(&file.path).map_err(internal)?;
+        gen.ensure_te(&cond.text_encoder).map_err(internal)?;
+        gen.set_int8_attention(settings.int8_attention);
+        let (width, height) = (lw * diffusion::vae21::SCALE, lh * diffusion::vae21::SCALE);
+        let mut data = Vec::with_capacity(batch * diffusion::qwen21::CH * lh * lw);
+        for i in 0..batch {
+            let r = Qwen21Request {
+                positive: positive.clone(),
+                negative: negative.clone(),
+                width,
+                height,
+                sampling: sampling(req, settings, shape, i)?,
+                noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, diffusion::qwen21::CH, lh, lw),
+                images: cond.images.clone(),
+                negative_images: negative_images.clone(),
+                references: references.clone(),
+            };
+            let (latent, stats) = gen
+                .sample_qwen21(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::qwen21(x0, lh, lw), lh, lw)), None)
+                .map_err(internal)?;
+            tracing::info!("qwen image 2.1: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
             data.extend_from_slice(&latent);
         }
         Ok(data)
@@ -682,6 +832,12 @@ impl Engine for NativeEngine {
                 self.gen().ensure_te(&file.path).map_err(internal)?;
                 "krea2"
             }
+            // Qwen Image 1's encoder (Qwen2.5-VL 7B) goes by the same type
+            "qwen_image" if is_qwen3vl_8b(file) => {
+                self.gen().ensure_te(&file.path).map_err(internal)?;
+                QWEN21_ENCODER
+            }
+            "qwen_image" => return Err(unsupported("Qwen Image 1's text encoder (this backend runs Qwen Image 2.1)")),
             "stable_diffusion" if is_qwen3_600m(file) => {
                 self.gen().ensure_qwen3(&file.path).map_err(internal)?;
                 ANIMA_ENCODER
@@ -694,7 +850,7 @@ impl Engine for NativeEngine {
                 self.gen().ensure_h3_te(&file.path).map_err(internal)?;
                 MINIMAX_ENCODER
             }
-            t => return Err(unsupported(format!("text encoder type {t} (this backend only runs Krea 2, Anima, MOSS Image and MiniMax H3)"))),
+            t => return Err(unsupported(format!("text encoder type {t} (this backend only runs Krea 2, Anima, MOSS Image, Qwen Image 2.1 and MiniMax H3)"))),
         };
         Ok(TextEncoderHandle { sources: req.files.clone(), encoder_type: encoder_type.into(), device: req.device.clone(), engine: Opaque::none(), patches: vec![] })
     }
@@ -704,22 +860,30 @@ impl Engine for NativeEngine {
             return Ok(VaeHandle::new(Some(req.file.clone()), Opaque::none()));
         }
         let mut gen = self.gen();
-        if is_flux2_vae(&req.file) { gen.ensure_flux2_vae(&req.file.path) } else { gen.ensure_vae(&req.file.path) }.map_err(internal)?;
+        if is_qwen21_vae(&req.file) {
+            gen.ensure_vae21(&req.file.path)
+        } else if is_flux2_vae(&req.file) {
+            gen.ensure_flux2_vae(&req.file.path)
+        } else {
+            gen.ensure_vae(&req.file.path)
+        }
+        .map_err(internal)?;
         Ok(VaeHandle::new(Some(req.file.clone()), Opaque::none()))
     }
 
     fn encode_text(&self, req: &TextEncodeRequest) -> EngineResult<Conditioning> {
         let [file] = req.text_encoder.sources.as_slice() else {
-            return Err(unsupported("this text encoder (Krea 2 needs one Qwen3-VL file, Anima one Qwen3 file, MOSS Image one Qwen3.5 file, MiniMax H3 one Qwen3-VL 32B file)"));
+            return Err(unsupported("this text encoder (Krea 2 needs one Qwen3-VL 4B file, Anima one Qwen3 file, MOSS Image one Qwen3.5 file, Qwen Image 2.1 one Qwen3-VL 8B file, MiniMax H3 one Qwen3-VL 32B file)"));
         };
         let family = match req.text_encoder.encoder_type.as_str() {
             ANIMA_ENCODER => Family::Anima,
             MOSS_ENCODER => Family::Moss,
             MINIMAX_ENCODER => Family::H3,
+            QWEN21_ENCODER => Family::Qwen21,
             _ => Family::Krea2,
         };
         let images = match &req.mode {
-            TextEncodeMode::Swarm(s) if family == Family::Krea2 => s.images.as_ref().map(prompt_images).unwrap_or_default(),
+            TextEncodeMode::Swarm(s) if family.one_piece() => s.images.as_ref().map(prompt_images).unwrap_or_default(),
             _ => Vec::new(),
         };
         let loras = req.text_encoder.patches.iter().filter_map(|p| match p {
@@ -749,6 +913,14 @@ impl Engine for NativeEngine {
                 PixelInfo::image(width, height, req.batch_size),
             ));
         }
+        // Qwen Image 2.1's placeholder, which `sample` widens to its 64 channels
+        if let EmptyLatentKind::Image4Ch { width, height } = req.kind {
+            let (b, h, w) = (req.batch_size as usize, height as usize / 8, width as usize / 8);
+            return Ok(Latent::single(
+                LatentTensor { format: LatentFormat::Image4Ch, shape: vec![b, 4, h, w], data: Opaque::none() },
+                PixelInfo::image(width, height, req.batch_size),
+            ));
+        }
         let EmptyLatentKind::Image16Ch { width, height } = req.kind else {
             return Err(unsupported(format!("latent {:?}", req.kind)));
         };
@@ -767,7 +939,10 @@ impl Engine for NativeEngine {
         if family == Family::H3 {
             return self.sample_h3(req, &settings, progress);
         }
-        let LatentSamples::Single(tensor) = &req.latent.samples else {
+        // SwarmUI sends Qwen Image 2.1 a half-size 4-channel placeholder, as ComfyUI widens it
+        let widened = if family == Family::Qwen21 { req.latent.conform_empty(LatentFormat::QwenImage21, family.latent().0, family.latent().1 as u32) } else { None };
+        let latent = widened.as_ref().unwrap_or(&req.latent);
+        let LatentSamples::Single(tensor) = &latent.samples else {
             return Err(unsupported("audio/video latents"));
         };
         let &[batch, channels, lh, lw] = tensor.shape.as_slice() else {
@@ -777,7 +952,7 @@ impl Engine for NativeEngine {
             return Err(unsupported(format!("latent shape {:?} for this model", tensor.shape)));
         }
         let finish = |data| {
-            Ok(req.latent.with_samples(LatentSamples::Single(LatentTensor {
+            Ok(latent.with_samples(LatentSamples::Single(LatentTensor {
                 format: tensor.format.clone(),
                 shape: tensor.shape.clone(),
                 data: Opaque::new(HostLatent { data }),
@@ -789,15 +964,18 @@ impl Engine for NativeEngine {
         if family == Family::Moss {
             return finish(self.sample_moss(req, (batch, lh, lw), &settings, progress)?);
         }
+        if family == Family::Qwen21 {
+            return finish(self.sample_qwen21(req, (batch, lh, lw), &settings, progress)?);
+        }
         let (cond, prompt) = single_prompt(&req.positive, family)?;
         let text_encoder = &cond.text_encoder;
-        let (references, timestep_zero) = reference_latents(&req.positive)?;
+        let (references, timestep_zero) = reference_latents(&req.positive, family)?;
         let (width, height) = (lw * 8, lh * 8);
         let shape = (batch, lh, lw);
         let (negative, negative_images) = if sampling(req, &settings, shape, 0)?.uses_negative() {
             let (c, p) = single_prompt(&req.negative, family)?;
             check_text_encoder_loras(cond, c)?;
-            if !reference_latents(&req.negative)?.0.is_empty() {
+            if !reference_latents(&req.negative, family)?.0.is_empty() {
                 return Err(unsupported("reference latents on the negative prompt"));
             }
             (p, c.images.clone())
@@ -848,6 +1026,9 @@ impl Engine for NativeEngine {
         };
         let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("decoding a latent this engine didn't sample"))?;
         let file = req.vae.source.as_ref().ok_or_else(|| unsupported("the pixel-space VAE"))?;
+        if is_qwen21_vae(file) {
+            return self.decode_qwen21(file, batch, channels, (lh, lw), &latent.data, progress);
+        }
         let flux2 = is_flux2_vae(file);
         if flux2 != (channels == diffusion::moss::CH) {
             return Err(unsupported(format!("this VAE on a {channels}-channel latent")));
@@ -874,6 +1055,9 @@ impl Engine for NativeEngine {
             return Err(unsupported("VAE tiling"));
         }
         let file = req.vae.source.as_ref().ok_or_else(|| unsupported("the pixel-space VAE"))?;
+        if is_qwen21_vae(file) {
+            return self.encode_qwen21(file, &req.pixels);
+        }
         if is_flux2_vae(file) {
             return Err(unsupported("VAE encoding with the Flux 2 VAE"));
         }
@@ -920,12 +1104,20 @@ impl Engine for NativeEngine {
                 ANIMA_ENCODER => gen.ensure_qwen3(&f.path),
                 MOSS_ENCODER => gen.ensure_qwen35(&f.path),
                 MINIMAX_ENCODER => gen.ensure_h3_te(&f.path),
+                // the 8B of Qwen Image 2.1 as ensure_te takes it too
                 _ => gen.ensure_te(&f.path),
             }
             .map_err(internal)?;
         }
         if let Some(f) = req.vae.source.as_ref().filter(|f| !is_h3_vae(f)) {
-            if is_flux2_vae(f) { gen.ensure_flux2_vae(&f.path) } else { gen.ensure_vae(&f.path) }.map_err(internal)?;
+            if is_qwen21_vae(f) {
+                gen.ensure_vae21(&f.path)
+            } else if is_flux2_vae(f) {
+                gen.ensure_flux2_vae(&f.path)
+            } else {
+                gen.ensure_vae(&f.path)
+            }
+            .map_err(internal)?;
         }
         Ok(())
     }
@@ -1059,6 +1251,15 @@ mod tests {
             let chunks = prompt_chunks(&ParsedPrompt::parse("a<break>b"), 8, family).unwrap();
             assert_eq!(chunks, [[("a".to_string(), 1.0)], [("b".to_string(), 1.0)]]);
         }
+    }
+
+    #[test]
+    fn qwen21_prompts_are_one_piece_without_breaks_or_weights() {
+        let chunks = prompt_chunks(&ParsedPrompt::parse("a, b"), 8, Family::Qwen21).unwrap();
+        assert_eq!(chunks, [[("a, b".to_string(), 1.0)]]);
+        assert!(prompt_chunks(&ParsedPrompt::parse("a<break>b"), 8, Family::Qwen21).is_err());
+        assert!(prompt_chunks(&ParsedPrompt::parse("a <weight[1.2]:b>"), 8, Family::Qwen21).is_err());
+        assert_eq!(Family::Qwen21.latent(), (64, 16));
     }
 
     #[test]

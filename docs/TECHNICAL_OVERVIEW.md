@@ -86,6 +86,7 @@ the baked weights match ComfyUI's bit for bit. Sampling then runs the normal int
 | Krea 2 Turbo | `src/dit.rs`, int8 W8A8 | Qwen3-VL-4B, `src/te.rs` | Qwen-Image (Wan 2.1), `src/vae.rs` |
 | Anima | `src/anima.rs`, int8 ConvRot | Qwen3 0.6B, `src/qwen3.rs` | Qwen-Image (Wan 2.1), `src/vae.rs` |
 | MOSS Image | `src/moss.rs`, int8 ConvRot | Qwen3.5 9B, `src/qwen35.rs` | Flux 2, `src/flux2vae.rs` |
+| Qwen Image 2.1 | `src/qwen21.rs`, int8 ConvRot | Qwen3-VL 8B, `src/te.rs` and `src/vision.rs` | RGBA Wan 2.2 layout, `src/vae21.rs` |
 | MiniMax H3 | `src/h3.rs`, w6a8 | Qwen3-VL 32B, `src/h3te.rs` | Video and audio, `src/h3vae.rs` |
 | Pixal3D | `src/trellis.rs`, int8 ConvRot | DINOv3 ViT-L and NAF, `src/dino3.rs` | Sparse convolution shape and texture decoders, `src/trellis_vae.rs` |
 

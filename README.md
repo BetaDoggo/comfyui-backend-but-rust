@@ -11,17 +11,18 @@
 A Rust and CUDA backend that speaks ComfyUI's API and replaces the ComfyUI features SwarmUI uses most, so SwarmUI can
 generate without Python or ComfyUI. The goal is speed first.
 
-It really generates with four image and video model families and one image-to-3D model, from specific quantized checkpoints only:
+It really generates with five image and video model families and one image-to-3D model, from specific quantized checkpoints only:
 
 | Family | Generates | 1024x1024 sampling here | ComfyUI |
 |---|---|---|---|
 | Krea 2 Turbo | Text to image, with Prompt Images and reference latents | 0.58 to 0.61 s/step | about 1.00 s/step |
 | Anima | Text to image | 115 ms/step | 199 ms/step |
 | MOSS Image | Text to image | 550 to 573 ms/step at CFG 4 | 601 ms/step |
+| Qwen Image 2.1 | Text to image with alpha, and edits with reference images | 0.36 s/step, 0.22 to 0.44 s/step with references | 0.46 s/step |
 | MiniMax H3 | Text to video with audio | 0.24 s/step, 5 frames at 512x512 | 1.59 s/step |
 | Pixal3D | Image to a vertex-coloured 3D mesh (GLB), cutting the object out first with BiRefNet | 40 s per mesh at resolution 1024, 110 s at 1536 | not timed |
 
-All of them take LoRAs and every ComfyUI sampler and scheduler. Init images, inpainting, ControlNet, refiners and every
+All of them take every ComfyUI sampler and scheduler, and all but Qwen Image 2.1 take LoRAs. Init images, inpainting, ControlNet, refiners and every
 other model family don't work yet. The server accepts far more of SwarmUI's features than that, but they only reach a
 mock engine, so run this beside a normal ComfyUI backend. [Status](docs/STATUS.md) lists what works and what's left, in
 priority order.
@@ -55,6 +56,7 @@ Put your models in one folder, keeping these subfolders, and point `MODELS_ROOT`
 | Krea 2 Turbo | `kroma-v0.3.1-turbo-opd-W8A8.safetensors` | `qwen3vl_4b.safetensors` | `qwen_image_vae.safetensors` |
 | Anima | `animaInt8Mxfp8_turboV11Int8.safetensors` | `qwen_3_600m.safetensors` | `qwen_image_vae.safetensors` |
 | MOSS Image | `moss_image_sft_int8_convrot_attn.safetensors` | `qwen3.5_9b_int8_convrot.safetensors` | `flux2-vae.safetensors` |
+| Qwen Image 2.1 | `rayQwen21_v1Int8Convrot.safetensors` | `qwen3vl_8b_int8_convrot.safetensors` | `QwenImage/qwen_image_2.1_vae_bf16.safetensors` |
 | MiniMax H3 | `minimax_h3_fl2va_pruned_w6a8.safetensors` | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `MiniMaxH3/minimax_h3_video_vae_int8_convrot.safetensors`, `MiniMaxH3/minimax_h3_audio_vae_fp32.safetensors` |
 
 Pixal3D uses other folders: `diffusion_models/Pixal3D/pixal3d_int8_convrot.safetensors`, `clip_vision/dino_v3_L_naf_fp32.safetensors`,

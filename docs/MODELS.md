@@ -135,6 +135,58 @@ layers run as the plain delta-rule recursion on the GPU), and the image embedder
 differs by 0.5%, because torch's bf16 GEMM isn't exact at those sizes. The same seed gives the same picture at about
 34 dB PSNR with int8 attention and 33 dB with flash.
 
+## Qwen Image 2.1
+
+Runs int8 ConvRot Qwen Image 2.1 checkpoints with the Qwen3-VL 8B text encoder and its RGBA VAE (64 channels at 1/16, so
+the image can have alpha). Every sampler and scheduler works. The model is a CFG 1 model: at CFG 1.5 the picture turns
+oversharp, and at 3 it breaks into stripes, exactly as in ComfyUI. LoRAs, init images and partial sampling are refused.
+
+```bash
+target/release/diffusion.exe --qwen21 -p "no people, a stone lighthouse on a rocky coast at sunset, calm sea" --steps 8 -o lighthouse.png
+target/release/diffusion.exe --qwen21 --image lighthouse.png -p "turn it into a night scene with a starry sky" --steps 8 -o night.png
+```
+
+**Edits.** Each `--image` is shown to the text encoder (through the 8B vision tower, which is 334 ms for a 768x768
+image) and VAE-encoded as a reference latent. The sequence is the text with each image spliced in at its slot, then the
+image being made. The text and the references are modulated as if at t = 0 and attend only to what comes before them, so
+their keys and values are the same at every step: they are computed once and kept (a cache of 2.2 GB per 1024x1024
+reference, per prompt). A step then runs only the new image's rows. With no room, up to 3 GiB per prompt, the prefix
+runs again in every step instead, which gives the same picture byte for byte (`QWEN21_NO_CACHE=1` forces it).
+
+Measured here (RTX 5070, 12 GB), 8 steps, after warm-up:
+
+| | ComfyUI | This engine |
+|---|---|---|
+| 1024x1024 text to image, sampling | 0.46 s/step (3.68 s) | 0.36 s/step (2.90 s) |
+| 768x768 edit, one reference, sampling | not timed | 0.22 s/step cached, 0.48 s/step without the cache |
+| 1024x1024 edit, one 1024x1024 reference | not timed | 0.44 s/step, part of the blocks streaming to make room for the cache |
+| VAE decode, 1024x1024 | not timed | 0.42 s |
+| Text encoder, a short prompt | not timed | 0.3 s |
+
+In one step at 1024x1024 the int8 GEMMs take 241 ms (gate and up 110, down 57, qkv 54, o 20) and attention 68 ms.
+
+**Against ComfyUI** (same seed and noise, its own code on the same files):
+
+| | Difference |
+|---|---|
+| Text encoder output, with and without an image | 1.7e-3 and 6.8e-3 relative |
+| First model evaluation, each block's image rows | 6e-3 to 2e-2 relative; the prefix rows 2e-3 to 9e-3 |
+| VAE decode of a random latent | 3.3e-3 relative |
+| VAE round trip of a picture | 39.01 dB from the original, ComfyUI's 38.98 dB; ours against theirs 54.5 dB |
+| 512x512 text to image, 4 steps | latent 3.8e-2 relative, picture 36.6 dB |
+| 768x768 edit, 4 steps | latent 1.2e-2 relative, picture 46.1 dB |
+
+**Transparent references.** SwarmUI's image loader (`SwarmLoadImageB64`) drops the alpha channel, here and in ComfyUI, so a
+reference with a transparent background reaches the model as an opaque picture of whatever colour is stored under the
+transparent pixels. Qwen Image 2.1's own transparent areas are stored as magenta, so an alpha picture it made and then
+edited through SwarmUI comes back with a pink opaque background. From the CLI (`--image`) the alpha is kept: the VAE encoder
+matches ComfyUI's with alpha in the picture (round trip 44.6 dB in alpha and 48.7 dB in colour where opaque), and the
+edit keeps its transparency.
+
+Not tested: SwarmUI itself (the two graphs SwarmUI makes for alpha text to image and a two-picture edit ran through
+`comfy-server` over HTTP, 8 s and 11 s from a cold start), more than two reference images, and the fp8 and bf16 files,
+which are refused.
+
 ## MiniMax H3
 
 H3 runs text to video with audio, from SwarmUI or with `--h3` on the CLI: the `w6a8` checkpoint, the nvfp4 text encoder, and the turbo LoRA in its ComfyUI form.

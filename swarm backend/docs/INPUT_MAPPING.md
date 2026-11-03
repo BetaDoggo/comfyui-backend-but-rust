@@ -338,11 +338,16 @@ and the server keeps it:
 
 Verified live: SwarmUI saved a 1024×768 RGBA PNG with the mock's alpha gradient intact.
 
-**Engine-side work:**
+**Engine-side work (done in `native-engine`):**
 
-* Qwen3-VL 8B encoding with vision inputs.
-* The Qwen Image 2.1 MMDiT with reference latents. ComfyUI caches the text/reference prefix as a KV cache across steps.
-* The RGBA VAE: pad RGB input with alpha 1.0 when encoding, and decode to 4 channels.
+* Qwen3-VL 8B encoding with vision inputs. `CLIPLoader type=qwen_image` is told from Qwen Image 1 by the file (the 8B has a
+  vision tower with DeepStack mergers). The prompt is the template with `<imageN>` and the vision block of each image in
+  front of the text; the system turn and the image tokens are dropped, and `slots` say where each image goes.
+* The MMDiT with reference latents, with the text/reference prefix cached across steps as ComfyUI does.
+* The RGBA VAE: RGB input is padded with alpha 1.0 when encoding, and decoding gives 4 channels.
+* `EmptyLatentImage` returns a 4-channel latent and `sample` widens it with `Latent::conform_empty`.
+* Refused: LoRAs, `<break>`, prompt weights, init images and refiners (partial sampling), differing reference latents on the
+  two prompts.
 
 ---
 

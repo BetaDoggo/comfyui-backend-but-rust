@@ -40,6 +40,8 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | MiniMax H3 | H3 text to video with audio | Through real SwarmUI and the CLI: w6a8 DiT, nvfp4 text encoder, turbo LoRA, video and audio decoders, mp4 through ffmpeg. 512x512, 5 and 22 frames, 0.24 to 0.53 s/step against 1.59 in ComfyUI; a warm repeat takes 2.6 to 3.8 s. Same picture at 21 dB; both are 1.2% from an exact refiner run. Audio not judged by ear. |
 | P1 | Engine core | Idle VRAM release | Diffusion blocks move to RAM after 5 minutes with no work (IDLE_RELEASE_SECS). Direct workflow test. |
 | P1 | Engine core | Lazy offloading | H3 reads weights on use through a few pinned staging buffers, ahead of compute; LoRA-baked blocks stay pinned and skip staging. Other models still pin everything at load. |
+| P1 | Qwen Image 2.1 | Qwen Image 2.1 engine | Text to image with alpha, CFG and negatives, through `comfy-server` over HTTP and the CLI: 0.36 s/step at 1024x1024 against ComfyUI's 0.46, picture 36.6 dB from ComfyUI's at 4 steps. Not run through SwarmUI itself. |
+| P1 | Qwen Image 2.1 | Qwen Image 2.1 edits | Reference images through the vision tower, the VAE encoder and a cached prefix: 46.1 dB from ComfyUI at 768x768, a two-picture edit through the server. 0.22 s/step at 768x768 with one reference. Not run through SwarmUI itself. |
 | P1 | MOSS Image | MOSS engine | Int8 ConvRot checkpoint through real SwarmUI: 550 to 573 ms/step at CFG 4, against 601 in ComfyUI, VAE 268 ms against 530 or more. Same picture at about 34 dB, not pixel-identical. |
 | P1 | Anima | Anima prompt weights | (word:1.2) and <weight> scale the T5 tokens, as ComfyUI does. Token ids match ComfyUI. |
 | P1 | Anima | Anima Batch Size, Sigma Shift and CFG | Generated through real SwarmUI. Output not compared with ComfyUI at CFG above 1. |
@@ -115,7 +117,8 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Krea 2 | Prompt weights | <weight> through SwarmAttnTokenWeights, inside attention. |
 | P1 | Krea 2 | <alternate> and <fromto> | Per-step conditioning. |
 | P1 | Krea 2 | Non-W8A8 Krea 2 files | fp8 and other formats are refused. |
-| P1 | Qwen Image 2.1 | Qwen Image 2.1 engine | Installed. Qwen3-VL 8B text encoder, RGBA VAE, 2x placeholder latent. |
+| P1 | Qwen Image 2.1 | Qwen Image 2.1 LoRAs | Refused. |
+| P1 | Qwen Image 2.1 | Qwen Image 2.1 init images and refiners | Refused with the other partial sampling. The VAE encoder exists. |
 | P1 | SD family | SD1 and SDXL engine | SD1 checkpoint installed. CLIP, UNet and classic VAE, and all-in-one checkpoints. Would widen coverage most. |
 | P1 | LoRA and control | LoRA hooks | Refused with an error. |
 | P1 | Anima | Other Anima checkpoint formats | bf16 and fp8 files are refused. Only int8 ConvRot runs. |

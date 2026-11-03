@@ -1,6 +1,7 @@
-//! Qwen3-VL 4B vision tower for Krea 2's prompt images: patch embedding, 24 attention blocks with 2D
-//! RoPE, a merger to the text encoder's width, and the DeepStack mergers after blocks 5, 11 and 17.
-//! Each image runs on its own, in f32 like ComfyUI, with its bf16 weights streamed from pinned RAM.
+//! Qwen3-VL vision tower for prompt images: patch embedding, attention blocks with 2D RoPE, a merger to the
+//! text encoder's width, and the three DeepStack mergers. Krea 2's 4B has 24 blocks of 1024 features, Qwen Image
+//! 2.1's 8B has 27 of 1152. Each image runs on its own, in f32 like ComfyUI, with its bf16 weights streamed
+//! from pinned RAM.
 
 use crate::cuda::{DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_F32, PM, PRO_LAYERNORM};
@@ -9,25 +10,50 @@ use crate::st::{f32_bytes, SafeTensors};
 use anyhow::{bail, Result};
 use half::bf16;
 
-/// Width of the merged tokens, the text encoder's.
-pub const OUT: usize = 2560;
-const D: usize = 1024;
 const HEADS: usize = 16;
-const HD: usize = D / HEADS;
-const FF: usize = 4096;
-const DEPTH: usize = 24;
 const PATCH: usize = 16;
 const MERGE: usize = 2;
-const MERGED: usize = D * MERGE * MERGE;
 const FRAME: usize = 3 * PATCH * PATCH;
 const POS_SIDE: usize = 48;
-const DEEPSTACK: [usize; 3] = [5, 11, 17];
 const EPS: f32 = 1e-6;
 const THETA: f32 = 10000.0;
 const PRE: &str = "model.visual.";
 // bounds of process_qwen2vl_images
 const MIN_PIXELS: usize = 3136;
 const MAX_PIXELS: usize = 12845056;
+
+/// The size of a tower: the 4B text encoder's, or the 8B's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spec {
+    pub d: usize,
+    pub ff: usize,
+    pub depth: usize,
+    pub deepstack: [usize; 3],
+    /// Width of the merged tokens, the text encoder's.
+    pub out: usize,
+}
+
+pub const QWEN3VL_4B: Spec = Spec { d: 1024, ff: 4096, depth: 24, deepstack: [5, 11, 17], out: 2560 };
+pub const QWEN3VL_8B: Spec = Spec { d: 1152, ff: 4304, depth: 27, deepstack: [8, 16, 24], out: 4096 };
+
+impl Spec {
+    /// The tower in `st`, read from its patch embedding.
+    pub fn detect(st: &SafeTensors) -> Result<Spec> {
+        match st.info(&format!("{PRE}patch_embed.proj.weight"))?.shape[0] {
+            d if d == QWEN3VL_4B.d => Ok(QWEN3VL_4B),
+            d if d == QWEN3VL_8B.d => Ok(QWEN3VL_8B),
+            d => bail!("a vision tower of {d} features, which is neither Qwen3-VL 4B's nor 8B's"),
+        }
+    }
+
+    fn hd(&self) -> usize {
+        self.d / HEADS
+    }
+
+    fn merged(&self) -> usize {
+        self.d * MERGE * MERGE
+    }
+}
 
 /// An RGB image, `[height, width, 3]`, 0 to 1.
 #[derive(Clone, PartialEq)]
@@ -37,7 +63,7 @@ pub struct PromptImage {
     pub rgb: Vec<f32>,
 }
 
-/// One image's tokens for the text encoder, f32 `[tokens, OUT]`.
+/// One image's tokens for the text encoder, f32 `[tokens, spec.out]`.
 pub struct Embeds {
     pub merged: DevBuf,
     pub deepstack: [DevBuf; 3],
@@ -128,41 +154,41 @@ fn merge_order(gh: usize, gw: usize) -> Vec<(usize, usize)> {
 
 /// The learned 48 x 48 position table, bilinear at this grid. Weights and products stay bf16, as
 /// `fast_pos_embed_interpolate` leaves them.
-fn position_embed(table: &[f32], gh: usize, gw: usize) -> Vec<f32> {
+fn position_embed(table: &[f32], gh: usize, gw: usize, d: usize) -> Vec<f32> {
     let line = |n: usize| -> Vec<f32> {
         let last = (POS_SIDE - 1) as f32;
         (0..n).map(|i| if n > 1 { if i == n - 1 { last } else { last * i as f32 / (n - 1) as f32 } } else { 0.0 }).collect()
     };
     let (ys, xs) = (line(gh), line(gw));
     let r = |v: f32| bf16::from_f32(v).to_f32();
-    let mut grid = vec![0f32; gh * gw * D];
+    let mut grid = vec![0f32; gh * gw * d];
     for (i, &y) in ys.iter().enumerate() {
         for (j, &x) in xs.iter().enumerate() {
             let (y0, x0) = (y as usize, x as usize);
             let (y1, x1) = ((y0 + 1).min(POS_SIDE - 1), (x0 + 1).min(POS_SIDE - 1));
             let (dy, dx) = (y - y0 as f32, x - x0 as f32);
             let corners = [(y0, x0, (1.0 - dy) * (1.0 - dx)), (y0, x1, (1.0 - dy) * dx), (y1, x0, dy * (1.0 - dx)), (y1, x1, dy * dx)];
-            let out = &mut grid[(i * gw + j) * D..][..D];
+            let out = &mut grid[(i * gw + j) * d..][..d];
             for (cy, cx, w) in corners {
-                let (w, row) = (r(w), &table[(cy * POS_SIDE + cx) * D..][..D]);
+                let (w, row) = (r(w), &table[(cy * POS_SIDE + cx) * d..][..d]);
                 for (o, v) in out.iter_mut().zip(row) {
                     *o = r(*o + r(v * w));
                 }
             }
         }
     }
-    let mut out = Vec::with_capacity(gh * gw * D);
+    let mut out = Vec::with_capacity(gh * gw * d);
     for (row, col) in merge_order(gh, gw) {
-        out.extend_from_slice(&grid[(row * gw + col) * D..][..D]);
+        out.extend_from_slice(&grid[(row * gw + col) * d..][..d]);
     }
     out
 }
 
 /// RoPE table `[n][HD / 2][(cos, sin)]`: the row's frequencies, then the column's.
-fn rope_table(gh: usize, gw: usize) -> Vec<f32> {
-    let dim = HD / 2;
+fn rope_table(gh: usize, gw: usize, hd: usize) -> Vec<f32> {
+    let dim = hd / 2;
     let inv: Vec<f32> = (0..dim / 2).map(|i| 1.0 / THETA.powf((2 * i) as f32 / dim as f32)).collect();
-    let mut t = Vec::with_capacity(gh * gw * HD);
+    let mut t = Vec::with_capacity(gh * gw * hd);
     for (row, col) in merge_order(gh, gw) {
         for pos in [row, col] {
             for f in &inv {
@@ -176,6 +202,7 @@ fn rope_table(gh: usize, gw: usize) -> Vec<f32> {
 }
 
 pub struct Vision {
+    spec: Spec,
     st: SafeTensors,
     ws: WeightSet,
     pos: Vec<f32>,
@@ -213,12 +240,12 @@ fn block_layout(st: &SafeTensors, i: usize) -> Result<Layout> {
     Ok(l)
 }
 
-/// The Conv3d weight of two identical frames, as one matrix `[D, 3 * 16 * 16]`: its slices add up.
-fn patch_matrix(st: &SafeTensors) -> Result<Vec<f32>> {
+/// The Conv3d weight of two identical frames, as one matrix `[d, 3 * 16 * 16]`: its slices add up.
+fn patch_matrix(st: &SafeTensors, d: usize) -> Result<Vec<f32>> {
     let name = format!("{PRE}patch_embed.proj.weight");
     let v = st.f32_vec(&name, false)?;
-    let mut out = vec![0f32; D * FRAME];
-    for o in 0..D {
+    let mut out = vec![0f32; d * FRAME];
+    for o in 0..d {
         for c in 0..3 {
             for t in 0..2 {
                 let src = &v[((o * 3 + c) * 2 + t) * PATCH * PATCH..][..PATCH * PATCH];
@@ -236,14 +263,15 @@ impl Vision {
         if !st.has(&format!("{PRE}patch_embed.proj.weight")) {
             bail!("this text encoder file has no vision tower");
         }
+        let spec = Spec::detect(&st)?;
         // streamed units have to be in the order they run
         let mut patch = Layout::new();
-        patch.bytes("w", f32_bytes(&patch_matrix(&st)?));
+        patch.bytes("w", f32_bytes(&patch_matrix(&st, spec.d)?));
         patch.f32(&st, "b", &format!("{PRE}patch_embed.proj.bias"), 0.0)?;
         let mut layouts = vec![patch];
-        for b in 0..DEPTH {
+        for b in 0..spec.depth {
             layouts.push(block_layout(&st, b)?);
-            if let Some(i) = DEEPSTACK.iter().position(|&l| l == b) {
+            if let Some(i) = spec.deepstack.iter().position(|&l| l == b) {
                 layouts.push(merger_layout(&st, &format!("deepstack_merger_list.{i}"))?);
             }
         }
@@ -251,32 +279,37 @@ impl Vision {
         let p = plan(&layouts, 0, 2);
         let ws = WeightSet::load("vision tower", &st, layouts, p, threads)?;
         let pos = st.f32_vec(&format!("{PRE}pos_embed.weight"), false)?;
-        let zeros = DevBuf::alloc(MERGED * 4)?;
-        zeros.upload(0, &vec![0u8; MERGED * 4], s0)?;
+        let zeros = DevBuf::alloc(spec.merged() * 4)?;
+        zeros.upload(0, &vec![0u8; spec.merged() * 4], s0)?;
         s0.sync()?;
-        Ok(Vision { st, ws, pos, zeros })
+        Ok(Vision { spec, st, ws, pos, zeros })
     }
 
     /// The tokens of one image.
     pub fn encode(&mut self, img: &PromptImage, st: &Stream, mut probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<Embeds> {
         let _ = &self.st;
+        let Spec { d: dm, ff: ff_w, depth, deepstack, out: out_w } = self.spec;
+        let (hd, merged_w) = (self.spec.hd(), self.spec.merged());
         let (gh, gw) = patch_grid(img.height, img.width);
         let n = gh * gw;
         let tokens = n / (MERGE * MERGE);
         let resized = bilinear(img, gh * PATCH, gw * PATCH);
         let px = DevBuf::alloc_async(n * FRAME * 4, st)?;
         px.upload(0, &f32_bytes(&patches(&resized, gh, gw)), st)?;
-        let rope = DevBuf::alloc_async(n * HD * 4, st)?;
-        rope.upload(0, &f32_bytes(&rope_table(gh, gw)), st)?;
+        let rope = DevBuf::alloc_async(n * hd * 4, st)?;
+        rope.upload(0, &f32_bytes(&rope_table(gh, gw, hd)), st)?;
 
         let nf = n as i64;
-        let xb = DevBuf::alloc_async(n * D * 4, st)?;
-        let wf = DevBuf::alloc_async(FF * FF * 4, st)?; // largest weight
-        let normed = DevBuf::alloc_async(n * D * 4, st)?;
-        let qkv = DevBuf::alloc_async(n * 3 * D * 4, st)?;
-        let attn = DevBuf::alloc_async(n * D * 4, st)?;
-        let y = DevBuf::alloc_async(n * D * 4, st)?;
-        let ff = DevBuf::alloc_async(n * FF * 4, st)?;
+        let xb = DevBuf::alloc_async(n * dm * 4, st)?;
+        let wf = DevBuf::alloc_async((merged_w * merged_w).max(ff_w * dm) * 4, st)?; // largest weight
+        let normed = DevBuf::alloc_async(n * dm * 4, st)?;
+        let qkv = DevBuf::alloc_async(n * 3 * dm * 4, st)?;
+        let attn = DevBuf::alloc_async(n * dm * 4, st)?;
+        let y = DevBuf::alloc_async(n * dm * 4, st)?;
+        // query rows per chunk of the attention: the f32 scores stay under ~256 MB
+        let chunk = ((256 << 20) / (n * 4)).clamp(64, n);
+        let scores = DevBuf::alloc_async(chunk * n * 4, st)?;
+        let ff = DevBuf::alloc_async(n * ff_w * 4, st)?;
         let x = xb.ptr();
         // y = x @ w^T + b, from a bf16 weight
         let lin = |a: PM, wq: PM, b: PM, rows: i64, out_w: usize, in_w: usize, out: PM| -> Result<()> {
@@ -295,60 +328,71 @@ impl Vision {
         let mut unit = 0;
         let base = self.ws.acquire(unit, st)?;
         let lay = &self.ws.layouts[unit];
-        k!(gpu_gemm(px.ptr(), FRAME as i64, off(base, lay.off("w")), FRAME as i64, x, D as i64, off(base, lay.off("b")), nf, D as i64,
+        k!(gpu_gemm(px.ptr(), FRAME as i64, off(base, lay.off("w")), FRAME as i64, x, dm as i64, off(base, lay.off("b")), nf, dm as i64,
             FRAME as i64, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
         self.ws.release(unit, st)?;
         drop(px);
         if let Some(p) = probe.as_mut() {
-            p("vision_patch", &xb, n * D * 4);
+            p("vision_patch", &xb, n * dm * 4);
         }
-        let pos = DevBuf::alloc_async(n * D * 4, st)?;
-        pos.upload(0, &f32_bytes(&position_embed(&self.pos, gh, gw)), st)?;
-        add(x, pos.ptr(), n * D)?;
+        let pos = DevBuf::alloc_async(n * dm * 4, st)?;
+        pos.upload(0, &f32_bytes(&position_embed(&self.pos, gh, gw, dm)), st)?;
+        add(x, pos.ptr(), n * dm)?;
         drop(pos);
 
         let merged_rows = |x: PM, base: PM, lay: &Layout, out: &DevBuf, h: &DevBuf, g: &DevBuf| -> Result<()> {
             let w = |key: &str| off(base, lay.off(key));
-            lin(x, w("w1"), w("b1"), tokens as i64, MERGED, MERGED, h.ptr())?;
-            crate::cuda::memcpy_d2d(g.ptr(), h.ptr(), tokens * MERGED * 4, st)?;
-            k!(gpu_gelu_f32(g.ptr(), (tokens * MERGED) as i64, 0, s(st)))?;
-            lin(g.ptr(), w("w2"), w("b2"), tokens as i64, OUT, MERGED, out.ptr())
+            lin(x, w("w1"), w("b1"), tokens as i64, merged_w, merged_w, h.ptr())?;
+            crate::cuda::memcpy_d2d(g.ptr(), h.ptr(), tokens * merged_w * 4, st)?;
+            k!(gpu_gelu_f32(g.ptr(), (tokens * merged_w) as i64, 0, s(st)))?;
+            lin(g.ptr(), w("w2"), w("b2"), tokens as i64, out_w, merged_w, out.ptr())
         };
-        let h1 = DevBuf::alloc_async(tokens * MERGED * 4, st)?;
-        let h2 = DevBuf::alloc_async(tokens * MERGED * 4, st)?;
-        let mut deep: Vec<DevBuf> = Vec::with_capacity(DEEPSTACK.len());
-        for b in 0..DEPTH {
+        let h1 = DevBuf::alloc_async(tokens * merged_w * 4, st)?;
+        let h2 = DevBuf::alloc_async(tokens * merged_w * 4, st)?;
+        let mut deep: Vec<DevBuf> = Vec::with_capacity(deepstack.len());
+        for b in 0..depth {
             unit += 1;
             let base = self.ws.acquire(unit, st)?;
             let lay = &self.ws.layouts[unit];
             let w = |key: &str| off(base, lay.off(key));
-            norm(x, w("n1w"), w("n1b"), D, n, normed.ptr())?;
-            lin(normed.ptr(), w("qkv"), w("qkvb"), nf, 3 * D, D, qkv.ptr())?;
+            norm(x, w("n1w"), w("n1b"), dm, n, normed.ptr())?;
+            lin(normed.ptr(), w("qkv"), w("qkvb"), nf, 3 * dm, dm, qkv.ptr())?;
             let q = qkv.ptr();
-            let (kp, vp) = (off(q, D * 4), off(q, 2 * D * 4));
-            k!(gpu_rope_rows(q, (3 * D) as i64, rope.ptr(), n as i32, HEADS as i32, HD as i32, s(st)))?;
-            k!(gpu_rope_rows(kp, (3 * D) as i64, rope.ptr(), n as i32, HEADS as i32, HD as i32, s(st)))?;
-            k!(gpu_attn_small(DT_F32, q, (3 * D) as i64, kp, vp, (3 * D) as i64, HEADS as i32, HEADS as i32, HD as i32, n as i32, n as i32,
-                attn.ptr(), D as i64, 1.0 / (HD as f32).sqrt(), 0, s(st)))?;
-            lin(attn.ptr(), w("proj"), w("projb"), nf, D, D, y.ptr())?;
-            add(x, y.ptr(), n * D)?;
-            norm(x, w("n2w"), w("n2b"), D, n, normed.ptr())?;
-            lin(normed.ptr(), w("fc1"), w("fc1b"), nf, FF, D, ff.ptr())?;
-            k!(gpu_gelu_f32(ff.ptr(), (n * FF) as i64, 1, s(st)))?;
-            lin(ff.ptr(), w("fc2"), w("fc2b"), nf, D, FF, y.ptr())?;
-            add(x, y.ptr(), n * D)?;
-            self.ws.release(unit, st)?;
-            if let Some(p) = probe.as_mut() {
-                if b == 0 || b == DEPTH - 1 {
-                    p(&format!("vision_block{b}"), &xb, n * D * 4);
+            let (kp, vp) = (off(q, dm * 4), off(q, 2 * dm * 4));
+            k!(gpu_rope_rows(q, (3 * dm) as i64, rope.ptr(), n as i32, HEADS as i32, hd as i32, s(st)))?;
+            k!(gpu_rope_rows(kp, (3 * dm) as i64, rope.ptr(), n as i32, HEADS as i32, hd as i32, s(st)))?;
+            // per head, a chunk of query rows at a time: scores, softmax, then the weighted values
+            let row = (3 * dm) as i64;
+            for h in 0..HEADS {
+                let col = h * hd * 4;
+                for r0 in (0..n).step_by(chunk) {
+                    let rows = chunk.min(n - r0);
+                    k!(gpu_gemm(off(q, r0 * 3 * dm * 4 + col), row, off(kp, col), row, scores.ptr(), n as i64, null(), rows as i64, n as i64, hd as i64, 1,
+                        DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
+                    k!(gpu_softmax_f32(scores.ptr(), rows as i32, n as i32, 1.0 / (hd as f32).sqrt(), s(st)))?;
+                    k!(gpu_gemm(scores.ptr(), n as i64, off(vp, col), row, off(attn.ptr(), r0 * dm * 4 + col), dm as i64, null(), rows as i64, hd as i64,
+                        n as i64, 0, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
                 }
             }
-            if DEEPSTACK.contains(&b) {
+            lin(attn.ptr(), w("proj"), w("projb"), nf, dm, dm, y.ptr())?;
+            add(x, y.ptr(), n * dm)?;
+            norm(x, w("n2w"), w("n2b"), dm, n, normed.ptr())?;
+            lin(normed.ptr(), w("fc1"), w("fc1b"), nf, ff_w, dm, ff.ptr())?;
+            k!(gpu_gelu_f32(ff.ptr(), (n * ff_w) as i64, 1, s(st)))?;
+            lin(ff.ptr(), w("fc2"), w("fc2b"), nf, dm, ff_w, y.ptr())?;
+            add(x, y.ptr(), n * dm)?;
+            self.ws.release(unit, st)?;
+            if let Some(p) = probe.as_mut() {
+                if b == 0 || b == depth - 1 {
+                    p(&format!("vision_block{b}"), &xb, n * dm * 4);
+                }
+            }
+            if deepstack.contains(&b) {
                 unit += 1;
                 let base = self.ws.acquire(unit, st)?;
                 let lay = &self.ws.layouts[unit];
-                norm(x, off(base, lay.off("nw")), off(base, lay.off("nb")), MERGED, tokens, h1.ptr())?;
-                let out = DevBuf::alloc_async(tokens * OUT * 4, st)?;
+                norm(x, off(base, lay.off("nw")), off(base, lay.off("nb")), merged_w, tokens, h1.ptr())?;
+                let out = DevBuf::alloc_async(tokens * out_w * 4, st)?;
                 merged_rows(h1.ptr(), base, lay, &out, &h2, &normed)?;
                 self.ws.release(unit, st)?;
                 deep.push(out);
@@ -357,15 +401,15 @@ impl Vision {
         unit += 1;
         let base = self.ws.acquire(unit, st)?;
         let lay = &self.ws.layouts[unit];
-        norm(x, off(base, lay.off("nw")), off(base, lay.off("nb")), D, n, normed.ptr())?;
-        let merged = DevBuf::alloc_async(tokens * OUT * 4, st)?;
+        norm(x, off(base, lay.off("nw")), off(base, lay.off("nb")), dm, n, normed.ptr())?;
+        let merged = DevBuf::alloc_async(tokens * out_w * 4, st)?;
         merged_rows(normed.ptr(), base, lay, &merged, &h2, &h1)?;
         self.ws.release(unit, st)?;
         st.sync()?;
         if let Some(p) = probe.as_mut() {
-            p("vision_merged", &merged, tokens * OUT * 4);
+            p("vision_merged", &merged, tokens * out_w * 4);
             for (i, d) in deep.iter().enumerate() {
-                p(&format!("vision_deepstack{i}"), d, tokens * OUT * 4);
+                p(&format!("vision_deepstack{i}"), d, tokens * out_w * 4);
             }
         }
         let [d0, d1, d2]: [DevBuf; 3] = deep.try_into().map_err(|_| anyhow::anyhow!("deepstack"))?;

@@ -550,15 +550,15 @@ GPU_API int gpu_qk_norm_rope(int dtype, int head_dim, void* buf, int64_t row_str
 // ---------------------------------------------------------------------------------------------
 template <typename T>
 __global__ void attn_small_kernel(const T* q, int64_t q_stride, const T* kp, const T* vp, int64_t kv_stride, int hq,
-                                  int hk, int lk, T* out, int64_t out_stride, float scale, int causal) {
+                                  int hk, int lk, T* out, int64_t out_stride, float scale, int causal, int d) {
     extern __shared__ float sm[];
-    const int d = blockDim.x;
+    // blockDim.x is d rounded up to whole warps (the reductions need them), so threads past d only help with the scores
     float* qs = sm;       // d
     float* p = sm + d;    // lk
     __shared__ float red[33];
     const int i = blockIdx.x, h = blockIdx.y, e0 = threadIdx.x;
     const int kh = h / (hq / hk);
-    qs[e0] = ldf(q, (int64_t)i * q_stride + h * d + e0);
+    if (e0 < d) qs[e0] = ldf(q, (int64_t)i * q_stride + h * d + e0);
     __syncthreads();
     const int n = causal ? i + 1 : lk;
     float mx = -INFINITY;
@@ -578,6 +578,7 @@ __global__ void attn_small_kernel(const T* q, int64_t q_stride, const T* kp, con
         sum += e;
     }
     sum = block_sum(sum, red);
+    if (e0 >= d) return;
     float acc = 0.f;
     for (int j = 0; j < n; ++j) acc += p[j] * ldf(vp, (int64_t)j * kv_stride + kh * d + e0);
     stf(out, (int64_t)i * out_stride + h * d + e0, acc / sum);
@@ -591,8 +592,8 @@ GPU_API int gpu_attn_small(int dtype, const void* q, int64_t q_stride, const voi
     cudaStream_t st = (cudaStream_t)stream;
 #define ATTN(T)                                                                                                 \
     if (smem > 48 * 1024) cudaFuncSetAttribute(attn_small_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem); \
-    attn_small_kernel<T><<<grid, d, smem, st>>>((const T*)q, q_stride, (const T*)k, (const T*)v, kv_stride, hq, hk, lk, \
-                                                (T*)out, out_stride, scale, causal)
+    attn_small_kernel<T><<<grid, (d + 31) / 32 * 32, smem, st>>>((const T*)q, q_stride, (const T*)k, (const T*)v, kv_stride, hq, hk, lk, \
+                                                (T*)out, out_stride, scale, causal, d)
     if (dtype == DT_F32) { ATTN(float); }
     else if (dtype == DT_BF16) { ATTN(bf16); }
     else return -4;
@@ -914,6 +915,10 @@ GPU_API int gpu_l2norm_silu(const void* x, void* out, const void* gamma, int64_t
         l2norm_silu_kernel<8><<<blocks, threads, 0, st>>>((const bf16*)x, (bf16*)out, (const bf16*)gamma, P, C, silu);
     else if (C <= 512)
         l2norm_silu_kernel<16><<<blocks, threads, 0, st>>>((const bf16*)x, (bf16*)out, (const bf16*)gamma, P, C, silu);
+    else if (C <= 768)
+        l2norm_silu_kernel<24><<<blocks, threads, 0, st>>>((const bf16*)x, (bf16*)out, (const bf16*)gamma, P, C, silu);
+    else if (C <= 1152)
+        l2norm_silu_kernel<36><<<blocks, threads, 0, st>>>((const bf16*)x, (bf16*)out, (const bf16*)gamma, P, C, silu);
     else
         return -1;
     KCHECK();

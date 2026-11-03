@@ -1,5 +1,6 @@
-//! Krea2 text encoder: Qwen3-VL-4B language model (int8 ConvRot weights), conditioning taken
-//! from the hidden states entering layers 2, 5, ..., 35 (no final norm), fp32 activations.
+//! Qwen3-VL language model as a text encoder (int8 ConvRot weights, fp32 activations), conditioning taken from
+//! hidden states with no final norm. Krea 2 uses the 4B and the states entering layers 2, 5, ..., 35; Qwen Image
+//! 2.1 uses the 8B and the state after its 36 layers.
 
 use crate::cuda::{memcpy_2d_d2d, memcpy_d2d, DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_F32, PM, PRO_PLAIN, PRO_RMS, PRO_SWIGLU};
@@ -11,18 +12,46 @@ use anyhow::Result;
 use std::path::Path;
 
 pub const TEMPLATE: &str = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n";
+/// Qwen Image 2.1's system turn, which is dropped from the conditioning again.
+const QWEN21_SYSTEM: &str = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n";
 pub const TAPS: [usize; 12] = [2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35];
 
-const D: usize = 2560;
+/// The size and conditioning of one encoder.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spec {
+    pub d: usize,
+    pub ff: usize,
+    pub pre: &'static str,
+    /// Numbers of layers run before each tap of the hidden state, in order. The last one ends the run.
+    pub taps: &'static [usize],
+}
+
+pub const KREA2: Spec = Spec { d: 2560, ff: 9728, pre: "model.language_model.", taps: &TAPS };
+pub const QWEN21: Spec = Spec { d: 4096, ff: 12288, pre: "model.", taps: &[36] };
+
+impl Spec {
+    /// The encoder in `st`, told apart by where its layers are and how wide.
+    pub fn detect(st: &SafeTensors) -> Result<Spec> {
+        for spec in [KREA2, QWEN21] {
+            if st.info(&format!("{}layers.0.input_layernorm.weight", spec.pre)).is_ok_and(|i| i.shape == [spec.d]) {
+                return Ok(spec);
+            }
+        }
+        anyhow::bail!("not a Qwen3-VL 4B or 8B text encoder")
+    }
+
+    fn qkv(&self) -> usize {
+        (HQ + 2 * HK) * HD
+    }
+}
+
 const HQ: usize = 32;
 const HK: usize = 8;
 const HD: usize = 128;
-const FF: usize = 9728;
-const QKV: usize = (HQ + 2 * HK) * HD; // 6144
 const EPS: f32 = 1e-6;
 const THETA: f32 = 5_000_000.0;
-const PRE: &str = "model.language_model.";
 const IMAGE_PAD: u32 = 151655;
+const IM_START: u32 = 151644;
 const VISION_BLOCK: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 
 pub struct TextEncoder {
@@ -30,14 +59,22 @@ pub struct TextEncoder {
     ws: WeightSet,
     tok: Tokenizer,
     lora: crate::lora::State,
+    pub spec: Spec,
 }
 
 pub struct Cond {
-    /// bf16 [len, 12 * 2560]
+    /// bf16 [len, taps * d]
     pub ctx: DevBuf,
     pub len: usize,
+    /// Row width of `ctx`.
+    pub width: usize,
     pub token_ids: Vec<u32>,
+    /// Qwen Image 2.1: where each prompt image goes, as a count of the tokens before it.
+    pub slots: Vec<usize>,
 }
+
+/// Where the encoder put an image: first token, tokens, merged grid.
+type Span = (usize, usize, (usize, usize));
 
 impl Cond {
     /// Conditionings joined along the tokens, as SwarmTextEncodeAdvanced joins `<break>` chunks.
@@ -45,7 +82,7 @@ impl Cond {
         if conds.len() == 1 {
             return Ok(conds.pop().unwrap());
         }
-        let row = TAPS.len() * D * 2;
+        let (width, row) = (conds[0].width, conds[0].width * 2);
         let len: usize = conds.iter().map(|c| c.len).sum();
         let ctx = DevBuf::alloc_async(len * row, st)?;
         let (mut at, mut token_ids) = (0, Vec::new());
@@ -55,8 +92,14 @@ impl Cond {
             token_ids.extend_from_slice(&c.token_ids);
         }
         st.sync()?;
-        Ok(Cond { ctx, len, token_ids })
+        Ok(Cond { ctx, len, width, token_ids, slots: Vec::new() })
     }
+}
+
+/// The prompt of Qwen Image 2.1 with `count` images: each is named in front of the text, then the text follows.
+pub fn qwen21_prompt(prompt: &str, count: usize) -> String {
+    let refs: Vec<String> = (1..=count).map(|i| format!("<image{i}>{VISION_BLOCK}")).collect();
+    format!("{QWEN21_SYSTEM}<|im_start|>user\n{}{prompt}<|im_end|>\n<|im_start|>assistant\n", refs.join(" "))
 }
 
 /// The prompt SwarmTextEncodeAdvanced builds for `count` images. Its `input_image_N` replacement
@@ -110,10 +153,11 @@ pub fn rope_table(pos: &[[f32; 3]]) -> Vec<f32> {
 impl TextEncoder {
     pub fn load(path: &Path, vram_budget: usize, threads: usize, s0: &Stream) -> Result<Self> {
         let st = SafeTensors::open(path)?;
-        let n_layers = *TAPS.last().unwrap(); // layers 0..35; the last tap is layer 35's input
+        let spec = Spec::detect(&st)?;
+        let n_layers = *spec.taps.last().unwrap(); // the last tap is the state after that many layers
         let mut layouts = Vec::new();
         for i in 0..n_layers {
-            let p = format!("{PRE}layers.{i}.");
+            let p = format!("{}layers.{i}.", spec.pre);
             let n = |x: &str| format!("{p}{x}");
             let mut l = Layout::new();
             l.raw(&st, "wqkv", &[n("self_attn.q_proj.weight"), n("self_attn.k_proj.weight"), n("self_attn.v_proj.weight")])?;
@@ -133,12 +177,18 @@ impl TextEncoder {
         let p = plan(&layouts, vram_budget, 2);
         let ws = WeightSet::load("text encoder", &st, layouts, p, threads)?;
         let _ = s0;
-        Ok(TextEncoder { st, ws, tok: Tokenizer::new()?, lora: Default::default() })
+        Ok(TextEncoder { st, ws, tok: Tokenizer::new()?, lora: Default::default(), spec })
     }
 
     /// Bake `loras` into the encoder. Returns true if any weight changed.
     pub fn apply_loras(&mut self, loras: &[crate::lora::Lora], s0: &Stream) -> Result<bool> {
-        crate::lora::apply(crate::lora::Arch::TextEncoder { comfy: "qwen3vl_4b" }, &self.st, PRE, vec![crate::offload::Store::Set(&mut self.ws)], &mut self.lora, loras, s0)
+        if self.spec != KREA2 {
+            if loras.is_empty() {
+                return Ok(false);
+            }
+            anyhow::bail!("LoRAs on this text encoder");
+        }
+        crate::lora::apply(crate::lora::Arch::TextEncoder { comfy: "qwen3vl_4b" }, &self.st, self.spec.pre, vec![crate::offload::Store::Set(&mut self.ws)], &mut self.lora, loras, s0)
     }
 
     pub fn tokenize(&self, prompt: &str) -> Result<Vec<u32>> {
@@ -153,6 +203,83 @@ impl TextEncoder {
     /// `scale` multiplies the conditioning.
     pub fn encode_with_images(&mut self, prompt: &str, images: &[&Embeds], scale: f32, st: &Stream) -> Result<Cond> {
         let ids = self.tokenize(prompt)?;
+        let (taps, l, _) = self.forward(&ids, images, st)?;
+        let l0 = ids.len();
+
+        // Drop the system prompt + "<|im_start|>user\n" (Krea2TEModel.encode_token_weights).
+        let mut template_end = 0usize;
+        let mut count = 0;
+        for (i, &t) in ids.iter().enumerate() {
+            if t == IM_START && count < 2 {
+                template_end = i;
+                count += 1;
+            }
+        }
+        if l0 > template_end + 3 && ids[template_end + 1] == 872 && ids[template_end + 2] == 198 {
+            template_end += 3;
+        }
+        let len = l - template_end;
+        let width = self.spec.taps.len() * self.spec.d;
+        if scale != 1.0 {
+            let (p, c) = ([taps.ptr() as crate::ffi::P], [scale]);
+            k!(gpu_lincomb(taps.ptr(), (l * width) as i64, 1, p.as_ptr(), c.as_ptr(), s(st)))?;
+        }
+        let ctx = DevBuf::alloc_async(len * width * 2, st)?;
+        k!(gpu_f32_to_bf16(off(taps.ptr(), template_end * width * 4), ctx.ptr(), (len * width) as i64, s(st)))?;
+        Ok(Cond { ctx, len, width, token_ids: ids, slots: Vec::new() })
+    }
+
+    /// Qwen Image 2.1's conditioning of `prompt` (see [`qwen21_prompt`]): the hidden state after the last layer, without
+    /// the system turn, and, unless `keep_vision`, without the image tokens, which the DiT replaces by reference latents.
+    /// `slots` of the result say where each of them was.
+    pub fn encode_qwen21(&mut self, prompt: &str, images: &[&Embeds], keep_vision: bool, scale: f32, st: &Stream) -> Result<Cond> {
+        let ids = self.tok.encode(prompt)?;
+        let (taps, l, spans) = self.forward(&ids, images, st)?;
+        // positions in the sequence with the images in it
+        let (mut starts, mut grown, mut next) = (Vec::new(), 0, spans.iter());
+        for (i, &t) in ids.iter().enumerate() {
+            if t == IM_START {
+                starts.push(i + grown);
+            } else if t == IMAGE_PAD {
+                if let Some(span) = next.next() {
+                    grown += span.1 - 1;
+                }
+            }
+        }
+        let mut keep = vec![true; l];
+        keep[..starts.get(1).copied().unwrap_or(0)].fill(false);
+        let mut slots = Vec::new();
+        if !keep_vision {
+            for &(start, size, _) in &spans {
+                keep[start..start + size].fill(false);
+                slots.push(keep[..start].iter().filter(|k| **k).count());
+            }
+        }
+        let (width, len) = (self.spec.d, keep.iter().filter(|k| **k).count());
+        if scale != 1.0 {
+            let (p, c) = ([taps.ptr() as crate::ffi::P], [scale]);
+            k!(gpu_lincomb(taps.ptr(), (l * width) as i64, 1, p.as_ptr(), c.as_ptr(), s(st)))?;
+        }
+        let ctx = DevBuf::alloc_async(len * width * 2, st)?;
+        let (mut at, mut i) = (0, 0);
+        while i < l {
+            if !keep[i] {
+                i += 1;
+                continue;
+            }
+            let run = keep[i..].iter().take_while(|k| **k).count();
+            k!(gpu_f32_to_bf16(off(taps.ptr(), i * width * 4), off(ctx.ptr(), at * width * 2), (run * width) as i64, s(st)))?;
+            at += run;
+            i += run;
+        }
+        Ok(Cond { ctx, len, width, token_ids: ids, slots })
+    }
+
+    /// The encoder's hidden states at its taps, f32 [tokens, taps * d], with `images` in place of the first
+    /// `<|image_pad|>` tokens, and where they went.
+    fn forward(&mut self, ids: &[u32], images: &[&Embeds], st: &Stream) -> Result<(DevBuf, usize, Vec<Span>)> {
+        let Spec { d: dm, ff, pre, taps: tap_at } = self.spec;
+        let qkv_w = self.spec.qkv();
         let pads: Vec<usize> = ids.iter().enumerate().filter(|(_, &t)| t == IMAGE_PAD).map(|(i, _)| i).take(images.len()).collect();
         // the image tokens' places, in the sequence with the images in it
         let mut spans = Vec::with_capacity(pads.len());
@@ -165,23 +292,23 @@ impl TextEncoder {
         let l = l0 + grown;
 
         // Embedding rows: gather int8 rows + scales on the host, dequantize + un-rotate on device.
-        let emb = self.st.bytes(&format!("{PRE}embed_tokens.weight"))?;
-        let emb_s = self.st.bytes(&format!("{PRE}embed_tokens.weight_scale"))?;
-        let mut q = Vec::with_capacity(l0 * D);
+        let emb = self.st.bytes(&format!("{pre}embed_tokens.weight"))?;
+        let emb_s = self.st.bytes(&format!("{pre}embed_tokens.weight_scale"))?;
+        let mut q = Vec::with_capacity(l0 * dm);
         let mut sc = Vec::with_capacity(l0 * 4);
-        for &t in &ids {
+        for &t in ids {
             let t = t as usize;
-            q.extend_from_slice(&emb[t * D..(t + 1) * D]);
+            q.extend_from_slice(&emb[t * dm..(t + 1) * dm]);
             sc.extend_from_slice(&emb_s[t * 4..t * 4 + 4]);
         }
         let q_d = DevBuf::alloc_async(q.len(), st)?;
         q_d.upload(0, &q, st)?;
         let s_d = DevBuf::alloc_async(sc.len(), st)?;
         s_d.upload(0, &sc, st)?;
-        let text = DevBuf::alloc_async(l0 * D * 4, st)?;
-        k!(gpu_embed_dequant(q_d.ptr(), s_d.ptr(), text.ptr(), l0 as i32, D as i32, 1, s(st)))?;
-        let x = DevBuf::alloc_async(l * D * 4, st)?;
-        let row = D * 4;
+        let text = DevBuf::alloc_async(l0 * dm * 4, st)?;
+        k!(gpu_embed_dequant(q_d.ptr(), s_d.ptr(), text.ptr(), l0 as i32, dm as i32, 1, s(st)))?;
+        let x = DevBuf::alloc_async(l * dm * 4, st)?;
+        let row = dm * 4;
         let (mut from, mut to) = (0, 0);
         for (&pad, img) in pads.iter().zip(images) {
             memcpy_d2d(off(x.ptr(), to * row), off(text.ptr(), from * row), (pad - from) * row, st)?;
@@ -209,17 +336,17 @@ impl TextEncoder {
         let rope_d = DevBuf::alloc_async(rope.len() * 4, st)?;
         rope_d.upload(0, &crate::st::f32_bytes(&rope), st)?;
 
-        let xr = DevBuf::alloc_async(l * FF * 4, st)?;
-        let wf = DevBuf::alloc_async(2 * FF * D * 4, st)?; // largest dequantized weight
-        let qkv = DevBuf::alloc_async(l * QKV * 4, st)?;
+        let xr = DevBuf::alloc_async(l * ff * 4, st)?;
+        let wf = DevBuf::alloc_async(2 * ff * dm * 4, st)?; // largest dequantized weight
+        let qkv = DevBuf::alloc_async(l * qkv_w * 4, st)?;
         let attn = DevBuf::alloc_async(l * HQ * HD * 4, st)?;
-        let gu = DevBuf::alloc_async(l * 2 * FF * 4, st)?;
-        let taps = DevBuf::alloc_async(l * TAPS.len() * D * 4, st)?;
+        let gu = DevBuf::alloc_async(l * 2 * ff * 4, st)?;
+        let taps = DevBuf::alloc_async(l * tap_at.len() * dm * 4, st)?;
         let (m, xp) = (l as i32, x.ptr());
 
-        for i in 0..=*TAPS.last().unwrap() {
-            if let Some(t) = TAPS.iter().position(|&t| t == i) {
-                memcpy_2d_d2d(off(taps.ptr(), t * D * 4), TAPS.len() * D * 4, xp, D * 4, D * 4, l, st)?;
+        for i in 0..=*tap_at.last().unwrap() {
+            if let Some(t) = tap_at.iter().position(|&t| t == i) {
+                memcpy_2d_d2d(off(taps.ptr(), t * dm * 4), tap_at.len() * dm * 4, xp, dm * 4, dm * 4, l, st)?;
             }
             if i == self.ws.len() {
                 break;
@@ -236,50 +363,29 @@ impl TextEncoder {
                     null(), l as i64, n as i64, kk as i64, 1, DT_F32, DT_F32, 1.0, beta, s(st)))
             };
             // attention
-            k!(gpu_rotate_rows_f32(PRO_RMS, xp, D as i64, 0, w("ln1"), EPS, xr.ptr(), m, D as i32, s(st)))?;
-            lin(xr.ptr(), "wqkv", "sqkv", QKV, D, qkv.ptr(), 0.0)?;
-            k!(gpu_qk_norm_rope(DT_F32, HD as i32, qkv.ptr(), QKV as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32, w("qn"),
+            k!(gpu_rotate_rows_f32(PRO_RMS, xp, dm as i64, 0, w("ln1"), EPS, xr.ptr(), m, dm as i32, s(st)))?;
+            lin(xr.ptr(), "wqkv", "sqkv", qkv_w, dm, qkv.ptr(), 0.0)?;
+            k!(gpu_qk_norm_rope(DT_F32, HD as i32, qkv.ptr(), qkv_w as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32, w("qn"),
                 w("kn"), EPS, rope_d.ptr(), 2, m, s(st)))?;
-            k!(gpu_attn_small(DT_F32, qkv.ptr(), QKV as i64, off(qkv.ptr(), HQ * HD * 4),
-                off(qkv.ptr(), (HQ + HK) * HD * 4), QKV as i64, HQ as i32, HK as i32, HD as i32, m, m, attn.ptr(),
+            k!(gpu_attn_small(DT_F32, qkv.ptr(), qkv_w as i64, off(qkv.ptr(), HQ * HD * 4),
+                off(qkv.ptr(), (HQ + HK) * HD * 4), qkv_w as i64, HQ as i32, HK as i32, HD as i32, m, m, attn.ptr(),
                 (HQ * HD) as i64, 1.0 / (HD as f32).sqrt(), 1, s(st)))?;
             k!(gpu_rotate_rows_f32(PRO_PLAIN, attn.ptr(), (HQ * HD) as i64, 0, null(), 0.0, xr.ptr(), m,
                 (HQ * HD) as i32, s(st)))?;
-            lin(xr.ptr(), "wo", "so", D, HQ * HD, xp, 1.0)?;
+            lin(xr.ptr(), "wo", "so", dm, HQ * HD, xp, 1.0)?;
             // MLP
-            k!(gpu_rotate_rows_f32(PRO_RMS, xp, D as i64, 0, w("ln2"), EPS, xr.ptr(), m, D as i32, s(st)))?;
-            lin(xr.ptr(), "wgu", "sgu", 2 * FF, D, gu.ptr(), 0.0)?;
-            k!(gpu_rotate_rows_f32(PRO_SWIGLU, gu.ptr(), (2 * FF) as i64, FF as i64, null(), 0.0, xr.ptr(), m,
-                FF as i32, s(st)))?;
-            lin(xr.ptr(), "wd", "sd", D, FF, xp, 1.0)?;
+            k!(gpu_rotate_rows_f32(PRO_RMS, xp, dm as i64, 0, w("ln2"), EPS, xr.ptr(), m, dm as i32, s(st)))?;
+            lin(xr.ptr(), "wgu", "sgu", 2 * ff, dm, gu.ptr(), 0.0)?;
+            k!(gpu_rotate_rows_f32(PRO_SWIGLU, gu.ptr(), (2 * ff) as i64, ff as i64, null(), 0.0, xr.ptr(), m,
+                ff as i32, s(st)))?;
+            lin(xr.ptr(), "wd", "sd", dm, ff, xp, 1.0)?;
             self.ws.release(i, st)?;
             if let Some(d) = deepstack.get(i) {
                 let (p, c) = ([xp as crate::ffi::P, d.ptr() as crate::ffi::P], [1.0f32, 1.0]);
-                k!(gpu_lincomb(xp, (l * D) as i64, 2, p.as_ptr(), c.as_ptr(), s(st)))?;
+                k!(gpu_lincomb(xp, (l * dm) as i64, 2, p.as_ptr(), c.as_ptr(), s(st)))?;
             }
         }
-
-        // Drop the system prompt + "<|im_start|>user\n" (Krea2TEModel.encode_token_weights).
-        let mut template_end = 0usize;
-        let mut count = 0;
-        for (i, &t) in ids.iter().enumerate() {
-            if t == 151644 && count < 2 {
-                template_end = i;
-                count += 1;
-            }
-        }
-        if l0 > template_end + 3 && ids[template_end + 1] == 872 && ids[template_end + 2] == 198 {
-            template_end += 3;
-        }
-        let len = l - template_end;
-        let row = TAPS.len() * D;
-        if scale != 1.0 {
-            let (p, c) = ([taps.ptr() as crate::ffi::P], [scale]);
-            k!(gpu_lincomb(taps.ptr(), (l * row) as i64, 1, p.as_ptr(), c.as_ptr(), s(st)))?;
-        }
-        let ctx = DevBuf::alloc_async(len * row * 2, st)?;
-        k!(gpu_f32_to_bf16(off(taps.ptr(), template_end * row * 4), ctx.ptr(), (len * row) as i64, s(st)))?;
-        Ok(Cond { ctx, len, token_ids: ids })
+        Ok((taps, l, spans))
     }
 }
 

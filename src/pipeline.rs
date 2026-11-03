@@ -3,7 +3,7 @@
 use crate::cuda::{self, DevBuf, Event, Stream};
 use crate::samplers::{self, CfgTweaks, Eval, ModelSampling, Uncond};
 use crate::vision::{self, PromptImage};
-use crate::{anima, dit, ffi, flux2vae, h3, h3te, h3vae, lora, moss, offload, qwen3, qwen35, sampling, st, te, tokenizer, vae};
+use crate::{anima, dit, ffi, flux2vae, h3, h3te, h3vae, lora, moss, offload, qwen21, qwen3, qwen35, sampling, st, te, tokenizer, vae, vae21};
 use anyhow::{bail, Context, Result};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -167,7 +167,7 @@ pub struct Request {
     pub timestep_zero: bool,
 }
 
-/// A reference latent, [16, height, width] f32 at model scale.
+/// A reference latent, [channels, height, width] f32 at model scale: 16 channels for Krea 2, 64 for Qwen Image 2.1.
 #[derive(Clone)]
 pub struct Reference {
     pub latent: Vec<f32>,
@@ -246,6 +246,40 @@ struct MossModel {
     dit: moss::Dit,
     st: st::SafeTensors,
     lora: lora::State,
+}
+
+pub struct Qwen21Request {
+    pub positive: Prompt,
+    /// Only encoded when the sampling uses it.
+    pub negative: Prompt,
+    pub width: usize,
+    pub height: usize,
+    pub sampling: Sampling,
+    pub noise: Vec<f32>,
+    /// Prompt images for the vision tower, which the DiT takes the place of as reference latents.
+    pub images: Vec<PromptImage>,
+    pub negative_images: Vec<PromptImage>,
+    /// Reference latents of both prompts, from [`Generator::encode_image21`].
+    pub references: Vec<Reference>,
+}
+
+struct Qwen21Model {
+    path: PathBuf,
+    dit: qwen21::Dit,
+    st: st::SafeTensors,
+}
+
+/// A prompt as Qwen Image 2.1's text encoder saw it.
+#[derive(PartialEq)]
+struct Qwen21Key {
+    text: String,
+    scale: f32,
+    images: Vec<PromptImage>,
+}
+
+struct Qwen21Context {
+    ctx: qwen21::Context,
+    slots: Vec<usize>,
 }
 
 pub struct H3Request {
@@ -337,6 +371,10 @@ pub struct Generator {
     /// Latest encoded prompts, most recent last.
     contexts: Vec<(Prompt, anima::Context)>,
     moss: Option<MossModel>,
+    qwen21: Option<Qwen21Model>,
+    vae21: Option<(PathBuf, vae21::Vae)>,
+    /// Latest encoded prompts, most recent last.
+    qwen21_contexts: Vec<(Qwen21Key, Qwen21Context)>,
     qwen35: Option<(PathBuf, qwen35::TextEncoder)>,
     moss_tokenizer: Option<tokenizer::Tokenizer>,
     /// Latest encoded tokens, most recent last.
@@ -421,6 +459,19 @@ fn moss_need(width: usize, height: usize) -> usize {
     moss::step_activation_bytes(lh * lw + MOSS_TEXT).max(flux2vae::Vae::activation_bytes(lh, lw))
 }
 
+/// Largest prefix cache kept in VRAM for one prompt; past this the prefix runs again in every step.
+const CACHE_LIMIT: usize = 3 << 30;
+/// Text rows budgeted for Qwen Image 2.1 when planning before the prompts are known.
+const QWEN21_TEXT: usize = 300;
+
+/// Peak activation memory of one Qwen Image 2.1 request: a step over an image of `width` x `height` with `prefix` rows
+/// before it, or the VAE.
+fn qwen21_need(width: usize, height: usize, prefix: usize) -> usize {
+    let (lh, lw) = (height / vae21::SCALE, width / vae21::SCALE);
+    let prefix = prefix.max(QWEN21_TEXT);
+    qwen21::step_activation_bytes(lh * lw, prefix + lh * lw).max(vae21::Vae::activation_bytes(lh, lw)).max(qwen21::step_activation_bytes(prefix, prefix))
+}
+
 fn anima_need(width: usize, height: usize) -> usize {
     let (lh, lw) = (height / 8, width / 8);
     anima::step_activation_bytes((lh / 2) * (lw / 2)).max(vae::Vae::activation_bytes(lh, lw))
@@ -434,7 +485,7 @@ impl Generator {
         let st0 = Stream::new()?;
         let (_, total) = cuda::mem_info()?;
         eprintln!("GPU memory: {} MB free (device-wide) / {} MB total", cuda::device_free()? / MB, total / MB);
-        Ok(Generator { st: st0, te: None, dit: None, anima: None, qwen3: None, tokenizers: None, contexts: Vec::new(), moss: None, qwen35: None,
+        Ok(Generator { st: st0, te: None, dit: None, anima: None, qwen3: None, tokenizers: None, contexts: Vec::new(), moss: None, qwen21: None, vae21: None, qwen21_contexts: Vec::new(), qwen35: None,
             moss_tokenizer: None, moss_contexts: Vec::new(), h3: None, h3_te: None, h3_tokenizer: None, h3_vae: None, h3_audio: None, h3_contexts: Vec::new(), vae: None, flux2: None, cached: None, cached_negative: None, vision: None, vision_cache: Vec::new(),
             max_pixels: o.max_pixels,
             max_width: o.max_width, max_height: o.max_height, reserve: o.reserve_vram_mb * MB,
@@ -487,6 +538,7 @@ impl Generator {
         }
         self.drop_anima()?;
         self.drop_moss()?;
+        self.drop_qwen21()?;
         self.dit = None;
         self.cached = None;
         self.cached_negative = None;
@@ -521,6 +573,15 @@ impl Generator {
         cuda::trim_pool()
     }
 
+    /// Qwen Image 2.1 shares the text encoder with Krea 2, so that stays.
+    fn drop_qwen21(&mut self) -> Result<()> {
+        self.st.sync()?;
+        self.qwen21_contexts.clear();
+        self.qwen21 = None;
+        self.vae21 = None;
+        cuda::trim_pool()
+    }
+
     fn drop_anima(&mut self) -> Result<()> {
         self.st.sync()?;
         self.contexts.clear();
@@ -550,6 +611,7 @@ impl Generator {
         }
         self.drop_krea()?;
         self.drop_moss()?;
+        self.drop_qwen21()?;
         self.contexts.clear();
         self.anima = None;
         let t0 = Instant::now();
@@ -572,6 +634,7 @@ impl Generator {
         }
         self.drop_krea()?;
         self.drop_moss()?;
+        self.drop_qwen21()?;
         self.contexts.clear();
         self.qwen3 = None;
         let t0 = Instant::now();
@@ -593,6 +656,7 @@ impl Generator {
         }
         self.drop_krea()?;
         self.drop_anima()?;
+        self.drop_qwen21()?;
         self.moss_contexts.clear();
         self.moss = None;
         let t0 = Instant::now();
@@ -608,6 +672,240 @@ impl Generator {
         Ok(())
     }
 
+    /// Load a Qwen Image 2.1 diffusion model unless `path` is loaded. Its text encoder is [`Generator::ensure_te`]'s, the
+    /// 8B this time.
+    pub fn ensure_qwen21(&mut self, path: &Path) -> Result<()> {
+        if self.qwen21.as_ref().is_some_and(|m| m.path == path) {
+            return Ok(());
+        }
+        self.drop_anima()?;
+        self.drop_moss()?;
+        self.drop_qwen21()?;
+        self.dit = None;
+        self.cached = None;
+        self.cached_negative = None;
+        let t0 = Instant::now();
+        let dst = st::SafeTensors::open(path)?;
+        let pre = qwen21::key_prefix(|k| dst.has(k)).context("not a Qwen Image 2.1 checkpoint")?;
+        let globals = qwen21::globals_layout(&dst, pre)?.size;
+        let free = cuda::device_free()?;
+        let budget = free.saturating_sub(self.reserve + globals + qwen21_need(self.max_width, self.max_height, 0));
+        let mut dit = qwen21::Dit::load(&dst, pre, budget, self.slots, self.threads, &self.st)?;
+        dit.attn_variant = self.attn_variant;
+        dit.int8_attn = self.int8_attn;
+        eprintln!("Qwen Image 2.1 ready in {:.1}s", t0.elapsed().as_secs_f64());
+        self.qwen21 = Some(Qwen21Model { path: path.to_path_buf(), dit, st: dst });
+        Ok(())
+    }
+
+    /// Load Qwen Image 2.1's VAE unless `path` is loaded.
+    pub fn ensure_vae21(&mut self, path: &Path) -> Result<()> {
+        if self.vae21.as_ref().is_some_and(|(p, _)| p == path) {
+            return Ok(());
+        }
+        self.vae21 = None;
+        let t0 = Instant::now();
+        self.vae21 = Some((path.to_path_buf(), vae21::Vae::load(path, &self.st)?));
+        eprintln!("VAE ready in {:.1}s", t0.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    /// Qwen Image 2.1's text for `prompt` with `images` named in front of it.
+    fn qwen21_text(prompt: &Prompt, images: usize) -> Result<String> {
+        let text: String = prompt.segments()?.iter().map(|(t, _)| t.as_str()).collect();
+        Ok(te::qwen21_prompt(&text, images))
+    }
+
+    /// Move the context of `prompt` with `images` to the end of the cache, encoding it if needed.
+    fn qwen21_context(&mut self, prompt: &Prompt, images: &[PromptImage], mut dump: Option<&mut Dump>) -> Result<()> {
+        let key = Qwen21Key { text: Self::qwen21_text(prompt, images.len())?, scale: prompt.scale, images: images.to_vec() };
+        if let Some(i) = self.qwen21_contexts.iter().position(|(k, _)| *k == key) {
+            let hit = self.qwen21_contexts.remove(i);
+            self.qwen21_contexts.push(hit);
+            return Ok(());
+        }
+        let embeds = self.vision_embeds(images, dump.as_deref_mut())?;
+        let refs: Vec<&vision::Embeds> = embeds.iter().map(|e| &**e).collect();
+        let st = &self.st;
+        let t0 = Instant::now();
+        let te = &mut self.te.as_mut().context("no text encoder loaded")?.1;
+        if te.spec != te::QWEN21 {
+            bail!("this text encoder is not Qwen Image 2.1's (the 8B)");
+        }
+        let m = self.qwen21.as_mut().context("no diffusion model loaded")?;
+        let cond = te.encode_qwen21(&key.text, &refs, false, prompt.scale, st)?;
+        let ctx = m.dit.encode_context(&cond.ctx, cond.len, st)?;
+        st.sync()?;
+        eprintln!("text: {} tokens ({} conditioning, {} images) in {:.0} ms", cond.token_ids.len(), cond.len, images.len(), t0.elapsed().as_secs_f64() * 1e3);
+        if let Some(d) = dump {
+            let ids: Vec<u8> = cond.token_ids.iter().flat_map(|&t| (t as i64).to_le_bytes()).collect();
+            d.insert("ids".into(), ("I64".into(), vec![cond.token_ids.len()], ids));
+            let mut b = vec![0u8; cond.ctx.size()];
+            cond.ctx.download(0, &mut b, st)?;
+            d.insert("cond".into(), ("BF16".into(), vec![cond.len, qwen21::F], b));
+            let mut b = vec![0u8; ctx.ctx.size()];
+            ctx.ctx.download(0, &mut b, st)?;
+            d.insert("txt_in".into(), ("BF16".into(), vec![cond.len, qwen21::F], b));
+            let slots: Vec<u8> = cond.slots.iter().flat_map(|&t| (t as i64).to_le_bytes()).collect();
+            d.insert("image_slots".into(), ("I64".into(), vec![cond.slots.len()], slots));
+        }
+        self.qwen21_contexts.push((key, Qwen21Context { ctx, slots: cond.slots }));
+        if self.qwen21_contexts.len() > ANIMA_CONTEXTS {
+            self.qwen21_contexts.remove(0);
+        }
+        Ok(())
+    }
+
+    /// One Qwen Image 2.1 latent, sampled as ComfyUI's KSampler does.
+    pub fn sample_qwen21(&mut self, r: &Qwen21Request, mut progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
+        -> Result<(Vec<f32>, Stats)> {
+        if r.width % 16 != 0 || r.height % 16 != 0 || r.width == 0 || r.height == 0 {
+            bail!("width and height must be positive multiples of 16");
+        }
+        if r.width * r.height > self.max_pixels {
+            bail!("{}x{} exceeds the {} pixel limit", r.width, r.height, self.max_pixels);
+        }
+        let (lh, lw) = (r.height / vae21::SCALE, r.width / vae21::SCALE);
+        let n = qwen21::CH * lh * lw;
+        if r.noise.len() != n {
+            bail!("noise has {} values, expected {n}", r.noise.len());
+        }
+        let guided = r.sampling.uses_negative();
+        let mut stats = Stats::default();
+        let t0 = Instant::now();
+        if guided {
+            self.qwen21_context(&r.negative, &r.negative_images, None)?;
+        }
+        self.qwen21_context(&r.positive, &r.images, dump.as_deref_mut())?;
+        stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let refs: Vec<(Vec<f32>, usize, usize)> = r.references.iter().map(|l| (l.latent.clone(), l.height, l.width)).collect();
+        let ref_rows: usize = refs.iter().map(|(_, h, w)| h * w).sum();
+        let find = |k: &Qwen21Key| self.qwen21_contexts.iter().find(|(key, _)| key == k).map(|(_, c)| c).unwrap();
+        let key = |p: &Prompt, i: &[PromptImage]| -> Result<Qwen21Key> {
+            Ok(Qwen21Key { text: Self::qwen21_text(p, i.len())?, scale: p.scale, images: i.to_vec() })
+        };
+        let (pos_key, neg_key) = (key(&r.positive, &r.images)?, key(&r.negative, &r.negative_images)?);
+        let rows = |c: &Qwen21Context| c.ctx.len + ref_rows;
+        let (pos_rows, neg_rows) = (rows(find(&pos_key)), if guided { rows(find(&neg_key)) } else { 0 });
+        let m = self.qwen21.as_mut().context("no diffusion model loaded")?;
+        let nb = m.dit.blocks.len();
+        // The cache is worth its memory when it fits. It costs the same for every step it spares.
+        let caching = dump.is_none() && std::env::var_os("QWEN21_NO_CACHE").is_none();
+        let fits = |p: usize| qwen21::Prefix::cache_bytes(nb, p) <= CACHE_LIMIT;
+        let (cache_pos, cache_neg) = (caching && fits(pos_rows), caching && guided && fits(neg_rows));
+        let cache_total = (cache_pos as usize) * qwen21::Prefix::cache_bytes(nb, pos_rows) + (cache_neg as usize) * qwen21::Prefix::cache_bytes(nb, neg_rows);
+        if self.dynamic {
+            let need = qwen21_need(r.width, r.height, pos_rows.max(neg_rows)) + cache_total;
+            rebalance(&self.st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, need, false)?;
+        }
+        let st = &self.st;
+        let t1 = Instant::now();
+        let mut build = |c: &Qwen21Context, cache: bool, probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>| -> Result<qwen21::Prefix> {
+            let mut pf = m.dit.prefix(&c.ctx, &c.slots, &refs, (lh, lw), st)?;
+            if cache {
+                m.dit.fill_cache(&mut pf, st, probe)?;
+            }
+            Ok(pf)
+        };
+        let pos_pf = build(find(&pos_key), cache_pos, None)?;
+        let neg_pf = if guided { Some(build(find(&neg_key), cache_neg, None)?) } else { None };
+        st.sync()?;
+        eprintln!("prefix: {pos_rows} rows{}{} in {:.0} ms", if cache_pos { ", cached" } else { "" },
+            if guided { format!(" and {neg_rows}{}", if cache_neg { ", cached" } else { "" }) } else { String::new() }, t1.elapsed().as_secs_f64() * 1e3);
+        stats.text_ms += t1.elapsed().as_secs_f64() * 1e3;
+
+        let copied0 = m.dit.blocks.copied_bytes;
+        let (dynamic, reserve, slots) = (self.dynamic, self.reserve, self.slots);
+        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, eval: usize| -> Result<()> {
+            if negative {
+                return m.dit.predict(x, lh, lw, neg_pf.as_ref().unwrap(), sigma, out, st, None);
+            }
+            if dynamic && eval > 0 && cuda::device_free()? < reserve / 2 {
+                eprintln!("VRAM pressure: free {} MB < {} MB", cuda::device_free()? / MB, reserve / 2 / MB);
+                let need = qwen21_need(lw * vae21::SCALE, lh * vae21::SCALE, pos_rows) + reserve;
+                rebalance(st, &mut m.dit.blocks, &m.st, reserve, slots, need, true)?;
+            }
+            let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
+            {
+                let mut probe = |name: &str, b: &DevBuf, bytes: usize| {
+                    if eval == 0 && matches!(name, "temb" | "block0" | "block1" | "block31" | "prefix_block0" | "prefix_block1" | "prefix_block31" | "proj_out") {
+                        let mut v = vec![0u8; bytes];
+                        b.download(0, &mut v, st).unwrap();
+                        probes.push((name.to_string(), v));
+                    }
+                };
+                let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if dump.is_some() { Some(&mut probe) } else { None };
+                m.dit.predict(x, lh, lw, &pos_pf, sigma, out, st, probe_ref)?;
+            }
+            if let Some(dm) = dump.as_deref_mut() {
+                for (name, v) in probes {
+                    dm.insert(name, ("BF16".into(), vec![v.len() / 2], v));
+                }
+            }
+            Ok(())
+        };
+        let latent = run_sampler(&r.sampling, &r.noise, st, &mut stats, &mut model, &mut progress)?;
+        stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
+        eprintln!("{:.2} GB streamed over PCIe", stats.streamed_gb);
+        if let Some(dm) = dump {
+            dm.insert("samples".into(), ("F32".into(), vec![qwen21::CH, lh, lw], st::f32_bytes(&latent).to_vec()));
+            qwen21::TRACE.with(|t| {
+                for (name, v) in t.borrow_mut().drain(..) {
+                    dm.entry(name).or_insert(("BF16".into(), vec![v.len() / 2], v));
+                }
+            });
+        }
+        Ok((latent, stats))
+    }
+
+    /// VAE-encode RGBA f32 [height, width, 4], 0 to 1, into a reference latent. Pixels past a multiple of 16 are
+    /// cropped evenly from each side, as ComfyUI's VAE does.
+    pub fn encode_image21(&mut self, rgba: &[f32], width: usize, height: usize) -> Result<Reference> {
+        if rgba.len() != width * height * 4 {
+            bail!("image has {} values, expected {}", rgba.len(), width * height * 4);
+        }
+        let s = vae21::SCALE;
+        let (cw, ch) = (width / s * s, height / s * s);
+        if cw == 0 || ch == 0 {
+            bail!("{width}x{height} is too small to encode");
+        }
+        let (x0, y0) = ((width - cw) / 2, (height - ch) / 2);
+        let mut cropped = Vec::with_capacity(cw * ch * 4);
+        for y in y0..y0 + ch {
+            cropped.extend_from_slice(&rgba[(y * width + x0) * 4..][..cw * 4]);
+        }
+        let st = &self.st;
+        let need = vae21::Vae::activation_bytes(ch / s, cw / s);
+        if let Some(m) = self.qwen21.as_mut().filter(|_| self.dynamic) {
+            if cuda::device_free()? < need + self.reserve {
+                rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, need, true)?;
+            }
+        }
+        let t0 = Instant::now();
+        let latent = self.vae21.as_ref().context("no VAE loaded")?.1.encode(&cropped, ch, cw, false, st)?;
+        eprintln!("VAE encode {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        Ok(Reference { latent, height: ch / s, width: cw / s })
+    }
+
+    /// Decode a host Qwen Image 2.1 latent ([64, H/16, W/16] f32) to RGBA8 pixels.
+    pub fn decode_qwen21(&mut self, latent: &[f32], width: usize, height: usize) -> Result<Vec<u8>> {
+        let (lh, lw) = (height / vae21::SCALE, width / vae21::SCALE);
+        if latent.len() != qwen21::CH * lh * lw {
+            bail!("latent has {} values, expected {}", latent.len(), qwen21::CH * lh * lw);
+        }
+        let st = &self.st;
+        if let Some(m) = self.qwen21.as_mut().filter(|_| self.dynamic) {
+            let need = vae21::Vae::activation_bytes(lh, lw);
+            if cuda::device_free()? < need + self.reserve {
+                rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, need, true)?;
+            }
+        }
+        let d = DevBuf::alloc_async(latent.len() * 4, st)?;
+        d.upload(0, &st::f32_bytes(latent), st)?;
+        self.vae21.as_ref().context("no VAE loaded")?.1.decode(&d, lh, lw, st)
+    }
+
     /// Load a MiniMax H3 diffusion model unless `path` is loaded. VRAM is taken when it samples.
     pub fn ensure_h3(&mut self, path: &Path) -> Result<()> {
         if self.h3.as_ref().is_some_and(|m| m.path == path) {
@@ -616,6 +914,7 @@ impl Generator {
         self.drop_krea()?;
         self.drop_anima()?;
         self.drop_moss()?;
+        self.drop_qwen21()?;
         self.h3_contexts.clear();
         self.h3 = None;
         let t0 = Instant::now();
@@ -793,6 +1092,7 @@ impl Generator {
         }
         self.drop_krea()?;
         self.drop_anima()?;
+        self.drop_qwen21()?;
         self.moss_contexts.clear();
         self.qwen35 = None;
         let t0 = Instant::now();
@@ -1108,6 +1408,10 @@ impl Generator {
                 m.dit.clear_mods();
                 self.moss_contexts.clear();
             }
+        } else if self.qwen21.is_some() {
+            if !loras.is_empty() {
+                bail!("LoRAs on Qwen Image 2.1");
+            }
         } else if !loras.is_empty() {
             bail!("no diffusion model loaded");
         }
@@ -1150,6 +1454,9 @@ impl Generator {
         if let Some(m) = &mut self.moss {
             m.dit.int8_attn = on;
         }
+        if let Some(m) = &mut self.qwen21 {
+            m.dit.int8_attn = on;
+        }
         if let Some(m) = &mut self.h3 {
             m.dit.int8_attn = on;
         }
@@ -1177,6 +1484,9 @@ impl Generator {
         self.h3_audio = None;
         self.flux2 = None;
         self.vae = None;
+        self.qwen21_contexts.clear();
+        self.qwen21 = None;
+        self.vae21 = None;
         cuda::trim_pool()
     }
 
@@ -1192,6 +1502,9 @@ impl Generator {
                 m.dit.blocks.set_resident(0, 1, &m.st)?;
             }
             if let Some(m) = &mut self.moss {
+                m.dit.blocks.set_resident(0, 1, &m.st)?;
+            }
+            if let Some(m) = &mut self.qwen21 {
                 m.dit.blocks.set_resident(0, 1, &m.st)?;
             }
             if let Some(m) = &mut self.h3 {

@@ -137,6 +137,14 @@ extern "C" {
     pub fn gpu_mul_rows(x: PM, sc: P, c: i32, rows: i64, s: PM) -> i32;
     pub fn gpu_add_f32(x: PM, y: P, n: i64, s: PM) -> i32;
     pub fn gpu_bcast_rows(v: P, c: i32, out: PM, ld: i64, rows: i64, s: PM) -> i32;
+
+    // Qwen Image 2.1 (csrc/qwen21.cu)
+    pub fn gpu_dup_up(x: P, out: PM, h: i32, w: i32, cin: i32, cout: i32, ft: i32, s: PM) -> i32;
+    pub fn gpu_avg_down(x: P, out: PM, h: i32, w: i32, cin: i32, cout: i32, ft: i32, fs: i32, s: PM) -> i32;
+    pub fn gpu_to_rgba8(x: P, cstride: i32, out: PM, p: i64, s: PM) -> i32;
+    pub fn gpu_attn_prefix(q: P, q_stride: i64, k: P, v: P, kv_stride: i64, h: i32, lq: i32, offset: i32, out: PM, out_stride: i64,
+        scale: f32, s: PM) -> i32;
+    pub fn gpu_tanh_bf16(x: PM, n: i64, s: PM) -> i32;
 }
 
 /// Turn a launcher return code into an error naming the call.

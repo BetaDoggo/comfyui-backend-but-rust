@@ -2,7 +2,8 @@
 
 A ComfyUI-API-compatible server that SwarmUI can use as a normal **"ComfyUI API By URL"** backend,
 fronting a native Rust generation engine. It ships with two engines: **native**, which really generates Krea 2
-Turbo, Anima and MOSS Image images and MiniMax H3 video with the Rust + CUDA pipelines in the parent repository, and the
+Turbo, Anima, MOSS Image and Qwen Image 2.1 images, MiniMax H3 video and Pixal3D meshes with the Rust + CUDA pipelines
+in the parent repository, and the
 **mock engine**, which returns placeholder images/video/audio of the correct shapes for every other model family.
 
 ```

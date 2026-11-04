@@ -65,7 +65,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 
 | Priority | Area | Item | Notes |
 |---|---|---|---|
-| P0 | Engine core | Route each model to its engine | One backend now serves Krea 2, Anima, MOSS Image and MiniMax H3, picked from the checkpoint's keys. Still inside native-engine; other families need a real router. |
+| P0 | Engine core | Route each model to its engine | One backend now serves Krea 2, Anima, MOSS Image, Qwen Image 2.1 and MiniMax H3, picked from the checkpoint's keys. Still inside native-engine; other families need a real router. |
 | P0 | Engine core | Dynamic VRAM offloading | Live residency works and adapted to ComfyUI's memory. Open: 16 to 11 drop at 1024, one 867 ms/step run after ComfyUI. |
 | P1 | Krea 2 | Model Attention Backend | int8 and flash, per request. flash not yet run through the server. |
 | P1 | Pixal3D | Image to 3D | Real meshes from the CLI and through comfy-server's `Pixal3DImageTo3D` node: 40 s at 1024, 110 s at 1536. Each stage compared with ComfyUI. Not yet run through SwarmUI. |
@@ -113,7 +113,6 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 
 | Priority | Area | Item | Notes |
 |---|---|---|---|
-| P0 | Engine core | Move Krea 2 behind a shared engine crate | Share the CUDA runtime, kernels, offloading and sampler between model families instead of hard-coding Krea 2. |
 | P0 | Engine core | Latent operations | Add, multiply, blend, batch, repeat and upscale. Needed by init images, refiners and regions. |
 | P1 | Engine core | Hardware beyond this card | Everything targets sm_120 on Windows. Other GPUs and Linux are untested. |
 | P1 | Krea 2 | Prompt weights | <weight> through SwarmAttnTokenWeights, inside attention. |

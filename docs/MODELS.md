@@ -45,11 +45,10 @@ takes both `(word:1.2)` and `<weight>`; Qwen Image 2.1's encoder reads `(word:1.
 
 ## Krea 2
 
-A standalone reimplementation of ComfyUI's **Krea-2 Turbo** text-to-image workflow
-(`blueprints/Text to Image (Krea-2 Turbo).json`: 1024², 8 steps, euler / simple, CFG 1, shift 1.15)
-for the int8 checkpoint `kroma-v0.3.1-turbo-opd-W8A8`, the Qwen3-VL-4B text encoder and the
-Qwen-Image (Wan 2.1) VAE. It loads the original `.safetensors` files read-only via mmap; nothing
-is copied or converted on disk.
+Runs the W8A8 int8 Krea 2 Turbo checkpoint `kroma-v0.3.1-turbo-opd-W8A8` with the Qwen3-VL-4B text encoder and the
+Qwen-Image (Wan 2.1) VAE. Files are read in place. Its defaults follow ComfyUI's Krea-2 Turbo blueprint
+(`blueprints/Text to Image (Krea-2 Turbo).json`): 1024², 8 steps, `euler` / `simple`, CFG 1, shift 1.15. Every sampler
+and scheduler works, at any CFG, with negative prompts, as on the other families.
 
 ```bash
 target/release/diffusion.exe -p "a red fox sitting in a snowy forest, golden hour, photograph" --seed 42 -o fox.png
@@ -109,7 +108,7 @@ Differences to know about:
 ## Anima
 
 Runs int8 ConvRot Anima checkpoints with the Qwen3 0.6B text encoder and the Qwen-Image VAE. Files are read in
-place, as with Krea 2. Every sampler and scheduler works (see [Samplers](USAGE.md#samplers); SwarmUI's default is `er_sde`), at any CFG, with
+place. Every sampler and scheduler works (see [Samplers](USAGE.md#samplers); SwarmUI's default is `er_sde`), at any CFG, with
 negative prompts and `(word:1.2)` emphasis.
 
 ```bash

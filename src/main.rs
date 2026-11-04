@@ -677,10 +677,13 @@ fn main() -> Result<()> {
             shift: args.shift,
         });
     }
+    run_krea(&args, load)
+}
 
+fn run_krea(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     let t_start = Instant::now();
-    let mut gen = pipeline::Generator::load(&load)?;
-    apply_loras(&mut gen, &args)?;
+    let mut gen = pipeline::Generator::load_krea(&load)?;
+    apply_loras(&mut gen, args)?;
     let prompts: Vec<String> = match &args.prompt_file {
         Some(p) => std::fs::read_to_string(p)
             .with_context(|| format!("reading {}", p.display()))?
@@ -710,7 +713,7 @@ fn main() -> Result<()> {
         gen.encode_image(&i.rgb, i.width, i.height)
     }).collect::<Result<Vec<_>>>()?;
     for (img_i, (prompt, seed_off)) in jobs.into_iter().enumerate() {
-        let req = pipeline::Request {
+        let req = pipeline::KreaRequest {
             prompt: Prompt::text(&prompt),
             negative: Prompt::text(&args.negative),
             seed: args.seed + seed_off,
@@ -727,7 +730,7 @@ fn main() -> Result<()> {
         if let Some(r) = references.first() {
             dump.insert("ref0".into(), ("F32".into(), vec![16, r.height, r.width], st::f32_bytes(&r.latent).to_vec()));
         }
-        let (rgb, _) = gen.generate(&req, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
+        let (rgb, _) = gen.generate_krea(&req, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
         let path = out_path(&args.out, img_i, n_jobs);
         std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
             .with_context(|| format!("writing {}", path.display()))?;

@@ -148,7 +148,7 @@ impl Sampling {
     }
 }
 
-pub struct Request {
+pub struct KreaRequest {
     pub prompt: Prompt,
     /// Only encoded when the sampling uses it.
     pub negative: Prompt,
@@ -206,7 +206,7 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-struct DitModel {
+struct KreaModel {
     path: PathBuf,
     dit: dit::Dit,
     st: st::SafeTensors,
@@ -367,7 +367,7 @@ type TokenKey = Vec<(Vec<u32>, Vec<f32>)>;
 pub struct Generator {
     st: Stream,
     te: Option<(PathBuf, te::TextEncoder)>,
-    dit: Option<DitModel>,
+    krea: Option<KreaModel>,
     anima: Option<AnimaModel>,
     qwen3: Option<(PathBuf, qwen3::TextEncoder)>,
     tokenizers: Option<(tokenizer::Tokenizer, tokenizer::T5Tokenizer)>,
@@ -391,8 +391,8 @@ pub struct Generator {
     h3_contexts: Vec<(TokenKey, usize, DevBuf)>,
     vae: Option<(PathBuf, vae::Vae)>,
     flux2: Option<(PathBuf, flux2vae::Vae)>,
-    cached: Option<(PromptKey, te::Cond, DevBuf)>,
-    cached_negative: Option<(PromptKey, te::Cond, DevBuf)>,
+    krea_prompt: Option<(PromptKey, te::Cond, DevBuf)>,
+    krea_negative: Option<(PromptKey, te::Cond, DevBuf)>,
     /// Loaded from the text encoder's file by the first prompt image.
     vision: Option<vision::Vision>,
     /// Latest images, most recent last.
@@ -488,20 +488,21 @@ impl Generator {
         let st0 = Stream::new()?;
         let (_, total) = cuda::mem_info()?;
         eprintln!("GPU memory: {} MB free (device-wide) / {} MB total", cuda::device_free()? / MB, total / MB);
-        Ok(Generator { st: st0, te: None, dit: None, anima: None, qwen3: None, tokenizers: None, contexts: Vec::new(), moss: None, qwen21: None, vae21: None, qwen21_contexts: Vec::new(), qwen35: None,
-            moss_tokenizer: None, moss_contexts: Vec::new(), h3: None, h3_te: None, h3_tokenizer: None, h3_vae: None, h3_audio: None, h3_contexts: Vec::new(), vae: None, flux2: None, cached: None, cached_negative: None, vision: None, vision_cache: Vec::new(),
+        Ok(Generator { st: st0, te: None, krea: None, anima: None, qwen3: None, tokenizers: None, contexts: Vec::new(), moss: None, qwen21: None, vae21: None, qwen21_contexts: Vec::new(), qwen35: None,
+            moss_tokenizer: None, moss_contexts: Vec::new(), h3: None, h3_te: None, h3_tokenizer: None, h3_vae: None, h3_audio: None, h3_contexts: Vec::new(), vae: None, flux2: None, krea_prompt: None, krea_negative: None, vision: None, vision_cache: Vec::new(),
             max_pixels: o.max_pixels,
             max_width: o.max_width, max_height: o.max_height, reserve: o.reserve_vram_mb * MB,
             resident_blocks: o.resident_blocks, slots: o.slots, threads: o.threads, attn_variant: o.attn_variant,
             int8_attn: o.int8_attn, dynamic: o.resident_blocks.is_none() })
     }
 
-    pub fn load(o: &LoadOptions) -> Result<Self> {
+    /// Start the GPU runtime with the Krea 2 files of `o` loaded, for the CLI and the web UI.
+    pub fn load_krea(o: &LoadOptions) -> Result<Self> {
         let t_start = Instant::now();
         let mut gen = Self::new(o)?;
         gen.ensure_vae(&o.vae)?;
         gen.ensure_te(&o.te)?;
-        gen.ensure_dit(&o.dit)?;
+        gen.ensure_krea(&o.dit)?;
         eprintln!("startup total {:.1}s", t_start.elapsed().as_secs_f64());
         Ok(gen)
     }
@@ -526,25 +527,25 @@ impl Generator {
         self.te = None;
         self.vision = None;
         self.vision_cache.clear();
-        self.cached = None;
-        self.cached_negative = None;
+        self.krea_prompt = None;
+        self.krea_negative = None;
         let t0 = Instant::now();
         self.te = Some((path.to_path_buf(), te::TextEncoder::load(path, 0, self.threads, &self.st)?));
         eprintln!("text encoder ready in {:.1}s", t0.elapsed().as_secs_f64());
         Ok(())
     }
 
-    /// Load the DiT unless `path` is already loaded, planning block residency from what is free.
-    pub fn ensure_dit(&mut self, path: &Path) -> Result<()> {
-        if self.dit.as_ref().is_some_and(|m| m.path == path) {
+    /// Load a Krea 2 diffusion model unless `path` is already loaded, planning block residency from what is free.
+    pub fn ensure_krea(&mut self, path: &Path) -> Result<()> {
+        if self.krea.as_ref().is_some_and(|m| m.path == path) {
             return Ok(());
         }
         self.drop_anima()?;
         self.drop_moss()?;
         self.drop_qwen21()?;
-        self.dit = None;
-        self.cached = None;
-        self.cached_negative = None;
+        self.krea = None;
+        self.krea_prompt = None;
+        self.krea_negative = None;
         let t0 = Instant::now();
         let dst = st::SafeTensors::open(path)?;
         let globals = dit::globals_layout(&dst)?.size;
@@ -561,15 +562,15 @@ impl Generator {
         dit.attn_variant = self.attn_variant;
         dit.int8_attn = self.int8_attn;
         eprintln!("DiT ready in {:.1}s (activation reserve {} MB)", t0.elapsed().as_secs_f64(), act / MB);
-        self.dit = Some(DitModel { path: path.to_path_buf(), dit, st: dst, lora: lora::State::default() });
+        self.krea = Some(KreaModel { path: path.to_path_buf(), dit, st: dst, lora: lora::State::default() });
         Ok(())
     }
 
     fn drop_krea(&mut self) -> Result<()> {
         self.st.sync()?;
-        self.cached = None;
-        self.cached_negative = None;
-        self.dit = None;
+        self.krea_prompt = None;
+        self.krea_negative = None;
+        self.krea = None;
         self.te = None;
         self.vision = None;
         self.vision_cache.clear();
@@ -684,9 +685,9 @@ impl Generator {
         self.drop_anima()?;
         self.drop_moss()?;
         self.drop_qwen21()?;
-        self.dit = None;
-        self.cached = None;
-        self.cached_negative = None;
+        self.krea = None;
+        self.krea_prompt = None;
+        self.krea_negative = None;
         let t0 = Instant::now();
         let dst = st::SafeTensors::open(path)?;
         let pre = qwen21::key_prefix(|k| dst.has(k)).context("not a Qwen Image 2.1 checkpoint")?;
@@ -1395,10 +1396,10 @@ impl Generator {
             return Ok(());
         }
         let st = &self.st;
-        if let Some(m) = &mut self.dit {
+        if let Some(m) = &mut self.krea {
             if lora::apply(lora::Arch::Krea2, &m.st, "", m.dit.stores(), &mut m.lora, loras, st)? {
-                self.cached = None;
-                self.cached_negative = None;
+                self.krea_prompt = None;
+                self.krea_negative = None;
             }
         } else if let Some(m) = &mut self.anima {
             let prefix = m.dit.prefix();
@@ -1429,8 +1430,8 @@ impl Generator {
         let loras: Vec<_> = loras.iter().filter(|l| l.strength != 0.0).cloned().collect();
         if let Some((_, te)) = &mut self.te {
             if te.apply_loras(&loras, st)? {
-                self.cached = None;
-                self.cached_negative = None;
+                self.krea_prompt = None;
+                self.krea_negative = None;
                 self.qwen21_contexts.clear();
             }
         } else if let Some((_, te)) = &mut self.qwen3 {
@@ -1450,7 +1451,7 @@ impl Generator {
     /// Choose the DiT attention: INT8 (fastest) or bf16 FlashAttention. Takes effect on the next step.
     pub fn set_int8_attention(&mut self, on: bool) {
         self.int8_attn = on;
-        if let Some(m) = &mut self.dit {
+        if let Some(m) = &mut self.krea {
             m.dit.int8_attn = on;
         }
         if let Some(m) = &mut self.anima {
@@ -1470,10 +1471,10 @@ impl Generator {
     /// Drop every model and give their VRAM and pinned RAM back. `ensure_*` loads them again.
     pub fn unload(&mut self) -> Result<()> {
         self.st.sync()?;
-        self.cached = None;
-        self.cached_negative = None;
+        self.krea_prompt = None;
+        self.krea_negative = None;
         self.contexts.clear();
-        self.dit = None;
+        self.krea = None;
         self.te = None;
         self.vision = None;
         self.vision_cache.clear();
@@ -1500,7 +1501,7 @@ impl Generator {
     pub fn idle(&mut self) -> Result<()> {
         self.st.sync()?;
         if self.dynamic {
-            if let Some(m) = &mut self.dit {
+            if let Some(m) = &mut self.krea {
                 m.dit.blocks.set_resident(0, 1, &m.st)?;
             }
             if let Some(m) = &mut self.anima {
@@ -1525,12 +1526,12 @@ impl Generator {
         cuda::trim_pool()
     }
 
-    /// Generate one image; returns RGB8 pixels. `progress(step, steps)` is called after each step
+    /// Generate one Krea 2 image; returns RGB8 pixels. `progress(step, steps)` is called after each step
     /// and stops the run with [`Cancelled`] by returning false.
-    pub fn generate(&mut self, r: &Request, progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
+    pub fn generate_krea(&mut self, r: &KreaRequest, progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
         -> Result<(Vec<u8>, Stats)> {
         let t_img = Instant::now();
-        let (latent, mut stats) = self.denoise(r, progress, dump.as_deref_mut())?;
+        let (latent, mut stats) = self.sample_krea(r, progress, dump.as_deref_mut())?;
         let (lh, lw) = (r.height / 8, r.width / 8);
         let t0 = Instant::now();
         let rgb = self.decode_latent(&latent, r.width, r.height)?;
@@ -1543,10 +1544,6 @@ impl Generator {
         Ok((rgb, stats))
     }
 
-    /// Text encoding and denoising only; returns the final latent ([16, H/8, W/8] f32) on the host.
-    pub fn sample_latent(&mut self, r: &Request, progress: impl FnMut(Step) -> bool) -> Result<(Vec<f32>, Stats)> {
-        self.denoise(r, progress, None)
-    }
 
     /// The vision tower's tokens for `images`, through the cache.
     fn vision_embeds(&mut self, images: &[PromptImage], mut dump: Option<&mut Dump>) -> Result<Vec<Arc<vision::Embeds>>> {
@@ -1606,7 +1603,7 @@ impl Generator {
         }
         let st = &self.st;
         let need = vae::Vae::activation_bytes(ch / 8, cw / 8);
-        if let Some(m) = self.dit.as_mut().filter(|_| self.dynamic) {
+        if let Some(m) = self.krea.as_mut().filter(|_| self.dynamic) {
             if cuda::device_free()? < need + self.reserve {
                 rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, need, true)?;
             }
@@ -1617,7 +1614,7 @@ impl Generator {
         Ok(Reference { latent, height: ch / 8, width: cw / 8 })
     }
 
-    /// Decode a host latent from [`Generator::sample_latent`] to RGB8 pixels.
+    /// Decode a host latent from [`Generator::sample_krea`] or [`Generator::sample_anima`] to RGB8 pixels.
     pub fn decode_latent(&mut self, latent: &[f32], width: usize, height: usize) -> Result<Vec<u8>> {
         let (lh, lw) = (height / 8, width / 8);
         if latent.len() != dit::CH * lh * lw {
@@ -1628,7 +1625,8 @@ impl Generator {
         self.decode(&d, lh, lw)
     }
 
-    fn denoise(&mut self, r: &Request, mut progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
+    /// Krea 2: text encoding and denoising only; returns the final latent ([16, H/8, W/8] f32) on the host.
+    pub fn sample_krea(&mut self, r: &KreaRequest, mut progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
         -> Result<(Vec<f32>, Stats)> {
         if r.width % 16 != 0 || r.height % 16 != 0 || r.width == 0 || r.height == 0 {
             bail!("width and height must be positive multiples of 16");
@@ -1641,7 +1639,7 @@ impl Generator {
         let pos_vision = self.vision_embeds(&r.images, dump.as_deref_mut())?;
         let neg_vision = if guided { self.vision_embeds(&r.negative_images, None)? } else { Vec::new() };
         let vision_ms = t0.elapsed().as_secs_f64() * 1e3;
-        let m = self.dit.as_mut().context("no diffusion model loaded")?;
+        let m = self.krea.as_mut().context("no diffusion model loaded")?;
         let te = &mut self.te.as_mut().context("no text encoder loaded")?.1;
         let ref_grids: Vec<(usize, usize)> = r.references.iter().map(|l| (l.height.div_ceil(dit::PATCH), l.width.div_ceil(dit::PATCH))).collect();
         let extra = pos_vision.iter().chain(&neg_vision).map(|e| e.tokens).max().unwrap_or(0) * r.images.len().max(r.negative_images.len())
@@ -1658,26 +1656,26 @@ impl Generator {
         let t0 = Instant::now();
         let refs: Vec<&vision::Embeds> = pos_vision.iter().map(|e| &**e).collect();
         let key = PromptKey { prompt: r.prompt.clone(), images: r.images.clone() };
-        if self.cached.as_ref().map_or(true, |(p, _, _)| *p != key) {
-            drop(self.cached.take());
+        if self.krea_prompt.as_ref().map_or(true, |(p, _, _)| *p != key) {
+            drop(self.krea_prompt.take());
             let cond = krea_cond(te, &r.prompt, &refs, st)?;
             let ctx = m.dit.encode_context(&cond.ctx, cond.len, st)?;
             st.sync()?;
             eprintln!("text: {} tokens ({} conditioning) in {:.0} ms", cond.token_ids.len(), cond.len,
                 t0.elapsed().as_secs_f64() * 1e3);
-            self.cached = Some((key, cond, ctx));
+            self.krea_prompt = Some((key, cond, ctx));
         }
         let key = PromptKey { prompt: r.negative.clone(), images: r.negative_images.clone() };
-        if guided && self.cached_negative.as_ref().map_or(true, |(p, _, _)| *p != key) {
-            drop(self.cached_negative.take());
+        if guided && self.krea_negative.as_ref().map_or(true, |(p, _, _)| *p != key) {
+            drop(self.krea_negative.take());
             let refs: Vec<&vision::Embeds> = neg_vision.iter().map(|e| &**e).collect();
             let cond = krea_cond(te, &r.negative, &refs, st)?;
             let ctx = m.dit.encode_context(&cond.ctx, cond.len, st)?;
             st.sync()?;
-            self.cached_negative = Some((key, cond, ctx));
+            self.krea_negative = Some((key, cond, ctx));
         }
         stats.text_ms = vision_ms + t0.elapsed().as_secs_f64() * 1e3;
-        let (_, cond, ctx) = self.cached.as_ref().unwrap();
+        let (_, cond, ctx) = self.krea_prompt.as_ref().unwrap();
         if let Some(d) = dump.as_deref_mut() {
             let mut b = vec![0u8; cond.ctx.size()];
             cond.ctx.download(0, &mut b, st)?;
@@ -1708,7 +1706,7 @@ impl Generator {
         let rope_d = upload_rope(lt, &ref_grids)?;
         let latents: Vec<(Vec<f32>, usize, usize)> = r.references.iter().map(|l| (l.latent.clone(), l.height, l.width)).collect();
         let references = if latents.is_empty() { None } else { Some(m.dit.references(&latents, r.timestep_zero, st)?) };
-        let negative = if guided { self.cached_negative.as_ref().map(|(_, c, ctx)| (ctx, c.len)) } else { None };
+        let negative = if guided { self.krea_negative.as_ref().map(|(_, c, ctx)| (ctx, c.len)) } else { None };
         let neg_rope = negative.map(|(_, len)| upload_rope(len, &[])).transpose()?;
 
         // denoise
@@ -1761,7 +1759,7 @@ impl Generator {
     fn decode(&mut self, latent: &DevBuf, lh: usize, lw: usize) -> Result<Vec<u8>> {
         let st = &self.st;
         // the decoder's activations may need memory freed since the request started
-        if let Some(m) = self.dit.as_mut().filter(|_| self.dynamic) {
+        if let Some(m) = self.krea.as_mut().filter(|_| self.dynamic) {
             if cuda::device_free()? < vae::Vae::activation_bytes(lh, lw) + self.reserve {
                 rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, vae::Vae::activation_bytes(lh, lw), true)?;
             }

@@ -8,7 +8,7 @@
 //!   GET  /api/image/<id>.png  the result
 
 use crate::samplers::ModelSampling;
-use crate::pipeline::{encode_png, Generator, LoadOptions, Prompt, Request, Sampling, Stats};
+use crate::pipeline::{encode_png, Generator, KreaRequest, LoadOptions, Prompt, Sampling, Stats};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -98,7 +98,7 @@ pub fn run(load: LoadOptions, opts: ServeOptions) -> Result<()> {
         let out_dir = opts.out_dir.clone();
         let shift = opts.shift;
         std::thread::spawn(move || {
-            let mut gen = match Generator::load(&load) {
+            let mut gen = match Generator::load_krea(&load) {
                 Ok(g) => g,
                 Err(e) => {
                     eprintln!("model load failed: {e:#}");
@@ -119,11 +119,11 @@ pub fn run(load: LoadOptions, opts: ServeOptions) -> Result<()> {
                     j.state = "running";
                     let ms = ModelSampling::Flux { shift };
                     let sampling = Sampling::new("euler", "simple", ms, j.steps, 1.0, j.seed, (j.width / 8, j.height / 8)).unwrap();
-                    Request { prompt: Prompt::text(&j.prompt), negative: Prompt::text(""), seed: j.seed, width: j.width, height: j.height, sampling, noise: None, images: Vec::new(), negative_images: Vec::new(), references: Vec::new(), timestep_zero: false }
+                    KreaRequest { prompt: Prompt::text(&j.prompt), negative: Prompt::text(""), seed: j.seed, width: j.width, height: j.height, sampling, noise: None, images: Vec::new(), negative_images: Vec::new(), references: Vec::new(), timestep_zero: false }
                 };
                 let st2 = state.clone();
                 let result = gen
-                    .generate(&req, |step| {
+                    .generate_krea(&req, |step| {
                         if let Some(j) = st2.lock().unwrap().jobs.iter_mut().find(|j| j.id == id) {
                             j.step = step.index;
                         }

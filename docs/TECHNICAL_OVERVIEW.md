@@ -123,9 +123,31 @@ Noise is reimplemented in [`src/sampling.rs`](../src/sampling.rs): `mt19937` for
 CUDA generator, so seeds give the same noise as ComfyUI. Images are close but not identical, because rounding differs
 at some steps. [Models](MODELS.md) gives the measured PSNR for each one.
 
-## How each stage maps to ComfyUI
+## System-memory offloading
 
-* **Text encoder** (`src/te.rs`): Qwen3-VL-4B language model, Krea2 template, hidden states
+[`src/offload.rs`](../src/offload.rs) is comparable to ComfyUI's DynamicVRAM, but planned statically:
+
+1. Every block is packed once into a contiguous image in the exact device layout the kernels read.
+2. From free VRAM minus the activation peak (largest of DiT step / VAE decode) and `--reserve-vram`,
+   the planner keeps blocks `0..R` resident and leaves the rest in **page-locked RAM**.
+3. Streamed blocks go through a ring of VRAM slots on a dedicated copy stream. A slot is refilled
+   as soon as the compute stream releases it (CUDA events), so the PCIe copy of a block overlaps the
+   compute of earlier ones; the compute stream only waits if a copy is genuinely late.
+
+Krea 2, Anima, MOSS Image and Qwen Image 2.1 plan this way. For Krea 2 on this machine, 16 of 28 blocks stay resident at 1024² and 12
+stream (5.2 GB/step at ~26 GB/s).
+Streaming *all* 28 blocks still costs only ~5% per step, because a block's copy (~17 ms) is shorter
+than its compute (~24 ms). The text encoder and text-fusion adapter stream the same way. Planning
+stays conservative on purpose: oversubscribing VRAM makes Windows fall back to shared system memory,
+which doubles step time.
+
+## Family notes
+
+### Krea 2
+
+How each stage maps to ComfyUI:
+
+* **Text encoder** (`src/te.rs`, shared with Qwen Image 2.1): Qwen3-VL-4B language model, Krea2 template, hidden states
   entering layers 2, 5, …, 35 (layer 35 itself never runs), system prefix stripped exactly like
   `Krea2TEModel.encode_token_weights`. ComfyUI builds text encoders with `full_precision_mm`, so the
   int8 weights are used weight-only with fp32 activations; this does the same, computing
@@ -138,27 +160,8 @@ at some steps. [Models](MODELS.md) gives the measured PSNR for each one.
   dequant (and gated residual) fused in the epilogue. q|k|v|gate and gate|up are fused into single
   GEMMs. Attention is FlashAttention-2 (bf16) reading q/k/v in place from the fused projection.
   The text-fusion adapter is timestep-independent, so it runs once per prompt instead of every step.
-* **VAE** (`src/vae.rs`): for one frame every causal 3D conv equals a 2D conv with the kernel's last
+* **VAE** (`src/vae.rs`, shared with Anima): for one frame every causal 3D conv equals a 2D conv with the kernel's last
   temporal slice, so the decoder runs as NHWC CUTLASS implicit-GEMM 2D convolutions.
-* **Sampling** (`src/sampling.rs`, `src/samplers.rs`): torch-compatible `mt19937` + Box-Muller noise, and
-  ComfyUI's samplers and schedulers on the host.
-
-## System-memory offloading
-
-[`src/offload.rs`](../src/offload.rs) is comparable to ComfyUI's DynamicVRAM, but planned statically:
-
-1. Every block is packed once into a contiguous image in the exact device layout the kernels read.
-2. From free VRAM minus the activation peak (largest of DiT step / VAE decode) and `--reserve-vram`,
-   the planner keeps blocks `0..R` resident and leaves the rest in **page-locked RAM**.
-3. Streamed blocks go through a ring of VRAM slots on a dedicated copy stream. A slot is refilled
-   as soon as the compute stream releases it (CUDA events), so the PCIe copy of a block overlaps the
-   compute of earlier ones; the compute stream only waits if a copy is genuinely late.
-
-On this machine 16 of 28 blocks stay resident at 1024² and 12 stream (5.2 GB/step at ~26 GB/s).
-Streaming *all* 28 blocks still costs only ~5% per step, because a block's copy (~17 ms) is shorter
-than its compute (~24 ms). The text encoder and text-fusion adapter stream the same way. Planning
-stays conservative on purpose: oversubscribing VRAM makes Windows fall back to shared system memory,
-which doubles step time.
 
 ### Pixal3D
 
@@ -196,7 +199,7 @@ csrc/trellis.cu     Pixal3D: per-head QK norm, voxel hashing and sparse-conv gat
 csrc/birefnet.cu    BiRefNet: im2col, deformable-conv columns, Swin window gather and attention, bilinear resize
 csrc/wddm.cu        VRAM queries under Windows
 csrc/vendor/        comfy-kitchen CUTLASS int8 GEMM + Sage INT8 attention (Apache-2.0)
-src/                Rust: loader, offload engine, tokenizer, text encoder, DiT, VAE, LoRA baking, CLI
+src/                Rust: loader, offloading, tokenizers, each family's models, samplers, LoRA baking, CLI
 web/index.html      the Krea 2 web UI
 tools/              ComfyUI reference dump / comparison / benchmark scripts
 ```

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use diffusion::h3;
-use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Request, Sampling, Step};
+use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, Step};
 use diffusion::pixal3d;
 use diffusion::preview;
 use diffusion::samplers::{self, CfgFunction, CfgTweaks, ModelSampling, SigmaRange};
@@ -33,6 +33,8 @@ const ANIMA_SHIFT: f64 = 3.0;
 const MOSS_SHIFT: f64 = 5.0;
 /// ComfyUI's Qwen Image 2.1 `shift`: its mu at 1024x1024.
 const QWEN21_SHIFT: f64 = 0.69;
+/// [`TextEncoderHandle::encoder_type`] of Krea 2's Qwen3-VL 4B, SwarmUI's own type.
+const KREA_ENCODER: &str = "krea2";
 /// [`TextEncoderHandle::encoder_type`] of Anima's Qwen3 0.6B; SwarmUI's own type is the generic
 /// `stable_diffusion`.
 const ANIMA_ENCODER: &str = "anima";
@@ -494,7 +496,7 @@ impl NativeEngine {
     fn load_model(&self, file: &ModelFile) -> EngineResult<ModelHandle> {
         // `weight_dtype` doesn't apply: the file's int8 weights are used as stored.
         let (family, name) = match check_dit(file)? {
-            Family::Krea2 => (self.gen().ensure_dit(&file.path), "krea-2"),
+            Family::Krea2 => (self.gen().ensure_krea(&file.path), "krea-2"),
             Family::Anima => (self.gen().ensure_anima(&file.path), "anima"),
             Family::Moss => (self.gen().ensure_moss(&file.path), "moss-image"),
             Family::H3 => (self.gen().ensure_h3(&file.path), "minimax-h3"),
@@ -502,6 +504,53 @@ impl NativeEngine {
         };
         family.map_err(internal)?;
         Ok(ModelHandle::new(Some(file.clone()), Some(name.into()), Opaque::none()))
+    }
+
+    fn sample_krea(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, progress: &mut dyn ProgressSink)
+        -> EngineResult<Vec<f32>> {
+        let (batch, lh, lw) = shape;
+        let mode = self.preview_mode(req);
+        let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
+        let (cond, prompt) = single_prompt(&req.positive, Family::Krea2)?;
+        let (references, timestep_zero) = reference_latents(&req.positive, Family::Krea2)?;
+        let (negative, negative_images) = if sampling(req, settings, shape, 0)?.uses_negative() {
+            let (c, p) = single_prompt(&req.negative, Family::Krea2)?;
+            check_text_encoder_loras(cond, c)?;
+            if !reference_latents(&req.negative, Family::Krea2)?.0.is_empty() {
+                return Err(unsupported("reference latents on the negative prompt"));
+            }
+            (p, c.images.clone())
+        } else {
+            (Prompt::text(""), Vec::new())
+        };
+        let mut gen = self.gen();
+        gen.ensure_krea(&file.path).map_err(internal)?;
+        gen.ensure_te(&cond.text_encoder).map_err(internal)?;
+        gen.set_int8_attention(settings.int8_attention);
+        gen.set_loras(&settings.loras).map_err(internal)?;
+        gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
+        let mut data = Vec::with_capacity(batch * 16 * lh * lw);
+        for i in 0..batch {
+            let r = KreaRequest {
+                prompt: prompt.clone(),
+                negative: negative.clone(),
+                seed: req.noise_seed,
+                width: lw * 8,
+                height: lh * 8,
+                sampling: sampling(req, settings, shape, i)?,
+                noise: Some(noise::swarm_noise(req.noise_seed, req.variation, i as u64, 16, lh, lw)),
+                images: cond.images.clone(),
+                negative_images: negative_images.clone(),
+                references: references.clone(),
+                timestep_zero,
+            };
+            let (latent, stats) = gen
+                .sample_krea(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::wan21(x0, lh, lw), lh, lw)), None)
+                .map_err(internal)?;
+            tracing::info!("krea2: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
+            data.extend_from_slice(&latent);
+        }
+        Ok(data)
     }
 
     fn sample_anima(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, progress: &mut dyn ProgressSink)
@@ -811,7 +860,7 @@ impl Engine for NativeEngine {
         // The file holds only the diffusion model; SwarmUI adds its own CLIPLoader and VAELoader.
         Ok((
             self.load_model(&req.file)?,
-            TextEncoderHandle { sources: vec![], encoder_type: "krea2".into(), device: "default".into(), engine: Opaque::none(), patches: vec![] },
+            TextEncoderHandle { sources: vec![], encoder_type: String::new(), device: "default".into(), engine: Opaque::none(), patches: vec![] },
             VaeHandle::new(None, Opaque::none()),
         ))
     }
@@ -825,9 +874,9 @@ impl Engine for NativeEngine {
             return Err(unsupported("dual text encoders"));
         };
         let encoder_type = match req.encoder_type.as_str() {
-            "krea2" => {
+            KREA_ENCODER => {
                 self.gen().ensure_te(&file.path).map_err(internal)?;
-                "krea2"
+                KREA_ENCODER
             }
             // Qwen Image 1's encoder (Qwen2.5-VL 7B) goes by the same type
             "qwen_image" if is_qwen3vl_8b(file) => {
@@ -877,7 +926,8 @@ impl Engine for NativeEngine {
             MOSS_ENCODER => Family::Moss,
             MINIMAX_ENCODER => Family::H3,
             QWEN21_ENCODER => Family::Qwen21,
-            _ => Family::Krea2,
+            KREA_ENCODER => Family::Krea2,
+            t => return Err(unsupported(format!("text encoder type {t}"))),
         };
         let images = match &req.mode {
             TextEncodeMode::Swarm(s) if family.one_piece() => s.images.as_ref().map(prompt_images).unwrap_or_default(),
@@ -955,52 +1005,14 @@ impl Engine for NativeEngine {
                 data: Opaque::new(HostLatent { data }),
             })))
         };
-        if family == Family::Anima {
-            return finish(self.sample_anima(req, (batch, lh, lw), &settings, progress)?);
-        }
-        if family == Family::Moss {
-            return finish(self.sample_moss(req, (batch, lh, lw), &settings, progress)?);
-        }
-        if family == Family::Qwen21 {
-            return finish(self.sample_qwen21(req, (batch, lh, lw), &settings, progress)?);
-        }
-        let (cond, prompt) = single_prompt(&req.positive, family)?;
-        let text_encoder = &cond.text_encoder;
-        let (references, timestep_zero) = reference_latents(&req.positive, family)?;
-        let (width, height) = (lw * 8, lh * 8);
         let shape = (batch, lh, lw);
-        let (negative, negative_images) = if sampling(req, &settings, shape, 0)?.uses_negative() {
-            let (c, p) = single_prompt(&req.negative, family)?;
-            check_text_encoder_loras(cond, c)?;
-            if !reference_latents(&req.negative, family)?.0.is_empty() {
-                return Err(unsupported("reference latents on the negative prompt"));
-            }
-            (p, c.images.clone())
-        } else {
-            (Prompt::text(""), Vec::new())
-        };
-
-        let mode = self.preview_mode(req);
-        let mut gen = self.gen();
-        gen.ensure_dit(&file.path).map_err(internal)?;
-        gen.ensure_te(text_encoder).map_err(internal)?;
-        gen.set_int8_attention(settings.int8_attention);
-        gen.set_loras(&settings.loras).map_err(internal)?;
-        gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
-
-        let mut data = Vec::with_capacity(batch * 16 * lh * lw);
-        for i in 0..batch {
-            let image = noise::swarm_noise(req.noise_seed, req.variation, i as u64, 16, lh, lw);
-            let r = Request { prompt: prompt.clone(), negative: negative.clone(), seed: req.noise_seed, width, height,
-                sampling: sampling(req, &settings, shape, i)?, noise: Some(image), images: cond.images.clone(),
-                negative_images: negative_images.clone(), references: references.clone(), timestep_zero };
-            let (latent, stats) = gen
-                .sample_latent(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::wan21(x0, lh, lw), lh, lw)))
-                .map_err(internal)?;
-            tracing::info!("native: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
-            data.extend_from_slice(&latent);
-        }
-        finish(data)
+        finish(match family {
+            Family::Krea2 => self.sample_krea(req, shape, &settings, progress)?,
+            Family::Anima => self.sample_anima(req, shape, &settings, progress)?,
+            Family::Moss => self.sample_moss(req, shape, &settings, progress)?,
+            Family::Qwen21 => self.sample_qwen21(req, shape, &settings, progress)?,
+            Family::H3 => unreachable!("H3 samples above"),
+        })
     }
 
     fn vae_decode(&self, req: &VaeDecodeRequest, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {

@@ -22,8 +22,8 @@ It really generates with five image and video model families and one image-to-3D
 | MiniMax H3 | Text to video with audio | 0.24 s/step, 5 frames at 512x512 | 1.59 s/step |
 | Pixal3D | Image to a vertex-coloured 3D mesh (GLB), cutting the object out first with BiRefNet | 40 s per mesh at resolution 1024, 110 s at 1536 | not timed |
 
-All of them take every ComfyUI sampler and scheduler, and all of them take LoRAs. Init images, inpainting, ControlNet, refiners and every
-other model family don't work yet. The server accepts far more of SwarmUI's features than that, but they only reach a
+All of them take every ComfyUI sampler and scheduler, and all of them take LoRAs. Init images, inpainting and refiners work on the image
+models (MOSS Image only refines, with no VAE encoder). ControlNet and every other model family don't work yet. The server accepts far more of SwarmUI's features than that, but they only reach a
 mock engine, so run this beside a normal ComfyUI backend. [Status](docs/STATUS.md) lists what works and what's left, in
 priority order.
 

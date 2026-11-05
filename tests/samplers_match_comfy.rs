@@ -80,7 +80,7 @@ fn samplers_match_comfy() {
         let mut mock = Mock { target: target.clone(), cfg: c["cfg"].as_f64().unwrap() as f32, evals: Vec::new() };
         let mut eval = |x: &[f32], s: f32, mode: Uncond| Ok(mock.eval(x, s, mode));
         let mut step = |_: usize, _: usize| Ok(());
-        let x = samplers::sample(sampler, ms, &sigmas, &noise, seed, batch, &mut eval, &mut step).unwrap();
+        let x = samplers::sample(sampler, ms, &sigmas, &noise, None, seed, batch, &mut eval, &mut step).unwrap();
 
         let want = floats(&c["x"]);
         let name = format!("{sampler} ({} {} {} {} cfg {})", c["kind"], c["shift"], c["scheduler"], c["steps"], c["cfg"]);

@@ -2,6 +2,7 @@
 
 use crate::cuda::{self, DevBuf, Event, Stream};
 use crate::samplers::{self, CfgTweaks, Eval, ModelSampling, Uncond};
+pub use crate::samplers::Inpaint;
 use crate::vision::{self, PromptImage};
 use crate::{anima, dit, ffi, flux2vae, h3, h3te, h3vae, lora, moss, offload, qwen21, qwen3, qwen35, sampling, st, te, tokenizer, vae, vae21};
 use anyhow::{bail, Context, Result};
@@ -45,6 +46,10 @@ pub struct Sampling {
     pub batch_index: usize,
     pub batch_size: usize,
     pub tweaks: CfgTweaks,
+    /// The latent sampling starts from, at the sampler's scale (after `process_latent_in`); `None` is an empty latent.
+    /// With `sigmas` starting below the model's highest this is img2img.
+    pub latent: Option<Vec<f32>>,
+    pub inpaint: Option<Inpaint>,
 }
 
 /// A prompt as ComfyUI's conditioning is built from it.
@@ -139,7 +144,18 @@ impl Sampling {
     /// One image at `cfg` with the given sampler and scheduler.
     pub fn new(sampler: &str, scheduler: &str, model_sampling: ModelSampling, steps: usize, cfg: f64, seed: u64, latent: (usize, usize)) -> Result<Self> {
         let sigmas = samplers::sigmas(model_sampling, sampler, scheduler, steps, latent, None)?;
-        Ok(Sampling { sampler: sampler.to_string(), model_sampling, sigmas, cfg, seed, batch_index: 0, batch_size: 1, tweaks: CfgTweaks::default() })
+        Ok(Sampling {
+            sampler: sampler.to_string(),
+            model_sampling,
+            sigmas,
+            cfg,
+            seed,
+            batch_index: 0,
+            batch_size: 1,
+            tweaks: CfgTweaks::default(),
+            latent: None,
+            inpaint: None,
+        })
     }
 
     /// True when the negative prompt has to be encoded.
@@ -313,6 +329,17 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
         bail!("could not read the GPU's core count");
     }
     let n = noise.len();
+    if s.latent.as_ref().is_some_and(|l| l.len() != n) || s.inpaint.as_ref().is_some_and(|i| i.mask.len() != n) {
+        bail!("the latent or mask doesn't match the noise's {n} values");
+    }
+    let zeros;
+    let latent = match &s.latent {
+        Some(l) => l.as_slice(),
+        None => {
+            zeros = vec![0f32; n];
+            &zeros
+        }
+    };
     let (x, den, und) = (DevBuf::alloc_async(n * 4, st)?, DevBuf::alloc_async(n * 4, st)?, DevBuf::alloc_async(n * 4, st)?);
     let (e0, e1) = (Event::timing()?, Event::timing()?);
     let cfg = s.cfg as f32;
@@ -322,6 +349,16 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
     let latest = RefCell::new(Vec::new());
     let mut eval = |v: &[f32], sigma: f32, mode: Uncond| -> Result<Eval> {
         e0.record(st)?;
+        // KSamplerX0Inpaint: the model sees the kept region noised to this sigma
+        let mask = s.inpaint.as_ref().map(|i| i.mask_at(s.model_sampling, &s.sigmas, sigma));
+        let masked: Vec<f32>;
+        let v = match &mask {
+            Some(m) => {
+                masked = Inpaint::input(m, v, sigma, noise, latent);
+                &masked
+            }
+            None => v,
+        };
         x.upload(0, &st::f32_bytes(v), st)?;
         model(&x, &den, sigma, false, evals)?;
         let negative = guided || mode == Uncond::Force;
@@ -344,6 +381,11 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
         } else {
             (read(&den)?, if negative && mode != Uncond::Skip { Some(read(&und)?) } else { None })
         };
+        // and its prediction there is the latent; the uncond a sampler reads stays the model's (post-CFG hooks)
+        let denoised = match &mask {
+            Some(m) => Inpaint::prediction(m, &denoised, latent),
+            None => denoised,
+        };
         latest.borrow_mut().clone_from(&denoised);
         e1.record(st)?;
         e1.sync()?;
@@ -355,7 +397,7 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
     };
     let mut step = |index: usize, total: usize| if progress(Step { index, total, denoised: &latest.borrow() }) { Ok(()) } else { Err(Cancelled.into()) };
     let batch = samplers::Batch { index: s.batch_index, size: s.batch_size, threads: threads as usize };
-    let out = samplers::sample(&s.sampler, s.model_sampling, &s.sigmas, noise, s.seed, batch, &mut eval, &mut step)?;
+    let out = samplers::sample(&s.sampler, s.model_sampling, &s.sigmas, noise, s.latent.as_deref(), s.seed, batch, &mut eval, &mut step)?;
     stats.sample_ms = sample_ms;
     eprintln!("sampling {:.2}s ({:.0} ms/evaluation)", sample_ms / 1e3, sample_ms / evals.max(1) as f64);
     Ok(out)

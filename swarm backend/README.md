@@ -72,8 +72,9 @@ These work on every family: all samplers and schedulers except `ltxv-image`, any
 Min, Sigma Max and Rho, LoRAs, live previews with `--live-previews`, Conditioning Multiplier, Negative Conditioning Multiplier and Zero Negative. See [Usage](../docs/USAGE.md) and [Models](../docs/MODELS.md).
 
 Anything else is refused with an error in SwarmUI rather than silently ignored, including `<alternate>`,
-`<fromto>`, LoRA hooks, init images, refiners, ControlNet, regions, Seamless Tileable, and VAE tiling. H3 only
-accepts VAE tile sizes of 256 / 64.
+`<fromto>`, LoRA hooks, ControlNet, regions, Seamless Tileable, and VAE tiling. H3 only accepts VAE tile sizes of 256 / 64,
+and refuses init videos and refiners. Init images, refiners and inpainting work on the image models, tested through
+SwarmUI.
 
 **LoRAs** come from the LoRA parameter or `<lora:name:weight>`, stacked, at any strength. The first image after a change
 bakes them into the weights (about 3 s on Krea 2, 1 s on Anima and MOSS Image, 11 s on H3, with the files cached), and sampling

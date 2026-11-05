@@ -36,7 +36,7 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | Prompt weights | Refused | Yes | Yes | Refused | Yes | - |
 | `<break>` | Yes | Refused | Yes | Refused | Refused | - |
 | `<alternate>`, `<fromto>` | Refused | Refused | Refused | Refused | Refused | - |
-| Init images, refiners, inpainting (partial sampling) | Refused | Refused | Refused | Refused | Refused | - |
+| Init images, refiners, inpainting (partial sampling) | Yes | Yes (refiner not tested) | Refiner only (no VAE encoder) | Yes (refiner not tested) | Refused | - |
 | VAE tiling, Seamless Tileable | Refused | Refused | Refused | Refused | Only the 256 / 64 tile | - |
 | Background removal | - | - | - | - | - | Yes (BiRefNet) |
 
@@ -170,7 +170,7 @@ differs by 0.5%, because torch's bf16 GEMM isn't exact at those sizes. The same 
 
 Runs int8 ConvRot Qwen Image 2.1 checkpoints with the Qwen3-VL 8B text encoder and its RGBA VAE (64 channels at 1/16, so
 the image can have alpha). Every sampler and scheduler works. The model is a CFG 1 model: at CFG 1.5 the picture turns
-oversharp, and at 3 it breaks into stripes, exactly as in ComfyUI. Init images and partial sampling are refused.
+oversharp, and at 3 it breaks into stripes, exactly as in ComfyUI. Init images and inpainting work, 47.6 and 51.7 dB from ComfyUI through SwarmUI.
 
 ```bash
 target/release/diffusion.exe --qwen21 -p "no people, a stone lighthouse on a rocky coast at sunset, calm sea" --steps 8 -o lighthouse.png

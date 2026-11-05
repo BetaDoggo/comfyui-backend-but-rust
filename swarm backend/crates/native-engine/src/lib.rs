@@ -1,7 +1,8 @@
 //! [`Engine`] implementation on the diffusion library: text-to-image for int8 ConvRot checkpoints of
 //! Krea 2, Anima, MOSS Image and Qwen Image 2.1 and text-to-video with audio for MiniMax H3, with every ComfyUI
 //! sampler and scheduler, any CFG and LoRAs, plus the prompt images and reference
-//! latents of Krea 2 and of Qwen Image 2.1's edits. Each
+//! latents of Krea 2 and of Qwen Image 2.1's edits. The image models also sample partially, from
+//! a latent and with a noise mask: init images, refiners and inpainting. Each
 //! file's architecture is read from its keys, so one backend serves them all.
 //!
 //! Text encoding is deferred to `sample`, so the negative prompt SwarmUI always sends costs nothing
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use diffusion::h3;
-use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, Step};
+use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, Step};
 use diffusion::pixal3d;
 use diffusion::preview;
 use diffusion::samplers::{self, CfgFunction, CfgTweaks, ModelSampling, SigmaRange};
@@ -257,9 +258,10 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<Vec<(St
             if s.guidance.is_some() {
                 return Err("Flux Guidance Scale".into());
             }
-            // The node only uses the template with images, and Krea 2's is the one its encoder has. Qwen Image 2.1
-            // builds its own.
-            if !matches!(s.llama_template.as_deref(), None) && !(family == Family::Krea2 && s.llama_template.as_deref() == Some("krea2")) {
+            // The node only uses the template with images (SwarmUI sends `krea2` to MOSS Image too), and Krea 2's is
+            // the one its encoder has. Qwen Image 2.1 builds its own.
+            let template_used = s.images.is_some() && s.llama_template.is_some();
+            if template_used && !(family == Family::Krea2 && s.llama_template.as_deref() == Some("krea2")) {
                 return Err(format!("prompt template {:?}", s.llama_template));
             }
             let chunks = prompt_chunks(&s.prompt, s.steps, family)?;
@@ -357,6 +359,8 @@ struct ModelSettings {
     /// MiniMax H3's audio flow shift.
     audio_shift: f64,
     tweaks: CfgTweaks,
+    /// `DifferentialDiffusion`'s strength, for noise masks.
+    differential: Option<f32>,
 }
 
 fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
@@ -368,7 +372,7 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::H3 => ModelSampling::Flow { shift: h3::SHIFT_VIDEO },
     };
     // H3's attention sink rows make int8's per-channel V scale lossy
-    let mut s = ModelSettings { model_sampling, int8_attention: family != Family::H3, loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default() };
+    let mut s = ModelSettings { model_sampling, int8_attention: family != Family::H3, loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None };
     for p in &model.patches {
         match p {
             ModelPatch::SamplingFlux { max_shift, base_shift, width, height } if matches!(family, Family::Krea2 | Family::Qwen21) => {
@@ -397,6 +401,8 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
             }
             ModelPatch::CfgZeroStar if family != Family::H3 => s.tweaks.zero_star = true,
             ModelPatch::Tcfg if family != Family::H3 => s.tweaks.tangential = true,
+            // only read with a noise mask, which H3 refuses
+            ModelPatch::DifferentialDiffusion { strength } => s.differential = Some(*strength as f32),
             // Weighted prompts are refused in encode_text; with none this patch has no effect.
             ModelPatch::AttnTokenWeights { .. } | ModelPatch::Compile { .. } => {}
             ModelPatch::Lora { file, strength } => s.loras.push(Lora { path: file.path.clone(), strength: *strength }),
@@ -409,7 +415,7 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
     Ok(s)
 }
 
-/// Everything in a sampler request beyond seeded text-to-image is refused here.
+/// Everything in a sampler request the pipeline can't run is refused here.
 fn check_sample(req: &SampleRequest) -> EngineResult<()> {
     if !samplers::SAMPLERS.contains(&req.sampler.as_str()) {
         return Err(unsupported(format!("sampler {}", req.sampler)));
@@ -417,31 +423,81 @@ fn check_sample(req: &SampleRequest) -> EngineResult<()> {
     if !samplers::SCHEDULERS.contains(&req.scheduler.as_str()) {
         return Err(unsupported(format!("scheduler {}", req.scheduler)));
     }
-    if req.start_at_step != 0 || req.end_at_step < req.steps || !req.add_noise || req.denoise != 1.0 {
-        return Err(unsupported("partial sampling (init images, refiners)"));
-    }
-    if !req.latent.empty || req.latent.noise_mask.is_some() {
-        return Err(unsupported("init images and masks (no VAE encoder yet)"));
-    }
     if req.tile_size.is_some() {
         return Err(unsupported("tiled sampling"));
     }
     Ok(())
 }
 
-/// The sampling of image `index` of `batch`.
-fn sampling(req: &SampleRequest, settings: &ModelSettings, (batch, lh, lw): (usize, usize, usize), index: usize) -> EngineResult<Sampling> {
+/// The sigmas a run takes: `KSampler.set_steps` for `denoise`, then the step range of `PatchedKSampler.sample`. `None`
+/// when no step is left, and the latent comes back as it is.
+fn schedule(req: &SampleRequest, settings: &ModelSettings, (lh, lw): (usize, usize)) -> EngineResult<Option<Vec<f32>>> {
     let range = req.sigma_min.zip(req.sigma_max).map(|(sigma_min, sigma_max)| SigmaRange { sigma_min, sigma_max, rho: req.rho });
-    let sigmas = samplers::sigmas(settings.model_sampling, &req.sampler, &req.scheduler, req.steps as usize, (lw, lh), range).map_err(internal)?;
+    let schedule = |steps| samplers::sigmas(settings.model_sampling, &req.sampler, &req.scheduler, steps, (lw, lh), range);
+    let (start, end) = (req.start_at_step as usize, req.end_at_step as usize);
+    samplers::ksampler_sigmas(req.steps as usize, req.denoise, start, end, req.return_with_leftover_noise, schedule).map_err(internal)
+}
+
+/// `comfy.utils.reshape_mask`: a noise mask resized to the latent `[batch, channels, lh, lw]`, bilinearly.
+fn denoise_mask(m: &Mask, format: LatentFormat, (batch, channels, lh, lw): (usize, usize, usize, usize)) -> EngineResult<Vec<f32>> {
+    let (count, h, w) = (m.count as usize, m.height as usize, m.width as usize);
+    if m.data.len() != count * h * w {
+        return Err(EngineError::InvalidInput(format!("a noise mask of {} values for {count}x{h}x{w}", m.data.len())));
+    }
+    // ComfyUI's image latents of these models are 5D, where a batch of masks is resized across the batch
+    if count > 1 && format != LatentFormat::Flux2 {
+        return Err(unsupported("a batch of different noise masks on this model's latents"));
+    }
+    let resized = diffusion::latent_ops::interpolate(&m.data, [count, 1, h, w], lh, lw, "bilinear").map_err(internal)?;
+    let planes = diffusion::latent_ops::repeat_to_batch(&resized, [count, 1, lh, lw], batch);
+    Ok(planes.chunks_exact(lh * lw).flat_map(|p| std::iter::repeat_n(p, channels).flatten().copied()).collect())
+}
+
+/// What the images of a batch share: the sigmas, and where sampling starts.
+struct Plan {
+    sigmas: Vec<f32>,
+    /// The batch's latent at the sampler's scale; `None` when empty.
+    latent: Option<Vec<f32>>,
+    /// The batch's noise mask, resized to the latent.
+    mask: Option<Vec<f32>>,
+    differential: Option<f32>,
+}
+
+impl Plan {
+    fn new(sigmas: Vec<f32>, latent: &Latent, tensor: &LatentTensor, settings: &ModelSettings) -> EngineResult<Self> {
+        let &[batch, channels, lh, lw] = tensor.shape.as_slice() else {
+            return Err(unsupported(format!("latent shape {:?}", tensor.shape)));
+        };
+        let values = match tensor.data.downcast_ref::<HostLatent>() {
+            Some(h) if h.data.len() == batch * channels * lh * lw => Some(h.data.clone()),
+            Some(h) => return Err(EngineError::InvalidInput(format!("a latent of {} values for shape {:?}", h.data.len(), tensor.shape))),
+            None if tensor.data.is_none() => None,
+            None => return Err(unsupported("a latent this engine didn't make")),
+        };
+        let mask = latent.noise_mask.as_ref().map(|m| denoise_mask(m, tensor.format, (batch, channels, lh, lw))).transpose()?;
+        Ok(Plan { sigmas, latent: values, mask, differential: settings.differential })
+    }
+
+    /// The noise of image `index`: SwarmKSampler's, or zeros without `add_noise`.
+    fn noise(&self, req: &SampleRequest, index: usize, (channels, lh, lw): (usize, usize, usize)) -> Vec<f32> {
+        if req.add_noise { noise::swarm_noise(req.noise_seed, req.variation, index as u64, channels, lh, lw) } else { vec![0.0; channels * lh * lw] }
+    }
+}
+
+/// The sampling of image `index` of `batch`.
+fn sampling(req: &SampleRequest, settings: &ModelSettings, plan: &Plan, (batch, _, _): (usize, usize, usize), index: usize) -> EngineResult<Sampling> {
+    let part = |v: &Vec<f32>| v.chunks_exact(v.len() / batch).nth(index).unwrap().to_vec();
     Ok(Sampling {
         sampler: req.sampler.clone(),
         model_sampling: settings.model_sampling,
-        sigmas,
+        sigmas: plan.sigmas.clone(),
         cfg: req.cfg,
         seed: req.noise_seed,
         batch_index: index,
         batch_size: batch,
         tweaks: settings.tweaks,
+        latent: plan.latent.as_ref().map(part),
+        inpaint: plan.mask.as_ref().map(|m| Inpaint { mask: part(m), differential: plan.differential }),
     })
 }
 
@@ -507,14 +563,14 @@ impl NativeEngine {
         Ok(ModelHandle::new(Some(file.clone()), Some(name.into()), Opaque::none()))
     }
 
-    fn sample_krea(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, progress: &mut dyn ProgressSink)
+    fn sample_krea(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, plan: &Plan, progress: &mut dyn ProgressSink)
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
         let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, prompt) = single_prompt(&req.positive, Family::Krea2)?;
         let (references, timestep_zero) = reference_latents(&req.positive, Family::Krea2)?;
-        let (negative, negative_images) = if sampling(req, settings, shape, 0)?.uses_negative() {
+        let (negative, negative_images) = if sampling(req, settings, plan, shape, 0)?.uses_negative() {
             let (c, p) = single_prompt(&req.negative, Family::Krea2)?;
             check_text_encoder_loras(cond, c)?;
             if !reference_latents(&req.negative, Family::Krea2)?.0.is_empty() {
@@ -538,8 +594,8 @@ impl NativeEngine {
                 seed: req.noise_seed,
                 width: lw * 8,
                 height: lh * 8,
-                sampling: sampling(req, settings, shape, i)?,
-                noise: Some(noise::swarm_noise(req.noise_seed, req.variation, i as u64, 16, lh, lw)),
+                sampling: sampling(req, settings, plan, shape, i)?,
+                noise: Some(plan.noise(req, i, (16, lh, lw))),
                 images: cond.images.clone(),
                 negative_images: negative_images.clone(),
                 references: references.clone(),
@@ -554,14 +610,14 @@ impl NativeEngine {
         Ok(data)
     }
 
-    fn sample_anima(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, progress: &mut dyn ProgressSink)
+    fn sample_anima(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, plan: &Plan, progress: &mut dyn ProgressSink)
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
         let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, positive) = single_prompt(&req.positive, Family::Anima)?;
         let text_encoder = &cond.text_encoder;
-        let first = sampling(req, settings, shape, 0)?;
+        let first = sampling(req, settings, plan, shape, 0)?;
         let negative = if first.uses_negative() {
             let (c, p) = single_prompt(&req.negative, Family::Anima)?;
             check_text_encoder_loras(cond, c)?;
@@ -582,8 +638,8 @@ impl NativeEngine {
                 negative: negative.clone(),
                 width: lw * 8,
                 height: lh * 8,
-                sampling: sampling(req, settings, shape, i)?,
-                noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, 16, lh, lw),
+                sampling: sampling(req, settings, plan, shape, i)?,
+                noise: plan.noise(req, i, (16, lh, lw)),
             };
             let (latent, stats) = gen
                 .sample_anima(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::wan21(x0, lh, lw), lh, lw)), None)
@@ -643,14 +699,14 @@ impl NativeEngine {
 
     /// Qwen Image 2.1: text to image and edits. Prompt images go through the vision tower and, as the reference latents
     /// of the prompts, into the sequence.
-    fn sample_qwen21(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, progress: &mut dyn ProgressSink)
+    fn sample_qwen21(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, plan: &Plan, progress: &mut dyn ProgressSink)
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
         let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, positive) = single_prompt(&req.positive, Family::Qwen21)?;
         let references = reference_latents(&req.positive, Family::Qwen21)?.0;
-        let first = sampling(req, settings, shape, 0)?;
+        let first = sampling(req, settings, plan, shape, 0)?;
         let (negative, negative_images) = if first.uses_negative() {
             let (c, p) = single_prompt(&req.negative, Family::Qwen21)?;
             check_text_encoder_loras(cond, c)?;
@@ -676,8 +732,8 @@ impl NativeEngine {
                 negative: negative.clone(),
                 width,
                 height,
-                sampling: sampling(req, settings, shape, i)?,
-                noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, diffusion::qwen21::CH, lh, lw),
+                sampling: sampling(req, settings, plan, shape, i)?,
+                noise: plan.noise(req, i, (diffusion::qwen21::CH, lh, lw)),
                 images: cond.images.clone(),
                 negative_images: negative_images.clone(),
                 references: references.clone(),
@@ -707,9 +763,15 @@ impl NativeEngine {
         if req.positive.entries.iter().any(|e| !e.meta.minimax_keyframes.is_empty()) {
             return Err(unsupported("first and last frame conditioning on MiniMax H3 (no VAE encoder yet)"));
         }
+        let partial = req.start_at_step != 0 || req.end_at_step < req.steps || !req.add_noise || req.denoise != 1.0;
+        if partial || req.latent.noise_mask.is_some() || req.latent.audio_noise_mask.is_some() || !video.data.is_none() || !audio.data.is_none() {
+            return Err(unsupported("init videos, refiners and noise masks on MiniMax H3"));
+        }
         let (cond, prompt) = single_prompt(&req.positive, Family::H3)?;
         let shape = h3::Shape { t, h: lh, w: lw, audio_t };
-        let sampling = sampling(req, settings, (1, lh, lw), 0)?;
+        let sigmas = schedule(req, settings, (lh, lw))?.ok_or_else(|| EngineError::InvalidInput("no steps to sample".into()))?;
+        let plan = Plan { sigmas, latent: None, mask: None, differential: None };
+        let sampling = sampling(req, settings, &plan, (1, lh, lw), 0)?;
         let negative = if sampling.uses_negative() { single_prompt(&req.negative, Family::H3)?.1 } else { Prompt::new(Vec::new()) };
         let ModelSampling::Flow { shift } = settings.model_sampling else { unreachable!("H3 is a flow model") };
         let mut gen = self.gen();
@@ -758,13 +820,13 @@ impl NativeEngine {
         Ok(ImageBatch::from_u8(frames as u32, h as u32, w as u32, 3, rgb))
     }
 
-    fn sample_moss(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, progress: &mut dyn ProgressSink)
+    fn sample_moss(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, plan: &Plan, progress: &mut dyn ProgressSink)
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
         let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, positive) = single_prompt(&req.positive, Family::Moss)?;
-        let negative = if sampling(req, settings, shape, 0)?.uses_negative() {
+        let negative = if sampling(req, settings, plan, shape, 0)?.uses_negative() {
             let (c, p) = single_prompt(&req.negative, Family::Moss)?;
             check_text_encoder_loras(cond, c)?;
             p
@@ -784,8 +846,8 @@ impl NativeEngine {
                 negative: negative.clone(),
                 width: lw * 16,
                 height: lh * 16,
-                sampling: sampling(req, settings, shape, i)?,
-                noise: noise::swarm_noise(req.noise_seed, req.variation, i as u64, diffusion::moss::CH, lh, lw),
+                sampling: sampling(req, settings, plan, shape, i)?,
+                noise: plan.noise(req, i, (diffusion::moss::CH, lh, lw)),
             };
             let (latent, stats) = gen
                 .sample_moss(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::flux2(x0, lh, lw), lh * 2, lw * 2)), None)
@@ -1007,11 +1069,17 @@ impl Engine for NativeEngine {
             })))
         };
         let shape = (batch, lh, lw);
+        let Some(sigmas) = schedule(req, &settings, (lh, lw))? else {
+            // no step left: ComfyUI returns the latent it was given
+            let plan = Plan::new(Vec::new(), latent, tensor, &settings)?;
+            return finish(plan.latent.unwrap_or_else(|| vec![0.0; batch * channels * lh * lw]));
+        };
+        let plan = Plan::new(sigmas, latent, tensor, &settings)?;
         finish(match family {
-            Family::Krea2 => self.sample_krea(req, shape, &settings, progress)?,
-            Family::Anima => self.sample_anima(req, shape, &settings, progress)?,
-            Family::Moss => self.sample_moss(req, shape, &settings, progress)?,
-            Family::Qwen21 => self.sample_qwen21(req, shape, &settings, progress)?,
+            Family::Krea2 => self.sample_krea(req, shape, &settings, &plan, progress)?,
+            Family::Anima => self.sample_anima(req, shape, &settings, &plan, progress)?,
+            Family::Moss => self.sample_moss(req, shape, &settings, &plan, progress)?,
+            Family::Qwen21 => self.sample_qwen21(req, shape, &settings, &plan, progress)?,
             Family::H3 => unreachable!("H3 samples above"),
         })
     }
@@ -1282,6 +1350,18 @@ mod tests {
         assert!(shows_preview(PreviewMode::One, 0, 2) && !shows_preview(PreviewMode::One, 1, 2));
         assert!(shows_preview(PreviewMode::Second, 1, 2) && shows_preview(PreviewMode::Second, 0, 1));
         assert!(shows_preview(PreviewMode::Default, 1, 2));
+    }
+
+    #[test]
+    fn noise_masks_resize_to_every_channel_and_image() {
+        let mask = Mask { count: 1, height: 2, width: 2, data: Arc::new(vec![0.0, 1.0, 0.0, 1.0]) };
+        let m = denoise_mask(&mask, LatentFormat::Image16Ch, (2, 3, 2, 4)).unwrap();
+        assert_eq!(m.len(), 2 * 3 * 2 * 4);
+        // torch's bilinear, align_corners=False: [0, 0.25, 0.75, 1] across
+        assert!(m.chunks_exact(4).all(|row| row == [0.0, 0.25, 0.75, 1.0]), "{m:?}");
+        let two = Mask { count: 2, height: 1, width: 1, data: Arc::new(vec![0.0, 1.0]) };
+        assert_eq!(denoise_mask(&two, LatentFormat::Flux2, (3, 1, 1, 1)).unwrap(), [0.0, 1.0, 0.0]);
+        assert!(matches!(denoise_mask(&two, LatentFormat::Image16Ch, (2, 1, 1, 1)), Err(EngineError::Unsupported(_))));
     }
 
     #[test]

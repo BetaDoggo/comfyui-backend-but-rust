@@ -346,7 +346,7 @@ Verified live: SwarmUI saved a 1024×768 RGBA PNG with the mock's alpha gradient
 * The MMDiT with reference latents, with the text/reference prefix cached across steps as ComfyUI does.
 * The RGBA VAE: RGB input is padded with alpha 1.0 when encoding, and decoding gives 4 channels.
 * `EmptyLatentImage` returns a 4-channel latent and `sample` widens it with `Latent::conform_empty`.
-* Refused: `<break>`, prompt weights, init images and refiners (partial sampling), differing reference latents on the
+* Refused: `<break>`, prompt weights, differing reference latents on the
   two prompts.
 
 ---

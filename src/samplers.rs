@@ -50,8 +50,17 @@ impl ModelSampling {
     }
 
     fn table(self) -> V {
-        let n = if matches!(self, ModelSampling::Flow { .. }) { 1000 } else { 10000 };
+        let n = self.table_len();
         (1..=n).map(|i| self.sigma(i as f32 / n as f32)).collect()
+    }
+
+    fn table_len(self) -> usize {
+        if matches!(self, ModelSampling::Flow { .. }) { 1000 } else { 10000 }
+    }
+
+    /// `model_sampling.sigma_min`: the table's first entry.
+    pub fn sigma_min(self) -> f32 {
+        self.sigma(1.0 / self.table_len() as f32)
     }
 
     pub fn percent_to_sigma(self, percent: f64) -> f32 {
@@ -68,6 +77,67 @@ impl ModelSampling {
             ModelSampling::Flux { shift } => shift.exp() / (shift.exp() + (1.0 / t - 1.0)),
         }) as f32
     }
+}
+
+/// `SetLatentNoiseMask`, as `KSamplerX0Inpaint` applies it: outside the mask each model input is the latent noised to
+/// the step's sigma, and each prediction is the latent.
+#[derive(Clone, Debug)]
+pub struct Inpaint {
+    /// One value per latent value (`comfy.utils.reshape_mask`): 1 denoises, 0 keeps the latent.
+    pub mask: V,
+    /// `DifferentialDiffusion`'s strength: each step denoises where the mask reaches the step's place in the schedule.
+    pub differential: Option<f32>,
+}
+
+impl Inpaint {
+    /// The mask at `sigma` of a run over `sigmas`: `DifferentialDiffusion.forward` when it applies.
+    pub fn mask_at(&self, ms: ModelSampling, sigmas: &[f32], sigma: f32) -> std::borrow::Cow<'_, [f32]> {
+        let Some(strength) = self.differential else { return std::borrow::Cow::Borrowed(&self.mask) };
+        // a flow model's timestep is its sigma (times a multiplier of 1)
+        let to = ms.sigma_min().max(sigmas[sigmas.len() - 1]);
+        let threshold = (sigma - to) / (sigmas[0] - to);
+        let binary = |m: f32| if m >= threshold { 1.0 } else { 0.0 };
+        std::borrow::Cow::Owned(if strength != 0.0 && strength < 1.0 {
+            self.mask.iter().map(|&m| strength * binary(m) + (1.0 - strength) * m).collect()
+        } else {
+            self.mask.iter().map(|&m| binary(m)).collect()
+        })
+    }
+
+    /// The model's input at `sigma`: `x` where `mask` denoises, else the latent noised to `sigma` (`noise_scaling`).
+    pub fn input(mask: &[f32], x: &[f32], sigma: f32, noise: &[f32], latent: &[f32]) -> V {
+        (0..x.len()).map(|j| x[j] * mask[j] + (sigma * noise[j] + (1.0 - sigma) * latent[j]) * (1.0 - mask[j])).collect()
+    }
+
+    /// The prediction the sampler sees: the model's where `mask` denoises, else the latent.
+    pub fn prediction(mask: &[f32], denoised: &[f32], latent: &[f32]) -> V {
+        (0..denoised.len()).map(|j| denoised[j] * mask[j] + latent[j] * (1.0 - mask[j])).collect()
+    }
+}
+
+/// The sigmas of a run from `steps` scheduled ones: `KSampler.set_steps` for `denoise`, then `KSampler.sample`'s step
+/// range, with the last sigma set to 0 unless the run returns with leftover noise. `schedule(n)` gives `n` steps' sigmas.
+/// `None` when no step is left, and the latent comes back as it is.
+pub fn ksampler_sigmas(steps: usize, denoise: f64, start: usize, end: usize, leftover_noise: bool, schedule: impl Fn(usize) -> Result<V>)
+    -> Result<Option<V>> {
+    let mut s = if denoise > 0.9999 {
+        schedule(steps)?
+    } else if denoise <= 0.0 {
+        V::new()
+    } else {
+        let all = schedule((steps as f64 / denoise) as usize)?;
+        all[all.len().saturating_sub(steps + 1)..].to_vec()
+    };
+    if end + 1 < s.len() {
+        s.truncate(end + 1);
+        if !leftover_noise {
+            *s.last_mut().unwrap() = 0.0;
+        }
+    }
+    if start + 1 >= s.len() {
+        return Ok(None);
+    }
+    Ok(Some(s.split_off(start)))
 }
 
 /// `torch.linspace` in f32.
@@ -1939,7 +2009,10 @@ impl Run<'_> {
             self.done(index)?;
         }
         let alpha = vp_alpha(ts[last]);
-        Ok(x.iter().map(|v| v / alpha / (1.0 - ts[last])).collect())
+        // ComfyUI sets a last sigma of 0 to 0.001 in place, so `inverse_noise_scaling` divides by 1 - 0.001 after
+        // this; any other last sigma is divided out by `sample`
+        let quirk = if sigmas[last] == 0.0 { 1.0 - ts[last] } else { 1.0 };
+        Ok(x.iter().map(|v| v / alpha / quirk).collect())
     }
 }
 
@@ -1974,17 +2047,29 @@ fn vp_lambda(s: f32) -> f32 {
     la - 0.5 * (1.0 - (2.0 * la).exp()).ln()
 }
 
-/// One sampling run: `KSAMPLER.sample` on an empty latent. `eval` is the guided model and `step`
+/// One sampling run: `KSAMPLER.sample`. `latent` is where it starts, at the sampler's scale (`None` for an empty
+/// latent), and `sigmas` may start below the model's highest (img2img, refiners). `eval` is the guided model and `step`
 /// reports progress; an error from either ends the run.
 #[allow(clippy::too_many_arguments)]
-pub fn sample(sampler: &str, ms: ModelSampling, sigmas: &[f32], noise: &[f32], seed: u64, batch: Batch,
+pub fn sample(sampler: &str, ms: ModelSampling, sigmas: &[f32], noise: &[f32], latent: Option<&[f32]>, seed: u64, batch: Batch,
     eval: &mut dyn FnMut(&[f32], f32, Uncond) -> Result<Eval>, step: &mut dyn FnMut(usize, usize) -> Result<()>) -> Result<V> {
-    if sigmas.len() <= 1 {
-        return Ok(noise.to_vec());
+    if latent.is_some_and(|l| l.len() != noise.len()) {
+        bail!("latent of {} values for noise of {}", latent.map_or(0, <[f32]>::len), noise.len());
+    }
+    // `CFGGuider.sample` returns the latent untouched without sigmas
+    let Some(&s0) = sigmas.first() else {
+        return Ok(latent.map_or_else(|| vec![0.0; noise.len()], <[f32]>::to_vec));
+    };
+    // CONST.noise_scaling
+    let x = match latent {
+        Some(l) => lc(&[(noise, s0), (l, 1.0 - s0)]),
+        None => lc(&[(noise, s0)]),
+    };
+    if sigmas.len() == 1 {
+        return Ok(if s0 != 0.0 { x.iter().map(|v| v / (1.0 - s0)).collect() } else { x });
     }
     let s = sigmas;
     let mut r = Run { ms, eval, step, total: s.len() - 1, seed, batch, n: noise.len() };
-    let x = lc(&[(noise, s[0])]);
     let out = match sampler {
         "euler" | "ddim" => r.euler(x, s),
         "euler_cfg_pp" => r.euler_ancestral_cfg_pp(x, s, 0.0),

@@ -147,6 +147,17 @@ than its compute (~24 ms). The text encoder and text-fusion adapter stream the s
 stays conservative on purpose: oversubscribing VRAM makes Windows fall back to shared system memory,
 which doubles step time.
 
+## Batches
+
+A batch is sampled together. `run_batches` in [`src/pipeline/mod.rs`](../src/pipeline/mod.rs) gives the sampler the
+images' latents one after another, and each model's step takes a batch: the int8 GEMMs and the norms run over every
+image's rows at once, and attention runs with a batch dimension. RoPE runs once per image, because the table is one
+image's. The cuBLAS GEMMs of the embedders and the last layer also run once per image, because cuBLAS picks its
+algorithm by the row count, and a batched image would otherwise round differently from the same image alone. The
+sampler's noise is drawn for the whole batch, as ComfyUI draws it, so sampling a batch in parts gives the same images.
+Before sampling, `Env::batch_fit` works out how many images fit next to the fewest streamed blocks, and the batch runs in
+parts of that size.
+
 ## Family notes
 
 ### Krea 2

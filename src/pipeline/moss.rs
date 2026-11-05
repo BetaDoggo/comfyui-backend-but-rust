@@ -1,6 +1,6 @@
 //! MOSS Image: its diffusion model, its Qwen3.5 text encoder, the Flux 2 VAE and the prompts encoded through them.
 
-use super::{crop, nothing_for, remember, run_sampler, scale_rows, touch, upload};
+use super::{crop, nothing_for, remember, run_batches, scale_rows, touch, upload};
 use super::{Dump, FamilyState, Generator, Kind, Prompt, Reference, Sampling, SharedTe, Stats, Step, TokenKey, CONTEXTS};
 use crate::cuda::{self, DevBuf, Stream};
 use crate::{ffi, flux2vae, lora, moss, offload, qwen35, st, tokenizer};
@@ -17,7 +17,9 @@ pub struct MossRequest {
     pub negative: Prompt,
     pub width: usize,
     pub height: usize,
+    /// Its `images` are sampled together.
     pub sampling: Sampling,
+    /// The images' noise, one after another.
     pub noise: Vec<f32>,
 }
 
@@ -78,9 +80,14 @@ impl FamilyState for Moss {
     }
 }
 
-fn moss_need(width: usize, height: usize) -> usize {
-    let (lh, lw) = (height / 16, width / 16);
-    moss::step_activation_bytes(lh * lw + MOSS_TEXT).max(flux2vae::Vae::activation_bytes(lh, lw))
+/// One image's activations in a denoising step.
+fn step_need(width: usize, height: usize) -> usize {
+    moss::step_activation_bytes((height / 16) * (width / 16) + MOSS_TEXT)
+}
+
+/// Peak activation memory of `images` sampled together (denoising step or VAE decode, whichever is larger).
+fn moss_need(width: usize, height: usize, images: usize) -> usize {
+    (images * step_need(width, height)).max(flux2vae::Vae::activation_bytes(height / 16, width / 16))
 }
 
 /// Token ids and per-token factors of a MOSS Image chunk: SwarmTextEncodeAdvanced tokenizes each
@@ -181,7 +188,7 @@ impl Generator {
         let dst = st::SafeTensors::open(path)?;
         let globals = moss::globals_layout(&dst)?.size;
         let free = cuda::device_free()?;
-        let budget = free.saturating_sub(env.reserve + globals + moss_need(env.max_width, env.max_height));
+        let budget = free.saturating_sub(env.reserve + globals + moss_need(env.max_width, env.max_height, 1));
         let mut dit = moss::Dit::load(&dst, budget, env.slots, env.threads, &env.st)?;
         dit.attn_variant = env.attn_variant;
         dit.int8_attn = env.int8_attn;
@@ -207,7 +214,7 @@ impl Generator {
             f.tokenizer = Some(tokenizer::Tokenizer::qwen35()?);
         }
         let size = qwen35::weight_bytes(&st::SafeTensors::open(path)?)?;
-        let keep = env.reserve + moss_need(env.max_width, env.max_height);
+        let keep = env.reserve + moss_need(env.max_width, env.max_height, 1);
         let budget = if cuda::device_free()? >= size + keep { size } else { 0 };
         f.te = Some((path.to_path_buf(), qwen35::TextEncoder::load(path, budget, env.threads, &env.st)?));
         eprintln!("text encoder ready in {:.1}s", t0.elapsed().as_secs_f64());
@@ -229,21 +236,24 @@ impl Generator {
         Ok(())
     }
 
-    /// One MOSS Image latent, sampled as ComfyUI's KSampler does.
+    /// MOSS Image latents, sampled as ComfyUI's KSampler does.
     pub fn sample_moss(&mut self, r: &MossRequest, mut progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
         -> Result<(Vec<f32>, Stats)> {
         let env = &self.env;
         env.check_size(r.width, r.height)?;
         let (lh, lw) = (r.height / 16, r.width / 16);
-        let n = moss::CH * lh * lw;
+        let images = r.sampling.images;
+        let n = images * moss::CH * lh * lw;
         if r.noise.len() != n {
             bail!("noise has {} values, expected {n}", r.noise.len());
         }
         let f = self.family.moss().context("no diffusion model loaded")?;
-        {
+        let together = {
             let m = f.model.as_mut().context("no diffusion model loaded")?;
-            env.plan(&mut m.dit.blocks, &m.st, moss_need(r.width, r.height))?;
-        }
+            let together = env.batch_fit(&m.dit.blocks, images, 0, step_need(r.width, r.height))?;
+            env.plan(&mut m.dit.blocks, &m.st, moss_need(r.width, r.height, together))?;
+            together
+        };
         let st = &env.st;
         let mut stats = Stats::default();
         let t0 = Instant::now();
@@ -264,12 +274,12 @@ impl Generator {
         let rope = m.dit.rope(lh, lw, pos.len, st)?;
         let neg_rope = neg.map(|c| m.dit.rope(lh, lw, c.len, st)).transpose()?;
         let copied0 = m.dit.blocks.copied_bytes;
-        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, eval: usize| -> Result<()> {
+        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, eval: usize, k: usize| -> Result<()> {
             if negative {
-                return m.dit.predict(x, lh, lw, neg.unwrap(), neg_rope.as_ref().unwrap(), sigma, out, st, None);
+                return m.dit.predict(x, k, lh, lw, neg.unwrap(), neg_rope.as_ref().unwrap(), sigma, out, st, None);
             }
             if eval > 0 {
-                env.relieve(&mut m.dit.blocks, &m.st, moss::step_activation_bytes(lh * lw + MOSS_TEXT))?;
+                env.relieve(&mut m.dit.blocks, &m.st, k * step_need(r.width, r.height))?;
             }
             let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
             {
@@ -281,7 +291,7 @@ impl Generator {
                     }
                 };
                 let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if dump.is_some() { Some(&mut probe) } else { None };
-                m.dit.predict(x, lh, lw, pos, &rope, sigma, out, st, probe_ref)?;
+                m.dit.predict(x, k, lh, lw, pos, &rope, sigma, out, st, probe_ref)?;
             }
             if let Some(dm) = dump.as_deref_mut() {
                 for (name, v) in probes {
@@ -290,7 +300,7 @@ impl Generator {
             }
             Ok(())
         };
-        let latent = run_sampler(&r.sampling, &r.noise, st, &mut stats, &mut model, &mut progress)?;
+        let latent = run_batches(&r.sampling, &r.noise, together, st, &mut stats, &mut model, &mut progress)?;
         stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
         eprintln!("{:.2} GB streamed over PCIe", stats.streamed_gb);
         if let Some(dm) = dump {

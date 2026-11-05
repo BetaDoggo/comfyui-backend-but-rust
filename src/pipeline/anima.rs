@@ -1,6 +1,6 @@
 //! Anima: its diffusion model, its Qwen3 text encoder and the prompts encoded through them. The VAE is the generator's.
 
-use super::{nothing_for, remember, run_sampler, scale_rows, touch};
+use super::{nothing_for, remember, run_batches, scale_rows, touch};
 use super::{Dump, FamilyState, Generator, Kind, Prompt, Sampling, SharedTe, Stats, Step, CONTEXTS};
 use crate::cuda::{self, DevBuf, Stream};
 use crate::{anima, dit, lora, offload, qwen3, st, tokenizer, vae};
@@ -15,7 +15,9 @@ pub struct AnimaRequest {
     pub negative: Prompt,
     pub width: usize,
     pub height: usize,
+    /// Its `images` are sampled together.
     pub sampling: Sampling,
+    /// The images' noise, one after another.
     pub noise: Vec<f32>,
 }
 
@@ -76,9 +78,14 @@ impl FamilyState for Anima {
     }
 }
 
-fn anima_need(width: usize, height: usize) -> usize {
-    let (lh, lw) = (height / 8, width / 8);
-    anima::step_activation_bytes((lh / 2) * (lw / 2)).max(vae::Vae::activation_bytes(lh, lw))
+/// One image's activations in a denoising step.
+fn step_need(width: usize, height: usize) -> usize {
+    anima::step_activation_bytes((height / 16) * (width / 16))
+}
+
+/// Peak activation memory of `images` sampled together (denoising step or VAE decode, whichever is larger).
+fn anima_need(width: usize, height: usize, images: usize) -> usize {
+    (images * step_need(width, height)).max(vae::Vae::activation_bytes(height / 8, width / 8))
 }
 
 impl Anima {
@@ -138,7 +145,7 @@ impl Generator {
         let dst = st::SafeTensors::open(path)?;
         let globals = anima::globals_layout(&dst)?.size;
         let free = cuda::device_free()?;
-        let budget = free.saturating_sub(env.reserve + globals + anima_need(env.max_width, env.max_height));
+        let budget = free.saturating_sub(env.reserve + globals + anima_need(env.max_width, env.max_height, 1));
         let mut dit = anima::Dit::load(&dst, budget, env.slots, env.threads, &env.st)?;
         dit.attn_variant = env.attn_variant;
         dit.int8_attn = env.int8_attn;
@@ -163,28 +170,31 @@ impl Generator {
             a.tokenizers = Some((tokenizer::Tokenizer::new()?, tokenizer::T5Tokenizer::new()?));
         }
         let size = qwen3::weight_bytes(&st::SafeTensors::open(path)?)?;
-        let keep = env.reserve + anima_need(env.max_width, env.max_height);
+        let keep = env.reserve + anima_need(env.max_width, env.max_height, 1);
         let budget = if cuda::device_free()? >= size + keep { size } else { 0 };
         a.te = Some((path.to_path_buf(), qwen3::TextEncoder::load(path, budget, env.threads, &env.st)?));
         eprintln!("text encoder ready in {:.1}s", t0.elapsed().as_secs_f64());
         Ok(())
     }
 
-    /// One Anima latent, sampled as ComfyUI's KSampler does.
+    /// Anima latents, sampled as ComfyUI's KSampler does.
     pub fn sample_anima(&mut self, r: &AnimaRequest, mut progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
         -> Result<(Vec<f32>, Stats)> {
         let env = &self.env;
         env.check_size(r.width, r.height)?;
         let (lh, lw) = (r.height / 8, r.width / 8);
-        let n = dit::CH * lh * lw;
+        let images = r.sampling.images;
+        let n = images * dit::CH * lh * lw;
         if r.noise.len() != n {
             bail!("noise has {} values, expected {n}", r.noise.len());
         }
         let a = self.family.anima().context("no diffusion model loaded")?;
-        {
+        let together = {
             let m = a.model.as_mut().context("no diffusion model loaded")?;
-            env.plan(&mut m.dit.blocks, &m.st, anima_need(r.width, r.height))?;
-        }
+            let together = env.batch_fit(&m.dit.blocks, images, 0, step_need(r.width, r.height))?;
+            env.plan(&mut m.dit.blocks, &m.st, anima_need(r.width, r.height, together))?;
+            together
+        };
         let st = &env.st;
         let mut stats = Stats::default();
         let t0 = Instant::now();
@@ -202,12 +212,12 @@ impl Generator {
         let neg = guided.then(|| find(&r.negative));
         let rope = m.dit.rope(lh / 2, lw / 2, st)?;
         let copied0 = m.dit.blocks.copied_bytes;
-        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, eval: usize| -> Result<()> {
+        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, eval: usize, k: usize| -> Result<()> {
             if negative {
-                return m.dit.predict(x, lh, lw, neg.unwrap(), &rope, sigma, out, st, None);
+                return m.dit.predict(x, k, lh, lw, neg.unwrap(), &rope, sigma, out, st, None);
             }
             if eval > 0 {
-                env.relieve(&mut m.dit.blocks, &m.st, anima::step_activation_bytes((lh / 2) * (lw / 2)))?;
+                env.relieve(&mut m.dit.blocks, &m.st, k * step_need(r.width, r.height))?;
             }
             let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
             {
@@ -219,7 +229,7 @@ impl Generator {
                     }
                 };
                 let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if dump.is_some() { Some(&mut probe) } else { None };
-                m.dit.predict(x, lh, lw, pos, &rope, sigma, out, st, probe_ref)?;
+                m.dit.predict(x, k, lh, lw, pos, &rope, sigma, out, st, probe_ref)?;
             }
             if let Some(dm) = dump.as_deref_mut() {
                 for (name, v) in probes {
@@ -228,7 +238,7 @@ impl Generator {
             }
             Ok(())
         };
-        let latent = run_sampler(&r.sampling, &r.noise, st, &mut stats, &mut model, &mut progress)?;
+        let latent = run_batches(&r.sampling, &r.noise, together, st, &mut stats, &mut model, &mut progress)?;
         stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
         eprintln!("{:.2} GB streamed over PCIe", stats.streamed_gb);
         if let Some(dm) = dump {

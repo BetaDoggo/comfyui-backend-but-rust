@@ -1,7 +1,7 @@
 //! Qwen Image 2.1: its diffusion model, its VAE and encoded prompts. The text encoder is the generator's
 //! (the 8B Qwen3-VL), shared with Krea 2.
 
-use super::{crop, nothing_for, remember, run_sampler, shared_te_loras, touch, upload};
+use super::{crop, nothing_for, remember, run_batches, shared_te_loras, touch, upload};
 use super::{Dump, Env, FamilyState, Generator, Kind, Prompt, Reference, Sampling, SharedTe, Stats, Step, CONTEXTS};
 use crate::cuda::{DevBuf, Stream};
 use crate::vision::{self, PromptImage};
@@ -21,7 +21,9 @@ pub struct Qwen21Request {
     pub negative: Prompt,
     pub width: usize,
     pub height: usize,
+    /// Its `images` are sampled together.
     pub sampling: Sampling,
+    /// The images' noise, one after another.
     pub noise: Vec<f32>,
     /// Prompt images for the vision tower, which the DiT takes the place of as reference latents.
     pub images: Vec<PromptImage>,
@@ -105,12 +107,17 @@ impl FamilyState for Qwen21 {
     }
 }
 
-/// Peak activation memory of one request: a step over an image of `width` x `height` with `prefix` rows
-/// before it, or the VAE.
-fn qwen21_need(width: usize, height: usize, prefix: usize) -> usize {
+/// One image's activations in a step over an image of `width` x `height` with `prefix` rows before it.
+fn step_need(width: usize, height: usize, prefix: usize) -> usize {
+    let l = (height / vae21::SCALE) * (width / vae21::SCALE);
+    qwen21::step_activation_bytes(l, prefix.max(QWEN21_TEXT) + l)
+}
+
+/// Peak activation memory of a request of `images` sampled together: their step, the prefix's, or the VAE.
+fn qwen21_need(width: usize, height: usize, prefix: usize, images: usize) -> usize {
     let (lh, lw) = (height / vae21::SCALE, width / vae21::SCALE);
     let prefix = prefix.max(QWEN21_TEXT);
-    qwen21::step_activation_bytes(lh * lw, prefix + lh * lw).max(vae21::Vae::activation_bytes(lh, lw)).max(qwen21::step_activation_bytes(prefix, prefix))
+    (images * step_need(width, height, prefix)).max(vae21::Vae::activation_bytes(lh, lw)).max(qwen21::step_activation_bytes(prefix, prefix))
 }
 
 impl Qwen21 {
@@ -176,7 +183,7 @@ impl Generator {
         let pre = qwen21::key_prefix(|k| dst.has(k)).context("not a Qwen Image 2.1 checkpoint")?;
         let globals = qwen21::globals_layout(&dst, pre)?.size;
         let free = cuda::device_free()?;
-        let budget = free.saturating_sub(env.reserve + globals + qwen21_need(env.max_width, env.max_height, 0));
+        let budget = free.saturating_sub(env.reserve + globals + qwen21_need(env.max_width, env.max_height, 0, 1));
         let mut dit = qwen21::Dit::load(&dst, pre, budget, env.slots, env.threads, &env.st)?;
         dit.attn_variant = env.attn_variant;
         dit.int8_attn = env.int8_attn;
@@ -200,13 +207,14 @@ impl Generator {
         Ok(())
     }
 
-    /// One Qwen Image 2.1 latent, sampled as ComfyUI's KSampler does.
+    /// Qwen Image 2.1 latents, sampled as ComfyUI's KSampler does.
     pub fn sample_qwen21(&mut self, r: &Qwen21Request, mut progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
         -> Result<(Vec<f32>, Stats)> {
         let env = &self.env;
         env.check_size(r.width, r.height)?;
         let (lh, lw) = (r.height / vae21::SCALE, r.width / vae21::SCALE);
-        let n = qwen21::CH * lh * lw;
+        let images = r.sampling.images;
+        let n = images * qwen21::CH * lh * lw;
         if r.noise.len() != n {
             bail!("noise has {} values, expected {n}", r.noise.len());
         }
@@ -235,7 +243,9 @@ impl Generator {
         let fits = |p: usize| qwen21::Prefix::cache_bytes(nb, p) <= CACHE_LIMIT;
         let (cache_pos, cache_neg) = (caching && fits(pos_rows), caching && guided && fits(neg_rows));
         let cache_total = (cache_pos as usize) * qwen21::Prefix::cache_bytes(nb, pos_rows) + (cache_neg as usize) * qwen21::Prefix::cache_bytes(nb, neg_rows);
-        env.plan(&mut m.dit.blocks, &m.st, qwen21_need(r.width, r.height, pos_rows.max(neg_rows)) + cache_total)?;
+        let prefix = pos_rows.max(neg_rows);
+        let together = env.batch_fit(&m.dit.blocks, images, cache_total, step_need(r.width, r.height, prefix))?;
+        env.plan(&mut m.dit.blocks, &m.st, qwen21_need(r.width, r.height, prefix, together) + cache_total)?;
         let st = &env.st;
         let t1 = Instant::now();
         let mut build = |c: &Context21, cache: bool| -> Result<qwen21::Prefix> {
@@ -253,12 +263,12 @@ impl Generator {
         stats.text_ms += t1.elapsed().as_secs_f64() * 1e3;
 
         let copied0 = m.dit.blocks.copied_bytes;
-        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, eval: usize| -> Result<()> {
+        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, eval: usize, k: usize| -> Result<()> {
             if negative {
-                return m.dit.predict(x, lh, lw, neg_pf.as_ref().unwrap(), sigma, out, st, None);
+                return m.dit.predict(x, k, lh, lw, neg_pf.as_ref().unwrap(), sigma, out, st, None);
             }
             if eval > 0 {
-                env.relieve(&mut m.dit.blocks, &m.st, qwen21_need(lw * vae21::SCALE, lh * vae21::SCALE, pos_rows))?;
+                env.relieve(&mut m.dit.blocks, &m.st, qwen21_need(r.width, r.height, pos_rows, k))?;
             }
             let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
             {
@@ -270,7 +280,7 @@ impl Generator {
                     }
                 };
                 let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if dump.is_some() { Some(&mut probe) } else { None };
-                m.dit.predict(x, lh, lw, &pos_pf, sigma, out, st, probe_ref)?;
+                m.dit.predict(x, k, lh, lw, &pos_pf, sigma, out, st, probe_ref)?;
             }
             if let Some(dm) = dump.as_deref_mut() {
                 for (name, v) in probes {
@@ -279,7 +289,7 @@ impl Generator {
             }
             Ok(())
         };
-        let latent = run_sampler(&r.sampling, &r.noise, st, &mut stats, &mut model, &mut progress)?;
+        let latent = run_batches(&r.sampling, &r.noise, together, st, &mut stats, &mut model, &mut progress)?;
         stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
         eprintln!("{:.2} GB streamed over PCIe", stats.streamed_gb);
         if let Some(dm) = dump {

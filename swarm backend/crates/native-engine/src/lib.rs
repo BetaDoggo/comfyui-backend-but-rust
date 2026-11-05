@@ -478,45 +478,54 @@ impl Plan {
         Ok(Plan { sigmas, latent: values, mask, differential: settings.differential })
     }
 
-    /// The noise of image `index`: SwarmKSampler's, or zeros without `add_noise`.
-    fn noise(&self, req: &SampleRequest, index: usize, (channels, lh, lw): (usize, usize, usize)) -> Vec<f32> {
-        if req.add_noise { noise::swarm_noise(req.noise_seed, req.variation, index as u64, channels, lh, lw) } else { vec![0.0; channels * lh * lw] }
+    /// The noise of the batch's images one after another: SwarmKSampler's, or zeros without `add_noise`.
+    fn noise(&self, req: &SampleRequest, batch: usize, (channels, lh, lw): (usize, usize, usize)) -> Vec<f32> {
+        if !req.add_noise {
+            return vec![0.0; batch * channels * lh * lw];
+        }
+        (0..batch).flat_map(|i| noise::swarm_noise(req.noise_seed, req.variation, i as u64, channels, lh, lw)).collect()
     }
 }
 
-/// The sampling of image `index` of `batch`.
-fn sampling(req: &SampleRequest, settings: &ModelSettings, plan: &Plan, (batch, _, _): (usize, usize, usize), index: usize) -> EngineResult<Sampling> {
-    let part = |v: &Vec<f32>| v.chunks_exact(v.len() / batch).nth(index).unwrap().to_vec();
+/// The sampling of a batch of `batch` images, all together.
+fn sampling(req: &SampleRequest, settings: &ModelSettings, plan: &Plan, batch: usize) -> EngineResult<Sampling> {
     Ok(Sampling {
         sampler: req.sampler.clone(),
         model_sampling: settings.model_sampling,
         sigmas: plan.sigmas.clone(),
         cfg: req.cfg,
         seed: req.noise_seed,
-        batch_index: index,
+        batch_index: 0,
         batch_size: batch,
+        images: batch,
         tweaks: settings.tweaks,
-        latent: plan.latent.as_ref().map(part),
-        inpaint: plan.mask.as_ref().map(|m| Inpaint { mask: part(m), differential: plan.differential }),
+        latent: plan.latent.clone(),
+        inpaint: plan.mask.as_ref().map(|m| Inpaint { mask: m.clone(), differential: plan.differential }),
     })
 }
 
-/// Whether SwarmKSampler's `previews` shows image `index` of `batch`.
-fn shows_preview(mode: PreviewMode, index: usize, batch: usize) -> bool {
-    match mode {
-        PreviewMode::None => false,
-        PreviewMode::One => index == 0,
-        PreviewMode::Second => index == 1 % batch,
-        PreviewMode::Default | PreviewMode::Iterate | PreviewMode::Animate => true,
-    }
+/// Which image of a step over images `first..first + images` of `batch` SwarmKSampler's `previews` shows, if any.
+fn preview_image(mode: PreviewMode, (first, images): (usize, usize), batch: usize, step: usize) -> Option<usize> {
+    let shown = match mode {
+        PreviewMode::None => return None,
+        PreviewMode::One => 0,
+        PreviewMode::Second => 1 % batch,
+        // Iterate goes through the images a step at a time
+        PreviewMode::Iterate => first + step % images,
+        PreviewMode::Default | PreviewMode::Animate => first,
+    };
+    (first..first + images).contains(&shown).then(|| shown - first)
 }
 
 /// Sends a step's progress within the whole batch, and its preview. False once cancelled.
-fn report(mode: PreviewMode, progress: &mut dyn ProgressSink, (index, batch): (usize, usize), step: Step, image: impl FnOnce(&[f32]) -> (Vec<u8>, usize, usize)) -> bool {
-    progress.progress((index * step.total + step.index) as u32, (batch * step.total) as u32);
-    if shows_preview(mode, index, batch) {
-        let (rgb, h, w) = image(step.denoised);
-        progress.preview(PreviewImage::Rgb(ImageBatch::from_u8(1, h as u32, w as u32, 3, rgb)));
+fn report(mode: PreviewMode, progress: &mut dyn ProgressSink, batch: usize, step: Step, image: impl FnOnce(&[f32]) -> (Vec<u8>, usize, usize)) -> bool {
+    progress.progress((step.first * step.total + step.index * step.images) as u32, (batch * step.total) as u32);
+    if let Some(i) = preview_image(mode, (step.first, step.images), batch, step.index) {
+        let per = step.denoised.len() / step.images.max(1);
+        if let Some(x0) = step.denoised.get(i * per..(i + 1) * per) {
+            let (rgb, h, w) = image(x0);
+            progress.preview(PreviewImage::Rgb(ImageBatch::from_u8(1, h as u32, w as u32, 3, rgb)));
+        }
     }
     !progress.interrupted()
 }
@@ -570,7 +579,8 @@ impl NativeEngine {
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, prompt) = single_prompt(&req.positive, Family::Krea2)?;
         let (references, timestep_zero) = reference_latents(&req.positive, Family::Krea2)?;
-        let (negative, negative_images) = if sampling(req, settings, plan, shape, 0)?.uses_negative() {
+        let sampling = sampling(req, settings, plan, batch)?;
+        let (negative, negative_images) = if sampling.uses_negative() {
             let (c, p) = single_prompt(&req.negative, Family::Krea2)?;
             check_text_encoder_loras(cond, c)?;
             if !reference_latents(&req.negative, Family::Krea2)?.0.is_empty() {
@@ -586,28 +596,24 @@ impl NativeEngine {
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
         gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
-        let mut data = Vec::with_capacity(batch * 16 * lh * lw);
-        for i in 0..batch {
-            let r = KreaRequest {
-                prompt: prompt.clone(),
-                negative: negative.clone(),
-                seed: req.noise_seed,
-                width: lw * 8,
-                height: lh * 8,
-                sampling: sampling(req, settings, plan, shape, i)?,
-                noise: Some(plan.noise(req, i, (16, lh, lw))),
-                images: cond.images.clone(),
-                negative_images: negative_images.clone(),
-                references: references.clone(),
-                timestep_zero,
-            };
-            let (latent, stats) = gen
-                .sample_krea(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::wan21(x0, lh, lw), lh, lw)), None)
-                .map_err(internal)?;
-            tracing::info!("krea2: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
-            data.extend_from_slice(&latent);
-        }
-        Ok(data)
+        let r = KreaRequest {
+            prompt,
+            negative,
+            seed: req.noise_seed,
+            width: lw * 8,
+            height: lh * 8,
+            sampling,
+            noise: Some(plan.noise(req, batch, (16, lh, lw))),
+            images: cond.images.clone(),
+            negative_images,
+            references,
+            timestep_zero,
+        };
+        let (latent, stats) = gen
+            .sample_krea(&r, |step| report(mode, progress, batch, step, |x0| (preview::wan21(x0, lh, lw), lh, lw)), None)
+            .map_err(internal)?;
+        tracing::info!("krea2: {batch} image(s): text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
+        Ok(latent)
     }
 
     fn sample_anima(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, plan: &Plan, progress: &mut dyn ProgressSink)
@@ -617,8 +623,8 @@ impl NativeEngine {
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, positive) = single_prompt(&req.positive, Family::Anima)?;
         let text_encoder = &cond.text_encoder;
-        let first = sampling(req, settings, plan, shape, 0)?;
-        let negative = if first.uses_negative() {
+        let sampling = sampling(req, settings, plan, batch)?;
+        let negative = if sampling.uses_negative() {
             let (c, p) = single_prompt(&req.negative, Family::Anima)?;
             check_text_encoder_loras(cond, c)?;
             p
@@ -631,23 +637,12 @@ impl NativeEngine {
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
         gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
-        let mut data = Vec::with_capacity(batch * 16 * lh * lw);
-        for i in 0..batch {
-            let r = AnimaRequest {
-                positive: positive.clone(),
-                negative: negative.clone(),
-                width: lw * 8,
-                height: lh * 8,
-                sampling: sampling(req, settings, plan, shape, i)?,
-                noise: plan.noise(req, i, (16, lh, lw)),
-            };
-            let (latent, stats) = gen
-                .sample_anima(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::wan21(x0, lh, lw), lh, lw)), None)
-                .map_err(internal)?;
-            tracing::info!("anima: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
-            data.extend_from_slice(&latent);
-        }
-        Ok(data)
+        let r = AnimaRequest { positive, negative, width: lw * 8, height: lh * 8, sampling, noise: plan.noise(req, batch, (16, lh, lw)) };
+        let (latent, stats) = gen
+            .sample_anima(&r, |step| report(mode, progress, batch, step, |x0| (preview::wan21(x0, lh, lw), lh, lw)), None)
+            .map_err(internal)?;
+        tracing::info!("anima: {batch} image(s): text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
+        Ok(latent)
     }
 
     /// Qwen Image 2.1's VAE on `pixels`, RGB or RGBA: the encoder pads RGB with opaque alpha, like ComfyUI.
@@ -731,8 +726,8 @@ impl NativeEngine {
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, positive) = single_prompt(&req.positive, Family::Qwen21)?;
         let references = reference_latents(&req.positive, Family::Qwen21)?.0;
-        let first = sampling(req, settings, plan, shape, 0)?;
-        let (negative, negative_images) = if first.uses_negative() {
+        let sampling = sampling(req, settings, plan, batch)?;
+        let (negative, negative_images) = if sampling.uses_negative() {
             let (c, p) = single_prompt(&req.negative, Family::Qwen21)?;
             check_text_encoder_loras(cond, c)?;
             let theirs = reference_latents(&req.negative, Family::Qwen21)?.0;
@@ -750,26 +745,22 @@ impl NativeEngine {
         gen.set_loras(&settings.loras).map_err(internal)?;
         gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
         let (width, height) = (lw * diffusion::vae21::SCALE, lh * diffusion::vae21::SCALE);
-        let mut data = Vec::with_capacity(batch * diffusion::qwen21::CH * lh * lw);
-        for i in 0..batch {
-            let r = Qwen21Request {
-                positive: positive.clone(),
-                negative: negative.clone(),
-                width,
-                height,
-                sampling: sampling(req, settings, plan, shape, i)?,
-                noise: plan.noise(req, i, (diffusion::qwen21::CH, lh, lw)),
-                images: cond.images.clone(),
-                negative_images: negative_images.clone(),
-                references: references.clone(),
-            };
-            let (latent, stats) = gen
-                .sample_qwen21(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::qwen21(x0, lh, lw), lh, lw)), None)
-                .map_err(internal)?;
-            tracing::info!("qwen image 2.1: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
-            data.extend_from_slice(&latent);
-        }
-        Ok(data)
+        let r = Qwen21Request {
+            positive,
+            negative,
+            width,
+            height,
+            sampling,
+            noise: plan.noise(req, batch, (diffusion::qwen21::CH, lh, lw)),
+            images: cond.images.clone(),
+            negative_images,
+            references,
+        };
+        let (latent, stats) = gen
+            .sample_qwen21(&r, |step| report(mode, progress, batch, step, |x0| (preview::qwen21(x0, lh, lw), lh, lw)), None)
+            .map_err(internal)?;
+        tracing::info!("qwen image 2.1: {batch} image(s): text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
+        Ok(latent)
     }
 
     /// A text-to-video clip: returns the video and audio latents.
@@ -796,7 +787,7 @@ impl NativeEngine {
         let shape = h3::Shape { t, h: lh, w: lw, audio_t };
         let sigmas = schedule(req, settings, (lh, lw))?.ok_or_else(|| EngineError::InvalidInput("no steps to sample".into()))?;
         let plan = Plan { sigmas, latent: None, mask: None, differential: None };
-        let sampling = sampling(req, settings, &plan, (1, lh, lw), 0)?;
+        let sampling = sampling(req, settings, &plan, 1)?;
         let negative = if sampling.uses_negative() { single_prompt(&req.negative, Family::H3)?.1 } else { Prompt::new(Vec::new()) };
         let ModelSampling::Flow { shift } = settings.model_sampling else { unreachable!("H3 is a flow model") };
         let mut gen = self.gen();
@@ -807,7 +798,7 @@ impl NativeEngine {
         let noise = noise::h3_noise(req.noise_seed, req.variation, (24, t, lh, lw), shape.audio_len());
         let r = H3Request { prompt, negative, shape, sampling, shifts: (shift, settings.audio_shift), noise };
         let (mut latent, stats) = gen
-            .sample_h3(&r, |step| report(mode, progress, (0, 1), step, |x0| (preview::h3(x0, t, lh, lw), lh, lw)), None)
+            .sample_h3(&r, |step| report(mode, progress, 1, step, |x0| (preview::h3(x0, t, lh, lw), lh, lw)), None)
             .map_err(internal)?;
         tracing::info!("h3: text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
         let audio_data = latent.split_off(shape.video_len());
@@ -851,7 +842,8 @@ impl NativeEngine {
         let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let (cond, positive) = single_prompt(&req.positive, Family::Moss)?;
-        let negative = if sampling(req, settings, plan, shape, 0)?.uses_negative() {
+        let sampling = sampling(req, settings, plan, batch)?;
+        let negative = if sampling.uses_negative() {
             let (c, p) = single_prompt(&req.negative, Family::Moss)?;
             check_text_encoder_loras(cond, c)?;
             p
@@ -864,23 +856,19 @@ impl NativeEngine {
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
         gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
-        let mut data = Vec::with_capacity(batch * diffusion::moss::CH * lh * lw);
-        for i in 0..batch {
-            let r = MossRequest {
-                positive: positive.clone(),
-                negative: negative.clone(),
-                width: lw * 16,
-                height: lh * 16,
-                sampling: sampling(req, settings, plan, shape, i)?,
-                noise: plan.noise(req, i, (diffusion::moss::CH, lh, lw)),
-            };
-            let (latent, stats) = gen
-                .sample_moss(&r, |step| report(mode, progress, (i, batch), step, |x0| (preview::flux2(x0, lh, lw), lh * 2, lw * 2)), None)
-                .map_err(internal)?;
-            tracing::info!("moss: image {}/{batch}: text {:.0} ms, sampling {:.0} ms", i + 1, stats.text_ms, stats.sample_ms);
-            data.extend_from_slice(&latent);
-        }
-        Ok(data)
+        let r = MossRequest {
+            positive,
+            negative,
+            width: lw * 16,
+            height: lh * 16,
+            sampling,
+            noise: plan.noise(req, batch, (diffusion::moss::CH, lh, lw)),
+        };
+        let (latent, stats) = gen
+            .sample_moss(&r, |step| report(mode, progress, batch, step, |x0| (preview::flux2(x0, lh, lw), lh * 2, lw * 2)), None)
+            .map_err(internal)?;
+        tracing::info!("moss: {batch} image(s): text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
+        Ok(latent)
     }
 }
 
@@ -1371,10 +1359,15 @@ mod tests {
 
     #[test]
     fn preview_modes_pick_images_like_swarm() {
-        assert!(!shows_preview(PreviewMode::None, 0, 1));
-        assert!(shows_preview(PreviewMode::One, 0, 2) && !shows_preview(PreviewMode::One, 1, 2));
-        assert!(shows_preview(PreviewMode::Second, 1, 2) && shows_preview(PreviewMode::Second, 0, 1));
-        assert!(shows_preview(PreviewMode::Default, 1, 2));
+        // (first, images) of the run, the batch, the step
+        assert_eq!(preview_image(PreviewMode::None, (0, 1), 1, 0), None);
+        assert_eq!(preview_image(PreviewMode::One, (0, 2), 2, 0), Some(0));
+        assert_eq!(preview_image(PreviewMode::Second, (0, 2), 2, 0), Some(1));
+        assert_eq!(preview_image(PreviewMode::Second, (0, 1), 1, 0), Some(0));
+        // a run of the second half of the batch
+        assert_eq!(preview_image(PreviewMode::One, (2, 2), 4, 0), None);
+        assert_eq!(preview_image(PreviewMode::Default, (2, 2), 4, 0), Some(0));
+        assert_eq!(preview_image(PreviewMode::Iterate, (0, 3), 3, 4), Some(1));
     }
 
     #[test]

@@ -27,7 +27,7 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | CFG and negative prompts | Yes | Yes | Yes | Yes | Yes | - |
 | Rescale, Renorm, Zero Star, TCFG | Yes | Yes | Yes | Not tested | Refused | - |
 | Conditioning multipliers, Zero Negative | Yes | Yes | Yes | Not tested | Not tested | - |
-| Batch size | Yes | Yes | Yes | Not tested | - | - |
+| Batch size (sampled together) | Yes | Yes | Yes | Yes (CLI) | Refused above 1 | First image only |
 | Variation seed | Yes | Not tested | Not tested | Not tested | Yes | - |
 | Live previews | Yes | Yes | Yes | Not tested | First frame only | - |
 | LoRAs | Yes | Yes | Yes | Yes | Yes (the turbo LoRA's ComfyUI file) | - |
@@ -42,6 +42,31 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 
 ControlNet, regions, IP-Adapter, style models, GLIGEN, LoRA hooks and embeddings are refused on every family. Anima
 takes both `(word:1.2)` and `<weight>`; Qwen Image 2.1's encoder reads `(word:1.2)` as plain text.
+
+### Batches
+
+The images of a batch go through the diffusion model together, as one batch in every block, and the sampler steps them
+together as ComfyUI does. When they don't all fit in VRAM, the engine samples as many at a time as fit, after moving
+blocks out to make room. With `euler`, each image of a batch of 2 was pixel-identical to its own render at batch 1 on
+Krea 2, Anima, MOSS Image and Qwen Image 2.1, at CFG 1 and with a negative prompt (CFG 2 or 3). That held through the
+CLI and, for Anima, through `comfy-server` over HTTP. Krea 2 matched too at batch 8, which ran with 7 of its 28 blocks
+left in VRAM, and when forced to sample a batch of 3 one image at a time.
+
+Sampling time, the same images one at a time against all together:
+
+| Family, size | One at a time | Together | PCIe streamed |
+| --- | --- | --- | --- |
+| Krea 2, 4 at 512² | 7.83 s | 4.26 s | 139 GB → 38 GB |
+| Krea 2, 2 at 1024² | 9.1 s | 9.05 s | 83 GB → 42 GB |
+| Krea 2, 8 at 1024² | not run (4.56 s per image alone) | 37.0 s | 21 of 28 blocks streamed |
+| Anima, 4 at 512² | 0.98 s | 0.89 s | none (resident) |
+| MOSS Image, 4 at 512² | 2.16 s | 1.98 s | |
+| MOSS Image, 2 at 1024², CFG 3 | 9.0 s | 8.72 s | |
+| Qwen Image 2.1, 2 at 1024², CFG 3 | 11.47 s | 11.63 s | |
+
+Batching pays when the model streams blocks and each image is small: every streamed block is then copied once per step
+for the whole batch. At 1024² these models are compute-bound, so a batch takes as long as its images one at a time.
+Not measured: other sizes and Qwen Image 2.1 below 1024².
 
 ## Krea 2
 

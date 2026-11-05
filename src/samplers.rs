@@ -492,13 +492,30 @@ fn seed_state(entropy: u64, spawn: Option<(u64, u32)>, n: usize) -> Vec<u32> {
     }).collect()
 }
 
-/// Where a Brownian tree's normals come from.
+/// Where a run's images sit in their batch: ComfyUI draws the sampler's noise as one tensor for the whole batch.
 #[derive(Clone, Copy)]
 pub struct Batch {
+    /// The run's first image.
     pub index: usize,
+    /// Images in the whole batch.
     pub size: usize,
+    /// Images in this run, from `index`; its latent holds them one after another.
+    pub images: usize,
     /// [`crate::ffi::gpu_randn_threads`]
     pub threads: usize,
+}
+
+impl Batch {
+    /// One image.
+    pub fn single(threads: usize) -> Self {
+        Batch { index: 0, size: 1, images: 1, threads }
+    }
+
+    /// For a run of `n` values: where they start in the whole batch's noise, and its length.
+    fn span(self, n: usize) -> (usize, usize) {
+        let per = n / self.images;
+        (self.index * per, self.size * per)
+    }
 }
 
 struct Interval {
@@ -541,10 +558,11 @@ impl BrownianTree {
 
     fn randn(&self, seed: u32) -> V {
         let (n, b) = (self.n, self.batch);
+        let (start, numel) = b.span(n);
         if self.cpu {
-            torch_randn(seed as u64, n * b.size)[b.index * n..(b.index + 1) * n].to_vec()
+            torch_randn(seed as u64, numel)[start..start + n].to_vec()
         } else {
-            CudaRandn::new(seed as u64, n * b.size, b.threads).next(b.index * n, n)
+            CudaRandn::new(seed as u64, numel, b.threads).next(start, n)
         }
     }
 
@@ -658,7 +676,8 @@ enum Noise {
 
 impl Noise {
     fn default(seed: u64, n: usize, b: Batch) -> Self {
-        Noise::Default(CudaRandn::new(seed, n * b.size, b.threads), b.index * n, n)
+        let (start, numel) = b.span(n);
+        Noise::Default(CudaRandn::new(seed, numel, b.threads), start, n)
     }
 
     fn tree(sigmas: &[f32], seed: u64, cpu: bool, n: usize, b: Batch) -> Self {
@@ -2135,7 +2154,7 @@ mod tests {
     #[test]
     fn brownian_tree_matches_torchsde() {
         // torchsde.BrownianTree(0.05, zeros(1, 4, 8, 8), 1.0, entropy=42)(0.5, 0.75) then (0.3, 0.4)
-        let batch = Batch { index: 0, size: 1, threads: 73728 };
+        let batch = Batch::single(73728);
         let mut t = BrownianTree::new(0.05f32 as f64, 1.0, 42, true, 256, batch);
         let close = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 2e-4);
         let w = t.query(0.5f32 as f64, 0.75f32 as f64);
@@ -2147,11 +2166,31 @@ mod tests {
     #[test]
     fn brownian_tree_matches_torchsde_at_full_size() {
         // BrownianTree(0.0291, zeros(1, 16, 128, 128), 1.0, entropy=42)(0.7, 0.95), on the CPU and on this GPU
-        let batch = Batch { index: 0, size: 1, threads: 73728 };
+        let batch = Batch::single(73728);
         for (cpu, want) in [(true, [0.779_023_8, -0.386_063_5, -0.527_965_8]), (false, [0.170_391_2, -0.264_144_2, 0.081_959_6])] {
             let mut t = BrownianTree::new(0.0291f32 as f64, 1.0, 42, cpu, 16 * 128 * 128, batch);
             let w = t.query(0.7f32 as f64, 0.95f32 as f64);
             assert!(w.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-5), "{:?}", &w[..3]);
+        }
+    }
+
+    #[test]
+    fn a_batch_samples_like_its_images_apart() {
+        // the model is per-value, so only the noise ties the images together
+        let ms = ModelSampling::Flow { shift: 1.0 };
+        let sigmas = [1.0, 0.7, 0.4, 0.1, 0.0];
+        let n = 300;
+        let noise = torch_randn(5, 2 * n);
+        let run = |sampler: &str, noise: &[f32], batch: Batch| {
+            let mut eval = |x: &[f32], s: f32, _: Uncond| Ok(Eval { denoised: x.iter().map(|v| v * 0.5 * (1.0 - s)).collect(), uncond: None });
+            sample(sampler, ms, &sigmas, noise, None, 9, batch, &mut eval, &mut |_, _| Ok(())).unwrap()
+        };
+        for sampler in ["euler_ancestral", "dpmpp_sde", "dpmpp_2m_sde_gpu"] {
+            let together = run(sampler, &noise, Batch { index: 0, size: 2, images: 2, threads: 73728 });
+            for i in 0..2 {
+                let alone = run(sampler, &noise[i * n..(i + 1) * n], Batch { index: i, size: 2, images: 1, threads: 73728 });
+                assert_eq!(&together[i * n..(i + 1) * n], &alone[..], "{sampler}, image {i}");
+            }
         }
     }
 

@@ -23,7 +23,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | Engine core | Sampler: er_sde | Anima and MOSS Image, generated through SwarmUI. Noise follows torch's CUDA Philox layout on this GPU. Other GPUs untested. |
 | P0 | Krea 2 | Turbo text-to-image | W8A8 int8 DiT, 4.65 s at 1024. Pixel-identical to the CLI through SwarmUI. |
 | P0 | Krea 2 | Seed parity with SwarmKSampler | Per-image seeds match Swarm's noise code. Batches confirmed against single renders. |
-| P0 | Krea 2 | Batch Size | Direct workflow test. Not yet tried from Swarm's UI. |
+| P0 | Krea 2 | Batch Size | The images go through the model together. Pixel-identical to single renders with euler on Krea 2, Anima, MOSS Image and Qwen Image 2.1 through the CLI, and on Anima through comfy-server over HTTP. The maintainer reports it works from Swarm's UI. |
 | P0 | Krea 2 | LoRAs | Baked into the int8 ConvRot weights like ComfyUI. Weights bit-identical on the modules checked, 31.6 dB image, about 3 s to bake 12 GB. Tested through SwarmUI. |
 | P0 | Anima | Anima engine | Int8 turbo checkpoint through real SwarmUI: 115 ms/step, 1.14 s per image at 1024, against 199 ms/step in ComfyUI. Same picture as ComfyUI at about 25 dB, not pixel-identical. |
 | P0 | Anima | Anima LoRAs | Baked into the int8 ConvRot weights like ComfyUI, and cached contexts and modulation are dropped. Weights bit-identical on the modules checked. Tested through SwarmUI. |
@@ -47,7 +47,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Anima | Anima prompt weights | (word:1.2) and <weight> scale the T5 tokens, as ComfyUI does. Token ids match ComfyUI. |
 | P1 | Anima | Anima Batch Size, Sigma Shift and CFG | Generated through real SwarmUI. Output not compared with ComfyUI at CFG above 1. |
 | P1 | MOSS Image | MOSS Image Batch Size, Sigma Shift and CFG | Generated through real SwarmUI at 1024x1024 and 832x1216. Euler at CFG 4 compared with ComfyUI; er_sde and CFG 1 not compared. |
-| P1 | Engine core | Samplers: dpmpp_2m, dpmpp_2m_sde, uni_pc, ddim | All 45 ComfyUI samplers: within 8e-6 of ComfyUI's own code on a mock model. Real images on all three models, through the server API and CLI, not the SwarmUI page. dpm_adaptive picks steps per image, not per batch. |
+| P1 | Engine core | Samplers: dpmpp_2m, dpmpp_2m_sde, uni_pc, ddim | All 45 ComfyUI samplers: within 8e-6 of ComfyUI's own code on a mock model. Real images on all three models, through the server API and CLI, not the SwarmUI page. dpm_adaptive picks steps per batch, as ComfyUI does, unless the batch is split to fit in VRAM. |
 | P1 | Engine core | Schedulers: normal, karras, sgm_uniform, beta | All 9 ComfyUI schedulers plus turbo, align_your_steps, flux2 and ideogram4. Within 2e-6 of ComfyUI on 1105 schedules. ltxv-image is refused. |
 | P2 | Engine core | Sigma overrides | Sigma Min, Sigma Max and Rho for karras and exponential, as SwarmKSampler does. Run once through the server API. |
 | P2 | Krea 2 | Prompt Images | Vision tower and DeepStack, up to several images, on both prompts. Tokens match SwarmUI's text node, 40.8 dB from ComfyUI, tested through SwarmUI. A 1024 image costs 3.9 s against 130 ms at 384. |

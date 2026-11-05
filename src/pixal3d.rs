@@ -374,7 +374,7 @@ fn sample(flow: &mut Flow, cond: &StageCond, rope: &DevBuf, n: usize, concat: Op
     };
     let total = sigmas.len() - 1;
     let mut step = |i: usize, t: usize| progress(label, i, t);
-    let batch = samplers::Batch { index: 0, size: 1, threads: unsafe { crate::ffi::gpu_randn_threads() }.max(1) as usize };
+    let batch = samplers::Batch::single(unsafe { crate::ffi::gpu_randn_threads() }.max(1) as usize);
     let out = samplers::sample(&sp.sampler, ms, &sigmas, &noise, None, sp.seed, batch, &mut eval, &mut step)?;
     eprintln!("[pixal3d] {label}: {total} steps, {evals} evaluations over {n} tokens in {:.1}s", t0.elapsed().as_secs_f64());
     Ok(out)

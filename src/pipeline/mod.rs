@@ -62,9 +62,12 @@ pub struct Sampling {
     pub cfg: f64,
     /// Seed of the sampler's own noise (ComfyUI's `noise_seed`).
     pub seed: u64,
-    /// This image's place in its batch: the sampler noise is one tensor for the whole batch.
+    /// The first image's place in its batch: the sampler noise is one tensor for the whole batch.
     pub batch_index: usize,
     pub batch_size: usize,
+    /// Images sampled from `batch_index`, together through the model. The noise, `latent` and the mask hold them one
+    /// after another.
+    pub images: usize,
     pub tweaks: CfgTweaks,
     /// The latent sampling starts from, at the sampler's scale (after `process_latent_in`); `None` is an empty latent.
     /// With `sigmas` starting below the model's highest this is img2img.
@@ -99,10 +102,13 @@ impl Prompt {
     }
 }
 
-/// One step of a run: `denoised` is the latest prediction of the image.
+/// One step of a run: `denoised` is the latest prediction of its images, one after another.
 pub struct Step<'a> {
     pub index: usize,
     pub total: usize,
+    /// The run's first image in the batch, and how many it samples together.
+    pub first: usize,
+    pub images: usize,
     pub denoised: &'a [f32],
 }
 
@@ -133,6 +139,7 @@ impl Sampling {
             seed,
             batch_index: 0,
             batch_size: 1,
+            images: 1,
             tweaks: CfgTweaks::default(),
             latent: None,
             inpaint: None,
@@ -186,6 +193,10 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
         bail!("could not read the GPU's core count");
     }
     let n = noise.len();
+    if s.images == 0 || n % s.images != 0 {
+        bail!("{n} noise values don't split into {} images", s.images);
+    }
+    let per = n / s.images;
     if s.latent.as_ref().is_some_and(|l| l.len() != n) || s.inpaint.as_ref().is_some_and(|i| i.mask.len() != n) {
         bail!("the latent or mask doesn't match the noise's {n} values");
     }
@@ -232,8 +243,16 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
             Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
         };
         let (denoised, uncond) = if s.tweaks.any() {
+            // the tweaks measure each image apart, as ComfyUI's do over the batch
             let raw = if negative { Some(read(&und)?) } else { None };
-            let (d, u) = s.tweaks.guide(v, &read(&den)?, raw, cfg, sigma);
+            let cond = read(&den)?;
+            let (mut d, mut u) = (Vec::with_capacity(n), Vec::with_capacity(n));
+            for i in 0..s.images {
+                let r = i * per..(i + 1) * per;
+                let (di, ui) = s.tweaks.guide(&v[r.clone()], &cond[r.clone()], raw.as_ref().map(|u| u[r].to_vec()), cfg, sigma);
+                d.extend(di);
+                u.extend(ui);
+            }
             (d, (negative && mode != Uncond::Skip).then_some(u))
         } else {
             (read(&den)?, if negative && mode != Uncond::Skip { Some(read(&und)?) } else { None })
@@ -252,11 +271,42 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
         eprintln!("evaluation {evals} sigma {sigma:.4}: {ms:.0} ms");
         Ok(Eval { denoised, uncond })
     };
-    let mut step = |index: usize, total: usize| if progress(Step { index, total, denoised: &latest.borrow() }) { Ok(()) } else { Err(Cancelled.into()) };
-    let batch = samplers::Batch { index: s.batch_index, size: s.batch_size, threads: threads as usize };
+    let (first, images) = (s.batch_index, s.images);
+    let mut step = |index: usize, total: usize| {
+        if progress(Step { index, total, first, images, denoised: &latest.borrow() }) { Ok(()) } else { Err(Cancelled.into()) }
+    };
+    let batch = samplers::Batch { index: s.batch_index, size: s.batch_size, images: s.images, threads: threads as usize };
     let out = samplers::sample(&s.sampler, s.model_sampling, &s.sigmas, noise, s.latent.as_deref(), s.seed, batch, &mut eval, &mut step)?;
-    stats.sample_ms = sample_ms;
+    stats.sample_ms += sample_ms;
     eprintln!("sampling {:.2}s ({:.0} ms/evaluation)", sample_ms / 1e3, sample_ms / evals.max(1) as f64);
+    Ok(out)
+}
+
+/// The images of `s` sampled in runs of at most `chunk`, each run's images together through the model, as
+/// `run_sampler` does one run. `model` gets the run's image count last. `dpm_adaptive` picks its steps per run.
+fn run_batches(s: &Sampling, noise: &[f32], chunk: usize, st: &Stream, stats: &mut Stats,
+    model: &mut dyn FnMut(&DevBuf, &DevBuf, f32, bool, usize, usize) -> Result<()>, progress: &mut dyn FnMut(Step) -> bool) -> Result<Vec<f32>> {
+    if s.images == 0 || noise.len() % s.images != 0 {
+        bail!("{} noise values don't split into {} images", noise.len(), s.images);
+    }
+    let per = noise.len() / s.images;
+    let chunk = chunk.clamp(1, s.images);
+    let mut out = Vec::with_capacity(noise.len());
+    for start in (0..s.images).step_by(chunk) {
+        let k = chunk.min(s.images - start);
+        let r = start * per..(start + k) * per;
+        let run = Sampling {
+            batch_index: s.batch_index + start,
+            images: k,
+            latent: s.latent.as_ref().map(|l| l[r.clone()].to_vec()),
+            inpaint: s.inpaint.as_ref().map(|i| Inpaint { mask: i.mask[r.clone()].to_vec(), differential: i.differential }),
+            ..s.clone()
+        };
+        if k < s.images {
+            eprintln!("sampling images {} to {} of {} together", start + 1, start + k, s.images);
+        }
+        out.extend(run_sampler(&run, &noise[r], st, stats, &mut |x, o, sigma, neg, eval| model(x, o, sigma, neg, eval, k), progress)?);
+    }
     Ok(out)
 }
 
@@ -380,6 +430,29 @@ impl Env {
             blocks.set_resident(p.resident, p.slots, dst)?;
         }
         Ok(())
+    }
+
+    /// How many images fit through the diffusion model together, at `per_image` bytes of activations each next to
+    /// `fixed` bytes, with the blocks streamed through the fewest slots when residency is dynamic. At least 1 and at
+    /// most `batch`.
+    fn batch_fit(&self, blocks: &offload::WeightSet, batch: usize, fixed: usize, per_image: usize) -> Result<usize> {
+        if batch <= 1 {
+            return Ok(1);
+        }
+        self.st.sync()?;
+        cuda::trim_pool()?;
+        let free = cuda::device_free()?;
+        let room = if self.dynamic {
+            let block = blocks.layouts.iter().map(|l| l.size).max().unwrap_or(0);
+            (free + blocks.vram_bytes()).saturating_sub(self.reserve + fixed + block * self.slots)
+        } else {
+            free.saturating_sub(self.reserve + fixed)
+        };
+        let fit = (room / per_image.max(1)).clamp(1, batch);
+        if fit < batch {
+            eprintln!("{fit} of {batch} images fit through the model at once ({} MB each, {} MB free)", per_image / MB, room / MB);
+        }
+        Ok(fit)
     }
 
     /// Before a request: re-plan residency for its activations, when residency is dynamic.

@@ -70,7 +70,7 @@ fn partial_runs_match_comfy() {
     let mask = floats(&g["mask"]);
     let n = latent.len();
     let target: Vec<f32> = (0..n).map(|i| (0.37 * i as f64 + 1.0).sin() as f32).collect();
-    let batch = Batch { index: 0, size: 1, threads: 73728 };
+    let batch = Batch::single(73728);
     let mut failed = Vec::new();
     let mut worst = 0f64;
     let runs = g["runs"].as_array().unwrap();

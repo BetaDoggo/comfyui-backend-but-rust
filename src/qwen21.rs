@@ -326,30 +326,34 @@ impl Dit {
         Ok(Mod { temb, vecs })
     }
 
-    fn flash(&self, q: PM, kp: PM, v: PM, o: PM, lse: PM, sq: usize, sk: usize, qrow: usize, krow: usize, st: &Stream) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn flash(&self, q: PM, kp: PM, v: PM, o: PM, lse: PM, batch: usize, sq: usize, sk: usize, qrow: usize, krow: usize, st: &Stream) -> Result<()> {
         let hs = HD as i64;
-        k!(gpu_flash_attn(q, kp, v, o, lse, 1, sq as i32, sk as i32, H as i32, H as i32, (sq * qrow) as i64, qrow as i64, hs, (sk * krow) as i64,
-            krow as i64, hs, (sk * krow) as i64, krow as i64, hs, (sq * F) as i64, F as i64, hs, 1.0 / (HD as f32).sqrt(), self.attn_variant, s(st)))
+        k!(gpu_flash_attn(q, kp, v, o, lse, batch as i32, sq as i32, sk as i32, H as i32, H as i32, (sq * qrow) as i64, qrow as i64, hs,
+            (sk * krow) as i64, krow as i64, hs, (sk * krow) as i64, krow as i64, hs, (sq * F) as i64, F as i64, hs, 1.0 / (HD as f32).sqrt(),
+            self.attn_variant, s(st)))
     }
 
-    /// Attention of `lq` rows of `q` (rows `qrow` apart) over `lk` rows of keys and values (`krow` apart).
+    /// Attention of `batch` images, each of `lq` rows of `q` (rows `qrow` apart) over its `lk` rows of keys and values
+    /// (`krow` apart).
     #[allow(clippy::too_many_arguments)]
-    fn attention(&self, q: PM, kp: PM, vp: PM, out: PM, lq: usize, lk: usize, qrow: usize, krow: usize, st: &Stream) -> Result<()> {
-        let hs = HD as i64;
+    fn attention(&self, q: PM, kp: PM, vp: PM, out: PM, batch: usize, lq: usize, lk: usize, qrow: usize, krow: usize, st: &Stream) -> Result<()> {
+        let (hs, b) = (HD as i64, batch as i32);
         if self.int8_attn {
-            let ws = DevBuf::alloc_async(unsafe { crate::ffi::gpu_int8_attn_workspace(1, H as i32, H as i32, lq as i32, lk as i32) } as usize, st)?;
-            k!(gpu_int8_attn(q, kp, vp, out, ws.ptr(), 1, lq as i32, lk as i32, H as i32, H as i32, (lq * qrow) as i64, qrow as i64, hs,
+            let ws = DevBuf::alloc_async(unsafe { crate::ffi::gpu_int8_attn_workspace(b, H as i32, H as i32, lq as i32, lk as i32) } as usize, st)?;
+            k!(gpu_int8_attn(q, kp, vp, out, ws.ptr(), b, lq as i32, lk as i32, H as i32, H as i32, (lq * qrow) as i64, qrow as i64, hs,
                 (lk * krow) as i64, krow as i64, hs, (lk * krow) as i64, krow as i64, hs, (lq * F) as i64, F as i64, hs, 1.0 / (HD as f32).sqrt(), s(st)))
         } else {
-            let lse = DevBuf::alloc_async(H * lq * 4, st)?;
-            self.flash(q, kp, vp, out, lse.ptr(), lq, lk, qrow, krow, st)
+            let lse = DevBuf::alloc_async(H * batch * lq * 4, st)?;
+            self.flash(q, kp, vp, out, lse.ptr(), batch, lq, lk, qrow, krow, st)
         }
     }
 
-    /// One block over `rows` rows of `x` that `scale`, `gate` etc. modulate alike. `kv` is called with the rows of q, k and v
-    /// (after the norm and RoPE) and returns the attention output for them.
+    /// One block over `rows` rows of `x` that `scale`, `gate` etc. modulate alike: `batch` sequences one after another, each
+    /// taking `rope`. `kv` is called with the rows of q, k and v (after the norm and RoPE) and returns the attention output
+    /// for them.
     #[allow(clippy::too_many_arguments)]
-    fn block(&self, tag: &str, base: PM, lay: &Layout, x: &DevBuf, rows: usize, m: &Mod, rope: PM, st: &Stream,
+    fn block(&self, tag: &str, base: PM, lay: &Layout, x: &DevBuf, batch: usize, rows: usize, m: &Mod, rope: PM, st: &Stream,
         attend: &mut dyn FnMut(&DevBuf, &DevBuf, &Stream) -> Result<()>) -> Result<()> {
         let wp = |key: &str| off(base, lay.off(key));
         let (fi, mi) = (F as i64, rows as i32);
@@ -364,7 +368,11 @@ impl Dit {
         mark("quant")?;
         k!(gpu_int8_gemm(a8.ptr(), wp("wqkv"), asc.ptr(), wp("sqkv"), null(), qkv.ptr(), rows as i64, QKV as i64, fi, DT_BF16, s(st)))?;
         mark("qkv gemm")?;
-        k!(gpu_qk_norm_rope(DT_BF16, HD as i32, qkv.ptr(), QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn"), wp("kn"), EPS, rope, 1, mi, s(st)))?;
+        let each = rows / batch;
+        for i in 0..batch {
+            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(qkv.ptr(), i * each * QKV * 2), QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn"), wp("kn"),
+                EPS, rope, 1, each as i32, s(st)))?;
+        }
         mark("norm rope")?;
         let attn = DevBuf::alloc_async(rows * F * 2, st)?;
         trace(tag, "x_in", x, rows * F * 2, st)?;
@@ -395,7 +403,7 @@ impl Dit {
     #[allow(clippy::too_many_arguments)]
     fn prefix_block(&self, tag: &str, base: PM, lay: &Layout, x: &DevBuf, pf: &Prefix, m0: &Mod, kout: PM, vout: PM, st: &Stream) -> Result<()> {
         let p = pf.rows;
-        self.block(&format!("p{tag}"), base, lay, x, p, m0, pf.rope.ptr(), st, &mut |qkv, attn, st| {
+        self.block(&format!("p{tag}"), base, lay, x, 1, p, m0, pf.rope.ptr(), st, &mut |qkv, attn, st| {
             let q = qkv.ptr();
             let (kp, vp) = (off(q, F * 2), off(q, 2 * F * 2));
             memcpy_2d_d2d(kout, F * 2, kp, QKV * 2, F * 2, p, st)?;
@@ -411,7 +419,7 @@ impl Dit {
                     // everything before it and all of itself
                     Seg::Image { .. } => {
                         let lse = DevBuf::alloc_async(H * n * 4, st)?;
-                        self.flash(qs, kp, vp, os, lse.ptr(), n, at + n, QKV, QKV, st)?;
+                        self.flash(qs, kp, vp, os, lse.ptr(), 1, n, at + n, QKV, QKV, st)?;
                     }
                 }
                 at += n;
@@ -441,25 +449,32 @@ impl Dit {
         Ok(())
     }
 
-    /// One model evaluation: writes the denoised latent (f32 [64, h, w]) to `den`.
+    /// One model evaluation of `batch` latents (f32 [batch, 64, h, w]) that share the prefix: writes the denoised ones
+    /// to `den`.
     #[allow(clippy::too_many_arguments)]
-    pub fn predict(&mut self, latent: &DevBuf, h: usize, w: usize, pf: &Prefix, sigma: f32, den: &DevBuf, st: &Stream,
+    pub fn predict(&mut self, latent: &DevBuf, batch: usize, h: usize, w: usize, pf: &Prefix, sigma: f32, den: &DevBuf, st: &Stream,
         mut probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<()> {
         let (lt, p) = (h * w, pf.rows);
+        let (rows, kl) = (batch * lt, p + lt);
+        let plane = CH * lt * 4;
         let fi = F as i64;
         let m = self.modulation(flow_time(sigma), st)?;
         if let Some(pr) = probe.as_mut() {
             pr("temb", &m.temb, F * 2);
         }
 
-        let x = DevBuf::alloc_async(lt * F * 2, st)?;
-        let tok = DevBuf::alloc_async(lt * CH * 2, st)?;
-        k!(gpu_patchify(latent.ptr(), tok.ptr(), CH as i32, h as i32, w as i32, 1, s(st)))?;
-        self.gemm(tok.ptr(), self.g("img_in"), x.ptr(), lt, F, CH, st)?;
+        let x = DevBuf::alloc_async(rows * F * 2, st)?;
+        let tok = DevBuf::alloc_async(rows * CH * 2, st)?;
+        // cuBLAS picks its algorithm by the rows, so each image keeps its own GEMMs and its result alone
+        for i in 0..batch {
+            let ti = off(tok.ptr(), i * lt * CH * 2);
+            k!(gpu_patchify(off(latent.ptr(), i * plane), ti, CH as i32, h as i32, w as i32, 1, s(st)))?;
+            self.gemm(ti, self.g("img_in"), off(x.ptr(), i * lt * F * 2), lt, F, CH, st)?;
+        }
 
-        // keys and values of the prefix, then of the image
-        let kcat = DevBuf::alloc_async((p + lt) * F * 2, st)?;
-        let vcat = DevBuf::alloc_async((p + lt) * F * 2, st)?;
+        // each image's keys and values: the prefix's, then its own
+        let kcat = DevBuf::alloc_async(batch * kl * F * 2, st)?;
+        let vcat = DevBuf::alloc_async(batch * kl * F * 2, st)?;
         let (xp, m0) = if pf.kv.is_none() {
             let xp = DevBuf::alloc_async(p * F * 2, st)?;
             memcpy_d2d(xp.ptr(), pf.tokens.ptr(), p * F * 2, st)?;
@@ -482,20 +497,25 @@ impl Dit {
                 }
                 _ => unreachable!(),
             }
-            let (kt, vt) = (off(kcat.ptr(), p * F * 2), off(vcat.ptr(), p * F * 2));
+            for i in 1..batch {
+                memcpy_d2d(off(kcat.ptr(), i * kl * F * 2), kcat.ptr(), p * F * 2, st)?;
+                memcpy_d2d(off(vcat.ptr(), i * kl * F * 2), vcat.ptr(), p * F * 2, st)?;
+            }
             let (kc, vc) = (kcat.ptr(), vcat.ptr());
-            self.block(&format!("t{b}"), base, &lay, &x, lt, &m, rope_t, st, &mut |qkv, attn, st| {
-                let q = qkv.ptr();
-                memcpy_2d_d2d(kt, F * 2, off(q, F * 2), QKV * 2, F * 2, lt, st)?;
-                memcpy_2d_d2d(vt, F * 2, off(q, 2 * F * 2), QKV * 2, F * 2, lt, st)?;
-                self.attention(q, kc, vc, attn.ptr(), lt, p + lt, QKV, F, st)
+            self.block(&format!("t{b}"), base, &lay, &x, batch, rows, &m, rope_t, st, &mut |qkv, attn, st| {
+                for i in 0..batch {
+                    let (q, at) = (off(qkv.ptr(), i * lt * QKV * 2), (i * kl + p) * F * 2);
+                    memcpy_2d_d2d(off(kc, at), F * 2, off(q, F * 2), QKV * 2, F * 2, lt, st)?;
+                    memcpy_2d_d2d(off(vc, at), F * 2, off(q, 2 * F * 2), QKV * 2, F * 2, lt, st)?;
+                }
+                self.attention(qkv.ptr(), kc, vc, attn.ptr(), batch, lt, kl, QKV, F, st)
             })?;
             self.blocks.release(b, st)?;
             if let Some(pr) = probe.as_mut() {
                 if let Some(xp) = &xp {
                     pr(&format!("prefix_block{b}"), xp, p * F * 2);
                 }
-                pr(&format!("block{b}"), &x, lt * F * 2);
+                pr(&format!("block{b}"), &x, rows * F * 2);
             }
         }
 
@@ -504,14 +524,19 @@ impl Dit {
         k!(gpu_prologue_rows(DT_BF16, PRO_SILU, m.temb.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), silu.ptr(), fi, 1, F as i32, s(st)))?;
         let scale = DevBuf::alloc_async(F * 2, st)?;
         self.gemm(silu.ptr(), self.g("norm_out"), scale.ptr(), 1, F, F, st)?;
-        let normed = DevBuf::alloc_async(lt * F * 2, st)?;
-        k!(gpu_prologue_rows_b(DT_BF16, PRO_LN_MOD, x.ptr(), fi, null(), null(), EPS, scale.ptr(), self.g("zero"), normed.ptr(), fi, lt as i32, F as i32,
-            s(st)))?;
-        self.gemm(normed.ptr(), self.g("proj_out"), tok.ptr(), lt, CH, F, st)?;
-        if let Some(pr) = probe.as_mut() {
-            pr("proj_out", &tok, lt * CH * 2);
+        let normed = DevBuf::alloc_async(rows * F * 2, st)?;
+        k!(gpu_prologue_rows_b(DT_BF16, PRO_LN_MOD, x.ptr(), fi, null(), null(), EPS, scale.ptr(), self.g("zero"), normed.ptr(), fi, rows as i32,
+            F as i32, s(st)))?;
+        for i in 0..batch {
+            self.gemm(off(normed.ptr(), i * lt * F * 2), self.g("proj_out"), off(tok.ptr(), i * lt * CH * 2), lt, CH, F, st)?;
         }
-        k!(gpu_unpatch_denoised(tok.ptr(), CH as i64, latent.ptr(), den.ptr(), CH as i32, h as i32, w as i32, 1, sigma, s(st)))?;
+        if let Some(pr) = probe.as_mut() {
+            pr("proj_out", &tok, rows * CH * 2);
+        }
+        for i in 0..batch {
+            k!(gpu_unpatch_denoised(off(tok.ptr(), i * lt * CH * 2), CH as i64, off(latent.ptr(), i * plane), off(den.ptr(), i * plane), CH as i32,
+                h as i32, w as i32, 1, sigma, s(st)))?;
+        }
         self.prof.borrow_mut().mark("end", st)?;
         self.prof.borrow_mut().report("qwen21 step", st)
     }

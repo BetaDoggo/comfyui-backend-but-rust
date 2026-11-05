@@ -34,6 +34,10 @@ struct Args {
     /// Images per prompt (seed, seed+1, ...)
     #[arg(short = 'n', long, default_value_t = 1)]
     count: usize,
+    /// Images of a prompt sampled together, through the model at once. Each keeps its seed's noise; the sampler's own
+    /// noise is one tensor for the batch, as in ComfyUI
+    #[arg(long, default_value_t = 1)]
+    batch: usize,
     /// Output path; with several images, "_<i>" is inserted before the extension
     #[arg(short, long, default_value = "output.png")]
     out: PathBuf,
@@ -228,6 +232,28 @@ impl Args {
         pipeline::Sampling::new(self.sampler.as_deref().unwrap_or(default), &self.scheduler, ms, self.steps, self.cfg, seed, latent)
     }
 
+    /// The sampling of images `first..first + k` of a prompt, sampled together.
+    fn batch_sampling(&self, default: &str, ms: ModelSampling, (first, k): (usize, usize), latent: (usize, usize)) -> Result<pipeline::Sampling> {
+        let mut s = self.sampling(default, ms, self.seed + first as u64, latent)?;
+        (s.batch_size, s.images) = (k, k);
+        Ok(s)
+    }
+
+    /// A prompt's images in the groups `--batch` samples together: (first, count).
+    fn batches(&self) -> Vec<(usize, usize)> {
+        let b = self.batch.max(1);
+        (0..self.count).step_by(b).map(|i| (i, b.min(self.count - i))).collect()
+    }
+
+    /// The noise of images `first..first + k`, `n` values each: each its seed's, or the reference dump's.
+    fn noise(&self, (first, k): (usize, usize), n: usize) -> Result<Vec<f32>> {
+        match &self.ref_noise {
+            Some(p) if k == 1 => st::SafeTensors::open(p)?.f32_vec("noise", false),
+            Some(_) => bail!("--ref-noise takes --batch 1"),
+            None => Ok((first..first + k).flat_map(|i| diffusion::sampling::torch_randn(self.seed + i as u64, n)).collect()),
+        }
+    }
+
     /// `path`, or `default` inside the models folder.
     fn model(&self, path: &Option<PathBuf>, default: &str) -> PathBuf {
         path.clone().unwrap_or_else(|| {
@@ -246,29 +272,27 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     gen.ensure_qwen3(&te)?;
     apply_loras(&mut gen, args)?;
     let n = 16 * (args.height / 8) * (args.width / 8);
-    for i in 0..args.count {
-        let seed = args.seed + i as u64;
-        let noise = match &args.ref_noise {
-            Some(p) => st::SafeTensors::open(p)?.f32_vec("noise", false)?,
-            None => diffusion::sampling::torch_randn(seed, n),
-        };
+    for group in args.batches() {
         let r = pipeline::AnimaRequest {
             positive: Prompt::new(diffusion::tokenizer::token_weights(&args.prompt, 1.0)),
             negative: Prompt::new(diffusion::tokenizer::token_weights(&args.negative, 1.0)),
             width: args.width,
             height: args.height,
-            sampling: args.sampling("er_sde", ModelSampling::Flow { shift }, seed, (args.width / 8, args.height / 8))?,
-            noise,
+            sampling: args.batch_sampling("er_sde", ModelSampling::Flow { shift }, group, (args.width / 8, args.height / 8))?,
+            noise: args.noise(group, n)?,
         };
         let mut dump = pipeline::Dump::new();
         let t0 = Instant::now();
-        let (latent, _) = gen.sample_anima(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
-        let rgb = gen.decode_latent(&latent, args.width, args.height)?;
-        eprintln!("image done in {:.2}s", t0.elapsed().as_secs_f64());
-        let path = out_path(&args.out, i, args.count);
-        std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
-            .with_context(|| format!("writing {}", path.display()))?;
-        eprintln!("[{i}] saved {} (seed {seed})", path.display());
+        let (latents, _) = gen.sample_anima(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
+        for (j, latent) in latents.chunks_exact(n).enumerate() {
+            let i = group.0 + j;
+            let rgb = gen.decode_latent(latent, args.width, args.height)?;
+            let path = out_path(&args.out, i, args.count);
+            std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
+                .with_context(|| format!("writing {}", path.display()))?;
+            eprintln!("[{i}] saved {} (seed {})", path.display(), args.seed + i as u64);
+        }
+        eprintln!("{} image(s) done in {:.2}s", group.1, t0.elapsed().as_secs_f64());
         if let Some(d) = &args.dump {
             write_safetensors(d, &dump)?;
         }
@@ -285,30 +309,29 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     gen.ensure_flux2_vae(&vae)?;
     apply_loras(&mut gen, args)?;
     let n = 128 * (args.height / 16) * (args.width / 16);
-    for i in 0..args.count {
-        let seed = args.seed + i as u64;
-        let noise = match &args.ref_noise {
-            Some(p) => st::SafeTensors::open(p)?.f32_vec("noise", false)?,
-            None => diffusion::sampling::torch_randn(seed, n),
-        };
+    for group in args.batches() {
         let r = pipeline::MossRequest {
             positive: Prompt::text(args.prompt.trim()),
             negative: Prompt::text(args.negative.trim()),
             width: args.width,
             height: args.height,
-            sampling: args.sampling("euler", ModelSampling::Flow { shift }, seed, (args.width / 16, args.height / 16))?,
-            noise,
+            sampling: args.batch_sampling("euler", ModelSampling::Flow { shift }, group, (args.width / 16, args.height / 16))?,
+            noise: args.noise(group, n)?,
         };
         let mut dump = pipeline::Dump::new();
         let t0 = Instant::now();
-        let (latent, _) = gen.sample_moss(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
-        let t1 = Instant::now();
-        let rgb = gen.decode_moss(&latent, args.width, args.height)?;
-        eprintln!("VAE decode {:.0} ms, image done in {:.2}s", t1.elapsed().as_secs_f64() * 1e3, t0.elapsed().as_secs_f64());
-        let path = out_path(&args.out, i, args.count);
-        std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
-            .with_context(|| format!("writing {}", path.display()))?;
-        eprintln!("[{i}] saved {} (seed {seed})", path.display());
+        let (latents, _) = gen.sample_moss(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
+        for (j, latent) in latents.chunks_exact(n).enumerate() {
+            let i = group.0 + j;
+            let t1 = Instant::now();
+            let rgb = gen.decode_moss(latent, args.width, args.height)?;
+            eprintln!("VAE decode {:.0} ms", t1.elapsed().as_secs_f64() * 1e3);
+            let path = out_path(&args.out, i, args.count);
+            std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
+                .with_context(|| format!("writing {}", path.display()))?;
+            eprintln!("[{i}] saved {} (seed {})", path.display(), args.seed + i as u64);
+        }
+        eprintln!("{} image(s) done in {:.2}s", group.1, t0.elapsed().as_secs_f64());
         if let Some(d) = &args.dump {
             write_safetensors(d, &dump)?;
         }
@@ -339,32 +362,31 @@ fn run_qwen21(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         references.push(gen.encode_image21(&f, w, h)?);
     }
     let n = 64 * (args.height / 16) * (args.width / 16);
-    for i in 0..args.count {
-        let seed = args.seed + i as u64;
-        let noise = match &args.ref_noise {
-            Some(p) => st::SafeTensors::open(p)?.f32_vec("noise", false)?,
-            None => diffusion::sampling::torch_randn(seed, n),
-        };
+    for group in args.batches() {
         let r = pipeline::Qwen21Request {
             positive: Prompt::text(args.prompt.trim()),
             negative: Prompt::text(args.negative.trim()),
             width: args.width,
             height: args.height,
-            sampling: args.sampling("euler", ModelSampling::Flux { shift }, seed, (args.width / 16, args.height / 16))?,
-            noise,
+            sampling: args.batch_sampling("euler", ModelSampling::Flux { shift }, group, (args.width / 16, args.height / 16))?,
+            noise: args.noise(group, n)?,
             images: images.clone(),
             negative_images: images.clone(),
             references: references.clone(),
         };
         let mut dump = pipeline::Dump::new();
         let t0 = Instant::now();
-        let (latent, _) = gen.sample_qwen21(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
-        let t1 = Instant::now();
-        let rgba = gen.decode_qwen21(&latent, args.width, args.height)?;
-        eprintln!("VAE decode {:.0} ms, image done in {:.2}s", t1.elapsed().as_secs_f64() * 1e3, t0.elapsed().as_secs_f64());
-        let path = out_path(&args.out, i, args.count);
-        write_rgba_png(&path, &rgba, args.width, args.height)?;
-        eprintln!("[{i}] saved {} (seed {seed})", path.display());
+        let (latents, _) = gen.sample_qwen21(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
+        for (j, latent) in latents.chunks_exact(n).enumerate() {
+            let i = group.0 + j;
+            let t1 = Instant::now();
+            let rgba = gen.decode_qwen21(latent, args.width, args.height)?;
+            eprintln!("VAE decode {:.0} ms", t1.elapsed().as_secs_f64() * 1e3);
+            let path = out_path(&args.out, i, args.count);
+            write_rgba_png(&path, &rgba, args.width, args.height)?;
+            eprintln!("[{i}] saved {} (seed {})", path.display(), args.seed + i as u64);
+        }
+        eprintln!("{} image(s) done in {:.2}s", group.1, t0.elapsed().as_secs_f64());
         if let Some(d) = &args.dump {
             write_safetensors(d, &dump)?;
         }
@@ -673,15 +695,9 @@ fn run_krea(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             .collect(),
         None => vec![args.prompt.clone()],
     };
-    let jobs: Vec<(String, u64)> = prompts
-        .iter()
-        .flat_map(|p| (0..args.count).map(move |i| (p.clone(), i as u64)))
-        .collect();
-    let n_jobs = jobs.len();
-    let ref_noise = match &args.ref_noise {
-        Some(p) => Some(st::SafeTensors::open(p)?.f32_vec("noise", false)?),
-        None => None,
-    };
+    let jobs: Vec<(usize, &String, (usize, usize))> = prompts.iter().enumerate().flat_map(|(p, prompt)| args.batches().into_iter().map(move |g| (p, prompt, g))).collect();
+    let n_jobs = prompts.len() * args.count;
+    let n = 16 * (args.height / 8) * (args.width / 8);
     let timestep_zero = match args.ref_method.as_str() {
         "index" => false,
         "index_timestep_zero" => true,
@@ -692,15 +708,15 @@ fn run_krea(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         let i = read_png(p)?;
         gen.encode_image(&i.rgb, i.width, i.height)
     }).collect::<Result<Vec<_>>>()?;
-    for (img_i, (prompt, seed_off)) in jobs.into_iter().enumerate() {
+    for (p, prompt, group) in jobs {
         let req = pipeline::KreaRequest {
-            prompt: Prompt::text(&prompt),
+            prompt: Prompt::text(prompt),
             negative: Prompt::text(&args.negative),
-            seed: args.seed + seed_off,
+            seed: args.seed + group.0 as u64,
             width: args.width,
             height: args.height,
-            sampling: args.sampling("euler", ModelSampling::Flux { shift: args.shift }, args.seed + seed_off, (args.width / 8, args.height / 8))?,
-            noise: ref_noise.clone(),
+            sampling: args.batch_sampling("euler", ModelSampling::Flux { shift: args.shift }, group, (args.width / 8, args.height / 8))?,
+            noise: Some(args.noise(group, n)?),
             images: images.clone(),
             negative_images: images.clone(),
             references: references.clone(),
@@ -711,10 +727,13 @@ fn run_krea(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             dump.insert("ref0".into(), ("F32".into(), vec![16, r.height, r.width], st::f32_bytes(&r.latent).to_vec()));
         }
         let (rgb, _) = gen.generate_krea(&req, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
-        let path = out_path(&args.out, img_i, n_jobs);
-        std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
-            .with_context(|| format!("writing {}", path.display()))?;
-        eprintln!("[{img_i}] saved {} (seed {})", path.display(), req.seed);
+        for (j, rgb) in rgb.chunks_exact(args.width * args.height * 3).enumerate() {
+            let img_i = p * args.count + group.0 + j;
+            let path = out_path(&args.out, img_i, n_jobs);
+            std::fs::write(&path, pipeline::encode_png(args.width, args.height, rgb)?)
+                .with_context(|| format!("writing {}", path.display()))?;
+            eprintln!("[{img_i}] saved {} (seed {})", path.display(), args.seed + (group.0 + j) as u64);
+        }
         if let Some(d) = &args.dump {
             write_safetensors(d, &dump)?;
             eprintln!("dump written to {}", d.display());

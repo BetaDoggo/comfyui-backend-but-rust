@@ -15,6 +15,7 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--sampler`, `--scheduler`, `--cfg`, `--negative` | any ComfyUI sampler and scheduler, on any model |
 | `--image`, `--ref-image`, `--ref-method` | Krea 2 reference images, see [Krea 2 reference images](MODELS.md#reference-images) |
 | `--prompt-file f.txt`, `-n N` | many prompts / seeds with the models loaded once |
+| `--batch N` | sample up to N of a prompt's `-n` images together, through the model at once. Each image keeps its own seed's noise, and the sampler's own noise is one tensor for the batch, as in ComfyUI, so stochastic samplers give other images than with `--batch 1` |
 | `--attention flash` | bf16 FlashAttention-2 like ComfyUI's default (closest numerics, ~15% slower per step); the default is `int8`, comfy-kitchen's SageAttention-style INT8 attention |
 | `--reserve-vram MB` | VRAM left untouched for the desktop (default 512) |
 | `--resident-blocks N`, `--slots N` | override the automatic VRAM residency plan |
@@ -126,7 +127,8 @@ attention backend. `dpmpp_2m_sde` with `karras` is 24 dB.
 
 Differences to know about:
 
-* `dpm_adaptive` picks its steps from the whole batch in ComfyUI, and from each image here, so its batches can differ.
+* `dpm_adaptive` picks its steps from the whole batch, as in ComfyUI, unless the batch doesn't fit in VRAM at once: then it
+  picks them per part, so such batches can differ.
 * `dpm_fast` and `dpm_adaptive` stop at the last non-zero sigma, as in ComfyUI, so they can leave visible noise.
 * Combinations ComfyUI runs badly run badly here too: `turbo` and `align_your_steps` use sigmas above 1 on these models.
 * The Brownian samplers (`dpmpp_sde`, `dpmpp_2m_sde`, `dpmpp_3m_sde` and their variants) generate their noise on the CPU, even

@@ -264,7 +264,7 @@ Single image mode (1 frame) samples one latent frame and decodes it as ComfyUI d
 video decoder, keeping the first real frame. A 768x512 still at 20 steps and CFG 5 took about 1 s per step once warm, through
 `comfy-server` over HTTP; not compared with ComfyUI's picture, and not run through SwarmUI itself.
 
-Not done: the video and audio encoders, sparse attention for long clips, and the web UI.
+Not done: the video and audio encoders, and sparse attention for long clips.
 
 ## Pixal3D
 

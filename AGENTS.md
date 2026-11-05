@@ -116,7 +116,7 @@ dotnet src/bin/live_release/SwarmUI.dll --data_dir <tmp> --settings_file <tmp> -
 | Document | Holds | Update it when |
 |---|---|---|
 | [README.md](README.md) | Setup and a short summary | Requirements or the supported families change |
-| [docs/USAGE.md](docs/USAGE.md) | CLI, web UI, LoRAs, samplers | A flag or behaviour changes |
+| [docs/USAGE.md](docs/USAGE.md) | CLI, LoRAs, samplers | A flag or behaviour changes |
 | [docs/MODELS.md](docs/MODELS.md) | Timings, parity, limits per family | Anything is measured again |
 | [docs/STATUS.md](docs/STATUS.md) | What works, by priority | A feature lands |
 | [docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md) | Design and dependencies | The design changes |

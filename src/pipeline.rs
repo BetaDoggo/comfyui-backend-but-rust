@@ -1,4 +1,4 @@
-//! Loaded models + one text-to-image generation, shared by the CLI and the web server.
+//! Loaded models + one text-to-image generation, used by the CLI and the server.
 
 use crate::cuda::{self, DevBuf, Event, Stream};
 use crate::samplers::{self, CfgTweaks, Eval, ModelSampling, Uncond};
@@ -496,7 +496,7 @@ impl Generator {
             int8_attn: o.int8_attn, dynamic: o.resident_blocks.is_none() })
     }
 
-    /// Start the GPU runtime with the Krea 2 files of `o` loaded, for the CLI and the web UI.
+    /// Start the GPU runtime with the Krea 2 files of `o` loaded, for the CLI and the server.
     pub fn load_krea(o: &LoadOptions) -> Result<Self> {
         let t_start = Instant::now();
         let mut gen = Self::new(o)?;

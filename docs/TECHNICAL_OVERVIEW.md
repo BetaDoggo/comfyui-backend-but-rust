@@ -46,7 +46,7 @@ serves only the mock engine.
 | `fancy-regex`, `unicode-normalization` | The hand-written Qwen BPE tokenizer |
 | `tokenizers` | The T5 tokenizer Anima uses |
 | `image`, `png`, `base64` | Image encoding and decoding |
-| `clap`, `tiny_http`, `anyhow` | Command line, the small Krea 2 web UI, errors |
+| `clap`, `anyhow` | Command line, errors |
 | `cc` (build only) | Finds MSVC for the nvcc build and the static library |
 
 There is no Rust binding to a tensor library. CUDA, NVML and the kernels are called through `extern "C"` declarations in
@@ -200,7 +200,6 @@ csrc/birefnet.cu    BiRefNet: im2col, deformable-conv columns, Swin window gathe
 csrc/wddm.cu        VRAM queries under Windows
 csrc/vendor/        comfy-kitchen CUTLASS int8 GEMM + Sage INT8 attention (Apache-2.0)
 src/                Rust: loader, offloading, tokenizers, each family's models, samplers, LoRA baking, CLI
-web/index.html      the Krea 2 web UI
 tools/              ComfyUI reference dump / comparison / benchmark scripts
 ```
 

@@ -24,7 +24,6 @@ pub mod qwen3;
 pub mod qwen35;
 pub mod samplers;
 pub mod sampling;
-pub mod serve;
 pub mod st;
 pub mod te;
 pub mod tokenizer;

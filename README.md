@@ -112,7 +112,7 @@ folders, so `MODELS_ROOT` isn't needed. This hasn't been run inside SwarmUI yet.
 
 For users:
 
-* [Usage](docs/USAGE.md): command line flags, the web UI, LoRAs and samplers
+* [Usage](docs/USAGE.md): command line flags, LoRAs and samplers
 * [Models](docs/MODELS.md): each family's timings, closeness to ComfyUI and limits
 * [SwarmUI backend](swarm%20backend/README.md): running the server and what SwarmUI can use
 * [Status](docs/STATUS.md): everything that works and everything left to do

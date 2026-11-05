@@ -1,6 +1,6 @@
 # Usage
 
-How to run the command line and the small web UI, and how LoRAs and samplers behave. Timings are from one machine: an
+How to run the command line, and how LoRAs and samplers behave. Timings are from one machine: an
 RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../README.md). For each model, see
 [Models](MODELS.md).
 
@@ -33,26 +33,6 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 
 Set `PROFILE=1` to print the time of each stage per step and per decoded tile. Stages are timed with events on the compute
 stream, so the run keeps its overlap and its output.
-
-## Web UI
-
-Krea 2 only.
-
-```bash
-target/release/diffusion.exe --serve 127.0.0.1:7860
-```
-
-```bash
-target/release/diffusion.exe --serve 127.0.0.1:7860
-```
-
-Then open http://127.0.0.1:7860. Models load once and stay in memory; requests queue on the GPU.
-The page has prompt, a side-length slider with aspect-ratio buttons (pixel count ≈ side², multiples of 16), steps, image count, seed (random or fixed), live step
-progress and a history strip. Images are also saved to `--out-dir` (default `outputs/`).
-The side length goes up to 2048 (`--max-side`, default 2048); `--width/--height` set the default
-size. Planning VRAM for 2048² keeps fewer DiT blocks resident (9 instead of 16 on a 12 GB card),
-which costs ~3% at 1024²; a 2048² image takes ~26 s. JSON API: `POST /api/generate`
-`{prompt, seed?, width?, height?, steps?}` → `{id}`, `GET /api/job/<id>`, `GET /api/image/<id>.png`.
 
 ## LoRAs
 

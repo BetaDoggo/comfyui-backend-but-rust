@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use diffusion::samplers::ModelSampling;
 use diffusion::pipeline::Prompt;
-use diffusion::{pipeline, serve, st};
+use diffusion::{pipeline, st};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -72,17 +72,6 @@ struct Args {
     /// Use the noise stored in a ComfyUI reference dump (tools/ref_dump.py) instead of the seed
     #[arg(long)]
     ref_noise: Option<PathBuf>,
-    /// Run the web UI on this address (e.g. 127.0.0.1:7860) instead of generating once.
-    /// --width/--height then set the default and the largest size the VRAM plan allows.
-    #[arg(long)]
-    serve: Option<String>,
-    /// Web UI: largest side length (pixels, at 1:1) a request may use. VRAM residency is re-planned
-    /// for each request, so this does not reserve memory up front.
-    #[arg(long, default_value_t = 2048)]
-    max_side: usize,
-    /// Where the web UI saves generated images
-    #[arg(long, default_value = "outputs")]
-    out_dir: PathBuf,
     /// Write intermediate tensors (safetensors) for parity checks
     #[arg(long)]
     dump: Option<PathBuf>,
@@ -642,12 +631,7 @@ fn main() -> Result<()> {
         vae: args.model(&args.vae, QWEN_VAE),
         max_width: args.width,
         max_height: args.height,
-        // the web UI accepts any size up to --max-side squared; residency is re-planned per request
-        max_pixels: if args.serve.is_some() {
-            (args.max_side * args.max_side).max(args.width * args.height)
-        } else {
-            args.width * args.height
-        },
+        max_pixels: args.width * args.height,
         reserve_vram_mb: args.reserve_vram,
         resident_blocks: args.resident_blocks,
         slots: args.slots,
@@ -666,16 +650,6 @@ fn main() -> Result<()> {
     }
     if args.qwen21 {
         return run_qwen21(&args, load);
-    }
-    if let Some(addr) = &args.serve {
-        return serve::run(load, serve::ServeOptions {
-            addr: addr.clone(),
-            out_dir: args.out_dir.clone(),
-            default_steps: args.steps,
-            default_width: args.width,
-            default_height: args.height,
-            shift: args.shift,
-        });
     }
     run_krea(&args, load)
 }

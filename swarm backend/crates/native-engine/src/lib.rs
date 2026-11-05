@@ -8,6 +8,7 @@
 //! at CFG 1. Everything the pipeline can't do is refused with [`EngineError::Unsupported`], which
 //! SwarmUI shows to the user, instead of being ignored and producing a different image.
 
+mod latent;
 mod noise;
 
 use std::io::Read;
@@ -1085,6 +1086,10 @@ impl Engine for NativeEngine {
         let (lh, lw) = size;
         let tensor = LatentTensor { format: LatentFormat::Image16Ch, shape: vec![frames.len(), 16, lh, lw], data: Opaque::new(HostLatent { data }) };
         Ok(Latent::single(tensor, PixelInfo::image(lw as u32 * 8, lh as u32 * 8, frames.len() as u32)))
+    }
+
+    fn latent_op(&self, op: &LatentOp) -> EngineResult<Latent> {
+        latent::latent_op(op)
     }
 
     fn vae_decode_audio(&self, req: &VaeDecodeAudioRequest) -> EngineResult<AudioData> {

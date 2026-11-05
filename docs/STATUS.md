@@ -67,6 +67,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 |---|---|---|---|
 | P0 | Engine core | Route each model to its engine | One backend now serves Krea 2, Anima, MOSS Image, Qwen Image 2.1 and MiniMax H3, picked from the checkpoint's keys. Still inside native-engine; other families need a real router. |
 | P0 | Engine core | Dynamic VRAM offloading | Live residency works and adapted to ComfyUI's memory. Open: 16 to 11 drop at 1024, one 867 ms/step run after ComfyUI. |
+| P0 | Engine core | Latent operations | `LatentAdd`, `LatentMultiply`, `SwarmLatentBlendMasked`, `RepeatLatentBatch`, `LatentFromBatch`, `LatentBatch` and `LatentUpscaleBy` with all five methods, on image latents. Each matches ComfyUI's own node code on recorded random latents to within 1e-6 (`tools/latent_ops_ref.py`). Tested through SwarmUI on Krea 2 at 768x512: Init Image Reset To Norm with Creativity 0 (batch 2, and with a mask) decodes at 47.7 and 49.0 dB from ComfyUI, and each upscale method at 41.8 to 44.8 dB, against 46.1 dB for the plain VAE round trip. `LatentFromBatch` and `LatentBatch` after sampling, as raw workflows, give exactly the images of the plain runs. Real ComfyUI fails on the Reset To Norm workflows with Krea 2, because its Qwen Image VAE latents are 5D and the empty latent is 4D, so it was compared with that axis dropped. Sampling still refuses non-empty latents, so init images with Creativity above 0 and refiners stay refused at the sampler. Video and audio latents, `TrimVideoLatent`, `SwarmReferenceOnly` and the Kandinsky 5 frame ops are refused. Anima, MOSS Image and Qwen Image 2.1 latents not tested. |
 | P1 | Krea 2 | Model Attention Backend | int8 and flash, per request. flash not yet run through the server. |
 | P1 | Pixal3D | Image to 3D | Real meshes from the CLI and through comfy-server's `Pixal3DImageTo3D` node: 40 s at 1024, 110 s at 1536. Each stage compared with ComfyUI. Not yet run through SwarmUI. |
 | P1 | Pixal3D | Background removal (BiRefNet) | Cut-outs from the CLI and through comfy-server's stock `LoadBackgroundRemovalModel` and `RemoveBackground` nodes, compared with ComfyUI. An opaque image went on through them to a mesh over HTTP. Not yet run through SwarmUI, and SwarmUI's own Remove Background parameter (`SwarmRemBg`, rembg) is still refused. |
@@ -113,7 +114,6 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 
 | Priority | Area | Item | Notes |
 |---|---|---|---|
-| P0 | Engine core | Latent operations | Add, multiply, blend, batch, repeat and upscale. Needed by init images, refiners and regions. |
 | P1 | Engine core | Hardware beyond this card | Everything targets sm_120 on Windows. Other GPUs and Linux are untested. |
 | P1 | Krea 2 | Prompt weights | <weight> through SwarmAttnTokenWeights, inside attention. |
 | P1 | Krea 2 | <alternate> and <fromto> | Per-step conditioning. |

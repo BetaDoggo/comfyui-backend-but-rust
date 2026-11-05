@@ -154,6 +154,9 @@ struct Args {
     /// Qwen Image 2.1: compare the VAE with a dump of tools/qwen21_ref.py --vae-only instead of generating
     #[arg(long)]
     qwen21_vae_check: Option<PathBuf>,
+    /// MOSS Image: compare the Flux 2 VAE's encoder with a dump of tools/flux2_vae_ref.py instead of generating
+    #[arg(long)]
+    flux2_vae_check: Option<PathBuf>,
 }
 
 /// RGB f32 [height, width, 3], 0 to 1.
@@ -615,6 +618,9 @@ fn main() -> Result<()> {
     }
     if let Some(reference) = &args.qwen21_vae_check {
         return diffusion::vae21::check(&args.model(&args.vae, QWEN21_VAE), reference);
+    }
+    if let Some(reference) = &args.flux2_vae_check {
+        return diffusion::flux2vae::check(&args.model(&args.vae, MOSS_VAE), reference);
     }
     if args.birefnet_check.is_some() {
         diffusion::cuda::init(0)?;

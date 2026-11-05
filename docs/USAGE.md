@@ -21,6 +21,7 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--anima`, `--moss`, `--qwen21`, `--h3` | pick the model family; the default is Krea 2 |
 | `--image a.png` | Qwen Image 2.1 edits: each image goes to the text encoder and into the sequence as a reference latent (repeatable); the prompt then says what to change, as in `put the boat from picture 2 on the sea in picture 1`. Output is RGBA |
 | `--qwen21-vae-check ref.safetensors` | Qwen Image 2.1: compare the VAE with `tools/qwen21_ref.py --vae-only` |
+| `--flux2-vae-check ref.safetensors` | MOSS Image: compare the Flux 2 VAE encoder with `tools/flux2_vae_ref.py` |
 | `--frames N` | H3 video length, snapped up to the 17k + 5 grid (default 5) |
 | `--lora path[:strength[:clip_strength]]` | repeatable, see [LoRAs](#loras) |
 | `--models`, `--dit`, `--te`, `--vae` | model folder, or individual files |

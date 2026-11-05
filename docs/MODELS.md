@@ -36,7 +36,7 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | Prompt weights | Refused | Yes | Yes | Refused | Yes | - |
 | `<break>` | Yes | Refused | Yes | Refused | Refused | - |
 | `<alternate>`, `<fromto>` | Refused | Refused | Refused | Refused | Refused | - |
-| Init images, refiners, inpainting (partial sampling) | Yes | Yes (refiner not tested) | Refiner only (no VAE encoder) | Yes (refiner not tested) | Refused | - |
+| Init images, refiners, inpainting (partial sampling) | Yes | Yes (refiner not tested) | Yes | Yes (refiner not tested) | Refused | - |
 | VAE tiling, Seamless Tileable | Refused | Refused | Refused | Refused | Only the 256 / 64 tile | - |
 | Background removal | - | - | - | - | - | Yes (BiRefNet) |
 
@@ -140,7 +140,7 @@ Anima drifts towards explicit images even on neutral prompts, so choose prompts 
 ## MOSS Image
 
 Runs int8 ConvRot MOSS Image checkpoints with fused q/k/v, the Qwen3.5 9B text encoder and the Flux 2 VAE. Both
-published key layouts of that VAE load. Every sampler and scheduler works, at any CFG (see [Samplers](USAGE.md#samplers)); SwarmUI's default is `euler`.
+published key layouts of that VAE load, with its encoder, whose latents have a cosine similarity of 0.99984 with ComfyUI's on a 768x512 picture. Every sampler and scheduler works, at any CFG (see [Samplers](USAGE.md#samplers)); SwarmUI's default is `euler`.
 Prompts are literal: like ComfyUI, this encoder has no `(word:1.2)` emphasis.
 
 ```bash

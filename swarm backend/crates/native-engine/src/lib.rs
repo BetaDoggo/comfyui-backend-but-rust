@@ -676,6 +676,31 @@ impl NativeEngine {
         Ok(Latent::single(tensor, PixelInfo::image(lw as u32 * scale, lh as u32 * scale, pixels.count)))
     }
 
+    /// MOSS Image's Flux 2 VAE on `pixels`. Alpha is dropped, as ComfyUI's VAEEncode does.
+    fn encode_flux2(&self, file: &ModelFile, pixels: &ImageBatch) -> EngineResult<Latent> {
+        let c = pixels.channels as usize;
+        if c < 3 {
+            return Err(unsupported("VAE encoding of a greyscale image"));
+        }
+        let (w, h) = (pixels.width as usize, pixels.height as usize);
+        let mut gen = self.gen();
+        gen.ensure_flux2_vae(&file.path).map_err(internal)?;
+        let (mut data, mut size) = (Vec::new(), (0, 0));
+        for i in 0..pixels.count {
+            let rgb: Vec<f32> = pixels.frame_f32(i).chunks_exact(c).flat_map(|px| [px[0], px[1], px[2]]).collect();
+            let r = gen.encode_moss(&rgb, w, h).map_err(internal)?;
+            data.extend_from_slice(&r.latent);
+            size = (r.height, r.width);
+        }
+        let (lh, lw) = size;
+        let tensor = LatentTensor {
+            format: LatentFormat::Flux2,
+            shape: vec![pixels.count as usize, diffusion::moss::CH, lh, lw],
+            data: Opaque::new(HostLatent { data }),
+        };
+        Ok(Latent::single(tensor, PixelInfo::image(lw as u32 * 16, lh as u32 * 16, pixels.count)))
+    }
+
     /// Qwen Image 2.1's RGBA VAE: the latent `[batch, 64, lh, lw]` to `[batch, 16lh, 16lw, 4]`.
     fn decode_qwen21(&self, file: &ModelFile, batch: usize, channels: usize, (lh, lw): (usize, usize), latent: &[f32], progress: &mut dyn ProgressSink)
         -> EngineResult<ImageBatch> {
@@ -1137,7 +1162,7 @@ impl Engine for NativeEngine {
             return self.encode_qwen21(file, &req.pixels);
         }
         if is_flux2_vae(file) {
-            return Err(unsupported("VAE encoding with the Flux 2 VAE"));
+            return self.encode_flux2(file, &req.pixels);
         }
         if is_h3_vae(file) {
             return Err(unsupported("VAE encoding with MiniMax H3's VAE"));

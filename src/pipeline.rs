@@ -1320,6 +1320,34 @@ impl Generator {
         self.flux2.as_ref().context("no VAE loaded")?.1.decode(&d, lh, lw, st)
     }
 
+    /// Encode RGB f32 [height, width, 3], 0 to 1, with the Flux 2 VAE into a MOSS Image latent
+    /// ([128, H/16, W/16] f32). Pixels past a multiple of 16 are cropped evenly from each side, as ComfyUI's VAE does.
+    pub fn encode_moss(&mut self, rgb: &[f32], width: usize, height: usize) -> Result<Reference> {
+        if rgb.len() != width * height * 3 {
+            bail!("image has {} values, expected {}", rgb.len(), width * height * 3);
+        }
+        let (cw, ch) = (width / 16 * 16, height / 16 * 16);
+        if cw == 0 || ch == 0 {
+            bail!("{width}x{height} is too small to encode");
+        }
+        let (x0, y0) = ((width - cw) / 2, (height - ch) / 2);
+        let mut cropped = Vec::with_capacity(cw * ch * 3);
+        for y in y0..y0 + ch {
+            cropped.extend_from_slice(&rgb[(y * width + x0) * 3..][..cw * 3]);
+        }
+        let st = &self.st;
+        if let Some(m) = self.moss.as_mut().filter(|_| self.dynamic) {
+            let need = flux2vae::Vae::activation_bytes(ch / 16, cw / 16);
+            if cuda::device_free()? < need + self.reserve {
+                rebalance(st, &mut m.dit.blocks, &m.st, self.reserve, self.slots, need, true)?;
+            }
+        }
+        let t0 = Instant::now();
+        let latent = self.flux2.as_ref().context("no VAE loaded")?.1.encode(&cropped, ch, cw, st)?;
+        eprintln!("VAE encode {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        Ok(Reference { latent, height: ch / 16, width: cw / 16 })
+    }
+
     /// Move `prompt`'s context to the end of the cache, encoding it if needed.
     fn anima_context(&mut self, prompt: &Prompt, dump: Option<&mut Dump>) -> Result<()> {
         if let Some(i) = self.contexts.iter().position(|(p, _)| p == prompt) {

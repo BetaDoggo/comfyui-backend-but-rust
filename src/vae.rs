@@ -18,7 +18,7 @@ pub const LATENT_MEAN: [f32; 16] = [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 
 pub const LATENT_STD: [f32; 16] = [2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526,
     2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160];
 const OUT_PAD: usize = 8;
-const RGB_PAD: usize = 8;
+pub(crate) const RGB_PAD: usize = 8;
 
 enum Op {
     Res { pre: String, cin: usize, cout: usize, shortcut: bool },
@@ -64,7 +64,7 @@ pub(crate) fn conv_krsc(st: &SafeTensors, name: &str, cout_pad: usize) -> Result
 }
 
 /// Like [`conv_krsc`] for a 3 channel input padded to 8, which `gpu_conv2d` needs.
-fn conv_krsc_rgb(st: &SafeTensors, name: &str) -> Result<Vec<u8>> {
+pub(crate) fn conv_krsc_rgb(st: &SafeTensors, name: &str) -> Result<Vec<u8>> {
     let (w, cout, ci, r) = conv_krsc(st, name, 0)?;
     let mut out = vec![0u8; cout * r * r * RGB_PAD * 2];
     for (i, px) in w.chunks_exact(ci * 2).enumerate() {

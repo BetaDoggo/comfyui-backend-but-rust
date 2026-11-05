@@ -131,7 +131,9 @@ Whichever route the nodes take, this part is always engine work:
 * **VAE.** Return RGBA from `vae_decode` if the VAE has alpha. For video, return frames as
   `PixelData::U8` to keep memory down.
 * **Warmup.** `warmup` is what SwarmUI's "load model" button and first-use preload call.
-* **The native engine.** Add the pipeline under `src/`, and detect the family from the checkpoint's keys in
+* **The native engine.** Add the model under `src/`, and its family to the generator as a file in
+  [`src/pipeline/`](../../src/pipeline/mod.rs): its state struct with every cache it keeps, an `impl FamilyState`, and a
+  `Kind` and `Family` variant. Then detect the family from the checkpoint's keys in
   [`native-engine`](../crates/native-engine/src/lib.rs). Refuse whatever the pipeline can't honour.
 
 ## Step 5: tests and docs

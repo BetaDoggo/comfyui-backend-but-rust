@@ -94,6 +94,12 @@ Each model is written directly against its checkpoint, with no general layer or 
 operations to be fused and work to be cached. For example, Anima's cross-attention k and v are computed once per prompt,
 and block modulation is cached per sigma.
 
+The generator ([`src/pipeline/`](../src/pipeline/mod.rs)) holds one family at a time. Each family has a file with a state
+struct for its diffusion model, the encoders and decoders only it uses, and every prompt cache it keeps. The same file
+drops those caches when a LoRA or a text encoder changes. Loading any part of another family drops the current one. Two
+parts outlive a switch: the Qwen3-VL text encoder, shared by Krea 2 and Qwen Image 2.1, and the Wan 2.1 VAE, shared by
+Krea 2 and Anima.
+
 ## Why it is faster than ComfyUI
 
 The gains come from running the same kernels with less around them, not from better kernels:

@@ -19,6 +19,8 @@ pub struct H3Request {
     pub shifts: (f64, f64),
     /// video, then audio
     pub noise: Vec<f32>,
+    /// block-sparse self-attention
+    pub sparse: Option<h3::SparseAttn>,
 }
 
 struct Model {
@@ -240,6 +242,7 @@ impl Generator {
             bail!("the {} sampler on HyperFlow H3 Flash (only euler for now)", r.sampling.sampler);
         }
         dit.shifts = shifts;
+        dit.sparse = r.sparse.clone();
         let neg_key = if r.sampling.uses_negative() { Some(f.context(&r.negative, st, None)?) } else { None };
         let pos_key = f.context(&r.prompt, st, dump.as_deref_mut())?;
         stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;

@@ -88,6 +88,25 @@ struct Args {
     /// Run MiniMax H3 (text to video with audio); --dit and --te then default to its files
     #[arg(long)]
     h3: bool,
+    /// MiniMax H3: block-sparse attention, "sol" (Sol-Attn's adaptive threshold) or "sla" (top-k), as ComfyUI's
+    /// BlockSparseAttention node
+    #[arg(long)]
+    sparse: Option<String>,
+    /// Sol-Attn's threshold: higher is sparser
+    #[arg(long, default_value_t = 1.3)]
+    sparse_tau: f32,
+    /// Top-k: percent of key blocks each query block keeps
+    #[arg(long, default_value_t = 10.0)]
+    sparse_keep: f64,
+    /// Sparse attention starts this far into the schedule
+    #[arg(long, default_value_t = 0.2)]
+    sparse_start: f64,
+    /// Sequences shorter than this stay dense
+    #[arg(long, default_value_t = 12288)]
+    sparse_min_tokens: usize,
+    /// Extra top-scoring tokens each query block attends: 0 to 256, in steps of 64
+    #[arg(long, default_value_t = 256)]
+    sparse_extra_tokens: usize,
     /// MiniMax H3: frames at 24 fps, snapped up to the model's 17k + 5 grid
     #[arg(long, default_value_t = 5)]
     frames: usize,
@@ -427,7 +446,24 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     // HyperFlow H3 Flash runs euler only, and reads each step's endpoint
     let default = if h3::hyperflow_config(&dit).is_some() { "euler" } else { "res_multistep" };
     let sampling = args.sampling(default, ModelSampling::Flow { shift: h3::SHIFT_VIDEO }, args.seed, (args.width / 16, args.height / 16))?;
-    let r = pipeline::H3Request { prompt: Prompt::text(&args.prompt), negative: Prompt::text(&args.negative), shape, sampling, shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO), noise };
+    let ms = ModelSampling::Flow { shift: h3::SHIFT_VIDEO };
+    let method = match args.sparse.as_deref() {
+        None => None,
+        Some("sol") => Some(h3::SparseMethod::Sol { tau: args.sparse_tau }),
+        Some("sla") => Some(h3::SparseMethod::TopK { ratio: args.sparse_keep / 100.0 }),
+        Some(m) => bail!("--sparse takes sol or sla, not {m}"),
+    };
+    let sparse = method.map(|method| h3::SparseAttn {
+        method,
+        sigma_start: ms.percent_to_sigma(args.sparse_start),
+        sigma_end: ms.percent_to_sigma(1.0),
+        min_tokens: args.sparse_min_tokens,
+        dense_blocks: Vec::new(),
+        sinks: h3::SparseSinks::ExactKvAndRows,
+        extra_tokens: args.sparse_extra_tokens,
+        verbose: true,
+    });
+    let r = pipeline::H3Request { prompt: Prompt::text(&args.prompt), negative: Prompt::text(&args.negative), shape, sampling, shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO), noise, sparse };
     let mut dump = pipeline::Dump::new();
     let t0 = Instant::now();
     let (latent, _) = gen.sample_h3(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;

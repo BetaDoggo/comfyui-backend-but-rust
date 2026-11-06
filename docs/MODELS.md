@@ -290,7 +290,30 @@ Single image mode (1 frame) samples one latent frame and decodes it as ComfyUI d
 video decoder, keeping the first real frame. A 768x512 still at 20 steps and CFG 5 took about 1 s per step once warm, through
 `comfy-server` over HTTP; not compared with ComfyUI's picture, and not run through SwarmUI itself.
 
-Not done: the video and audio encoders, and sparse attention for long clips.
+Not done: the video and audio encoders.
+
+### Sparse attention
+
+SwarmUI's Use Sparse Attention, ComfyUI's Model Sparse Attention node, runs on H3 and HyperFlow H3 Flash with comfy-kitchen's
+own Sol-Attn kernels, copied into `csrc/vendor/sage/`. `sol` is the training-free adaptive threshold. `topk`, ComfyUI's `sla`,
+keeps a fixed share of key blocks, with the threshold ported from comfy-kitchen to `csrc/sparse_attn.cu`. The node's window,
+`min_tokens`, `extra_tokens`, `dense_blocks` and `sink_conditioning` work as in ComfyUI: the text and audio rows stay exact,
+and the audio queries run dense. On HyperFlow, `dense_blocks` counts blocks by their index in the checkpoint. VSA is refused
+with an error that suggests the other two methods: it needs FastH3's VSA-trained weights. Other model families refuse the
+node.
+
+ComfyUI feeds H3's kernel through a chunked producer that quantizes with the previous step's statistics. This engine already
+has q, k and v after RoPE, so it uses comfy-kitchen's direct entry, which takes the statistics from the current step.
+`tests/sparse_attn_match_comfy.rs` runs both methods, with and without sinks and extra tokens, on inputs from
+`tools/sparse_attn_ref.py`. Its output matches comfy-kitchen's `sol_attn` bit for bit, and the top-k thresholds match within
+3e-7. Those inputs come out 12 to 16% from dense attention.
+
+On the CLI, 512x512, 22 frames (1,882 tokens), 4 turbo LoRA steps, sparse was forced with `--sparse-min-tokens 0`. Attention
+took 53 to 60 ms per step with `sol` and 66 to 74 ms with `sla`, against 90 ms dense. The first step stayed dense, as the
+window sets. `sla` kept dense's composition (14.9 dB). `sol` changed the composition (11.2 dB) and showed some blocky texture.
+Sequences that short are below the default 12,288 tokens, where both stay dense. The maintainer reports that it works
+through SwarmUI, though it hasn't been tested extensively. Its speedup on longer clips, above that threshold, hasn't been
+measured, and its output hasn't been compared with ComfyUI's.
 
 ### HyperFlow H3 Flash
 

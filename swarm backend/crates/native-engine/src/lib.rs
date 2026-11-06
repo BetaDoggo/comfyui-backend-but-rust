@@ -368,6 +368,8 @@ struct ModelSettings {
     tweaks: CfgTweaks,
     /// `DifferentialDiffusion`'s strength, for noise masks.
     differential: Option<f32>,
+    /// `BlockSparseAttention`, on H3.
+    sparse: Option<h3::SparseAttn>,
 }
 
 fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
@@ -379,7 +381,8 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::H3 => ModelSampling::Flow { shift: h3::SHIFT_VIDEO },
     };
     // H3's attention sink rows make int8's per-channel V scale lossy
-    let mut s = ModelSettings { model_sampling, int8_attention: family != Family::H3, loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None };
+    let mut s = ModelSettings { model_sampling, int8_attention: family != Family::H3, loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None };
+    let mut sparse = None;
     for p in &model.patches {
         match p {
             ModelPatch::SamplingFlux { max_shift, base_shift, width, height } if matches!(family, Family::Krea2 | Family::Qwen21) => {
@@ -391,6 +394,17 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
             ModelPatch::MiniMaxH3Shift { shift_video, shift_audio } if family == Family::H3 => {
                 s.model_sampling = ModelSampling::Flow { shift: *shift_video };
                 s.audio_shift = *shift_audio;
+            }
+            ModelPatch::BlockSparseAttention(sp) => {
+                if let SparseAttentionMethod::Vsa { .. } = sp.method {
+                    return Err(unsupported(
+                        "VSA sparse attention: it needs FastH3's VSA-trained weights and kernel. Use Sol-Attn or Top-K (SLA) instead",
+                    ));
+                }
+                if family != Family::H3 {
+                    return Err(unsupported("sparse attention on this model (only MiniMax H3 takes it)"));
+                }
+                sparse = Some(sp.clone());
             }
             ModelPatch::AttentionBackend { backend } => {
                 s.int8_attention = match backend.as_str() {
@@ -419,7 +433,79 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
             }
         }
     }
+    // after the loop: the window is in the model's sigmas, which a later shift patch may change
+    s.sparse = sparse.map(|sp| sparse_attention(&sp, s.model_sampling)).transpose()?;
     Ok(s)
+}
+
+/// `BlockSparseAttention`'s settings for the H3 model, its window turned into sigmas as ComfyUI's `percent_to_sigma`.
+fn sparse_attention(sp: &SparseAttention, ms: ModelSampling) -> EngineResult<h3::SparseAttn> {
+    let method = match sp.method {
+        SparseAttentionMethod::SolAttn { tau } => h3::SparseMethod::Sol { tau: tau as f32 },
+        SparseAttentionMethod::Sla { keep_percent } => h3::SparseMethod::TopK { ratio: keep_percent / 100.0 },
+        SparseAttentionMethod::Vsa { .. } => unreachable!("refused above"),
+    };
+    let sinks = match sp.sink_conditioning.as_str() {
+        "off" => h3::SparseSinks::Off,
+        "exact_kv" => h3::SparseSinks::ExactKv,
+        "exact_kv_and_rows" => h3::SparseSinks::ExactKvAndRows,
+        other => return Err(EngineError::InvalidInput(format!("sink_conditioning {other}"))),
+    };
+    if sp.extra_tokens > 256 || sp.extra_tokens % 64 != 0 {
+        return Err(EngineError::InvalidInput(format!("extra_tokens {} (0 to 256, in steps of 64)", sp.extra_tokens)));
+    }
+    Ok(h3::SparseAttn {
+        method,
+        sigma_start: ms.percent_to_sigma(sp.start_percent),
+        sigma_end: ms.percent_to_sigma(sp.end_percent),
+        min_tokens: sp.min_tokens as usize,
+        dense_blocks: block_list(&sp.dense_blocks),
+        sinks,
+        extra_tokens: sp.extra_tokens as usize,
+        verbose: sp.verbose,
+    })
+}
+
+/// ComfyUI's `parse_block_list`: the matches of `\d+\s*-\s*\d+|\d+`, so `"0, 1, 47-49"` is blocks 0, 1 and 47 to 49.
+fn block_list(text: &str) -> Vec<usize> {
+    let b = text.as_bytes();
+    let number = |i: &mut usize| {
+        let start = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        text[start..*i].parse::<usize>().unwrap_or(usize::MAX)
+    };
+    let skip_space = |i: &mut usize| {
+        while *i < b.len() && b[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+    };
+    let (mut out, mut i) = (Vec::new(), 0);
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let first = number(&mut i);
+        let mut j = i;
+        skip_space(&mut j);
+        if j < b.len() && b[j] == b'-' {
+            j += 1;
+            skip_space(&mut j);
+            if j < b.len() && b[j].is_ascii_digit() {
+                let last = number(&mut j);
+                let (lo, hi) = (first.min(last), first.max(last));
+                out.extend(lo..=hi.min(lo.saturating_add(1 << 16)));
+                i = j;
+                continue;
+            }
+        }
+        out.push(first);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Everything in a sampler request the pipeline can't run is refused here.
@@ -812,7 +898,7 @@ impl NativeEngine {
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
         let noise = noise::h3_noise(req.noise_seed, req.variation, (24, t, lh, lw), shape.audio_len());
-        let r = H3Request { prompt, negative, shape, sampling, shifts: (shift, settings.audio_shift), noise };
+        let r = H3Request { prompt, negative, shape, sampling, shifts: (shift, settings.audio_shift), noise, sparse: settings.sparse.clone() };
         let (mut latent, stats) = gen
             .sample_h3(&r, |step| report(mode, progress, 1, step, |x0| (preview::h3(x0, t, lh, lw), lh, lw)), None)
             .map_err(internal)?;
@@ -1324,6 +1410,14 @@ impl Engine for NativeEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_block_lists() {
+        assert_eq!(block_list("0, 1, 47-49"), vec![0, 1, 47, 48, 49]);
+        assert_eq!(block_list("5 - 3;9"), vec![3, 4, 5, 9]);
+        assert_eq!(block_list(""), Vec::<usize>::new());
+        assert_eq!(block_list("2-, x7"), vec![2, 7]);
+    }
 
     #[test]
     fn plain_prompts_keep_comfy_literal_parentheses() {

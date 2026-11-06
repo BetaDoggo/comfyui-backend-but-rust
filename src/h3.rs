@@ -422,8 +422,71 @@ pub fn n_blocks(st: &SafeTensors) -> usize {
 }
 
 /// Rough activation footprint of one evaluation (bytes) for `l` tokens.
+/// ComfyUI's `BlockSparseAttention` on the blocks' self-attention, through comfy-kitchen's Sol-Attn kernels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SparseAttn {
+    pub method: SparseMethod,
+    /// Sparse while the video sigma is in `sigma_end..=sigma_start`, dense outside.
+    pub sigma_start: f32,
+    pub sigma_end: f32,
+    /// Shorter sequences stay dense.
+    pub min_tokens: usize,
+    /// Blocks that always run dense, by their index in the checkpoint.
+    pub dense_blocks: Vec<usize>,
+    pub sinks: SparseSinks,
+    /// Unrouted tokens each query block attends exactly: 0, or a multiple of 64 up to 256.
+    pub extra_tokens: usize,
+    /// Log, once per sequence length, whether the attention ran sparse.
+    pub verbose: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SparseMethod {
+    /// The training-free adaptive threshold, in sigmas of each query block's score distribution.
+    Sol { tau: f32 },
+    /// SLA-style: keep this fraction of the key blocks of every query block.
+    TopK { ratio: f64 },
+}
+
+/// What of the packed text and audio rows stays exact.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SparseSinks {
+    Off,
+    /// Every query attends the text and audio rows exactly.
+    ExactKv,
+    /// That, and the audio query rows attend everything exactly.
+    ExactKvAndRows,
+}
+
+impl SparseAttn {
+    /// Key blocks `_topk_count` keeps besides the sinks, as comfy-kitchen counts them.
+    fn topk_count(ratio: f64, n: usize) -> usize {
+        if n <= 1 {
+            return 0;
+        }
+        let k = (ratio * n as f64).round_ties_even() as i64;
+        k.max(1).min(n as i64 - 1) as usize
+    }
+
+    /// Workspace bytes for a sequence of `l` tokens.
+    fn bytes(&self, l: usize) -> usize {
+        let ws = unsafe { crate::ffi::gpu_sol_attn_workspace(l as i32, H as i32, self.extra_tokens as i32) }.max(0) as usize;
+        ws + match self.method {
+            SparseMethod::Sol { .. } => 0,
+            SparseMethod::TopK { .. } => (unsafe { crate::ffi::gpu_sol_topk_workspace(l as i32, H as i32) }) as usize + H * l.div_ceil(64) * 4,
+        }
+    }
+}
+
 pub fn step_activation_bytes(l: usize) -> usize {
     l * (F * 2 + INNER * 2 + 2 * FFN * 2 + FFN + 1024) + 4 * 28672 * F / 3 + (128 << 20)
+}
+
+/// A sparse call's buffers: the Sol-Attn workspace, and top-k's thresholds and their scratch.
+struct SparseWork {
+    ws: DevBuf,
+    thr: Option<DevBuf>,
+    scratch: Option<DevBuf>,
 }
 
 pub struct Dit {
@@ -442,6 +505,12 @@ pub struct Dit {
     mid_width: usize,
     pub int8_attn: bool,
     pub attn_variant: i32,
+    /// block-sparse self-attention, when set
+    pub sparse: Option<SparseAttn>,
+    /// sequence lengths whose sparse or dense choice was logged
+    sparse_logged: Vec<(usize, bool)>,
+    /// each block's index in the checkpoint
+    block_ids: Vec<usize>,
     /// video, audio
     pub shifts: (f32, f32),
     pub prof: crate::prof::Prof,
@@ -451,7 +520,7 @@ impl Dit {
     /// Reads the small tensors. The blocks take no VRAM until [`Self::reserve`], and are read from the
     /// file as they are used.
     pub fn load(st: &Arc<SafeTensors>, threads: usize, s0: &Stream) -> Result<Self> {
-        let (gl, layouts, units, ref_layouts, table, inv_freq, tdim, hyper);
+        let (gl, layouts, units, ref_layouts, table, inv_freq, tdim, hyper, block_ids);
         if is_hyperflow(|k| st.has(k)) {
             let cfg = st.config.as_ref().context("HyperFlow H3 Flash needs the config.json next to its shards")?;
             let q = &cfg["quantization"];
@@ -476,6 +545,7 @@ impl Dit {
             }
             hyper = Some(Hyper { gate, te, ee, cache: Default::default() });
             gl = hf_globals_layout(st, &ids)?;
+            block_ids = ids.clone();
             (layouts, units) = ids.iter().map(|&i| hf_block_layout(st, i)).collect::<Result<Vec<_>>>()?.into_iter().unzip();
             ref_layouts = (0..REFINER).map(|i| hf_refiner_layout(st, i)).collect::<Result<Vec<_>>>()?;
             table = Vec::new();
@@ -484,6 +554,7 @@ impl Dit {
             inv_freq = (0..pairs).map(|i| 1.0 / 10000f32.powf((2 * i) as f32 / (2 * pairs) as f32)).collect();
         } else {
             let n = n_blocks(st);
+            block_ids = (0..n).collect();
             gl = globals_layout(st, n)?;
             layouts = (0..n).map(|i| block_layout(st, i)).collect::<Result<Vec<_>>>()?;
             units = vec![Unit { lins: [Lin::W6; 4], ranks: [0; 6] }; n];
@@ -502,7 +573,7 @@ impl Dit {
         let blocks = WeightSet::lazy("h3 blocks", st.clone(), layouts, Plan { resident: 0, slots: 0 }, threads)?;
         let refiner = WeightSet::lazy("h3 refiner", st.clone(), ref_layouts, Plan { resident: 0, slots: 0 }, threads)?;
         Ok(Dit { globals, gl, blocks, units, refiner, table, inv_freq, tdim, hyper, mid_width, int8_attn: true, attn_variant: 0,
-            shifts: (SHIFT_VIDEO as f32, SHIFT_AUDIO as f32), prof: crate::prof::Prof::new() })
+            sparse: None, sparse_logged: Vec::new(), block_ids, shifts: (SHIFT_VIDEO as f32, SHIFT_AUDIO as f32), prof: crate::prof::Prof::new() })
     }
 
     /// HyperFlow H3 Flash, which reads the step's endpoint.
@@ -512,7 +583,9 @@ impl Dit {
 
     /// Rough activation footprint of one evaluation (bytes) for `l` tokens.
     pub fn step_activation_bytes(&self, l: usize) -> usize {
-        step_activation_bytes(l) + if self.hyper.is_some() { l * (FFN + self.mid_width) * 2 } else { 0 }
+        step_activation_bytes(l)
+            + if self.hyper.is_some() { l * (FFN + self.mid_width) * 2 } else { 0 }
+            + self.sparse.as_ref().filter(|sp| l >= sp.min_tokens).map_or(0, |sp| sp.bytes(l))
     }
 
     /// Give the blocks `budget` bytes of VRAM (what they hold now counts).
@@ -627,6 +700,70 @@ impl Dit {
         }
     }
 
+    /// Block-sparse attention over the packed rows: text and audio (the first `al`, audio from `text`), then video.
+    #[allow(clippy::too_many_arguments)]
+    fn sparse_attention(&self, sp: &SparseAttn, q: PM, out: PM, sw: &SparseWork, l: usize, (text, al): (usize, usize), st: &Stream) -> Result<()> {
+        let sc = 1.0 / (HD as f32).sqrt();
+        let (kp, vp) = (off(q, INNER * 2), off(q, 2 * INNER * 2));
+        let prefix = al.div_ceil(64) as i32;
+        let (sink, sink_q) = match sp.sinks {
+            SparseSinks::Off => ((0, 0), (0, 0)),
+            SparseSinks::ExactKv => ((0, prefix), (0, 0)),
+            SparseSinks::ExactKvAndRows if al > text => ((0, prefix), ((text / 64) as i32, prefix)),
+            SparseSinks::ExactKvAndRows => ((0, prefix), (0, prefix)),
+        };
+        let (tau, thr) = match sp.method {
+            SparseMethod::Sol { tau } => (tau, null()),
+            SparseMethod::TopK { ratio } => {
+                let n = l.div_ceil(64);
+                let sinks = (sink.1 - sink.0).max(0) as usize;
+                let kk = SparseAttn::topk_count(ratio, n - sinks.min(n));
+                let thr = sw.thr.as_ref().context("no top-k threshold buffer")?;
+                k!(gpu_sol_topk_threshold(q, kp, QKV as i64, HD as i64, l as i32, H as i32, kk as i32, sc, sink.0, sink.1, thr.ptr(), sw.scratch.as_ref().unwrap().ptr(), s(st)))?;
+                (1.3, thr.ptr() as crate::ffi::P)
+            }
+        };
+        k!(gpu_sol_attn(q, kp, vp, out, sw.ws.ptr(), l as i32, H as i32, QKV as i64, HD as i64, tau, sc, thr, sink.0, sink.1, sink_q.0, sink_q.1, sp.extra_tokens as i32, s(st)))
+    }
+
+    /// The sparse settings and buffers for a call of `l` tokens at `sigma`, if it runs sparse.
+    fn sparse_work(&mut self, l: usize, sigma: f32, st: &Stream) -> Result<Option<(SparseAttn, SparseWork)>> {
+        let Some(sp) = self.sparse.clone() else { return Ok(None) };
+        let reason = if sigma > sp.sigma_start || sigma < sp.sigma_end {
+            Some(format!("sigma {sigma:.3} outside the start/end window"))
+        } else if l < sp.min_tokens {
+            Some(format!("{l} tokens < min_tokens {}", sp.min_tokens))
+        } else {
+            None
+        };
+        if sp.verbose && !self.sparse_logged.contains(&(l, reason.is_none())) {
+            self.sparse_logged.push((l, reason.is_none()));
+            match &reason {
+                Some(r) => eprintln!("sparse attention: dense ({l} tokens): {r}"),
+                None => eprintln!("sparse attention: {:?} over {l} tokens", sp.method),
+            }
+        }
+        if reason.is_some() {
+            return Ok(None);
+        }
+        let n = unsafe { crate::ffi::gpu_sol_attn_workspace(l as i32, H as i32, sp.extra_tokens as i32) };
+        if n < 0 {
+            bail!("sparse attention can't take {l} tokens with {} extra tokens", sp.extra_tokens);
+        }
+        let ws = DevBuf::alloc_async(n as usize, st)?;
+        let (thr, scratch) = match sp.method {
+            SparseMethod::Sol { .. } => (None, None),
+            SparseMethod::TopK { .. } => {
+                if l.div_ceil(64) * 4 > 96 * 1024 {
+                    bail!("top-k sparse attention over {l} tokens: more key blocks than its selection holds");
+                }
+                let scratch = unsafe { crate::ffi::gpu_sol_topk_workspace(l as i32, H as i32) } as usize;
+                (Some(DevBuf::alloc_async(H * l.div_ceil(64) * 4, st)?), Some(DevBuf::alloc_async(scratch, st)?))
+            }
+        };
+        Ok(Some((sp, SparseWork { ws, thr, scratch })))
+    }
+
     fn attention(&self, q: PM, out: PM, ws: PM, l: usize, st: &Stream) -> Result<()> {
         let (hi, hs, sc) = (H as i32, HD as i64, 1.0 / (HD as f32).sqrt());
         let (bs, rs, ob, or) = ((l * QKV) as i64, QKV as i64, (l * INNER) as i64, INNER as i64);
@@ -718,6 +855,7 @@ impl Dit {
         let attn = DevBuf::alloc_async(l * INNER * 2, st)?;
         let wdec = DevBuf::alloc_async(2 * FFN * F, st)?;
         let ws = DevBuf::alloc_async(self.attn_workspace(l), st)?;
+        let sparse = self.sparse_work(l, sigma, st)?;
         let modf = DevBuf::alloc_async(2 * MODS * 4, st)?;
         let modb = DevBuf::alloc_async(2 * MODS * 2, st)?;
         let folded = DevBuf::alloc_async(6 * F * 2, st)?;
@@ -796,8 +934,16 @@ impl Dit {
             k!(gpu_rope_bf16(q, QKV as i64, HD as i64, wp("qn"), EPS, rope.ptr(), l as i32, H as i32, HD as i32, ROPE_PAIRS as i32, s(st)))?;
             k!(gpu_rope_bf16(off(q, INNER * 2), QKV as i64, HD as i64, wp("kn"), EPS, rope.ptr(), l as i32, H as i32, HD as i32, ROPE_PAIRS as i32, s(st)))?;
             self.prof.mark("rope", st)?;
-            self.attention(q, attn.ptr(), ws.ptr(), l, st)?;
-            self.prof.mark("attn", st)?;
+            match &sparse {
+                Some((sp, sw)) if !sp.dense_blocks.contains(&self.block_ids[b]) => {
+                    self.sparse_attention(sp, q, attn.ptr(), sw, l, (text, al), st)?;
+                    self.prof.mark("sparse attn", st)?;
+                }
+                _ => {
+                    self.attention(q, attn.ptr(), ws.ptr(), l, st)?;
+                    self.prof.mark("attn", st)?;
+                }
+            }
             if b == 0 {
                 if let Some(p) = probe.as_mut() {
                     p("b0.out_proj.in", &attn, l * INNER * 2);

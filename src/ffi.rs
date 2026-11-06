@@ -41,6 +41,14 @@ extern "C" {
         q_rs: i64, q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64, v_hs: i64, o_bs: i64, o_rs: i64,
         o_hs: i64, scale: f32, variant: i32, s: PM) -> i32;
 
+    // block-sparse attention (csrc/sparse_attn.cu over comfy-kitchen's Sol-Attn)
+    pub fn gpu_sol_attn_workspace(t: i32, h: i32, n_tok: i32) -> i64;
+    pub fn gpu_sol_topk_workspace(t: i32, h: i32) -> i64;
+    pub fn gpu_sol_topk_threshold(q: P, k: P, rs: i64, hs: i64, t: i32, h: i32, kk: i32, scale: f32, s0: i32, s1: i32,
+        thr: PM, scratch: PM, s: PM) -> i32;
+    pub fn gpu_sol_attn(q: P, k: P, v: P, out: PM, ws: PM, t: i32, h: i32, rs: i64, hs: i64, tau: f32, scale: f32, thr: P,
+        s0: i32, s1: i32, q0: i32, q1: i32, n_tok: i32, s: PM) -> i32;
+
     pub fn gpu_int8_attn_workspace(b: i32, h: i32, hk: i32, lq: i32, lk: i32) -> i64;
     pub fn gpu_int8_attn(q: P, k: P, v: P, o: PM, ws: PM, b: i32, lq: i32, lk: i32, h: i32, hk: i32, q_bs: i64,
         q_rs: i64, q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64, v_hs: i64, o_bs: i64, o_rs: i64,

@@ -107,7 +107,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P2 | Video and audio | Video generation workflow | Frames, swap, extend, boomerang, trim and end image, on the mock. |
 | P3 | LoRA and control | ControlNet preprocessors | Third-party nodes. Generic route only. |
 | P3 | Masks and detection | SAM2 points and box | Generic route only. |
-| P3 | Guidance and speed | Sparse attention and HyperTile | Patches reach the engine. |
+| P3 | Guidance and speed | Sparse attention and HyperTile | Sparse attention runs on H3 (Sol-Attn and top-k, kernels bitwise equal to comfy-kitchen's); VSA and other families are refused. Works through SwarmUI per the maintainer, not tested extensively; speedup above 12,288 tokens unmeasured. HyperTile: patch reaches the engine. |
 | P3 | Guidance and speed | Dynamic Thresholding and TeaCache | Third-party. Generic route only. |
 | P3 | Video and audio | Video frame interpolation | RIFE and FILM. Generic route only. |
 
@@ -125,7 +125,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Anima | Close the ComfyUI output gap | LLM adapter output differs by 1.7%, cause unknown. Same picture at about 25 dB PSNR. |
 | P1 | Anima | Anima <break>, <alternate> and <fromto> | Per-chunk and per-step conditioning. |
 | P1 | MiniMax H3 | H3 first and last frame, references | Needs the video and audio encoders and the 32B vision tower. The turbo LoRA is trained for these modes. |
-| P1 | MiniMax H3 | H3 long clips | Longer than 22 frames and above 512x512 untested. Sparse attention isn't ported; its source is in comfy-kitchen. |
+| P1 | MiniMax H3 | H3 long clips | Longer than 22 frames and above 512x512 untested, so sparse attention's speedup above its 12,288-token threshold is unmeasured. |
 | P1 | MOSS Image | MOSS Image reference images | Prompt Images and edit LoRAs need Qwen3.5's vision encoder, the VAE encoder and reference tokens. |
 | P1 | MOSS Image | Other MOSS Image checkpoint formats | bf16 and unfused q/k/v files are refused. Only fused int8 ConvRot runs. |
 | P2 | Server | ComfyUI node editor page | SwarmUI's Comfy Workflow tab won't render. Generation doesn't need it. |

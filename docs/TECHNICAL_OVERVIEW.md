@@ -59,7 +59,7 @@ There is no Rust binding to a tensor library. CUDA, NVML and the kernels are cal
 | CUDA 13 toolkit | Installed, `CUDA_PATH` | `nvcc`, the static CUDA runtime, streams, events, pinned memory |
 | cuBLASLt | Linked from the toolkit | bf16 and fp32 GEMMs, such as text encoders and non-quantized layers |
 | [CUTLASS](https://github.com/NVIDIA/cutlass) | Build-time checkout, BSD-3-Clause | Int8 GEMMs with fused dequantization, and VAE 2D convolutions |
-| [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) | Copied into `csrc/vendor/`, Apache-2.0 | The int8 GEMM kernel and INT8 attention |
+| [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) | Copied into `csrc/vendor/`, Apache-2.0 | The int8 GEMM kernel, INT8 attention, and H3's Sol-Attn block-sparse attention |
 | [SageAttention](https://github.com/thu-ml/SageAttention) | Reaches us through comfy-kitchen, Apache-2.0 | Origin of the INT8 attention, the default for the diffusion models |
 | [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) | Build-time checkout, BSD-3-Clause | bf16 attention, selected with `--attention flash` |
 | NVML, DXCore | NVML linked, DXCore loaded at run time | How much VRAM is really free under Windows |
@@ -215,7 +215,8 @@ csrc/h3.cu          MiniMax H3 kernels
 csrc/trellis.cu     Pixal3D: per-head QK norm, voxel hashing and sparse-conv gathers, NAF attention, feature sampling
 csrc/birefnet.cu    BiRefNet: im2col, deformable-conv columns, Swin window gather and attention, bilinear resize
 csrc/wddm.cu        VRAM queries under Windows
-csrc/vendor/        comfy-kitchen CUTLASS int8 GEMM + Sage INT8 attention (Apache-2.0)
+csrc/sparse_attn.cu block-sparse attention over the vendored Sol-Attn kernels, and the SLA top-k threshold
+csrc/vendor/        comfy-kitchen CUTLASS int8 GEMM, Sage INT8 attention and Sol-Attn (Apache-2.0)
 src/                Rust: loader, offloading, tokenizers, each family's models, samplers, LoRA baking, CLI
 tools/              ComfyUI reference dump / comparison / benchmark scripts
 ```

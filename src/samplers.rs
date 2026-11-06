@@ -20,8 +20,23 @@ pub const SAMPLERS: &[&str] = &[
 
 pub const SCHEDULERS: &[&str] = &[
     "simple", "sgm_uniform", "karras", "exponential", "ddim_uniform", "beta", "normal", "linear_quadratic", "kl_optimal", "turbo",
-    "align_your_steps", "ltxv", "flux2", "ideogram4", "ideogram4turbo",
+    "align_your_steps", "ltxv", "flux2", "ideogram4", "ideogram4turbo", "hyperflow",
 ];
+
+/// HyperFlow H3 Flash's raw sigma grids by step count, before the model's shift.
+const HYPERFLOW_GRIDS: [&[f32]; 3] = [
+    &[1.0, 0.681872, 0.205019, 0.036496, 0.0],
+    &[1.0, 0.825217, 0.471725, 0.147401, 0.049626, 0.015517, 0.0],
+    &[1.0, 0.931506, 0.839236, 0.703462, 0.5, 0.296538, 0.160764, 0.068494, 0.0],
+];
+
+/// The grid HyperFlow H3 Flash was distilled on, shifted as its pipeline shifts it (`shift_sigmas`, in float32).
+pub fn hyperflow_sigmas(ms: ModelSampling, steps: usize) -> Result<V> {
+    let ModelSampling::Flow { shift } = ms else { bail!("the hyperflow scheduler needs a flow model") };
+    let Some(grid) = HYPERFLOW_GRIDS.iter().find(|g| g.len() == steps + 1) else { bail!("the hyperflow scheduler has 4, 6 or 8 steps, not {steps}") };
+    let s = shift as f32;
+    Ok(grid.iter().map(|&g| s * g / (1.0 + (s - 1.0) * g)).collect())
+}
 
 /// True for samplers that read the uncond prediction even at CFG 1 (`disable_cfg1_optimization`).
 pub fn forces_uncond(sampler: &str) -> bool {
@@ -411,6 +426,7 @@ pub fn sigmas(ms: ModelSampling, sampler: &str, scheduler: &str, steps: usize, (
         "align_your_steps" => return Ok(align_your_steps(steps)),
         "ideogram4" => return Ok(ideogram4_sigmas(steps, w, h, 0.0, 1.75)),
         "ideogram4turbo" => return Ok(ideogram4_sigmas(steps, w, h, 0.5, 1.75)),
+        "hyperflow" => return hyperflow_sigmas(ms, steps),
         _ => {}
     }
     let scheduler = if scheduler == "ltxv" { "simple" } else { scheduler };

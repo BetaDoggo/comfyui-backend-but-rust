@@ -141,6 +141,13 @@ fn read_header(path: &Path) -> anyhow::Result<serde_json::Value> {
 
 /// The file's architecture. Refuses other models and formats before any weights are touched.
 fn check_dit(file: &ModelFile) -> EngineResult<Family> {
+    // HyperFlow H3 Flash is a diffusers folder: any of its shards stands for the model
+    if let Some(c) = h3::hyperflow_config(&file.path) {
+        if c["quantization"]["method"] != "int8_convrot" {
+            return Err(unsupported(format!("{}: this backend only runs the int8 ConvRot HyperFlow H3 Flash release", file.name)));
+        }
+        return Ok(Family::H3);
+    }
     let h = read_header(&file.path).map_err(|e| unsupported(format!("{}: not a readable safetensors file ({e})", file.name)))?;
     if let Some(p) = diffusion::qwen21::key_prefix(|k| h.get(k).is_some()) {
         if h.get(format!("{p}transformer_blocks.0.img_mlp.gate_up.weight_scale")).is_none() {
@@ -783,6 +790,15 @@ impl NativeEngine {
         if partial || req.latent.noise_mask.is_some() || req.latent.audio_noise_mask.is_some() || !video.data.is_none() || !audio.data.is_none() {
             return Err(unsupported("init videos, refiners and noise masks on MiniMax H3"));
         }
+        if h3::hyperflow_config(&file.path).is_some() {
+            // its time embedding reads where each step ends, which only euler's steps are sure to
+            if req.sampler != "euler" {
+                return Err(unsupported(format!("the {} sampler on HyperFlow H3 Flash (only euler for now)", req.sampler)));
+            }
+            if !settings.loras.is_empty() {
+                return Err(unsupported("LoRAs on HyperFlow H3 Flash (its layers are pruned and factorized)"));
+            }
+        }
         let (cond, prompt) = single_prompt(&req.positive, Family::H3)?;
         let shape = h3::Shape { t, h: lh, w: lw, audio_t };
         let sigmas = schedule(req, settings, (lh, lw))?.ok_or_else(|| EngineError::InvalidInput("no steps to sample".into()))?;
@@ -1059,6 +1075,9 @@ impl Engine for NativeEngine {
         let family = check_dit(file)?;
         check_sample(req)?;
         let settings = model_settings(&req.model, family)?;
+        if req.scheduler == "hyperflow" && h3::hyperflow_config(&file.path).is_none() {
+            return Err(unsupported("the hyperflow scheduler on a model other than HyperFlow H3 Flash"));
+        }
         if family == Family::H3 {
             return self.sample_h3(req, &settings, progress);
         }

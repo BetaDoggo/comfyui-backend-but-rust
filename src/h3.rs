@@ -6,8 +6,8 @@
 use crate::cuda::{DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_BF16, DT_F32, PM, PRO_ADALN, PRO_PLAIN, PRO_RMS, PRO_SWIGLU};
 use crate::offload::{plan, Layout, Plan, Store, WeightSet};
-use crate::st::{f32_bytes, SafeTensors};
-use anyhow::Result;
+use crate::st::{f32_bytes, Dt, SafeTensors};
+use anyhow::{bail, Context, Result};
 use half::bf16;
 use std::sync::Arc;
 
@@ -137,6 +137,236 @@ fn row_bytes(st: &SafeTensors, name: &str) -> Result<Vec<u8>> {
     Ok(f32_bytes(&st.f32_vec(name, false)?))
 }
 
+/// True for HyperFlow H3 Flash: H3 conditioned on the step's endpoint as well as its time, in diffusers form.
+pub fn is_hyperflow(has: impl Fn(&str) -> bool) -> bool {
+    has("endpoint_time_embedder.linear_1.weight")
+}
+
+/// The `config.json` of a HyperFlow H3 Flash model, if `path` is one of its shards.
+pub fn hyperflow_config(path: &std::path::Path) -> Option<serde_json::Value> {
+    let (_, config) = crate::st::diffusers_shards(path)?;
+    let c: serde_json::Value = serde_json::from_slice(&std::fs::read(config).ok()?).ok()?;
+    (c["_class_name"] == "HyperFlowH3FlashTransformer3DModel").then_some(c)
+}
+
+/// Name the halves of HyperFlow's fused SwiGLU inputs. Diffusers stores them `[value; gate]`; the kernels here read
+/// ComfyUI's `[gate; value]`, so the layouts list `#gate` first. Rows only change places, so int8 rows keep their scales.
+pub fn prepare(st: &mut SafeTensors) -> Result<()> {
+    if !is_hyperflow(|k| st.has(k)) {
+        return Ok(());
+    }
+    let fused: Vec<String> = st.tensors.keys().filter(|k| k.contains("ff.net.0.proj.") && [".qweight", ".wscale", "proj.weight"].iter().any(|s| k.ends_with(s))).cloned().collect();
+    for k in fused {
+        st.alias_rows(&k, &format!("{k}#value"), 0, FFN)?;
+        st.alias_rows(&k, &format!("{k}#gate"), FFN, FFN)?;
+    }
+    Ok(())
+}
+
+/// How one linear of a block is stored.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Lin {
+    /// ComfyUI's w6a8, decoded to int8 before its GEMM
+    W6,
+    /// HyperFlow's int8 ConvRot: W8A8 behind the same 256-wide Hadamard rotation
+    Int8,
+    /// HyperFlow's factorized `up(down(x))`, both bf16
+    LowRank,
+}
+
+/// The four linears of a block, in [`MODULES`] order, by their HyperFlow names.
+const HF_LINEARS: [(&str, &[&str]); 4] =
+    [("qkv", &["attn.to_q", "attn.to_k", "attn.to_v"]), ("o", &["attn.to_out.0"]), ("up", &["ff.net.0.proj"]), ("d", &["ff.net.2"])];
+/// Where each linear's low-rank pairs start among a block's six (q, k, v, o, up, d).
+const RANK_SLOT: [usize; 4] = [0, 3, 4, 5];
+/// Low-rank ranks are zero-padded to this, so every stride is 16-byte aligned.
+const RANK_ALIGN: usize = 8;
+
+#[derive(Clone, Copy, Debug)]
+struct Unit {
+    lins: [Lin; 4],
+    /// padded rank of each low-rank pair, 0 for the others
+    ranks: [usize; 6],
+}
+
+impl Unit {
+    /// Columns of the widest low-rank middle: q, k and v's together, or one other pair's.
+    fn mid_width(&self) -> usize {
+        (self.ranks[0] + self.ranks[1] + self.ranks[2]).max(self.ranks[3]).max(self.ranks[4]).max(self.ranks[5])
+    }
+}
+
+fn hf_block_layout(st: &SafeTensors, i: usize) -> Result<(Layout, Unit)> {
+    let n = |x: &str| format!("transformer_blocks.{i}.{x}");
+    let mut l = Layout::new();
+    let mut u = Unit { lins: [Lin::Int8; 4], ranks: [0; 6] };
+    for (m, (key, names)) in HF_LINEARS.iter().enumerate() {
+        if names.iter().all(|x| st.has(&format!("{}.qweight", n(x)))) {
+            let pick = |suffix: &str| -> Vec<String> {
+                if *key == "up" {
+                    vec![format!("{}.{suffix}#gate", n(names[0])), format!("{}.{suffix}#value", n(names[0]))]
+                } else {
+                    names.iter().map(|x| format!("{}.{suffix}", n(x))).collect()
+                }
+            };
+            l.raw(st, &format!("w_{key}"), &pick("qweight"))?;
+            l.raw(st, &format!("c_{key}"), &pick("wscale"))?;
+        } else if names.iter().all(|x| st.has(&format!("{}.down.weight", n(x)))) {
+            u.lins[m] = Lin::LowRank;
+            // ranks padded with zeros to multiples of 8 for aligned GEMMs; q, k and v share one down GEMM
+            let mut downs = Vec::new();
+            for (j, x) in names.iter().enumerate() {
+                let slot = RANK_SLOT[m] + j;
+                let (down, up) = (format!("{}.down.weight", n(x)), format!("{}.up.weight", n(x)));
+                let (di, ui) = (st.info(&down)?, st.info(&up)?);
+                if di.dtype != Dt::BF16 || ui.dtype != Dt::BF16 {
+                    bail!("{down}: low-rank pairs must be bf16");
+                }
+                let r = di.shape[0].next_multiple_of(RANK_ALIGN);
+                u.ranks[slot] = r;
+                downs.push((down, r, di.shape[1]));
+                l.padded(st, &format!("up{slot}"), &[(up, ui.shape[0], r)])?;
+            }
+            l.padded(st, &format!("dn{}", RANK_SLOT[m]), &downs)?;
+        } else {
+            bail!("{}: neither int8 ConvRot nor low-rank in every part", n(names[0]));
+        }
+    }
+    l.bf16(st, "n1", &[n("norm1.weight")])?;
+    l.bf16(st, "n2", &[n("norm2.weight")])?;
+    l.f32(st, "qn", &n("attn.norm_q.weight"), 0.0)?;
+    l.f32(st, "kn", &n("attn.norm_k.weight"), 0.0)?;
+    Ok((l, u))
+}
+
+/// HyperFlow's token refiner is plain bf16.
+fn hf_refiner_layout(st: &SafeTensors, i: usize) -> Result<Layout> {
+    let n = |x: &str| format!("token_refiner.refiner_blocks.{i}.{x}");
+    let mut l = Layout::new();
+    l.bf16(st, "w_qkv", &[n("attn.to_q.weight"), n("attn.to_k.weight"), n("attn.to_v.weight")])?;
+    l.bf16(st, "w_o", &[n("attn.to_out.0.weight")])?;
+    l.bf16(st, "w_up", &[n("ff.net.0.proj.weight#gate"), n("ff.net.0.proj.weight#value")])?;
+    l.bf16(st, "w_d", &[n("ff.net.2.weight")])?;
+    l.f32(st, "n1", &n("norm1.weight"), 0.0)?;
+    l.f32(st, "n2", &n("norm2.weight"), 0.0)?;
+    l.f32(st, "qn", &n("attn.norm_q.weight"), 0.0)?;
+    l.f32(st, "kn", &n("attn.norm_k.weight"), 0.0)?;
+    Ok(l)
+}
+
+fn hf_globals_layout(st: &SafeTensors, ids: &[usize]) -> Result<Layout> {
+    let mut g = Layout::new();
+    for (key, name) in [("vid_w", "proj_in.weight"), ("vid_b", "proj_in.bias"), ("aud_w", "audio_proj_in.weight"), ("aud_b", "audio_proj_in.bias"),
+        ("ao_w", "audio_proj_out.weight"), ("ao_b", "audio_proj_out.bias"), ("vo_w", "proj_out.weight"), ("vo_b", "proj_out.bias")]
+    {
+        if st.info(name)?.dtype != Dt::F32 {
+            bail!("{name}: expected float32");
+        }
+        g.raw(st, key, &[name.to_string()])?;
+    }
+    g.bf16(st, "cond_w", &["context_embedder.weight".to_string()])?;
+    g.bf16(st, "cond_b", &["context_embedder.bias".to_string()])?;
+    g.bf16(st, "fn", &["norm_out.norm.weight".to_string()])?;
+    g.f32(st, "rn", "token_refiner.final_norm.weight", 0.0)?;
+    // the AdaLN projections are bf16 in the file; held as f32 for the small f32 GEMM
+    g.f32(st, "fa_w", "norm_out.linear.weight", 0.0)?;
+    g.f32(st, "fa_b", "norm_out.linear.bias", 0.0)?;
+    for (u, i) in ids.iter().enumerate() {
+        g.f32(st, &format!("a{u}_w"), &format!("transformer_blocks.{i}.adaln_proj.linear.weight"), 0.0)?;
+        g.f32(st, &format!("a{u}_b"), &format!("transformer_blocks.{i}.adaln_proj.linear.bias"), 0.0)?;
+    }
+    Ok(g)
+}
+
+/// Diffusers' `Timesteps(256, flip_sin_to_cos=True)` then `TimestepEmbedding`, in float32 on the host.
+struct TimeMlp {
+    w1: Vec<f32>,
+    b1: Vec<f32>,
+    w2: Vec<f32>,
+    b2: Vec<f32>,
+}
+
+const FREQ: usize = 256;
+
+impl TimeMlp {
+    fn load(st: &SafeTensors, p: &str) -> Result<Self> {
+        let v = |x: &str| st.f32_vec(&format!("{p}.{x}"), false);
+        let m = TimeMlp { w1: v("linear_1.weight")?, b1: v("linear_1.bias")?, w2: v("linear_2.weight")?, b2: v("linear_2.bias")? };
+        if m.w1.len() != m.b1.len() * FREQ || m.w2.len() != m.b2.len() * m.b1.len() {
+            bail!("{p}: unexpected shapes");
+        }
+        Ok(m)
+    }
+
+    fn at(&self, t: f32) -> Vec<f32> {
+        let half = FREQ / 2;
+        let emb: Vec<f32> = (0..FREQ)
+            .map(|j| {
+                let f = (-(10000f32).ln() * (j % half) as f32 / half as f32).exp();
+                if j < half { (t * f).cos() } else { (t * f).sin() }
+            })
+            .collect();
+        let hid: Vec<f32> = self.b1.iter().enumerate().map(|(o, b)| silu(b + dot(&self.w1[o * FREQ..][..FREQ], &emb))).collect();
+        let k = hid.len();
+        self.b2.iter().enumerate().map(|(o, b)| b + dot(&self.w2[o * k..][..k], &hid)).collect()
+    }
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// HyperFlow's two-time conditioning: `temb(t, r) = emb_t(t) + gate * (emb_r(r) - emb_t(t))`.
+struct Hyper {
+    gate: f32,
+    te: TimeMlp,
+    ee: TimeMlp,
+    /// by the bits of (t, r): a schedule repeats its pairs every run, and CFG asks twice per step
+    cache: std::collections::HashMap<(u32, u32), Vec<f32>>,
+}
+
+impl Hyper {
+    /// What the AdaLN projections read: `silu(temb)`, rounded to their bf16.
+    fn adaln_input(&mut self, t: f32, r: f32) -> Vec<f32> {
+        let (te, ee, gate) = (&self.te, &self.ee, self.gate);
+        self.cache
+            .entry((t.to_bits(), r.to_bits()))
+            .or_insert_with(|| {
+                let (a, b) = (te.at(t), ee.at(r));
+                a.iter().zip(&b).map(|(a, b)| bf16::from_f32(silu(a + gate * (b - a))).to_f32()).collect()
+            })
+            .clone()
+    }
+}
+
+/// One up projection of a low-rank pair: it reads `rank` middle columns from `col`, and writes rows `first..first + rows`
+/// of `w` to `out`, `ldo` apart.
+struct Up {
+    col: usize,
+    rank: usize,
+    w: PM,
+    first: usize,
+    rows: usize,
+    out: PM,
+    ldo: usize,
+}
+
+/// `x · downᵀ` into `width` middle columns, then each up projection: diffusers' two bf16 linears.
+#[allow(clippy::too_many_arguments)]
+fn low_rank(x: PM, ldx: usize, k: usize, down: PM, width: usize, ups: &[Up], mid: PM, l: usize, st: &Stream) -> Result<()> {
+    let wd = width as i64;
+    k!(gpu_gemm(x, ldx as i64, down, k as i64, mid, wd, null(), l as i64, wd, k as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
+    for u in ups {
+        k!(gpu_gemm(off(mid, u.col * 2), wd, off(u.w, u.first * u.rank * 2), u.rank as i64, u.out, u.ldo as i64, null(), l as i64, u.rows as i64, u.rank as i64, 1, DT_BF16,
+            DT_BF16, 1.0, 0.0, s(st)))?;
+    }
+    Ok(())
+}
+
 pub fn block_layout(st: &SafeTensors, i: usize) -> Result<Layout> {
     let n = |x: &str| format!("blocks.{i}.{x}");
     let mut l = Layout::new();
@@ -200,9 +430,16 @@ pub struct Dit {
     globals: DevBuf,
     gl: Layout,
     pub blocks: WeightSet,
+    /// how each block's linears are stored
+    units: Vec<Unit>,
     refiner: WeightSet,
     table: Vec<f32>,
     inv_freq: Vec<f32>,
+    /// width of what the AdaLN projections read: the curve basis, or HyperFlow's time embedding
+    tdim: usize,
+    hyper: Option<Hyper>,
+    /// columns of the low-rank middle buffer
+    mid_width: usize,
     pub int8_attn: bool,
     pub attn_variant: i32,
     /// video, audio
@@ -214,18 +451,68 @@ impl Dit {
     /// Reads the small tensors. The blocks take no VRAM until [`Self::reserve`], and are read from the
     /// file as they are used.
     pub fn load(st: &Arc<SafeTensors>, threads: usize, s0: &Stream) -> Result<Self> {
-        let n = n_blocks(st);
-        let gl = globals_layout(st, n)?;
+        let (gl, layouts, units, ref_layouts, table, inv_freq, tdim, hyper);
+        if is_hyperflow(|k| st.has(k)) {
+            let cfg = st.config.as_ref().context("HyperFlow H3 Flash needs the config.json next to its shards")?;
+            let q = &cfg["quantization"];
+            if q["method"] != "int8_convrot" || q["group"] != 256 {
+                bail!("HyperFlow H3 Flash: only the int8 ConvRot release (group 256) runs here, not {q}");
+            }
+            if !st.has("transformer_blocks.0.norm1.weight") || !st.has("proj_in.weight") {
+                bail!("HyperFlow H3 Flash: some shards are missing");
+            }
+            let layers = cfg["num_layers"].as_u64().context("no num_layers in config.json")? as usize;
+            let ids: Vec<usize> = (0..layers).filter(|i| st.has(&format!("transformer_blocks.{i}.norm1.weight"))).collect();
+            let dropped: Vec<usize> =
+                cfg["dropped_blocks"].as_array().map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect()).unwrap_or_default();
+            if ids.len() + dropped.len() != layers || dropped.iter().any(|d| ids.contains(d)) {
+                bail!("HyperFlow H3 Flash: blocks {ids:?} don't match dropped_blocks {dropped:?}");
+            }
+            let gate = cfg["hyperflow_gate"].as_f64().context("no hyperflow_gate in config.json")? as f32;
+            let (te, ee) = (TimeMlp::load(st, "time_embedder")?, TimeMlp::load(st, "endpoint_time_embedder")?);
+            tdim = te.b2.len();
+            if ee.b2.len() != tdim {
+                bail!("HyperFlow H3 Flash: the two time embedders differ in width");
+            }
+            hyper = Some(Hyper { gate, te, ee, cache: Default::default() });
+            gl = hf_globals_layout(st, &ids)?;
+            (layouts, units) = ids.iter().map(|&i| hf_block_layout(st, i)).collect::<Result<Vec<_>>>()?.into_iter().unzip();
+            ref_layouts = (0..REFINER).map(|i| hf_refiner_layout(st, i)).collect::<Result<Vec<_>>>()?;
+            table = Vec::new();
+            // diffusers recomputes it; the original checkpoints' buffer is bitwise equal
+            let pairs = ROPE_PAIRS / 3;
+            inv_freq = (0..pairs).map(|i| 1.0 / 10000f32.powf((2 * i) as f32 / (2 * pairs) as f32)).collect();
+        } else {
+            let n = n_blocks(st);
+            gl = globals_layout(st, n)?;
+            layouts = (0..n).map(|i| block_layout(st, i)).collect::<Result<Vec<_>>>()?;
+            units = vec![Unit { lins: [Lin::W6; 4], ranks: [0; 6] }; n];
+            ref_layouts = (0..REFINER).map(|i| refiner_layout(st, i)).collect::<Result<Vec<_>>>()?;
+            table = st.f32_vec("adaln_t_table", false)?;
+            inv_freq = st.f32_vec("rope.inv_freq", false)?;
+            tdim = 8;
+            hyper = None;
+        }
         let mut host = vec![0u8; gl.size];
         gl.pack(st, &mut host)?;
         let globals = DevBuf::alloc(gl.size)?;
         globals.upload(0, &host, s0)?;
         s0.sync()?;
-        let layouts = (0..n).map(|i| block_layout(st, i)).collect::<Result<Vec<_>>>()?;
+        let mid_width = units.iter().map(Unit::mid_width).max().unwrap_or(0);
         let blocks = WeightSet::lazy("h3 blocks", st.clone(), layouts, Plan { resident: 0, slots: 0 }, threads)?;
-        let ref_layouts = (0..REFINER).map(|i| refiner_layout(st, i)).collect::<Result<Vec<_>>>()?;
         let refiner = WeightSet::lazy("h3 refiner", st.clone(), ref_layouts, Plan { resident: 0, slots: 0 }, threads)?;
-        Ok(Dit { globals, gl, blocks, refiner, table: st.f32_vec("adaln_t_table", false)?, inv_freq: st.f32_vec("rope.inv_freq", false)?, int8_attn: true, attn_variant: 0, shifts: (SHIFT_VIDEO as f32, SHIFT_AUDIO as f32), prof: crate::prof::Prof::new() })
+        Ok(Dit { globals, gl, blocks, units, refiner, table, inv_freq, tdim, hyper, mid_width, int8_attn: true, attn_variant: 0,
+            shifts: (SHIFT_VIDEO as f32, SHIFT_AUDIO as f32), prof: crate::prof::Prof::new() })
+    }
+
+    /// HyperFlow H3 Flash, which reads the step's endpoint.
+    pub fn is_hyperflow(&self) -> bool {
+        self.hyper.is_some()
+    }
+
+    /// Rough activation footprint of one evaluation (bytes) for `l` tokens.
+    pub fn step_activation_bytes(&self, l: usize) -> usize {
+        step_activation_bytes(l) + if self.hyper.is_some() { l * (FFN + self.mid_width) * 2 } else { 0 }
     }
 
     /// Give the blocks `budget` bytes of VRAM (what they hold now counts).
@@ -267,10 +554,32 @@ impl Dit {
         let y = DevBuf::alloc_async(l * F * 2, st)?;
         let hid = DevBuf::alloc_async(l * 2 * FFN * 2, st)?;
         let (xp, q) = (x.ptr(), qkv.ptr());
+        let dense = self.hyper.is_some();
+        let (h16, h16b) = if dense { (Some(DevBuf::alloc_async(l * F * 2, st)?), Some(DevBuf::alloc_async(l * FFN * 2, st)?)) } else { (None, None) };
         for b in 0..REFINER {
             let base = self.refiner.acquire(b, st)?;
             let lay = self.refiner.layouts[b].clone();
             let wp = |key: &str| off(base, lay.off(key));
+            if let (Some(h), Some(hb)) = (&h16, &h16b) {
+                let gemm = |a: PM, k: usize, w: &str, out: PM, n: usize| -> Result<()> {
+                    k!(gpu_gemm(a, k as i64, wp(w), k as i64, out, n as i64, null(), l as i64, n as i64, k as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))
+                };
+                k!(gpu_prologue_rows(DT_BF16, PRO_RMS, xp, fi, null(), 0, 0, wp("n1"), EPS, null(), null(), h.ptr(), fi, m, F as i32, s(st)))?;
+                gemm(h.ptr(), F, "w_qkv", q, QKV)?;
+                k!(gpu_qk_norm_rope(DT_BF16, HD as i32, q, QKV as i64, 0, INNER as i32, H as i32, H as i32, wp("qn"), wp("kn"), EPS, null(), 0, m, s(st)))?;
+                k!(gpu_attn_small(DT_BF16, q, QKV as i64, off(q, INNER * 2), off(q, 2 * INNER * 2), QKV as i64, H as i32, H as i32, HD as i32, m, m, attn.ptr(), INNER as i64,
+                    1.0 / (HD as f32).sqrt(), 0, s(st)))?;
+                gemm(attn.ptr(), INNER, "w_o", y.ptr(), F)?;
+                k!(gpu_add_gated_bf16(xp, fi, y.ptr(), fi, null(), m, F as i32, s(st)))?;
+                k!(gpu_prologue_rows(DT_BF16, PRO_RMS, xp, fi, null(), 0, 0, wp("n2"), EPS, null(), null(), h.ptr(), fi, m, F as i32, s(st)))?;
+                gemm(h.ptr(), F, "w_up", hid.ptr(), 2 * FFN)?;
+                k!(gpu_prologue_rows(DT_BF16, PRO_SWIGLU, hid.ptr(), (2 * FFN) as i64, null(), 0, FFN as i64, null(), 0.0, null(), null(), hb.ptr(), FFN as i64, m,
+                    FFN as i32, s(st)))?;
+                gemm(hb.ptr(), FFN, "w_d", y.ptr(), F)?;
+                k!(gpu_add_gated_bf16(xp, fi, y.ptr(), fi, null(), m, F as i32, s(st)))?;
+                self.refiner.release(b, st)?;
+                continue;
+            }
             k!(gpu_quant_rows(DT_BF16, PRO_RMS, xp, fi, null(), 0, 0, wp("n1"), EPS, null(), null(), a8.ptr(), asc.ptr(), m, F as i32, 1, s(st)))?;
             k!(gpu_int8_gemm(a8.ptr(), wp("w_qkv"), asc.ptr(), wp("s_qkv"), null(), q, l as i64, QKV as i64, fi, DT_BF16, s(st)))?;
             k!(gpu_qk_norm_rope(DT_BF16, HD as i32, q, QKV as i64, 0, INNER as i32, H as i32, H as i32, wp("qn"), wp("kn"), EPS, null(), 0, m, s(st)))?;
@@ -330,9 +639,9 @@ impl Dit {
     }
 
     /// One model evaluation. `x` is the sampler's pack (video, then audio carried on the video
-    /// schedule); writes the denoised pack to `den`.
+    /// schedule); writes the denoised pack to `den`. `sigma_next` is where this step ends, which only HyperFlow reads.
     #[allow(clippy::too_many_arguments)]
-    pub fn predict(&mut self, x_in: &DevBuf, sh: &Shape, ctx: &DevBuf, text: usize, rope: &DevBuf, sigma: f32, den: &DevBuf, st: &Stream,
+    pub fn predict(&mut self, x_in: &DevBuf, sh: &Shape, ctx: &DevBuf, text: usize, rope: &DevBuf, sigma: f32, sigma_next: f32, den: &DevBuf, st: &Stream,
         mut probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<()> {
         self.prof.mark("start", st)?;
         let t0 = std::time::Instant::now();
@@ -377,8 +686,16 @@ impl Dit {
         let (al, l) = (text + ar, text + ar + vr);
         let fi = F as i64;
         let (t_v, t_a) = (1.0 - sigma_v, 1.0 - sigma_a);
-        let curve: Vec<f32> = [self.curve(t_v), self.curve(t_a)].concat();
-        let cd = DevBuf::alloc_async(2 * 8 * 4, st)?;
+        let curve: Vec<f32> = match &mut self.hyper {
+            None => [self.curve(t_v), self.curve(t_a)].concat(),
+            // text follows video; audio's endpoint is on its own schedule, as its time is
+            Some(h) => {
+                let next = sigma_next.clamp(0.0, 1.0);
+                [h.adaln_input(t_v, 1.0 - next), h.adaln_input(t_a, 1.0 - audio_sigma(next, self.shifts))].concat()
+            }
+        };
+        let td = self.tdim;
+        let cd = DevBuf::alloc_async(2 * td * 4, st)?;
         cd.upload(0, &f32_bytes(&curve), st)?;
 
         // tokens
@@ -404,6 +721,11 @@ impl Dit {
         let modf = DevBuf::alloc_async(2 * MODS * 4, st)?;
         let modb = DevBuf::alloc_async(2 * MODS * 2, st)?;
         let folded = DevBuf::alloc_async(6 * F * 2, st)?;
+        // HyperFlow's low-rank pairs: the SwiGLU output in bf16, and the rank-wide middle
+        let (lrin, mid) = match self.hyper {
+            Some(_) => (Some(DevBuf::alloc_async(l * FFN * 2, st)?), Some(DevBuf::alloc_async(l * self.mid_width.max(8) * 2, st)?)),
+            None => (None, None),
+        };
         if let Some(p) = probe.as_mut() {
             p("x_in", &x, l * F * 2);
         }
@@ -412,7 +734,9 @@ impl Dit {
         let segs = [(0, text, 0usize, 1usize), (text, ar, 1, 2), (al, vr, 0, 0)];
 
         for b in 0..self.blocks.len() {
-            k!(gpu_gemm(cd.ptr(), 8, self.g(&format!("a{b}_w")), 8, modf.ptr(), MODS as i64, self.g(&format!("a{b}_b")), 2, MODS as i64, 8, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
+            let u = self.units[b];
+            k!(gpu_gemm(cd.ptr(), td as i64, self.g(&format!("a{b}_w")), td as i64, modf.ptr(), MODS as i64, self.g(&format!("a{b}_b")), 2, MODS as i64, td as i64, 1, DT_F32, DT_F32,
+                1.0, 0.0, s(st)))?;
             k!(gpu_f32_to_bf16(modf.ptr(), modb.ptr(), (2 * MODS) as i64, s(st)))?;
             self.prof.mark("mod", st)?;
             let base = self.blocks.acquire(b, st)?;
@@ -421,20 +745,54 @@ impl Dit {
             let wp = |key: &str| off(base, lay.off(key));
             let vecs = |seg: &(usize, usize, usize, usize), j: usize| off(modb.ptr(), ((seg.2 * 3 + seg.3) * 6 + j) * F * 2);
             let fold = |i: usize, j: usize| off(folded.ptr(), (i * 2 + j) * F * 2);
-            let decode = |key: &str, n: usize, kk: usize| -> Result<()> {
-                k!(gpu_w6_decode(wp(&format!("w_{key}")), wp(&format!("r_{key}")), wdec.ptr(), n as i64, kk as i32, G, s(st)))
+            let mid = mid.as_ref().map_or(null() as PM, |m| m.ptr());
+            // the int8 weight of linear `m`: w6a8 decoded into `wdec`, or HyperFlow's as stored
+            let weight = |m: usize, n: usize, kk: usize| -> Result<PM> {
+                let key = MODULES[m].0;
+                if u.lins[m] == Lin::W6 {
+                    k!(gpu_w6_decode(wp(&format!("w_{key}")), wp(&format!("r_{key}")), wdec.ptr(), n as i64, kk as i32, G, s(st)))?;
+                    Ok(wdec.ptr())
+                } else {
+                    Ok(wp(&format!("w_{key}")))
+                }
             };
+            // the normed and modulated rows of every segment: int8 for an int8 linear, else bf16 in `attn`
+            let modulate = |m: usize, j: usize| -> Result<()> {
+                for (i, seg) in segs.iter().enumerate() {
+                    let (xs, rows, (sc, sh)) = (off(xp, seg.0 * F * 2), seg.1 as i32, (fold(i, j), vecs(seg, 3 * j)));
+                    if u.lins[m] == Lin::LowRank {
+                        k!(gpu_prologue_rows(DT_BF16, PRO_ADALN, xs, fi, null(), 0, 0, null(), EPS, sc, sh, off(attn.ptr(), seg.0 * F * 2), fi, rows, F as i32, s(st)))?;
+                    } else {
+                        k!(gpu_quant_rows(DT_BF16, PRO_ADALN, xs, fi, null(), 0, 0, null(), EPS, sc, sh, off(a8.ptr(), seg.0 * F), off(asc.ptr(), seg.0 * 4), rows, F as i32, 1, s(st)))?;
+                    }
+                }
+                Ok(())
+            };
+            // x += gate * y, segment by segment, for a low-rank output in `y`
+            let add_gated = |y: PM, j: usize| -> Result<()> {
+                for seg in &segs {
+                    k!(gpu_add_gated_bf16(off(xp, seg.0 * F * 2), fi, off(y, seg.0 * F * 2), fi, vecs(seg, j), seg.1 as i32, F as i32, s(st)))?;
+                }
+                Ok(())
+            };
+            let (dn, up, r) = (|slot: usize| wp(&format!("dn{slot}")), |slot: usize| wp(&format!("up{slot}")), u.ranks);
             for (i, seg) in segs.iter().enumerate() {
                 k!(gpu_adaln_weight(wp("n1"), vecs(seg, 1), fold(i, 0), F as i32, s(st)))?;
                 k!(gpu_adaln_weight(wp("n2"), vecs(seg, 4), fold(i, 1), F as i32, s(st)))?;
-                k!(gpu_quant_rows(DT_BF16, PRO_ADALN, off(xp, seg.0 * F * 2), fi, null(), 0, 0, null(), EPS, fold(i, 0), vecs(seg, 0), off(a8.ptr(), seg.0 * F), off(asc.ptr(), seg.0 * 4),
-                    seg.1 as i32, F as i32, 1, s(st)))?;
             }
+            modulate(0, 0)?;
             self.prof.mark("quant", st)?;
-            decode("qkv", QKV, F)?;
-            self.prof.mark("w6", st)?;
-            k!(gpu_int8_gemm(a8.ptr(), wdec.ptr(), asc.ptr(), wp("c_qkv"), null(), q, l as i64, QKV as i64, fi, DT_BF16, s(st)))?;
-            self.prof.mark("gemm", st)?;
+            if u.lins[0] == Lin::LowRank {
+                let ups: Vec<Up> =
+                    (0..3).map(|j| Up { col: r[..j].iter().sum(), rank: r[j], w: up(j), first: 0, rows: INNER, out: off(q, j * INNER * 2), ldo: QKV }).collect();
+                low_rank(attn.ptr(), F, F, dn(0), r[0] + r[1] + r[2], &ups, mid, l, st)?;
+                self.prof.mark("lowrank", st)?;
+            } else {
+                let w = weight(0, QKV, F)?;
+                self.prof.mark("w6", st)?;
+                k!(gpu_int8_gemm(a8.ptr(), w, asc.ptr(), wp("c_qkv"), null(), q, l as i64, QKV as i64, fi, DT_BF16, s(st)))?;
+                self.prof.mark("gemm", st)?;
+            }
             k!(gpu_rope_bf16(q, QKV as i64, HD as i64, wp("qn"), EPS, rope.ptr(), l as i32, H as i32, HD as i32, ROPE_PAIRS as i32, s(st)))?;
             k!(gpu_rope_bf16(off(q, INNER * 2), QKV as i64, HD as i64, wp("kn"), EPS, rope.ptr(), l as i32, H as i32, HD as i32, ROPE_PAIRS as i32, s(st)))?;
             self.prof.mark("rope", st)?;
@@ -446,31 +804,54 @@ impl Dit {
                     p("b0.q", qkv, l * QKV * 2);
                 }
             }
-            k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), INNER as i64, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), l as i32, INNER as i32, 1, s(st)))?;
-            self.prof.mark("quant", st)?;
-            decode("o", F, INNER)?;
-            self.prof.mark("w6", st)?;
-            for seg in &segs {
-                let xs = off(xp, seg.0 * F * 2);
-                k!(gpu_int8_gemm_residual(off(a8.ptr(), seg.0 * INNER), wdec.ptr(), off(asc.ptr(), seg.0 * 4), wp("c_o"), null(), vecs(seg, 2), xs, xs, seg.1 as i64, fi, INNER as i64, DT_BF16, s(st)))?;
+            if u.lins[1] == Lin::LowRank {
+                // q, k and v are spent, so their buffer takes the output
+                low_rank(attn.ptr(), INNER, INNER, dn(3), r[3], &[Up { col: 0, rank: r[3], w: up(3), first: 0, rows: F, out: hid.ptr(), ldo: F }], mid, l, st)?;
+                add_gated(hid.ptr(), 2)?;
+                self.prof.mark("lowrank", st)?;
+            } else {
+                k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), INNER as i64, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), l as i32, INNER as i32, 1, s(st)))?;
+                self.prof.mark("quant", st)?;
+                let w = weight(1, F, INNER)?;
+                self.prof.mark("w6", st)?;
+                for seg in &segs {
+                    let xs = off(xp, seg.0 * F * 2);
+                    k!(gpu_int8_gemm_residual(off(a8.ptr(), seg.0 * INNER), w, off(asc.ptr(), seg.0 * 4), wp("c_o"), null(), vecs(seg, 2), xs, xs, seg.1 as i64, fi, INNER as i64,
+                        DT_BF16, s(st)))?;
+                }
             }
             self.prof.mark("gemm", st)?;
-            for (i, seg) in segs.iter().enumerate() {
-                k!(gpu_quant_rows(DT_BF16, PRO_ADALN, off(xp, seg.0 * F * 2), fi, null(), 0, 0, null(), EPS, fold(i, 1), vecs(seg, 3), off(a8.ptr(), seg.0 * F), off(asc.ptr(), seg.0 * 4),
-                    seg.1 as i32, F as i32, 1, s(st)))?;
+            modulate(2, 1)?;
+            self.prof.mark("quant", st)?;
+            if u.lins[2] == Lin::LowRank {
+                // diffusers' up rows are [value; gate]; the SwiGLU kernels read [gate; value]
+                let half = |first: usize, out: PM| Up { col: 0, rank: r[4], w: up(4), first, rows: FFN, out, ldo: 2 * FFN };
+                low_rank(attn.ptr(), F, F, dn(4), r[4], &[half(0, off(hid.ptr(), FFN * 2)), half(FFN, hid.ptr())], mid, l, st)?;
+                self.prof.mark("lowrank", st)?;
+            } else {
+                let w = weight(2, 2 * FFN, F)?;
+                self.prof.mark("w6", st)?;
+                k!(gpu_int8_gemm(a8.ptr(), w, asc.ptr(), wp("c_up"), null(), hid.ptr(), l as i64, (2 * FFN) as i64, fi, DT_BF16, s(st)))?;
+                self.prof.mark("gemm", st)?;
             }
-            self.prof.mark("quant", st)?;
-            decode("up", 2 * FFN, F)?;
-            self.prof.mark("w6", st)?;
-            k!(gpu_int8_gemm(a8.ptr(), wdec.ptr(), asc.ptr(), wp("c_up"), null(), hid.ptr(), l as i64, (2 * FFN) as i64, fi, DT_BF16, s(st)))?;
-            self.prof.mark("gemm", st)?;
-            k!(gpu_quant_rows(DT_BF16, PRO_SWIGLU, hid.ptr(), (2 * FFN) as i64, null(), 0, FFN as i64, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), l as i32, FFN as i32, 1, s(st)))?;
-            self.prof.mark("quant", st)?;
-            decode("d", F, FFN)?;
-            self.prof.mark("w6", st)?;
-            for seg in &segs {
-                let xs = off(xp, seg.0 * F * 2);
-                k!(gpu_int8_gemm_residual(off(a8.ptr(), seg.0 * FFN), wdec.ptr(), off(asc.ptr(), seg.0 * 4), wp("c_d"), null(), vecs(seg, 5), xs, xs, seg.1 as i64, fi, FFN as i64, DT_BF16, s(st)))?;
+            if u.lins[3] == Lin::LowRank {
+                let lrin = lrin.as_ref().context("low-rank layers without their buffers")?;
+                k!(gpu_prologue_rows(DT_BF16, PRO_SWIGLU, hid.ptr(), (2 * FFN) as i64, null(), 0, FFN as i64, null(), 0.0, null(), null(), lrin.ptr(), FFN as i64, l as i32,
+                    FFN as i32, s(st)))?;
+                low_rank(lrin.ptr(), FFN, FFN, dn(5), r[5], &[Up { col: 0, rank: r[5], w: up(5), first: 0, rows: F, out: hid.ptr(), ldo: F }], mid, l, st)?;
+                add_gated(hid.ptr(), 5)?;
+                self.prof.mark("lowrank", st)?;
+            } else {
+                k!(gpu_quant_rows(DT_BF16, PRO_SWIGLU, hid.ptr(), (2 * FFN) as i64, null(), 0, FFN as i64, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), l as i32, FFN as i32, 1,
+                    s(st)))?;
+                self.prof.mark("quant", st)?;
+                let w = weight(3, F, FFN)?;
+                self.prof.mark("w6", st)?;
+                for seg in &segs {
+                    let xs = off(xp, seg.0 * F * 2);
+                    k!(gpu_int8_gemm_residual(off(a8.ptr(), seg.0 * FFN), w, off(asc.ptr(), seg.0 * 4), wp("c_d"), null(), vecs(seg, 5), xs, xs, seg.1 as i64, fi, FFN as i64,
+                        DT_BF16, s(st)))?;
+                }
             }
             self.prof.mark("gemm", st)?;
             self.blocks.release(b, st)?;
@@ -483,7 +864,7 @@ impl Dit {
 
         // final layer: [2][shift | scale]
         let fm = DevBuf::alloc_async(2 * 2 * F * 4, st)?;
-        k!(gpu_gemm(cd.ptr(), 8, self.g("fa_w"), 8, fm.ptr(), (2 * F) as i64, self.g("fa_b"), 2, (2 * F) as i64, 8, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
+        k!(gpu_gemm(cd.ptr(), td as i64, self.g("fa_w"), td as i64, fm.ptr(), (2 * F) as i64, self.g("fa_b"), 2, (2 * F) as i64, td as i64, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
         let fb = DevBuf::alloc_async(2 * 2 * F * 2, st)?;
         k!(gpu_f32_to_bf16(fm.ptr(), fb.ptr(), (4 * F) as i64, s(st)))?;
         let h16 = &attn;
@@ -494,9 +875,14 @@ impl Dit {
         }
         k!(gpu_bf16_to_f32(off(h16.ptr(), text * F * 2), fbuf.ptr(), ((ar + vr) * F) as i64, s(st)))?;
         let vout = DevBuf::alloc_async((vr * PATCH + ar * ACH) * 4, st)?;
-        k!(gpu_w6_decode(self.g("vo_w"), self.g("vo_r"), wdec.ptr(), PATCH as i64, F as i32, G, s(st)))?;
-        k!(gpu_quant_rows(DT_F32, PRO_PLAIN, off(fbuf.ptr(), ar * F * 4), fi, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), vr as i32, F as i32, 1, s(st)))?;
-        k!(gpu_int8_gemm(a8.ptr(), wdec.ptr(), asc.ptr(), self.g("vo_c"), self.g("vo_b"), vout.ptr(), vr as i64, PATCH as i64, fi, DT_F32, s(st)))?;
+        if self.hyper.is_some() {
+            // HyperFlow keeps the video head in float32
+            k!(gpu_gemm(off(fbuf.ptr(), ar * F * 4), fi, self.g("vo_w"), fi, vout.ptr(), PATCH as i64, self.g("vo_b"), vr as i64, PATCH as i64, fi, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
+        } else {
+            k!(gpu_w6_decode(self.g("vo_w"), self.g("vo_r"), wdec.ptr(), PATCH as i64, F as i32, G, s(st)))?;
+            k!(gpu_quant_rows(DT_F32, PRO_PLAIN, off(fbuf.ptr(), ar * F * 4), fi, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), vr as i32, F as i32, 1, s(st)))?;
+            k!(gpu_int8_gemm(a8.ptr(), wdec.ptr(), asc.ptr(), self.g("vo_c"), self.g("vo_b"), vout.ptr(), vr as i64, PATCH as i64, fi, DT_F32, s(st)))?;
+        }
         k!(gpu_gemm(fbuf.ptr(), fi, self.g("ao_w"), fi, off(vout.ptr(), vr * PATCH * 4), ACH as i64, self.g("ao_b"), ar as i64, ACH as i64, fi, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
 
         self.prof.mark("head", st)?;
@@ -556,6 +942,27 @@ mod tests {
         let shifts = (SHIFT_VIDEO as f32, SHIFT_AUDIO as f32);
         assert!((audio_sigma(1.0, shifts) - 1.0).abs() < 1e-6);
         assert!(audio_sigma(0.5, shifts) < 0.5);
+    }
+
+    #[test]
+    fn hyperflow_schedule_is_its_grid_shifted_like_video() {
+        let ms = crate::samplers::ModelSampling::Flow { shift: SHIFT_VIDEO };
+        let s = crate::samplers::hyperflow_sigmas(ms, 6).unwrap();
+        let want = [1.0, 0.98271, 0.91463, 0.67479, 0.38518, 0.15911, 0.0];
+        assert!(s.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4), "{s:?}");
+        assert!(crate::samplers::hyperflow_sigmas(ms, 5).is_err());
+        assert!(crate::samplers::hyperflow_sigmas(crate::samplers::ModelSampling::Flux { shift: 1.0 }, 6).is_err());
+    }
+
+    #[test]
+    fn time_embedding_is_cos_then_sin() {
+        // one hidden unit reading emb[0] = cos(0) = 1 and one reading emb[128] = sin(0) = 0
+        let mut w1 = vec![0f32; 2 * FREQ];
+        w1[0] = 1.0;
+        w1[FREQ + 128] = 1.0;
+        let m = TimeMlp { w1, b1: vec![0.0; 2], w2: vec![1.0, 0.0, 0.0, 1.0], b2: vec![0.0; 2] };
+        let out = m.at(0.0);
+        assert!((out[0] - silu(1.0)).abs() < 1e-6 && out[1].abs() < 1e-6, "{out:?}");
     }
 
     #[test]

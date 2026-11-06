@@ -42,6 +42,9 @@ pub(super) struct H3 {
 impl FamilyState for H3 {
     fn set_loras(&mut self, loras: &[lora::Lora], st: &Stream) -> Result<()> {
         let Some(m) = &mut self.model else { return nothing_for(loras, "diffusion model") };
+        if m.dit.is_hyperflow() && !loras.is_empty() {
+            bail!("LoRAs on HyperFlow H3 Flash: its layers are pruned and factorized, so H3 LoRAs don't fit them");
+        }
         if lora::apply(lora::Arch::H3, &m.st, "", m.dit.stores(), &mut m.lora, loras, st)? {
             self.clear_prompts();
         }
@@ -147,11 +150,14 @@ impl Generator {
         f.clear_prompts();
         f.model = None;
         let t0 = Instant::now();
-        let dst = Arc::new(st::SafeTensors::open(path)?);
+        let mut file = st::SafeTensors::open(path)?;
+        h3::prepare(&mut file)?;
+        let dst = Arc::new(file);
         let mut dit = h3::Dit::load(&dst, env.threads, &env.st)?;
         dit.attn_variant = env.attn_variant;
         dit.int8_attn = env.int8_attn;
-        eprintln!("MiniMax H3 loaded in {:.1}s", t0.elapsed().as_secs_f64());
+        let name = if dit.is_hyperflow() { "HyperFlow H3 Flash" } else { "MiniMax H3" };
+        eprintln!("{name} loaded in {:.1}s", t0.elapsed().as_secs_f64());
         f.model = Some(Model { path: path.to_path_buf(), dit, st: dst, lora: lora::State::default() });
         Ok(())
     }
@@ -228,7 +234,12 @@ impl Generator {
         let st = &env.st;
         let f = self.family.h3().context("no H3 model")?;
         let shifts = (r.shifts.0 as f32, r.shifts.1 as f32);
-        f.model.as_mut().context("no H3 model")?.dit.shifts = shifts;
+        let dit = &mut f.model.as_mut().context("no H3 model")?.dit;
+        // its time embedding reads where each step ends, which only euler's steps are sure to
+        if dit.is_hyperflow() && r.sampling.sampler != "euler" {
+            bail!("the {} sampler on HyperFlow H3 Flash (only euler for now)", r.sampling.sampler);
+        }
+        dit.shifts = shifts;
         let neg_key = if r.sampling.uses_negative() { Some(f.context(&r.negative, st, None)?) } else { None };
         let pos_key = f.context(&r.prompt, st, dump.as_deref_mut())?;
         stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -247,14 +258,18 @@ impl Generator {
         st.sync()?;
         cuda::trim_pool()?;
         let tokens = text.max(neg.map_or(0, |n| n.1)) + 2 * r.shape.audio_t + r.shape.t * (r.shape.h / 2) * (r.shape.w / 2);
-        let budget = (cuda::device_free()? + m.dit.blocks_vram()).saturating_sub(env.reserve + (1 << 29) + h3::step_activation_bytes(tokens) + m.dit.attn_workspace(tokens));
+        let budget = (cuda::device_free()? + m.dit.blocks_vram()).saturating_sub(env.reserve + (1 << 29) + m.dit.step_activation_bytes(tokens) + m.dit.attn_workspace(tokens));
         m.dit.reserve(budget, env.slots)?;
         let rope = m.dit.rope(text, &r.shape, st)?;
         let rope_neg = neg.map(|(_, l)| m.dit.rope(l, &r.shape, st)).transpose()?;
         let dit = &mut m.dit;
         let n = r.noise.len();
         let mut first = dump;
+        let sigmas = &r.sampling.sigmas;
         let mut model = |x: &DevBuf, den: &DevBuf, sigma: f32, negative: bool, e: usize| -> Result<()> {
+            // the schedule's next sigma after the nearest one, as HyperFlow's ComfyUI node finds it
+            let i = (0..sigmas.len()).min_by(|&a, &b| (sigmas[a] - sigma).abs().total_cmp(&(sigmas[b] - sigma).abs())).unwrap_or(0);
+            let next = sigmas.get(i + 1).or(sigmas.last()).copied().unwrap_or(0.0);
             let mut keep = |name: &str, b: &DevBuf, bytes: usize| {
                 if let (0, false, Some(d)) = (e, negative, first.as_mut()) {
                     let mut v = vec![0u8; bytes];
@@ -264,8 +279,8 @@ impl Generator {
                 }
             };
             match (negative, neg, &rope_neg) {
-                (true, Some((c, l)), Some(rn)) => dit.predict(x, &r.shape, c, l, rn, sigma, den, st, None)?,
-                _ => dit.predict(x, &r.shape, pos, text, &rope, sigma, den, st, Some(&mut keep))?,
+                (true, Some((c, l)), Some(rn)) => dit.predict(x, &r.shape, c, l, rn, sigma, next, den, st, None)?,
+                _ => dit.predict(x, &r.shape, pos, text, &rope, sigma, next, den, st, Some(&mut keep))?,
             }
             if let (0, false, Some(d)) = (e, negative, first.as_mut()) {
                 let mut b = vec![0u8; n * 4];

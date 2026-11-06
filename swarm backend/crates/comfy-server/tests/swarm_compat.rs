@@ -793,7 +793,8 @@ async fn stock_schema_parity() {
         json!([ty, keep])
     }
     // Documented, intentional deviations.
-    let allowed = [("VAEDecodeTiled", "temporal_size"), ("ModelAttentionBackend", "attention")];
+    // SwarmKSampler also lists the hyperflow scheduler, so SwarmUI offers HyperFlow H3 Flash's grid.
+    let allowed = [("VAEDecodeTiled", "temporal_size"), ("ModelAttentionBackend", "attention"), ("SwarmKSampler", "scheduler")];
     let stock: Value = serde_json::from_str(&std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stock_schemas.json")).unwrap()).unwrap();
     let ours = TestServer::start(0).await.get("object_info").await;
     let mut problems = Vec::new();

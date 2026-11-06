@@ -25,8 +25,11 @@ pub const SCHEDULERS: &[&str] = &["simple", "sgm_uniform", "karras", "exponentia
 /// Extra schedulers `SwarmKSampler` adds in front of ComfyUI's.
 pub const SWARM_EXTRA_SCHEDULERS: &[&str] = &["turbo", "align_your_steps", "ltxv", "ltxv-image", "flux2", "ideogram4", "ideogram4turbo"];
 
+/// Schedulers this server adds to `SwarmKSampler`'s, which SwarmUI then lists: HyperFlow H3 Flash's distilled grid.
+pub const ENGINE_SCHEDULERS: &[&str] = &["hyperflow"];
+
 fn swarm_schedulers() -> Vec<&'static str> {
-    SWARM_EXTRA_SCHEDULERS.iter().chain(SCHEDULERS).copied().collect()
+    SWARM_EXTRA_SCHEDULERS.iter().chain(SCHEDULERS).chain(ENGINE_SCHEDULERS).copied().collect()
 }
 
 fn opt_sigma(v: f64) -> Option<f64> {

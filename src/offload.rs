@@ -34,6 +34,8 @@ pub enum Src {
     F32(String, f32),
     /// literal bytes
     Bytes(Vec<u8>),
+    /// 2D tensors as stored, each zero-padded to (rows, cols) and concatenated, for aligned GEMMs
+    Padded(Vec<(String, usize, usize)>),
 }
 
 #[derive(Clone)]
@@ -104,6 +106,21 @@ impl Layout {
         Ok(())
     }
 
+    /// 2D tensors zero-padded to `(rows, cols)` each, one after another. Padding with zeros leaves their products as
+    /// they are; it only aligns the strides.
+    pub fn padded(&mut self, st: &SafeTensors, key: &str, parts: &[(String, usize, usize)]) -> Result<()> {
+        let mut len = 0;
+        for (n, rows, cols) in parts {
+            let i = st.info(n)?;
+            if i.shape.len() != 2 || i.shape[0] > *rows || i.shape[1] > *cols {
+                anyhow::bail!("{n}: {:?} doesn't pad to {rows}x{cols}", i.shape);
+            }
+            len += rows * cols * i.dtype.size();
+        }
+        self.push(key, Src::Padded(parts.to_vec()), len);
+        Ok(())
+    }
+
     pub fn bytes(&mut self, key: &str, b: Vec<u8>) {
         let len = b.len();
         self.push(key, Src::Bytes(b), len);
@@ -127,7 +144,8 @@ impl Layout {
                 Src::Raw(n) => (n.clone(), None, Stored::Raw),
                 Src::Bf16(n) => (n.clone(), Some(Dt::BF16), Stored::Bf16),
                 Src::F32(n, add) => (vec![n.clone()], Some(Dt::F32), Stored::F32(*add)),
-                Src::Bytes(_) => continue,
+                // padded copies aren't the file's layout; nothing patches them in place
+                Src::Bytes(_) | Src::Padded(_) => continue,
             };
             let mut off = e.off;
             for n in names {
@@ -148,6 +166,7 @@ impl Layout {
             match &e.src {
                 Src::Raw(names) | Src::Bf16(names) => names.iter().for_each(|n| st.evict(n)),
                 Src::F32(n, _) => st.evict(n),
+                Src::Padded(parts) => parts.iter().for_each(|(n, ..)| st.evict(n)),
                 Src::Bytes(_) => {}
             }
         }
@@ -178,6 +197,19 @@ impl Layout {
                     d.copy_from_slice(&f32_bytes(&v));
                 }
                 Src::Bytes(b) => d.copy_from_slice(b),
+                Src::Padded(parts) => {
+                    d.fill(0);
+                    let mut o = 0;
+                    for (n, rows, cols) in parts {
+                        let i = st.info(n)?;
+                        let (es, (r, c)) = (i.dtype.size(), (i.shape[0], i.shape[1]));
+                        let b = st.bytes(n)?;
+                        for y in 0..r {
+                            d[o + y * cols * es..][..c * es].copy_from_slice(&b[y * c * es..][..c * es]);
+                        }
+                        o += rows * cols * es;
+                    }
+                }
             }
         }
         Ok(())

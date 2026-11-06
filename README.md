@@ -20,6 +20,7 @@ It really generates with five image and video model families and one image-to-3D
 | MOSS Image | Text to image | 550 to 573 ms/step at CFG 4 | 601 ms/step |
 | Qwen Image 2.1 | Text to image with alpha, and edits with reference images | 0.36 s/step, 0.22 to 0.44 s/step with references | 0.46 s/step |
 | MiniMax H3 | Text to video with audio | 0.24 s/step, 5 frames at 512x512 | 1.59 s/step |
+| HyperFlow H3 Flash | Text to video with audio, 6 steps | 0.49 s/step, 22 frames at 512x512 | needs custom nodes, not timed |
 | Pixal3D | Image to a vertex-coloured 3D mesh (GLB), cutting the object out first with BiRefNet | 40 s per mesh at resolution 1024, 110 s at 1536 | not timed |
 
 All of them take every ComfyUI sampler and scheduler, and all of them take LoRAs. Init images, inpainting and refiners work on the image
@@ -58,6 +59,7 @@ Put your models in one folder, keeping these subfolders, and point `MODELS_ROOT`
 | MOSS Image | `moss_image_sft_int8_convrot_attn.safetensors` | `qwen3.5_9b_int8_convrot.safetensors` | `flux2-vae.safetensors` |
 | Qwen Image 2.1 | `rayQwen21_v1Int8Convrot.safetensors` | `qwen3vl_8b_int8_convrot.safetensors` | `QwenImage/qwen_image_2.1_vae_bf16.safetensors` |
 | MiniMax H3 | `minimax_h3_fl2va_pruned_w6a8.safetensors` | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `MiniMaxH3/minimax_h3_video_vae_int8_convrot.safetensors`, `MiniMaxH3/minimax_h3_audio_vae_fp32.safetensors` |
+| HyperFlow H3 Flash | a folder holding `fl2va_int8_convrot/` from [its repository](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash); pick any shard | as MiniMax H3 | as MiniMax H3 |
 
 Pixal3D uses other folders: `diffusion_models/Pixal3D/pixal3d_int8_convrot.safetensors`, `clip_vision/dino_v3_L_naf_fp32.safetensors`,
 and `VAE/Pixal3D/trellis_2_shape_vae_bf16.safetensors` with `trellis_2_texture_vae_bf16.safetensors`, all from

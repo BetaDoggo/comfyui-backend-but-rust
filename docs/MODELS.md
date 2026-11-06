@@ -9,6 +9,7 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | Anima | Images | `er_sde`, `simple` | int8 ConvRot only |
 | MOSS Image | Images | `euler`, `simple` | int8 ConvRot with fused q/k/v only |
 | MiniMax H3 | Video with audio | `res_multistep`, `simple` | `w6a8` only |
+| HyperFlow H3 Flash | Video with audio | `euler`, `hyperflow`, 6 steps | the int8 ConvRot diffusers folder only |
 | Pixal3D | A 3D mesh from one image | the example workflow's four `euler` samplers | int8 ConvRot (`pixal3d_int8_convrot`) only |
 
 ## Support matrix
@@ -290,6 +291,46 @@ video decoder, keeping the first real frame. A 768x512 still at 20 steps and CFG
 `comfy-server` over HTTP; not compared with ComfyUI's picture, and not run through SwarmUI itself.
 
 Not done: the video and audio encoders, and sparse attention for long clips.
+
+### HyperFlow H3 Flash
+
+[HyperFlow H3 Flash](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash) is a community few-step H3, which
+ComfyUI doesn't run without its custom nodes. It loads as H3, picked by the `config.json` next to its shards: point
+`--dit` or SwarmUI at any shard of `fl2va_int8_convrot/`, and keep the folder's `config.json` and index beside it. Its
+text encoder and decoders are H3's own.
+
+```bash
+target/release/diffusion.exe --h3 --dit "$MODELS_ROOT/Stable-diffusion/hyperflow_h3_flash_fl2va/diffusion_pytorch_model-00001-of-00003.safetensors" --width 512 --height 512 --frames 22 --steps 6 --scheduler hyperflow -p "a stone lighthouse on a sea cliff at dawn, waves crashing below, no people" -o clip.mp4
+```
+
+What differs from H3, all read from the files as they are:
+
+* Blocks 6, 21 and 22 are gone. Each linear of the other 47 is either int8 ConvRot (W8A8 behind the same 256-wide
+  Hadamard as ComfyUI's) or a low-rank bf16 pair run as two GEMMs, as diffusers runs it. q, k and v are joined at load.
+  The low-rank ranks are zero-padded to multiples of 8 as each block is staged, so the GEMM strides are aligned, and
+  q, k and v share one down GEMM. That changes no value, but cuBLASLt then picks other kernels, and this model is
+  sensitive to their rounding: padding to 8 or to 64, which are the same mathematics, gave first evaluations 1.8%
+  apart and frames 25.5 dB apart, with the same picture.
+  Diffusers stores each SwiGLU input as `[value; gate]`, so its halves are read in ComfyUI's order.
+* The token refiner and the video head are bf16 and float32, not int8.
+* Each AdaLN reads `temb(t, r) = emb_t(t) + 0.25 (emb_r(r) - emb_t(t))`, where `r` is where the step ends: the
+  schedule's next sigma, found as HyperFlow's ComfyUI node finds it. Audio's `r` follows its own shift, as its `t` does.
+
+The `hyperflow` scheduler is its 4, 6 or 8-step grid, shifted by the model's video shift (12, or SwarmUI's Sigma Shift).
+The server lists it on `SwarmKSampler`, so SwarmUI offers it; other models refuse it. Other schedulers run too, with `r`
+taken from their own next sigma, as in the ComfyUI node; only the grid is what the model was distilled on. Refused:
+samplers other than `euler` (the endpoint isn't defined for multistep or ancestral steps yet), and LoRAs, since its
+layers no longer match H3's.
+
+On this machine, 512x512, 22 frames, 6 steps, CFG 1, once the weights were in the file cache: 0.49 s per evaluation
+after the first (0.52 s before the padding), of which the int8 GEMMs took about 215 ms (about 200 TOPS), the low-rank
+pairs about 100 ms (4.8 TFLOP, about 48 TFLOPS in bf16) and attention about 90 ms. The first evaluation took 5.0 s, 4.5 s
+of it reading the blocks from the file mapping as it placed 32 of 47 in VRAM; blocks are read from the file again after
+the decoders park them. Video decode took 1.9 s and audio decode 0.2 s. Reading the files cold, the text encoder took
+195 s and sampling 30 s. The clip was clean and coherent across its frames.
+The maintainer reports it works through SwarmUI, but it's a bit janky there: SwarmUI expects one file per model, not a
+folder of diffusers shards. It hasn't been compared with HyperFlow's own pipeline or tried above 22 frames or 512x512,
+and its audio hasn't been listened to.
 
 ## Pixal3D
 

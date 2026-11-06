@@ -424,7 +424,9 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         }
         None => diffusion::sampling::torch_randn_streams(args.seed, &[shape.video_len(), shape.audio_len()]).concat(),
     };
-    let sampling = args.sampling("res_multistep", ModelSampling::Flow { shift: h3::SHIFT_VIDEO }, args.seed, (args.width / 16, args.height / 16))?;
+    // HyperFlow H3 Flash runs euler only, and reads each step's endpoint
+    let default = if h3::hyperflow_config(&dit).is_some() { "euler" } else { "res_multistep" };
+    let sampling = args.sampling(default, ModelSampling::Flow { shift: h3::SHIFT_VIDEO }, args.seed, (args.width / 16, args.height / 16))?;
     let r = pipeline::H3Request { prompt: Prompt::text(&args.prompt), negative: Prompt::text(&args.negative), shape, sampling, shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO), noise };
     let mut dump = pipeline::Dump::new();
     let t0 = Instant::now();

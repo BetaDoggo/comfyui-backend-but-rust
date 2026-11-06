@@ -39,6 +39,8 @@ impl Dt {
 pub struct TensorInfo {
     pub dtype: Dt,
     pub shape: Vec<usize>,
+    /// Which of the model's files holds it.
+    pub file: usize,
     pub start: usize,
     pub len: usize,
 }
@@ -50,18 +52,53 @@ impl TensorInfo {
 }
 
 pub struct SafeTensors {
-    pub mmap: memmap2::Mmap,
+    mmaps: Vec<memmap2::Mmap>,
     pub tensors: HashMap<String, TensorInfo>,
+    /// The diffusers `config.json` next to a sharded model.
+    pub config: Option<serde_json::Value>,
+}
+
+/// The index and config of a diffusers model stored in shards, if `path` is one of its shards.
+pub fn diffusers_shards(path: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".safetensors")?;
+    // <base>-00001-of-00003
+    let base = stem.rsplit_once("-of-").and_then(|(a, _)| a.rsplit_once('-')).map(|(a, _)| a)?;
+    let dir = path.parent()?;
+    let index = dir.join(format!("{base}.safetensors.index.json"));
+    let config = dir.join("config.json");
+    (index.is_file() && config.is_file()).then_some((index, config))
 }
 
 impl SafeTensors {
+    /// One safetensors file, or every shard of a diffusers model when `path` is one of them.
     pub fn open(path: &Path) -> Result<Self> {
+        let Some((index, config)) = diffusers_shards(path) else {
+            let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), config: None };
+            st.add_file(path)?;
+            return Ok(st);
+        };
+        let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(&index)?).with_context(|| format!("reading {}", index.display()))?;
+        let mut files: Vec<&str> = idx["weight_map"].as_object().ok_or_else(|| anyhow!("{}: no weight_map", index.display()))?
+            .values().filter_map(|v| v.as_str()).collect();
+        files.sort_unstable();
+        files.dedup();
+        let config = serde_json::from_slice(&std::fs::read(&config)?).with_context(|| format!("reading {}", config.display()))?;
+        let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), config: Some(config) };
+        let dir = index.parent().unwrap();
+        for f in files {
+            st.add_file(&dir.join(f))?;
+        }
+        Ok(st)
+    }
+
+    fn add_file(&mut self, path: &Path) -> Result<()> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let fi = self.mmaps.len();
         let n = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
         let header: serde_json::Value = serde_json::from_slice(&mmap[8..8 + n])?;
         let base = 8 + n;
-        let mut tensors = HashMap::new();
         for (k, v) in header.as_object().ok_or_else(|| anyhow!("bad header"))? {
             if k == "__metadata__" {
                 continue;
@@ -80,9 +117,23 @@ impl SafeTensors {
             let shape = v["shape"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as usize).collect();
             let off = v["data_offsets"].as_array().unwrap();
             let (a, b) = (off[0].as_u64().unwrap() as usize, off[1].as_u64().unwrap() as usize);
-            tensors.insert(k.clone(), TensorInfo { dtype, shape, start: base + a, len: b - a });
+            self.tensors.insert(k.clone(), TensorInfo { dtype, shape, file: fi, start: base + a, len: b - a });
         }
-        Ok(SafeTensors { mmap, tensors })
+        self.mmaps.push(mmap);
+        Ok(())
+    }
+
+    /// Name rows `first..first + rows` of `name` (along its first axis) as the tensor `as_name`, without copying.
+    pub fn alias_rows(&mut self, name: &str, as_name: &str, first: usize, rows: usize) -> Result<()> {
+        let i = self.info(name)?.clone();
+        let row = i.len / i.shape[0];
+        if first + rows > i.shape[0] {
+            bail!("{name}: rows {first}..{} of {}", first + rows, i.shape[0]);
+        }
+        let mut shape = i.shape.clone();
+        shape[0] = rows;
+        self.tensors.insert(as_name.to_string(), TensorInfo { shape, start: i.start + first * row, len: rows * row, ..i });
+        Ok(())
     }
 
     pub fn info(&self, name: &str) -> Result<&TensorInfo> {
@@ -95,16 +146,17 @@ impl SafeTensors {
 
     pub fn bytes(&self, name: &str) -> Result<&[u8]> {
         let i = self.info(name)?;
-        Ok(&self.mmap[i.start..i.start + i.len])
+        Ok(&self.mmaps[i.file][i.start..i.start + i.len])
     }
 
     /// Take a tensor's pages out of this process. They stay in the file cache, so a later read costs
     /// a soft fault per page rather than a disk read: not for tensors read again on every step.
     pub fn evict(&self, name: &str) {
         if let Ok(i) = self.info(name) {
-            let (start, end) = (i.start & !4095, (i.start + i.len).next_multiple_of(4096).min(self.mmap.len()));
+            let m = &self.mmaps[i.file];
+            let (start, end) = (i.start & !4095, (i.start + i.len).next_multiple_of(4096).min(m.len()));
             // on pages that aren't locked this reports failure and does what we want, as documented
-            unsafe { VirtualUnlock(self.mmap[start..end].as_ptr().cast(), end - start) };
+            unsafe { VirtualUnlock(m[start..end].as_ptr().cast(), end - start) };
         }
     }
 

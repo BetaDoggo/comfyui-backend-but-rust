@@ -3,7 +3,8 @@
 use super::{nothing_for, run_sampler, scale_rows, touch};
 use super::{Dump, FamilyState, Generator, Kind, Prompt, Sampling, SharedTe, Stats, Step, TokenKey, CONTEXTS};
 use crate::cuda::{self, DevBuf, Stream};
-use crate::{h3, h3te, h3vae, lora, offload, st, tokenizer};
+use crate::st::f32_bytes;
+use crate::{h3, h3te, h3vae, h3window, lora, offload, st, tokenizer};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,6 +22,9 @@ pub struct H3Request {
     pub noise: Vec<f32>,
     /// block-sparse self-attention
     pub sparse: Option<h3::SparseAttn>,
+    /// Video Context Window: each evaluation runs on overlapping windows of the clip. FreeNoise
+    /// is applied to `noise` by the caller.
+    pub windows: Option<h3window::ContextWindows>,
 }
 
 struct Model {
@@ -260,11 +264,26 @@ impl Generator {
         // what is left after the activations goes to the blocks, re-planned for this shape
         st.sync()?;
         cuda::trim_pool()?;
-        let tokens = text.max(neg.map_or(0, |n| n.1)) + 2 * r.shape.audio_t + r.shape.t * (r.shape.h / 2) * (r.shape.w / 2);
+        // with context windows, a call only holds one window's tokens
+        let windows = r.windows.as_ref().filter(|c| c.applies(&r.shape));
+        let shapes: Vec<h3::Shape> = match windows {
+            Some(c) => c.windows(&r.shape).iter().map(|w| w.shape(&r.shape)).collect(),
+            None => vec![r.shape],
+        };
+        let largest = shapes.iter().map(|s| 2 * s.audio_t + s.t * (s.h / 2) * (s.w / 2)).max().unwrap_or(0);
+        let tokens = text.max(neg.map_or(0, |n| n.1)) + largest;
         let budget = (cuda::device_free()? + m.dit.blocks_vram()).saturating_sub(env.reserve + (1 << 29) + m.dit.step_activation_bytes(tokens) + m.dit.attn_workspace(tokens));
         m.dit.reserve(budget, env.slots)?;
-        let rope = m.dit.rope(text, &r.shape, st)?;
-        let rope_neg = neg.map(|(_, l)| m.dit.rope(l, &r.shape, st)).transpose()?;
+        // a rope table per window shape: windows can differ by an audio latent
+        let mut ropes: Vec<(h3::Shape, DevBuf, Option<DevBuf>)> = Vec::new();
+        for s in &shapes {
+            if !ropes.iter().any(|(k, ..)| k == s) {
+                ropes.push((*s, m.dit.rope(text, s, st)?, neg.map(|(_, l)| m.dit.rope(l, s, st)).transpose()?));
+            }
+        }
+        if let Some(c) = windows {
+            eprintln!("context windows: {} of {} latents with {} overlapping, for {} latents", shapes.len(), c.length, c.overlap, r.shape.t);
+        }
         let dit = &mut m.dit;
         let n = r.noise.len();
         let mut first = dump;
@@ -281,9 +300,30 @@ impl Generator {
                     }
                 }
             };
-            match (negative, neg, &rope_neg) {
-                (true, Some((c, l)), Some(rn)) => dit.predict(x, &r.shape, c, l, rn, sigma, next, den, st, None)?,
-                _ => dit.predict(x, &r.shape, pos, text, &rope, sigma, next, den, st, Some(&mut keep))?,
+            let mut call = |x: &DevBuf, sh: &h3::Shape, den: &DevBuf, probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>| -> Result<()> {
+                let (_, rope, rope_neg) = ropes.iter().find(|(k, ..)| k == sh).context("no rope table for this window")?;
+                match (negative, neg, rope_neg) {
+                    (true, Some((c, l)), Some(rn)) => dit.predict(x, sh, c, l, rn, sigma, next, den, st, None),
+                    _ => dit.predict(x, sh, pos, text, rope, sigma, next, den, st, probe),
+                }
+            };
+            match windows {
+                None => call(x, &r.shape, den, Some(&mut keep))?,
+                Some(c) => {
+                    let mut b = vec![0u8; n * 4];
+                    x.download(0, &mut b, st)?;
+                    let full: Vec<f32> = b.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect();
+                    let fused = c.run(&full, &r.shape, |pack, sh| {
+                        let wx = DevBuf::alloc_async(pack.len() * 4, st)?;
+                        wx.upload(0, &f32_bytes(pack), st)?;
+                        let wd = DevBuf::alloc_async(pack.len() * 4, st)?;
+                        call(&wx, sh, &wd, None)?;
+                        let mut o = vec![0u8; pack.len() * 4];
+                        wd.download(0, &mut o, st)?;
+                        Ok(o.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect())
+                    })?;
+                    den.upload(0, &f32_bytes(&fused), st)?;
+                }
             }
             if let (0, false, Some(d)) = (e, negative, first.as_mut()) {
                 let mut b = vec![0u8; n * 4];

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use diffusion::h3;
+use diffusion::h3window;
 use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, Step};
 use diffusion::pixal3d;
 use diffusion::preview;
@@ -376,6 +377,8 @@ struct ModelSettings {
     differential: Option<f32>,
     /// `BlockSparseAttention`, on H3.
     sparse: Option<h3::SparseAttn>,
+    /// `MiniMaxH3ContextWindows`.
+    windows: Option<h3window::ContextWindows>,
 }
 
 fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
@@ -386,7 +389,7 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::Moss => ModelSampling::Flow { shift: MOSS_SHIFT },
         Family::H3 => ModelSampling::Flow { shift: h3::SHIFT_VIDEO },
     };
-    let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None };
+    let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None };
     let mut sparse = None;
     for p in &model.patches {
         match p {
@@ -399,6 +402,16 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
             ModelPatch::MiniMaxH3Shift { shift_video, shift_audio } if family == Family::H3 => {
                 s.model_sampling = ModelSampling::Flow { shift: *shift_video };
                 s.audio_shift = *shift_audio;
+            }
+            ModelPatch::MiniMaxH3ContextWindows { context_length, context_overlap, fuse_method, freenoise, split_conds_to_windows: _ } => {
+                if family != Family::H3 {
+                    return Err(unsupported("context windows on this model (only MiniMax H3 takes them)"));
+                }
+                // split_conds_to_windows only picks among several conditionings, and H3 takes one prompt
+                let fuse = h3window::Fuse::parse(fuse_method).ok_or_else(|| EngineError::InvalidInput(format!("fuse_method {fuse_method}")))?;
+                let w = h3window::ContextWindows::from_frames(*context_length as usize, *context_overlap as usize, fuse, *freenoise)
+                    .map_err(|e| EngineError::InvalidInput(e.to_string()))?;
+                s.windows = Some(w);
             }
             ModelPatch::BlockSparseAttention(sp) => {
                 if let SparseAttentionMethod::Vsa { .. } = sp.method {
@@ -903,8 +916,12 @@ impl NativeEngine {
         gen.ensure_h3_te(&cond.text_encoder).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
-        let noise = noise::h3_noise(req.noise_seed, req.variation, (24, t, lh, lw), shape.audio_len());
-        let r = H3Request { prompt, negative, shape, sampling, shifts: (shift, settings.audio_shift), noise, sparse: settings.sparse.clone() };
+        let mut noise = noise::h3_noise(req.noise_seed, req.variation, (24, t, lh, lw), shape.audio_len());
+        if let Some(w) = &settings.windows {
+            // the sampler's seed, as ComfyUI's sampler wrapper reads it
+            w.freenoise(&mut noise, &shape, req.noise_seed);
+        }
+        let r = H3Request { prompt, negative, shape, sampling, shifts: (shift, settings.audio_shift), noise, sparse: settings.sparse.clone(), windows: settings.windows.clone() };
         let (mut latent, stats) = gen
             .sample_h3(&r, |step| report(mode, progress, 1, step, |x0| (preview::h3(x0, t, lh, lw), lh, lw)), None)
             .map_err(internal)?;

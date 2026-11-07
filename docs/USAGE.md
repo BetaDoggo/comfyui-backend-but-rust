@@ -27,6 +27,7 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--flux2-vae-check ref.safetensors` | MOSS Image: compare the Flux 2 VAE encoder with `tools/flux2_vae_ref.py` |
 | `--frames N` | H3 video length, snapped up to the 17k + 5 grid (default 5) |
 | `--sparse sol` or `--sparse sla` | H3 block-sparse attention, as ComfyUI's Model Sparse Attention node: Sol-Attn's adaptive threshold (`--sparse-tau`, default 1.3) or SLA-style top-k (`--sparse-keep` percent, default 10). `--sparse-start` (default 0.2), `--sparse-min-tokens` (default 12288) and `--sparse-extra-tokens` (default 256) are the node's start_percent, min_tokens and extra_tokens; see [sparse attention](MODELS.md#sparse-attention) |
+| `--context-windows 124,39` | H3: sample in context windows of LENGTH,OVERLAP frames, as SwarmUI's Video Context Window: pyramid blending and FreeNoise; see [context windows](MODELS.md#context-windows) |
 | `--lora path[:strength[:clip_strength]]` | repeatable, see [LoRAs](#loras) |
 | `--models`, `--dit`, `--te`, `--vae` | model folder, or individual files |
 | `--dump f.safetensors`, `--ref-noise ref.safetensors` | parity debugging against `tools/ref_dump.py` |

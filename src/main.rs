@@ -115,6 +115,10 @@ struct Args {
     /// Extra top-scoring tokens each query block attends: 0 to 256, in steps of 64
     #[arg(long, default_value_t = 256)]
     sparse_extra_tokens: usize,
+    /// MiniMax H3: sample in context windows of LENGTH,OVERLAP frames (pyramid blend, FreeNoise),
+    /// as SwarmUI's Video Context Window, e.g. 124,39
+    #[arg(long)]
+    context_windows: Option<String>,
     /// MiniMax H3: frames at 24 fps, snapped up to the model's 17k + 5 grid
     #[arg(long, default_value_t = 5)]
     frames: usize,
@@ -442,7 +446,14 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     eprintln!("MiniMax H3 ready in {:.1}s", t0.elapsed().as_secs_f64());
     let (model, _) = parse_loras(args)?;
     gen.set_loras(&model)?;
-    let noise = match &args.ref_noise {
+    let windows = match args.context_windows.as_deref() {
+        None => None,
+        Some(s) => {
+            let (l, o) = s.split_once(',').context("--context-windows takes LENGTH,OVERLAP in frames")?;
+            Some(diffusion::h3window::ContextWindows::from_frames(l.trim().parse()?, o.trim().parse()?, diffusion::h3window::Fuse::Pyramid, true)?)
+        }
+    };
+    let mut noise = match &args.ref_noise {
         Some(p) => {
             let st = st::SafeTensors::open(p)?;
             let mut v = st.f32_vec("noise0", false)?;
@@ -451,6 +462,9 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         }
         None => diffusion::sampling::torch_randn_streams(args.seed, &[shape.video_len(), shape.audio_len()]).concat(),
     };
+    if let Some(w) = &windows {
+        w.freenoise(&mut noise, &shape, args.seed);
+    }
     // HyperFlow H3 Flash runs euler only, and reads each step's endpoint
     let default = if h3::hyperflow_config(&dit).is_some() { "euler" } else { "res_multistep" };
     let sampling = args.sampling(default, ModelSampling::Flow { shift: h3::SHIFT_VIDEO }, args.seed, (args.width / 16, args.height / 16))?;
@@ -471,7 +485,7 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         extra_tokens: args.sparse_extra_tokens,
         verbose: true,
     });
-    let r = pipeline::H3Request { prompt: Prompt::text(&args.prompt), negative: Prompt::text(&args.negative), shape, sampling, shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO), noise, sparse };
+    let r = pipeline::H3Request { prompt: Prompt::text(&args.prompt), negative: Prompt::text(&args.negative), shape, sampling, shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO), noise, sparse, windows };
     let mut dump = pipeline::Dump::new();
     let t0 = Instant::now();
     let (latent, _) = gen.sample_h3(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;

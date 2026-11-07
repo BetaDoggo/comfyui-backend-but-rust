@@ -237,6 +237,31 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
     r.add(
         env,
         |_| {
+            NodeSchema::new("MiniMaxH3ContextWindows", "MiniMax H3 Context Windows", "model/patch/minimax")
+                .describe("Set context windows for MiniMax H3. Windows start on the model's 17-frame chunks to keep video and audio in sync.")
+                .input(link("model", "MODEL"))
+                .input(int_step("context_length", 124, 22, MAX_RESOLUTION, 17))
+                .input(int_step("context_overlap", 39, 5, i32::MAX as i64, 17))
+                .input(combo_default("fuse_method", &["pyramid", "relative", "flat", "overlap-linear"], "pyramid"))
+                .input(boolean("freenoise", true).advanced())
+                .input(boolean("split_conds_to_windows", false).advanced())
+                .output("MODEL", "MODEL")
+        },
+        |i, _| {
+            let p = ModelPatch::MiniMaxH3ContextWindows {
+                context_length: i.uint("context_length")?,
+                context_overlap: i.uint("context_overlap")?,
+                fuse_method: i.string("fuse_method")?.to_string(),
+                freenoise: i.boolean("freenoise")?,
+                split_conds_to_windows: i.boolean("split_conds_to_windows")?,
+            };
+            Ok(NodeOutput::one(Value::Model(i.model("model")?.with_patch(p))))
+        },
+    );
+
+    r.add(
+        env,
+        |_| {
             NodeSchema::new("SwarmAttnTokenWeights", "Swarm Attn Token Weights", "SwarmUI/clip")
                 .describe("Applies per-token prompt weights through attention patches instead of scaling the embedding.")
                 .input(link("model", "MODEL"))

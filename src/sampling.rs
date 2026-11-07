@@ -1,13 +1,13 @@
 //! ComfyUI-compatible noise: torch's CPU and CUDA randn.
 
 /// std::mt19937 / at::mt19937 (torch.manual_seed uses the low 32 bits of the seed).
-struct Mt19937 {
+pub(crate) struct Mt19937 {
     mt: [u32; 624],
     idx: usize,
 }
 
 impl Mt19937 {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         let mut mt = [0u32; 624];
         mt[0] = (seed & 0xffff_ffff) as u32;
         for i in 1..624 {
@@ -16,7 +16,7 @@ impl Mt19937 {
         Mt19937 { mt, idx: 624 }
     }
 
-    fn next(&mut self) -> u32 {
+    pub(crate) fn next(&mut self) -> u32 {
         if self.idx >= 624 {
             for i in 0..624 {
                 let y = (self.mt[i] & 0x8000_0000) | (self.mt[(i + 1) % 624] & 0x7fff_ffff);
@@ -39,6 +39,16 @@ impl Mt19937 {
     fn uniform_f32(&mut self) -> f32 {
         ((self.next() & ((1 << 24) - 1)) as f64 * (1.0 / (1u64 << 24) as f64)) as f32
     }
+}
+
+/// torch.randperm(n, generator=g) on CPU: Fisher-Yates on 32-bit draws, as torch does below 2^32 / 20.
+pub(crate) fn torch_randperm(g: &mut Mt19937, n: usize) -> Vec<usize> {
+    let mut r: Vec<usize> = (0..n).collect();
+    for i in 0..n.saturating_sub(1) {
+        let z = g.next() as usize % (n - i);
+        r.swap(i, z + i);
+    }
+    r
 }
 
 fn normal_fill_16(d: &mut [f32]) {

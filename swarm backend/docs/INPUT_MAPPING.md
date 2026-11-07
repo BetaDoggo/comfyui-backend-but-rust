@@ -94,6 +94,7 @@ per option between the loader and the sampler, in a fixed order, and each one ap
 | EasyCache Mode / Threshold / Start / End | `EasyCache` | `ModelPatch::EasyCache` |
 | Model Attention Backend | `ModelAttentionBackend` | `ModelPatch::AttentionBackend { backend }`: one of `EngineInfo::attention_backends`. SwarmUI always offers its own default, `pytorch attention`, so the server lists that first and turns it into the engine's first backend. |
 | Use Sparse Attention (`sol` / `topk` / `vsa`) | `BlockSparseAttention` (V3 DynamicCombo `selection` + `selection.tau` / `selection.keep_percent`) | `ModelPatch::BlockSparseAttention(SparseAttention { method: SolAttn{tau} / Sla{keep_percent} / Vsa{keep_percent}, .. })` |
+| Video Context Window: Video Context Length / Overlap (MiniMax H3; SwarmUI sends Wan and LTX-V models other nodes) | `MiniMaxH3ContextWindows` (`fuse_method: pyramid`, `freenoise: true`, `split_conds_to_windows: false`) | `ModelPatch::MiniMaxH3ContextWindows`, lengths in frames. SwarmUI refuses an overlap not below the length; the node's minimums (22 and 5 frames) are validated like ComfyUI's |
 | Torch Compile | `TorchCompileModel` | `ModelPatch::Compile { backend }` (map to the engine's own compilation, or ignore) |
 | Override Prediction Type (SD-family models only) | `ModelSamplingDiscrete` | `ModelPatch::SamplingDiscrete` |
 | automatic for some model classes (Lens, HiDream O1) | `CFGNorm` / `ModelNoiseScale` | `ModelPatch::CfgNorm` / `ModelPatch::NoiseScale` |

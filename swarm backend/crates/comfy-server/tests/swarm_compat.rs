@@ -593,6 +593,43 @@ async fn h3_trim_then_boomerang() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn h3_context_windows_reach_the_engine() {
+    let engine = RecordingEngine::new();
+    let s = TestServer::start_engine(engine.clone(), 0, false).await;
+    // SwarmUI's Video Context Window group at its defaults: MiniMaxH3ContextWindows between the
+    // sigma shift and the sampler.
+    let r = run_like_swarm(&s, fixture("minimax_h3_context_windows.json"), |_| {}).await;
+    assert!(r.status() == "success" || !ffmpeg_available(), "{:#}", r.history);
+    let seen = engine.seen.lock().unwrap();
+    assert_eq!(
+        seen.model_patches,
+        [
+            "MiniMaxH3Shift { shift_video: 12.0, shift_audio: 3.0 }",
+            "MiniMaxH3ContextWindows { context_length: 120, context_overlap: 24, fuse_method: \"pyramid\", freenoise: true, split_conds_to_windows: false }",
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h3_context_windows_validate_like_comfy() {
+    let s = TestServer::start(0).await;
+    // the node's minimums: 22 frames of length, 5 of overlap
+    let mut wf = fixture("minimax_h3_context_windows.json");
+    wf["106"]["inputs"]["context_length"] = json!(21);
+    wf["106"]["inputs"]["context_overlap"] = json!(4);
+    let resp = s.post("prompt", json!({ "prompt": wf, "client_id": "x" })).await;
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    let errors = body["node_errors"]["106"]["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 2, "{body:#}");
+    assert!(errors.iter().all(|e| e["type"] == "value_smaller_than_min"), "{body:#}");
+    let mut wf = fixture("minimax_h3_context_windows.json");
+    wf["106"]["inputs"]["fuse_method"] = json!("average");
+    let body: Value = s.post("prompt", json!({ "prompt": wf, "client_id": "x" })).await.json().await.unwrap();
+    assert_eq!(body["node_errors"]["106"]["errors"][0]["type"], "value_not_in_list", "{body:#}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn h3_video_audio_input_is_encoded_and_kept() {
     let engine = RecordingEngine::new();
     let s = TestServer::start_engine(engine.clone(), 0, false).await;

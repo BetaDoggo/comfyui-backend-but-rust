@@ -21,7 +21,8 @@ pack = torch.cat([r["samples0"].flatten(), r["samples1"].flatten()])
 if "denoised0" in o and "step0_out" in r:
     d, ref = o["denoised0"].flatten(), r["step0_out"].flatten()
     n = r["samples0"].numel()
-    print("step 0 sigma", r["step0_sigma"].flatten()[:2].tolist(), "shapes", r["step0_in"].shape, r["step0_out"].shape)
+    if "step0_in" in r:  # absent with context windows, whose step 0 is the fused pack
+        print("step 0 sigma", r["step0_sigma"].flatten()[:2].tolist(), "shapes", r["step0_in"].shape, r["step0_out"].shape)
     print(f"step 0 denoised video rel {rel(d[:n], ref[:n]):.3e}, audio rel {rel(d[n:], ref[n:]):.3e}")
     print(f"step 0 norms ours {d[:n].norm():.1f} / {d[n:].norm():.1f}, ref {ref[:n].norm():.1f} / {ref[n:].norm():.1f}")
 for name, rk in (("ctx", "ctx"), ("b0.out_proj.in", "b0.out_proj.in"), ("b0.out", "b0.out"), ("b1.out", "b1.out"), ("b49.out", "b49.out")):

@@ -21,6 +21,11 @@ pub enum ModelPatch {
     /// `MiniMaxH3SigmaShift`. Always emitted for MiniMax H3: video shift = Sigma Shift param
     /// (default 12), audio shift = 3.
     MiniMaxH3Shift { shift_video: f64, shift_audio: f64 },
+    /// `MiniMaxH3ContextWindows` (Video Context Window): sample the clip in overlapping windows of
+    /// `context_length` frames, `context_overlap` shared, blended by `fuse_method` (`pyramid`,
+    /// `relative`, `flat` or `overlap-linear`). SwarmUI sends `pyramid`, FreeNoise on and
+    /// `split_conds_to_windows` off. Lengths are in frames, as the node takes them.
+    MiniMaxH3ContextWindows { context_length: u32, context_overlap: u32, fuse_method: String, freenoise: bool, split_conds_to_windows: bool },
     /// `SwarmAttnTokenWeights`: Krea 2 "model specific enhancement" that applies per-token
     /// prompt weights inside attention instead of scaling embeddings. Carries the
     /// positive conditioning whose weights should be applied.

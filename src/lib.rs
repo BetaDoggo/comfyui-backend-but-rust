@@ -12,6 +12,7 @@ pub mod flux2vae;
 pub mod h3;
 pub mod h3te;
 pub mod h3vae;
+pub mod h3window;
 pub mod latent_ops;
 pub mod lora;
 mod lora_adapters;

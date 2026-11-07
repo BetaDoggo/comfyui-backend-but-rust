@@ -329,6 +329,25 @@ Sequences that short are below the default 12,288 tokens, where both stay dense.
 through SwarmUI, though it hasn't been tested extensively. Its speedup on longer clips, above that threshold, hasn't been
 measured, and its output hasn't been compared with ComfyUI's.
 
+### Context windows
+
+SwarmUI's Video Context Window (Video Context Length and Overlap) sends ComfyUI's `MiniMaxH3ContextWindows` node, which
+`src/h3window.rs` follows. Each model evaluation runs on overlapping stretches of the clip, and their denoised outputs are
+blended. Lengths in frames become latents as the node converts them, so with an overlap of at most 5 latents below the
+length, every window starts on one of the model's 5-latent chunks. Each window takes the audio latents of the same pixel
+frames, a window's rope positions start at its own first latent, and FreeNoise shuffles the initial noise from a CPU
+generator seeded with the sampler's seed, video and audio apart. All four fuse methods are there. SwarmUI uses `pyramid`. A
+clip no longer than one window samples as it would without the node. Other families refuse it.
+
+The windows, the audio split and FreeNoise were checked against ComfyUI's own functions (`cargo test --lib h3window`). On
+the CLI, 384x384, 260 frames (77 latents), the turbo LoRA's 4 steps and windows of 124 and 39 frames, against
+`tools/h3_ref.py --context-windows 124,39` on the same noise, the first fused evaluation is within 4.6% on video and 11.3%
+on audio. That is close to the 3.4% and 13% without windows, and the error is flat across the clip, with no rise where
+windows meet. Decoded with ComfyUI's VAE, the two clips have the same composition at 16.6 dB. Both break up into blocks and
+streaks in the later windows, so that comes from context windows at 4 steps, not from this port. Through SwarmUI with the
+same settings, sampling took 18.4 s for the 4 steps, against ComfyUI's 41.4 s on its warm second run. Other sizes,
+lengths, step counts and fuse methods weren't tried, and the audio wasn't judged by ear.
+
 ### HyperFlow H3 Flash
 
 [HyperFlow H3 Flash](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash) is a community few-step H3, which

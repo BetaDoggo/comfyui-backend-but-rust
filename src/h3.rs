@@ -29,7 +29,7 @@ const MODS: usize = 18 * F; // 3 modalities x 6 vectors
 pub const SHIFT_VIDEO: f64 = 12.0;
 pub const SHIFT_AUDIO: f64 = 3.0;
 const FRAME_RESCALE: f64 = 5.0 / 3.0;
-const FRAME_PER_TOKEN: [usize; 5] = [1, 4, 4, 4, 4];
+pub(crate) const FRAME_PER_TOKEN: [usize; 5] = [1, 4, 4, 4, 4];
 const MODULES: [(&str, &str); 4] = [("qkv", "attn.qkv_proj"), ("o", "attn.out_proj"), ("up", "mlp.fc1"), ("d", "mlp.fc2")];
 
 /// True if `has` finds the keys of a MiniMax H3 diffusion model.

@@ -130,4 +130,5 @@ For contributors:
 ## License
 
 Licensed under the [GNU GPL v3](LICENSE), like ComfyUI, which this code was written from. Files under `csrc/vendor/` stay
-Apache-2.0, see `csrc/vendor/LICENSE.comfy-kitchen`.
+Apache-2.0, see `csrc/vendor/LICENSE.comfy-kitchen` and its attributions in `csrc/vendor/NOTICE.comfy-kitchen`. The
+tokenizer files under `assets/` keep their upstream licenses, listed in `assets/README.md`.

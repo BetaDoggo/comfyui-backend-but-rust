@@ -3,6 +3,9 @@
 //
 // W6A8 requantize in one launch: raw bf16 weight -> ConvRot -> packed codes + fp8 s_rel + f32
 // s_channel. comfy-kitchen's w4a8_gemm.cu, its 6-bit path.
+//
+// Modified from comfy-kitchen (https://github.com/Comfy-Org/comfy-kitchen): only the 6-bit requantize path is kept,
+// as one standalone kernel launch.
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>

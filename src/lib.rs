@@ -3,6 +3,7 @@
 
 pub mod anima;
 pub mod birefnet;
+pub mod comfy_memory;
 pub mod cuda;
 pub mod dino3;
 pub mod dit;

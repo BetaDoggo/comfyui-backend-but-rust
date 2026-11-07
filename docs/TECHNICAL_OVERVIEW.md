@@ -107,8 +107,8 @@ The gains come from running the same kernels with less around them, not from bet
 * **Fused operations.** Several tensor operations become one kernel, which avoids intermediate tensors and memory traffic.
 * **Less repeated work.** Anything that depends only on the prompt or only on sigma is computed once.
 * **LoRAs are baked once.** Weights are rewritten in bulk before sampling, and nothing is added per step.
-* **Planned memory.** [`src/offload.rs`](../src/offload.rs) packs each block once in the layout the kernels read. It keeps
-  as many as fit in VRAM and streams the rest from page-locked RAM on a separate copy stream, overlapping with compute.
+* **Packed blocks.** [`src/offload.rs`](../src/offload.rs) packs each block once in the layout the kernels read. As many
+  as fit stay in VRAM, and the rest stream from page-locked RAM on a separate copy stream, overlapping with compute.
 * **No interpreter.** There is no Python or tensor object overhead between kernels.
 
 This also sets the limit. Where GPU time is already almost all GEMM and attention, as with MOSS Image, the gain is small.
@@ -131,21 +131,67 @@ at some steps. [Models](MODELS.md) gives the measured PSNR for each one.
 
 ## System-memory offloading
 
-[`src/offload.rs`](../src/offload.rs) is comparable to ComfyUI's DynamicVRAM, but planned statically:
+[`src/offload.rs`](../src/offload.rs) packs every block once into a contiguous image in the exact device layout the
+kernels read, and keeps a copy in page-locked RAM. Which blocks stay in VRAM is decided by ComfyUI's own policy by
+default ([ComfyUI memory management](#comfyui-memory-management)), or by the older planner with `--legacy-offload`.
 
-1. Every block is packed once into a contiguous image in the exact device layout the kernels read.
-2. From free VRAM minus the activation peak (largest of DiT step / VAE decode) and `--reserve-vram`,
+### Legacy offload
+
+`--legacy-offload` (CLI and `comfy-server`) plans residency from estimates, statically:
+
+1. From free VRAM minus the activation peak (largest of DiT step / VAE decode) and `--reserve-vram` (512 MB by default),
    the planner keeps blocks `0..R` resident and leaves the rest in **page-locked RAM**.
-3. Streamed blocks go through a ring of VRAM slots on a dedicated copy stream. A slot is refilled
+2. Streamed blocks go through a ring of VRAM slots on a dedicated copy stream. A slot is refilled
    as soon as the compute stream releases it (CUDA events), so the PCIe copy of a block overlaps the
    compute of earlier ones; the compute stream only waits if a copy is genuinely late.
 
-Krea 2, Anima, MOSS Image and Qwen Image 2.1 plan this way. For Krea 2 on this machine, 16 of 28 blocks stay resident at 1024² and 12
+For Krea 2 on this machine, 16 of 28 blocks stay resident at 1024² and 12
 stream (5.2 GB/step at ~26 GB/s).
 Streaming *all* 28 blocks still costs only ~5% per step, because a block's copy (~17 ms) is shorter
 than its compute (~24 ms). The text encoder and text-fusion adapter stream the same way. Planning
 stays conservative on purpose: oversubscribing VRAM makes Windows fall back to shared system memory,
-which doubles step time.
+which doubles step time. That caution is what costs it under tight memory: when the estimates leave no room for two
+slots, it streams every block through one, and Krea 2 slows from about 630 to 994 ms/evaluation.
+
+### ComfyUI memory management
+
+The default on the CLI and `comfy-server`, because models do better under it as memory gets tight. SwarmUI's ComfyUI
+runs DynamicVRAM: `ModelPatcherDynamic` over comfy-aimdo 0.6.0.
+[`src/comfy_memory.rs`](../src/comfy_memory.rs) follows aimdo's `model-vbar.c`, its budget and its allocator hooks, with
+one of our streamed units (a block) in place of aimdo's 32 MB page:
+
+* Nothing is planned from estimates. Each streamed model registers its units in run order. A unit is faulted into VRAM
+  on first use while the budget allows, and otherwise copied into one of two shared cast buffers before each use
+  (ComfyUI's two offload streams; `--slots` sets the count).
+* A model is prioritized when it starts running for a node, as `load_models_gpu` does: it moves to the top of the
+  priority list and its watermark returns to the top. Units at or above the watermark stream, and the watermark only
+  falls until the model is prioritized again, so a run settles instead of thrashing.
+* Every device allocation (`DevBuf`) frees the budget deficit first, and a failed one frees its size and retries.
+  Freeing lowers watermarks from the top, the lowest-priority model first and the running model last, so activations
+  push weights out, and a text encoder that ran earlier goes before the diffusion model.
+* The budget is aimdo's: live device buffers plus the request plus the headroom (256 MB, or `--reserve-vram`) against
+  capacity, and, polled every two seconds, the DXCore process budget less 512 MB and NVML's free memory less 512 MB.
+* Weights stay in VRAM between prompts, and the cast buffers are released after each sampler run, as ComfyUI does
+  after each node. A latent batch is never split.
+
+What differs from ComfyUI: residency moves by block, not by 32 MB page, so a block is either in VRAM or streamed; the
+small weights outside the blocks, the image VAEs and encoded prompts are plain allocations, where ComfyUI streams those
+models too; one copy stream carries both cast buffers; host copies are packed and pinned for every block at load,
+without ComfyUI's RAM-pressure pin eviction; and CFG's two halves still run one after the other, where ComfyUI batches
+them when they fit.
+
+Measured on the RTX 5070 (12 GB), Krea 2 at 1024x1024, 8 steps, warm second image, pictures pixel-identical in both
+modes:
+
+| `--reserve-vram` | legacy offload | ComfyUI memory management |
+|---|---|---|
+| default (512 / 256) | 16 blocks resident, 622 ms/evaluation | 18 resident, 614 ms |
+| 6000 | 3 resident, 637 ms | 10 resident, 620 ms |
+| 9000 | one-slot fallback, 994 ms | 2 resident and two cast buffers, 631 ms |
+
+Anima at 1024x1024: 125 ms/evaluation against 120, all blocks resident in both, pixel-identical. MOSS Image, Qwen Image
+2.1, MiniMax H3 (the lazy sets and decoders), Pixal3D and LoRAs haven't been measured in this mode; the maintainer
+reports it working well through SwarmUI.
 
 ## Batches
 

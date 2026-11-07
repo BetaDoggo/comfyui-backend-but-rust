@@ -17,8 +17,10 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--prompt-file f.txt`, `-n N` | many prompts / seeds with the models loaded once |
 | `--batch N` | sample up to N of a prompt's `-n` images together, through the model at once. Each image keeps its own seed's noise, and the sampler's own noise is one tensor for the batch, as in ComfyUI, so stochastic samplers give other images than with `--batch 1` |
 | `--attention flash` | bf16 FlashAttention-2 like ComfyUI's default (closest numerics, ~15% slower per step); the default is `int8`, comfy-kitchen's SageAttention-style INT8 attention |
-| `--reserve-vram MB` | VRAM left untouched for the desktop (default 512) |
-| `--resident-blocks N`, `--slots N` | override the automatic VRAM residency plan |
+| `--reserve-vram MB` | VRAM left untouched for the desktop (default 256, as ComfyUI's `--reserve-vram`; 512 with `--legacy-offload`) |
+| `--slots N` | cast buffers for streamed blocks (default 2, ComfyUI's offload streams); the streaming ring's slots with `--legacy-offload` |
+| `--legacy-offload` | plan VRAM residency from estimates, the older offloading, instead of the default [ComfyUI memory management](TECHNICAL_OVERVIEW.md#comfyui-memory-management) |
+| `--resident-blocks N` | with `--legacy-offload`: force the number of diffusion blocks kept in VRAM |
 | `--anima`, `--moss`, `--qwen21`, `--h3` | pick the model family; the default is Krea 2 |
 | `--image a.png` | Qwen Image 2.1 edits: each image goes to the text encoder and into the sequence as a reference latent (repeatable); the prompt then says what to change, as in `put the boat from picture 2 on the sea in picture 1`. Output is RGBA |
 | `--qwen21-vae-check ref.safetensors` | Qwen Image 2.1: compare the VAE with `tools/qwen21_ref.py --vae-only` |

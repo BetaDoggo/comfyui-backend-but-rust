@@ -50,6 +50,10 @@ in SwarmUI. Extra arguments go to the server, so `--models-root` can add a secon
 
 Extra flags: `--reserve-vram 512` (MB left for the desktop and other apps), `--max-side 2048`, `--live-previews` (off by default)
 and `--extra-model-paths-config <file>` (a ComfyUI `extra_model_paths` YAML, repeatable, searched before `--models-root`).
+VRAM is managed as ComfyUI's DynamicVRAM does (see
+[ComfyUI memory management](../docs/TECHNICAL_OVERVIEW.md#comfyui-memory-management)), and `--reserve-vram` defaults to
+256, as in ComfyUI. `--legacy-offload` plans residency from estimates instead, the older offloading, with
+`--reserve-vram` at 512. With SwarmUI starting the server, put flags in the backend's extra arguments.
 
 The checkpoint's keys pick the family, and one family is loaded at a time. Switching took 4 s to Anima, 9 s to Krea 2 and
 about 3 s to MOSS Image with the files cached.
@@ -161,8 +165,9 @@ to the node's `mask` input. The mock engine's mask is an ellipse.
 
 ## Idle memory
 
-After 5 minutes with no work the engine moves diffusion blocks to RAM, so other applications get the VRAM.
-The next generation takes them back. `IDLE_RELEASE_SECS` changes the wait, and 0 turns this off.
+Diffusion blocks stay in VRAM between prompts, as in ComfyUI, until an allocation or another application needs the room.
+With `--legacy-offload`, after 5 minutes with no work the engine moves them to RAM instead, so other applications get
+the VRAM, and the next generation takes them back. `IDLE_RELEASE_SECS` changes the wait, and 0 turns this off.
 
 ## Test
 

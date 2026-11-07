@@ -7,12 +7,21 @@ use comfy_server::mock_engine::MockEngine;
 use swarm_engine_api::Engine;
 
 fn make_engine(cfg: &Config) -> anyhow::Result<Arc<dyn Engine>> {
+    if (cfg.legacy_offload || cfg.comfy_memory_mode) && cfg.engine != "native" {
+        anyhow::bail!("--legacy-offload and --comfy-memory-mode need --engine native");
+    }
     match cfg.engine.as_str() {
         "mock" => Ok(Arc::new(if cfg.mock_native_only { MockEngine::native_only(cfg.mock_step_ms) } else { MockEngine::new(cfg.mock_step_ms) })),
         #[cfg(feature = "native")]
         "native" => {
             // Serves Krea 2, Anima and MOSS Image; the checkpoint picks which.
-            let options = native_engine::NativeOptions { reserve_vram_mb: cfg.reserve_vram, max_side: cfg.max_side, live_previews: cfg.live_previews, ..Default::default() };
+            let options = native_engine::NativeOptions {
+                reserve_vram_mb: cfg.reserve_vram.unwrap_or(512),
+                comfy_memory: (!cfg.legacy_offload).then(|| cfg.reserve_vram.unwrap_or(native_engine::COMFY_HEADROOM_MB)),
+                max_side: cfg.max_side,
+                live_previews: cfg.live_previews,
+                ..Default::default()
+            };
             Ok(Arc::new(native_engine::NativeEngine::new(&options)?))
         }
         #[cfg(not(feature = "native"))]

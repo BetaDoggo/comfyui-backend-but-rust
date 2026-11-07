@@ -12,10 +12,15 @@
 //! ahead of compute. Clean file pages can be dropped without touching the pagefile, so a model larger
 //! than free RAM costs reads, not paging. Units rewritten by a LoRA keep a pinned host image and go
 //! straight to VRAM: a copy through staging would cross the memory bus twice, and it is the slow part.
+//!
+//! Under ComfyUI's memory management ([`comfy_memory`], the default) plans are ignored: each unit is faulted into
+//! VRAM on use while ComfyUI's budget allows, or copied into a shared cast buffer, and other allocations can take it
+//! back out. `--legacy-offload` plans as above.
 
+use crate::comfy_memory;
 use crate::cuda::{memcpy_d2d, memcpy_h2d, DevBuf, Event, PinnedBuf, Stream};
 use crate::st::{f32_bytes, Dt, SafeTensors};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -364,7 +369,45 @@ pub struct WeightSet {
     slots: Vec<Slot>,
     copy: Stream,
     lazy: Option<Lazy>,
+    comfy: Option<Comfy>,
     pub copied_bytes: usize,
+}
+
+/// A set under ComfyUI's memory management: its model in [`comfy_memory`], and the units acquired and not yet released,
+/// each pinned in VRAM (None) or in a cast buffer (its index).
+struct Comfy {
+    id: u64,
+    held: HashMap<usize, Option<usize>>,
+}
+
+impl Comfy {
+    fn new(name: &str, layouts: &[Layout]) -> Result<Option<Self>> {
+        if !comfy_memory::enabled() {
+            return Ok(None);
+        }
+        let id = comfy_memory::register(name, layouts.iter().map(|l| l.size).collect())?;
+        Ok(Some(Comfy { id, held: HashMap::new() }))
+    }
+
+    /// Give back what `unit` holds.
+    fn drop_hold(&self, unit: usize, hold: Option<usize>, compute: Option<&Stream>) -> Result<()> {
+        match (hold, compute) {
+            (None, _) => comfy_memory::unpin(self.id, unit),
+            (Some(i), Some(c)) => comfy_memory::cast_release(i, c),
+            (Some(i), None) => comfy_memory::cast_abandon(i),
+        }
+    }
+}
+
+impl Drop for WeightSet {
+    fn drop(&mut self) {
+        if let Some(c) = &mut self.comfy {
+            for (u, h) in std::mem::take(&mut c.held) {
+                let _ = c.drop_hold(u, h, None);
+            }
+            comfy_memory::unregister(c.id);
+        }
+    }
 }
 
 pub struct Plan {
@@ -395,6 +438,9 @@ impl WeightSet {
     /// Pack all units from `st` (multi-threaded; disk/page-cache bound), uploading resident ones.
     pub fn load(name: &str, st: &SafeTensors, layouts: Vec<Layout>, plan: Plan, threads: usize) -> Result<Self> {
         let t0 = Instant::now();
+        // ComfyUI's policy decides residency as it runs, from a host copy of every unit
+        let plan = if comfy_memory::enabled() { Plan { resident: 0, slots: 0 } } else { plan };
+        let comfy = Comfy::new(name, &layouts)?;
         let n = layouts.len();
         let copy = Stream::new()?;
         let max_size = layouts.iter().map(|l| l.size).max().unwrap_or(0);
@@ -482,6 +528,7 @@ impl WeightSet {
             name: name.to_string(), layouts, stores, rewritten: vec![false; n], streamed, slot_of: HashMap::new(), next_rank: 0, rr: 0, slots,
             copy,
             lazy: None,
+            comfy,
             copied_bytes: 0,
         };
         ws.prefetch_initial()?;
@@ -490,6 +537,8 @@ impl WeightSet {
 
     /// A set that reads nothing until it is used. VRAM for the plan is taken now.
     pub fn lazy(name: &str, st: Arc<SafeTensors>, layouts: Vec<Layout>, plan: Plan, threads: usize) -> Result<Self> {
+        let plan = if comfy_memory::enabled() { Plan { resident: 0, slots: 0 } } else { plan };
+        let comfy = Comfy::new(name, &layouts)?;
         let n = layouts.len();
         let max_size = layouts.iter().map(|l| l.size).max().unwrap_or(0);
         let stores = (0..n).map(|i| Ok(Copies { dev: if i < plan.resident { Some(DevBuf::alloc(layouts[i].size)?) } else { None }, host: None })).collect::<Result<Vec<_>>>()?;
@@ -550,12 +599,16 @@ impl WeightSet {
         let total: usize = layouts.iter().map(|l| l.size).sum();
         eprintln!("[{name}] {n} units, {:.2} GB: {} resident, {} streamed via {} slots, read on use", total as f64 / 1e9, plan.resident, streamed.len(), slots.len());
         let lazy = Lazy { st, images, keep, want, done, staging, staged: HashMap::new(), asked: HashSet::new(), filled: vec![false; n], generation: 0 };
-        Ok(WeightSet { name: name.to_string(), layouts, stores, rewritten: vec![false; n], streamed, slot_of: HashMap::new(), next_rank: 0, rr: 0, slots, copy: Stream::new()?, lazy: Some(lazy), copied_bytes: 0 })
+        Ok(WeightSet { name: name.to_string(), layouts, stores, rewritten: vec![false; n], streamed, slot_of: HashMap::new(), next_rank: 0, rr: 0, slots, copy: Stream::new()?, lazy: Some(lazy), comfy, copied_bytes: 0 })
     }
 
     /// Move a lazy set to `p`, freeing VRAM before taking any. What leaves VRAM is read again on use,
     /// LoRA bakes included. The compute stream must be idle. Keeps everything if `p` is the current plan.
     pub fn replan(&mut self, p: Plan) -> Result<()> {
+        if self.comfy.is_some() {
+            // a plan to run is ComfyUI's load_models_gpu; a plan to park leaves it to the budget
+            return if p.resident > 0 || p.slots > 0 { self.prioritize() } else { Ok(()) };
+        }
         let n = self.len();
         if self.resident() == p.resident.min(n) && self.slots.len() == p.slots {
             return Ok(());
@@ -624,6 +677,9 @@ impl WeightSet {
     /// True when `unit`'s data will have to come from the host.
     fn needs_data(&self, unit: usize) -> bool {
         let Some(l) = &self.lazy else { return false };
+        if let Some(c) = &self.comfy {
+            return !comfy_memory::holds(c.id, unit);
+        }
         if self.stores[unit].dev.is_some() { !l.filled[unit] } else { !self.slot_of.contains_key(&unit) }
     }
 
@@ -688,11 +744,17 @@ impl WeightSet {
 
     /// Number of units held in VRAM.
     pub fn resident(&self) -> usize {
+        if let Some(c) = &self.comfy {
+            return comfy_memory::resident(c.id).0;
+        }
         self.stores.iter().filter(|s| s.dev.is_some()).count()
     }
 
     /// VRAM held by this set (resident units + streaming slots).
     pub fn vram_bytes(&self) -> usize {
+        if let Some(c) = &self.comfy {
+            return comfy_memory::resident(c.id).1;
+        }
         let res: usize = self.stores.iter().filter_map(|s| s.dev.as_ref()).map(|d| d.size()).sum();
         res + self.slots.iter().map(|s| s.buf.size()).sum::<usize>()
     }
@@ -704,6 +766,9 @@ impl WeightSet {
     /// Move the residency boundary to `r` units (the first `r` in VRAM, the rest streamed through
     /// `nslots` ring slots). Frees VRAM before allocating it. The compute stream must be idle.
     pub fn set_resident(&mut self, r: usize, nslots: usize, st: &SafeTensors) -> Result<()> {
+        if self.comfy.is_some() {
+            return Ok(());
+        }
         let t0 = Instant::now();
         let n = self.len();
         let r = r.min(n);
@@ -780,6 +845,9 @@ impl WeightSet {
     /// Copy `len` bytes of `src` over every copy of `unit`. Call [`Self::restart_ring`] when done.
     fn write(&mut self, unit: usize, off: usize, src: &DevBuf, len: usize, st: &Stream) -> Result<()> {
         self.rewritten[unit] = true;
+        if let Some(c) = &self.comfy {
+            comfy_memory::write(c.id, unit, off, src, len, st)?;
+        }
         if let Some(l) = &self.lazy {
             let mut image = l.images[unit].write().unwrap();
             if image.is_none() {
@@ -848,6 +916,9 @@ impl WeightSet {
 
     /// Device base pointer of `unit`, making `compute` wait for its copy if it is streamed.
     pub fn acquire(&mut self, unit: usize, compute: &Stream) -> Result<*mut c_void> {
+        if self.comfy.is_some() {
+            return self.comfy_acquire(unit, compute);
+        }
         if self.lazy.is_some() {
             self.read_ahead(unit)?;
             if self.stores[unit].dev.is_some() && self.needs_data(unit) {
@@ -872,6 +943,12 @@ impl WeightSet {
 
     /// Mark `unit` finished on `compute`; freed slots are refilled with upcoming units.
     pub fn release(&mut self, unit: usize, compute: &Stream) -> Result<()> {
+        if let Some(c) = &mut self.comfy {
+            if let Some(h) = c.held.remove(&unit) {
+                c.drop_hold(unit, h, Some(compute))?;
+            }
+            return Ok(());
+        }
         if let Some(&si) = self.slot_of.get(&unit) {
             self.slots[si].free.record(compute)?;
             self.slots[si].released = true;
@@ -882,5 +959,60 @@ impl WeightSet {
             }
         }
         Ok(())
+    }
+
+    /// The model is loaded for a node, as ComfyUI's `load_models_gpu`: top priority, and every unit may come back into
+    /// VRAM. Anything still held from a failed run is let go. Does nothing under `--legacy-offload`.
+    pub fn prioritize(&mut self) -> Result<()> {
+        let Some(c) = &mut self.comfy else { return Ok(()) };
+        for (u, h) in std::mem::take(&mut c.held) {
+            c.drop_hold(u, h, None)?;
+        }
+        comfy_memory::prioritize(c.id)
+    }
+
+    /// Copy `unit` from the host to `dst` on the copy stream; returns the copy's event.
+    fn copy_unit(&mut self, unit: usize, dst: *mut c_void) -> Result<Event> {
+        if self.lazy.is_some() {
+            return self.fill(unit, dst);
+        }
+        let size = self.layouts[unit].size;
+        let h = self.stores[unit].host.as_ref().context("streamed unit without host copy")?;
+        memcpy_h2d(dst, h.ptr(), size, &self.copy)?;
+        let done = Event::new()?;
+        done.record(&self.copy)?;
+        self.copied_bytes += size;
+        Ok(done)
+    }
+
+    /// `acquire` under ComfyUI's policy: fault the unit into VRAM, else copy it into a cast buffer.
+    fn comfy_acquire(&mut self, unit: usize, compute: &Stream) -> Result<*mut c_void> {
+        let id = self.comfy.as_ref().unwrap().id;
+        comfy_memory::ensure_active(id)?;
+        if self.lazy.is_some() {
+            self.read_ahead(unit)?;
+        }
+        let (ptr, hold) = match comfy_memory::fault(id, unit)? {
+            Some((ptr, valid)) => {
+                if !valid {
+                    let done = self.copy_unit(unit, ptr)?;
+                    compute.wait(&done)?;
+                    comfy_memory::mark_valid(id, unit)?;
+                }
+                (ptr, None)
+            }
+            None => {
+                let (idx, ptr) = comfy_memory::cast_take(self.layouts[unit].size, &self.copy)?;
+                let done = self.copy_unit(unit, ptr)?;
+                compute.wait(&done)?;
+                (ptr, Some(idx))
+            }
+        };
+        let c = self.comfy.as_mut().unwrap();
+        if let Some(old) = c.held.insert(unit, hold) {
+            // acquired again without a release: the earlier use is over on this stream
+            c.drop_hold(unit, old, Some(compute))?;
+        }
+        Ok(ptr)
     }
 }

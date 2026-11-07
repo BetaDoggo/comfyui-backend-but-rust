@@ -39,9 +39,20 @@ pub struct Config {
     #[arg(long, default_value = "mock")]
     pub engine: String,
 
-    /// native engine: VRAM (MB) to leave untouched for the desktop and other applications.
-    #[arg(long, default_value_t = 512)]
-    pub reserve_vram: usize,
+    /// native engine: VRAM (MB) to leave untouched for the desktop and other applications. Default 256, as ComfyUI's
+    /// `--reserve-vram`, or 512 with `--legacy-offload`.
+    #[arg(long)]
+    pub reserve_vram: Option<usize>,
+
+    /// native engine: plan block residency from activation estimates, the older offloading, instead of the default
+    /// ComfyUI DynamicVRAM policy (weights fault into VRAM as they run while there is room, and activations push
+    /// them back out).
+    #[arg(long, default_value_t = false)]
+    pub legacy_offload: bool,
+
+    /// The default now; kept so existing launch arguments still work.
+    #[arg(long, hide = true, default_value_t = false, conflicts_with = "legacy_offload")]
+    pub comfy_memory_mode: bool,
 
     /// native engine: largest side (pixels, at 1:1) of a generation.
     #[arg(long, default_value_t = 2048)]
@@ -84,7 +95,9 @@ impl Config {
             temp_dir: root.join("temp"),
             ffmpeg: "ffmpeg".into(),
             engine: "mock".into(),
-            reserve_vram: 512,
+            reserve_vram: None,
+            legacy_offload: false,
+            comfy_memory_mode: false,
             max_side: 2048,
             live_previews: false,
             mock_step_ms: 0,

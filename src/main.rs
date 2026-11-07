@@ -53,15 +53,23 @@ struct Args {
     /// VAE, instead of the default file in the models folder
     #[arg(long)]
     vae: Option<PathBuf>,
-    /// VRAM (MB) to leave untouched for the desktop / other apps
-    #[arg(long, default_value_t = 512)]
-    reserve_vram: usize,
-    /// Force the number of DiT blocks kept resident in VRAM (default: as many as fit)
+    /// VRAM (MB) to leave untouched for the desktop / other apps (default 256, as ComfyUI's --reserve-vram; 512 with
+    /// --legacy-offload)
+    #[arg(long)]
+    reserve_vram: Option<usize>,
+    /// Force the number of DiT blocks kept resident in VRAM (needs --legacy-offload)
     #[arg(long)]
     resident_blocks: Option<usize>,
-    /// Streaming ring slots for offloaded blocks
+    /// Cast buffers for streamed blocks (the streaming ring's slots with --legacy-offload)
     #[arg(long, default_value_t = 2)]
     slots: usize,
+    /// Plan block residency from activation estimates, our older offloading, instead of the default ComfyUI
+    /// DynamicVRAM policy (weights fault into VRAM as they run while there is room, activations push them back out)
+    #[arg(long)]
+    legacy_offload: bool,
+    /// The default now; kept so existing command lines still work
+    #[arg(long, hide = true, conflicts_with = "legacy_offload")]
+    comfy_memory_mode: bool,
     /// Loader threads
     #[arg(long, default_value_t = 6)]
     threads: usize,
@@ -698,12 +706,14 @@ fn main() -> Result<()> {
         max_width: args.width,
         max_height: args.height,
         max_pixels: args.width * args.height,
-        reserve_vram_mb: args.reserve_vram,
+        reserve_vram_mb: args.reserve_vram.unwrap_or(512),
+        // comfy_memory_mode is the default, so only --legacy-offload changes anything
         resident_blocks: args.resident_blocks,
         slots: args.slots,
         threads: args.threads,
         attn_variant: args.attn_variant,
         int8_attn,
+        comfy_memory: (!args.legacy_offload).then(|| args.reserve_vram.unwrap_or(diffusion::comfy_memory::DEFAULT_HEADROOM_MB)),
     };
     if args.h3 {
         return run_h3(&args, load);

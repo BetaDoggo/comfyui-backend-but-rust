@@ -38,6 +38,24 @@ extern "C" {
     fn cudaMemPoolSetAttribute(pool: *mut c_void, attr: c_int, value: *mut c_void) -> c_int;
     fn cudaMemPoolTrimTo(pool: *mut c_void, keep: usize) -> c_int;
     fn cudaDeviceGetPCIBusId(id: *mut c_char, len: c_int, dev: c_int) -> c_int;
+    fn cudaGetLastError() -> c_int;
+    fn cudaDeviceSynchronize() -> c_int;
+}
+
+/// cudaErrorMemoryAllocation
+pub const OOM: c_int = 2;
+
+/// Device memory held by live [`DevBuf`]s: what comfy-aimdo calls its recorded usage.
+static USAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Bytes of device memory held by live [`DevBuf`]s.
+pub fn usage() -> usize {
+    USAGE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Wait for all work on the device, every stream included.
+pub fn device_sync() -> Result<()> {
+    check(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")
 }
 
 pub fn err_str(e: i32) -> String {
@@ -132,13 +150,23 @@ pub fn device_free() -> Result<usize> {
         return Ok(cuda_free.min(budget.saturating_sub(usage) as usize));
     }
     LOGGED.call_once(|| eprintln!("VRAM accounting: {}", if nvml_device().is_some() { "NVML" } else { "CUDA" }));
-    if let Some(dev) = nvml_device() {
-        let mut m = NvmlMemory { total: 0, free: 0, used: 0 };
-        if unsafe { nvmlDeviceGetMemoryInfo(dev as *mut c_void, &mut m) } == 0 {
-            return Ok(cuda_free.min(m.free as usize));
-        }
+    if let Some(free) = nvml_free() {
+        return Ok(cuda_free.min(free));
     }
     Ok(cuda_free)
+}
+
+/// Device-wide free memory from NVML, if NVML is usable.
+pub fn nvml_free() -> Option<usize> {
+    let dev = nvml_device()?;
+    let mut m = NvmlMemory { total: 0, free: 0, used: 0 };
+    (unsafe { nvmlDeviceGetMemoryInfo(dev as *mut c_void, &mut m) } == 0).then_some(m.free as usize)
+}
+
+/// This process's DXCore local memory budget, if DXCore answers.
+pub fn wddm_budget() -> Option<usize> {
+    let (mut budget, mut usage) = (0u64, 0u64);
+    (unsafe { gpu_wddm_budget(&mut budget, &mut usage) } == 0 && budget > 0).then_some(budget as usize)
 }
 
 pub fn mem_info() -> Result<(usize, usize)> {
@@ -226,14 +254,33 @@ unsafe impl Send for DevBuf {}
 
 impl DevBuf {
     pub fn alloc(size: usize) -> Result<Self> {
-        let mut p = std::ptr::null_mut();
-        ck!(cudaMalloc(&mut p, size.max(1)))?;
-        Ok(DevBuf { ptr: p, size, stream: std::ptr::null_mut() })
+        if crate::comfy_memory::enabled() {
+            return crate::comfy_memory::alloc(size, None);
+        }
+        Self::alloc_raw(size, None)
     }
     pub fn alloc_async(size: usize, s: &Stream) -> Result<Self> {
+        if crate::comfy_memory::enabled() {
+            return crate::comfy_memory::alloc(size, Some(s));
+        }
+        Self::alloc_raw(size, Some(s))
+    }
+    /// cudaMalloc, or cudaMallocAsync on `s`, with no memory policy in between.
+    pub(crate) fn alloc_raw(size: usize, s: Option<&Stream>) -> Result<Self> {
+        Self::try_alloc_raw(size, s).map_err(|e| anyhow::anyhow!("{} of {} MB: {} ({e})",
+            if s.is_some() { "cudaMallocAsync" } else { "cudaMalloc" }, size >> 20, err_str(e)))
+    }
+    /// As [`Self::alloc_raw`], returning the CUDA error so an out-of-memory can be retried.
+    pub(crate) fn try_alloc_raw(size: usize, s: Option<&Stream>) -> std::result::Result<Self, c_int> {
         let mut p = std::ptr::null_mut();
-        ck!(cudaMallocAsync(&mut p, size.max(1), s.0))?;
-        Ok(DevBuf { ptr: p, size, stream: s.0 })
+        let stream = s.map_or(std::ptr::null_mut(), |s| s.0);
+        let e = unsafe { if s.is_some() { cudaMallocAsync(&mut p, size.max(1), stream) } else { cudaMalloc(&mut p, size.max(1)) } };
+        if e != 0 {
+            unsafe { cudaGetLastError() };
+            return Err(e);
+        }
+        USAGE.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        Ok(DevBuf { ptr: p, size, stream })
     }
     pub fn ptr(&self) -> *mut c_void {
         self.ptr
@@ -263,6 +310,7 @@ impl DevBuf {
 }
 impl Drop for DevBuf {
     fn drop(&mut self) {
+        USAGE.fetch_sub(self.size, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             if self.stream.is_null() {
                 cudaFree(self.ptr);

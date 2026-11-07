@@ -49,6 +49,10 @@ pub struct LoadOptions {
     pub threads: usize,
     pub attn_variant: i32,
     pub int8_attn: bool,
+    /// `Some(headroom MB)`: ComfyUI's DynamicVRAM memory management ([`crate::comfy_memory`]), the default, keeping
+    /// that much VRAM free (ComfyUI's `--reserve-vram`, 256 MB by default). `slots` is then its cast buffer count, and
+    /// `resident_blocks` is refused. `None` is the legacy planner (`--legacy-offload`).
+    pub comfy_memory: Option<usize>,
 }
 
 /// What the families share in a request: a sampler, its sigmas and the guidance.
@@ -279,6 +283,11 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
     let out = samplers::sample(&s.sampler, s.model_sampling, &s.sigmas, noise, s.latent.as_deref(), s.seed, batch, &mut eval, &mut step)?;
     stats.sample_ms += sample_ms;
     eprintln!("sampling {:.2}s ({:.0} ms/evaluation)", sample_ms / 1e3, sample_ms / evals.max(1) as f64);
+    if crate::comfy_memory::enabled() {
+        // the sampler node is done
+        crate::comfy_memory::log_residency();
+        crate::comfy_memory::node_done()?;
+    }
     Ok(out)
 }
 
@@ -383,8 +392,10 @@ struct Env {
     threads: usize,
     attn_variant: i32,
     int8_attn: bool,
-    /// Re-plan DiT block residency from live free VRAM (off when --resident-blocks is forced).
+    /// Re-plan DiT block residency from live free VRAM (--legacy-offload, unless --resident-blocks is forced).
     dynamic: bool,
+    /// ComfyUI's memory management decides residency as it runs (the default; off with `--legacy-offload`).
+    comfy: bool,
 }
 
 impl Env {
@@ -439,6 +450,10 @@ impl Env {
         if batch <= 1 {
             return Ok(1);
         }
+        if self.comfy {
+            // ComfyUI never splits a latent batch: what doesn't fit pushes weights out, then runs out of memory
+            return Ok(batch);
+        }
         self.st.sync()?;
         cuda::trim_pool()?;
         let free = cuda::device_free()?;
@@ -457,6 +472,10 @@ impl Env {
 
     /// Before a request: re-plan residency for its activations, when residency is dynamic.
     fn plan(&self, blocks: &mut offload::WeightSet, dst: &st::SafeTensors, need: usize) -> Result<()> {
+        if self.comfy {
+            // the sampler loads its model: ComfyUI's load_models_gpu, with no estimate
+            return blocks.prioritize();
+        }
         if self.dynamic {
             self.rebalance(blocks, dst, need, false)?;
         }
@@ -631,6 +650,12 @@ impl Generator {
         let st = Stream::new()?;
         let (_, total) = cuda::mem_info()?;
         eprintln!("GPU memory: {} MB free (device-wide) / {} MB total", cuda::device_free()? / MB, total / MB);
+        if let Some(headroom) = o.comfy_memory {
+            if o.resident_blocks.is_some() {
+                bail!("--resident-blocks needs --legacy-offload: the default ComfyUI memory management decides residency as it runs");
+            }
+            crate::comfy_memory::enable(headroom * MB, o.slots)?;
+        }
         let env = Env {
             st,
             max_pixels: o.max_pixels,
@@ -642,7 +667,8 @@ impl Generator {
             threads: o.threads,
             attn_variant: o.attn_variant,
             int8_attn: o.int8_attn,
-            dynamic: o.resident_blocks.is_none(),
+            dynamic: o.resident_blocks.is_none() && o.comfy_memory.is_none(),
+            comfy: o.comfy_memory.is_some(),
         };
         Ok(Generator { env, te: None, vae: None, family: Family::None })
     }
@@ -732,13 +758,18 @@ impl Generator {
     }
 
     /// Nothing is running: other applications get the VRAM, and the next generation takes its blocks
-    /// back from RAM. Models keep their place, LoRAs and prompts. Forced residency is left alone.
+    /// back from RAM. Models keep their place, LoRAs and prompts. Forced residency is left alone, and under
+    /// ComfyUI's memory management (the default) weights stay in VRAM, as ComfyUI leaves them, until something else
+    /// needs the room.
     pub fn idle(&mut self) -> Result<()> {
         self.env.st.sync()?;
         if self.env.dynamic {
             if let Some(f) = self.family.state() {
                 f.idle()?;
             }
+        }
+        if self.env.comfy {
+            crate::comfy_memory::node_done()?;
         }
         cuda::trim_pool()
     }

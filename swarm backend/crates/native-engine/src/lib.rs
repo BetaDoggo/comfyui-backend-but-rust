@@ -76,9 +76,15 @@ impl Family {
     }
 }
 
+/// The VRAM ComfyUI keeps free without `--reserve-vram`.
+pub const COMFY_HEADROOM_MB: usize = diffusion::comfy_memory::DEFAULT_HEADROOM_MB;
+
 pub struct NativeOptions {
     /// VRAM (MB) to leave untouched for the desktop and other applications.
     pub reserve_vram_mb: usize,
+    /// `Some(headroom MB)`: ComfyUI's DynamicVRAM memory management, the default; `None` is the legacy planner
+    /// (`--legacy-offload`).
+    pub comfy_memory: Option<usize>,
     /// Largest side (pixels, at 1:1) of a generation.
     pub max_side: usize,
     pub threads: usize,
@@ -88,7 +94,7 @@ pub struct NativeOptions {
 
 impl Default for NativeOptions {
     fn default() -> Self {
-        Self { reserve_vram_mb: 512, max_side: 2048, threads: 6, live_previews: false }
+        Self { reserve_vram_mb: 512, comfy_memory: Some(COMFY_HEADROOM_MB), max_side: 2048, threads: 6, live_previews: false }
     }
 }
 
@@ -637,6 +643,7 @@ impl NativeEngine {
             threads: o.threads,
             attn_variant: 0,
             int8_attn: true,
+            comfy_memory: o.comfy_memory,
         };
         Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads })
     }

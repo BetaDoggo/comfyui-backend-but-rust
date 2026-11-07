@@ -276,7 +276,21 @@ That covers sampling, video decode and audio decode. ComfyUI took 28.3 s for vid
 The first video decode reads 2.4 GB from the file, about 23 s on this drive.
 
 Baking the LoRA adds about 11 s when it changes, and text encoding from a cold disk takes about 140 s on both engines, as the drive reads at about 100 MB/s.
-ComfyUI's text encoding took 151 s cold. Runs longer than 22 frames and sizes above 512x512 haven't been tested.
+ComfyUI's text encoding took 151 s cold.
+
+Longer clips, per step once warm, 4 turbo LoRA steps, against ComfyUI run with SwarmUI's flags (`--fast --use-ck-attention`,
+comfy-kitchen's int8 attention):
+
+| Clip | Tokens | ComfyUI | Here, int8 (default) | Here, `--attention flash` |
+|---|---|---|---|---|
+| 512x512, 90 frames | about 7k | 3.46 s | 1.99 s | 2.75 s |
+| 768x512, 124 frames | about 12k | 6.2 s | 5.0 s | 8.37 s |
+
+H3 used to default to flash attention. Attention grows with the square of the length, so past about 100 frames flash
+fell behind ComfyUI: at 768x512 and 124 frames it took 5.4 s of the 8.4 s step, where int8 takes 1.9 s. Offloading didn't
+matter: 25 of the 50 blocks were streamed, and the waits for their copies came to 0 to 11 ms per step. The GEMMs, 2.5 s
+of the step, run at about 230 TOPS, near this card's int8 peak. These int8 runs sampled, but their clips weren't
+watched, and int8 and flash weren't compared on H3. Nothing above 768x512 or 124 frames was tried.
 
 Compared with ComfyUI on the same noise, the context is within 8.6e-4, and the first step within 3.4% on video and 13% on audio. Frames come to 21 dB with the same composition.
 That gap is rounding: both engines are about 1.2% from an exact float32 run of the token refiner (`tools/h3_refiner_check.py`), and differ by 1.5% from each other because their int8 activations round differently.

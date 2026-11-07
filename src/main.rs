@@ -70,7 +70,7 @@ struct Args {
     attn_variant: i32,
     /// Attention for the DiT blocks: "int8" (SageAttention-style INT8 attention from comfy-kitchen,
     /// fastest) or "flash" (bf16 FlashAttention-2, matches ComfyUI's default numerics most closely).
-    /// Default int8, except flash for MiniMax H3, whose attention sink rows suit int8 poorly
+    /// Default int8 for every model
     #[arg(long)]
     attention: Option<String>,
     /// Use the noise stored in a ComfyUI reference dump (tools/ref_dump.py) instead of the seed
@@ -686,7 +686,7 @@ fn main() -> Result<()> {
         diffusion::cuda::init(0)?;
         return diffusion::birefnet::check(&args.model(&args.birefnet, BIREFNET), args.birefnet_check.as_ref().unwrap());
     }
-    let int8_attn = match args.attention.as_deref().unwrap_or(if args.h3 { "flash" } else { "int8" }) {
+    let int8_attn = match args.attention.as_deref().unwrap_or("int8") {
         "flash" => false,
         "int8" | "sage" => true,
         a => bail!("unknown --attention {a} (flash | int8)"),

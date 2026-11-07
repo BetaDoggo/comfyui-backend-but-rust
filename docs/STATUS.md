@@ -125,7 +125,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Anima | Close the ComfyUI output gap | LLM adapter output differs by 1.7%, cause unknown. Same picture at about 25 dB PSNR. |
 | P1 | Anima | Anima <break>, <alternate> and <fromto> | Per-chunk and per-step conditioning. |
 | P1 | MiniMax H3 | H3 first and last frame, references | Needs the video and audio encoders and the 32B vision tower. The turbo LoRA is trained for these modes. |
-| P1 | MiniMax H3 | H3 long clips | Longer than 22 frames and above 512x512 untested, so sparse attention's speedup above its 12,288-token threshold is unmeasured. |
+| P1 | MiniMax H3 | H3 long clips | Sampling timed on the CLI up to 768x512 and 124 frames, with int8 attention now the default: faster per step than ComfyUI (5.0 s against 6.2 s at 124 frames). The clips weren't watched, nothing larger was tried, and sparse attention's speedup above its 12,288-token threshold is unmeasured. |
 | P1 | MOSS Image | MOSS Image reference images | Prompt Images and edit LoRAs need Qwen3.5's vision encoder, the VAE encoder and reference tokens. |
 | P1 | MOSS Image | Other MOSS Image checkpoint formats | bf16 and unfused q/k/v files are refused. Only fused int8 ConvRot runs. |
 | P2 | Server | ComfyUI node editor page | SwarmUI's Comfy Workflow tab won't render. Generation doesn't need it. |

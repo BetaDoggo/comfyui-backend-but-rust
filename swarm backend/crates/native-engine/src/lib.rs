@@ -380,8 +380,7 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::Moss => ModelSampling::Flow { shift: MOSS_SHIFT },
         Family::H3 => ModelSampling::Flow { shift: h3::SHIFT_VIDEO },
     };
-    // H3's attention sink rows make int8's per-channel V scale lossy
-    let mut s = ModelSettings { model_sampling, int8_attention: family != Family::H3, loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None };
+    let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None };
     let mut sparse = None;
     for p in &model.patches {
         match p {

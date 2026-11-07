@@ -95,7 +95,7 @@ The scripts in `tools/` run ComfyUI's real code and compare the results. Most ne
 * JSON websocket frames must begin with the exact bytes `{"type":`.
 * On Windows, pages read through a mapping stay in the working set. Don't evict tensors that are re-read every step,
   because each page then costs a soft fault.
-* H3 needs flash attention by default.
+* Attention defaults to `int8` for every model, H3 included. Flash is only an explicit choice.
 
 ## Testing against SwarmUI
 

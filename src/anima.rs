@@ -1,9 +1,10 @@
 //! Anima: Cosmos Predict2 MiniTrainDIT (int8 ConvRot blocks) with an LLM adapter that turns Qwen3
 //! hidden states and T5 token ids into cross-attention context. bf16 activations like ComfyUI.
 
-use crate::cuda::{DevBuf, Stream};
-use crate::ffi::{k, null, off, s, DT_BF16, PM, PRO_GELU, PRO_LAYERNORM, PRO_PLAIN, PRO_RMS, PRO_SILU};
+use crate::cuda::{self, DevBuf, Stream};
+use crate::ffi::{k, null, off, s, MergeGroups, DT_BF16, MERGE_GROUPS, P, PM, PRO_GELU, PRO_LAYERNORM, PRO_PLAIN, PRO_RMS, PRO_SILU};
 use crate::offload::{plan, Layout, Store, WeightSet};
+use crate::snapref::{self, Adapter, LoraStream, Mat, Module, RefKv, RefRead};
 use crate::st::SafeTensors;
 use anyhow::{bail, Result};
 use half::bf16;
@@ -18,6 +19,8 @@ const MLP: usize = 8192;
 const ADALN: usize = 256;
 const MOD: usize = 3 * F;
 pub const CTX: usize = 1024;
+/// The blocks' width.
+pub const WIDTH: usize = F;
 const MIN_CTX: usize = 512;
 const PATCH: usize = 2;
 const CH: usize = 16;
@@ -55,6 +58,37 @@ pub struct Context {
     /// cross-attention projections run once per prompt instead of once per step
     kv: DevBuf,
     pub len: usize,
+}
+
+/// What a model evaluation runs besides the plain model: SnapRef's streams (see [`crate::snapref`]).
+#[derive(Clone, Copy)]
+pub enum Pass<'a> {
+    Plain,
+    /// A target evaluation: the adapter's "tgt" LoRA, and the references' keys and values when `read` is set.
+    Target { adapter: &'a Adapter, read: Option<(&'a RefKv, &'a RefRead)> },
+    /// A reference: its "ref" LoRA, recording each block's self-attention k and v at row `row0` of `out`.
+    Reference { adapter: &'a Adapter, out: &'a RefKv, row0: usize },
+}
+
+impl Pass<'_> {
+    fn lora(&self) -> Option<(&Adapter, LoraStream)> {
+        match *self {
+            Pass::Plain => None,
+            Pass::Target { adapter, .. } => Some((adapter, LoraStream::Tgt)),
+            Pass::Reference { adapter, .. } => Some((adapter, LoraStream::Ref)),
+        }
+    }
+}
+
+/// [`Dit::time`]'s embeddings of a timestep.
+struct TimeEmb {
+    /// bf16 [F], normalized
+    tn: DevBuf,
+    /// bf16 [3F], the AdaLN LoRA
+    lora: DevBuf,
+    /// silu(tn), int8 and its scale
+    a8t: DevBuf,
+    ast: DevBuf,
 }
 
 /// File prefix of the diffusion model's keys, if `st` looks like Anima.
@@ -151,25 +185,33 @@ pub fn step_activation_bytes(l: usize) -> usize {
 
 /// Rope table [L][64][(cos, sin)] for a ht x wt grid: 22 temporal, 21 height and 21 width pairs.
 fn rope_table(ht: usize, wt: usize) -> Vec<f32> {
+    rope_positions(ht, wt, 0.0, 0, 0)
+}
+
+/// [`rope_table`] for frame `t`, the grid's first row and column at `h0` and `w0` (SnapRef's reference).
+fn rope_positions(ht: usize, wt: usize, t: f32, h0: i64, w0: i64) -> Vec<f32> {
     let (dim_h, dim_t) = (42usize, 44usize);
     let ntk = ROPE_EXTRAPOLATION.powf(dim_h as f64 / (dim_h - 2) as f64);
     let theta = (10000.0 * ntk) as f32;
     let spatial: Vec<f32> = (0..dim_h / 2).map(|i| 1.0 / theta.powf((2 * i) as f32 / dim_h as f32)).collect();
-    let mut t = Vec::with_capacity(ht * wt * HD);
+    // the temporal extrapolation ratio is 1
+    let temporal: Vec<f32> = (0..dim_t / 2).map(|i| 1.0 / 10000f32.powf((2 * i) as f32 / dim_t as f32)).collect();
+    let mut table = Vec::with_capacity(ht * wt * HD);
     for y in 0..ht {
         for x in 0..wt {
-            for _ in 0..dim_t / 2 {
-                t.extend_from_slice(&[1.0, 0.0]);
+            for f in &temporal {
+                let a = t * f;
+                table.extend_from_slice(&[a.cos(), a.sin()]);
             }
-            for pos in [y, x] {
+            for pos in [y as i64 + h0, x as i64 + w0] {
                 for f in &spatial {
                     let a = pos as f32 * f;
-                    t.extend_from_slice(&[a.cos(), a.sin()]);
+                    table.extend_from_slice(&[a.cos(), a.sin()]);
                 }
             }
         }
     }
-    t
+    table
 }
 
 /// Adapter rope [rows][32][(cos, sin)].
@@ -373,19 +415,10 @@ impl Dit {
         }
     }
 
-    /// One model evaluation of `batch` latents (f32 [batch, 16, H, W]) that share the prompt: writes the denoised ones
-    /// to `den`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn predict(&mut self, latent: &DevBuf, batch: usize, h: usize, w: usize, c: &Context, rope: &DevBuf, sigma: f32, den: &DevBuf,
-        st: &Stream, mut probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<()> {
-        if h % PATCH != 0 || w % PATCH != 0 {
-            bail!("latent size must be even");
-        }
-        let l = (h / PATCH) * (w / PATCH);
-        let rows = batch * l;
-        let plane = CH * h * w * 4;
-        let (fi, m, nil) = (F as i64, rows as i32, std::ptr::null_mut());
-
+    /// The timestep embedding at `sigma`: its normalized form (plus `add`, SnapRef's mode embedding), the AdaLN LoRA,
+    /// and silu of the former quantized for the modulation MLPs.
+    fn time(&self, sigma: f32, add: Option<PM>, st: &Stream) -> Result<TimeEmb> {
+        let fi = F as i64;
         // t_emb = norm(sinusoid); adaln_lora = linear_2(silu(linear_1(sinusoid)))
         let emb = DevBuf::alloc_async(F * 2, st)?;
         emb.upload(0, &timestep_embedding(sigma), st)?;
@@ -400,13 +433,23 @@ impl Dit {
             s(st)))?;
         k!(gpu_prologue_rows(DT_BF16, PRO_RMS, emb.ptr(), fi, null(), 0, 0, self.g("tn"), EPS, null(), null(), tn.ptr(), fi, 1,
             F as i32, s(st)))?;
+        if let Some(e) = add {
+            k!(gpu_add_vec_bf16(tn.ptr(), tn.ptr(), e, 0, F as i32, s(st)))?;
+        }
         // silu(t_emb) enters all 84 modulation MLPs, so it is quantized once
         let a8t = DevBuf::alloc_async(F, st)?;
         let ast = DevBuf::alloc_async(4, st)?;
         k!(gpu_quant_rows(DT_BF16, PRO_SILU, tn.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), a8t.ptr(), ast.ptr(), 1,
             F as i32, 1, s(st)))?;
+        Ok(TimeEmb { tn, lora, a8t, ast })
+    }
 
-        // patch embedding; the 17th channel is an all-zero padding mask, so its columns are skipped
+    /// Patch embedding of `batch` latents (f32 [batch, 16, h, w]): bf16 [batch * l, F] tokens, and the token buffer
+    /// the final layer reuses.
+    fn embed(&self, latent: &DevBuf, batch: usize, h: usize, w: usize, st: &Stream) -> Result<(DevBuf, DevBuf)> {
+        let l = (h / PATCH) * (w / PATCH);
+        let (rows, plane, fi) = (batch * l, CH * h * w * 4, F as i64);
+        // the 17th channel is an all-zero padding mask, so its columns are skipped
         let x = DevBuf::alloc_async(rows * F * 2, st)?;
         let tok = DevBuf::alloc_async(rows * TOK * 2, st)?;
         // cuBLAS picks its algorithm by the rows, so each image keeps its own GEMMs and its result alone
@@ -416,121 +459,48 @@ impl Dit {
             k!(gpu_gemm(ti, TOK as i64, self.g("x_w"), (TOK + 4) as i64, off(x.ptr(), i * l * F * 2), fi, null(), l as i64, fi, TOK as i64, 1,
                 DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
         }
+        Ok((x, tok))
+    }
+
+    /// One model evaluation of `batch` latents (f32 [batch, 16, H, W]) that share the prompt: writes the denoised ones
+    /// to `den`. `pass` adds SnapRef's target stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn predict(&mut self, latent: &DevBuf, batch: usize, h: usize, w: usize, c: &Context, rope: &DevBuf, sigma: f32, den: &DevBuf,
+        st: &Stream, pass: &Pass, mut probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<()> {
+        if h % PATCH != 0 || w % PATCH != 0 {
+            bail!("latent size must be even");
+        }
+        if matches!(pass, Pass::Reference { .. }) {
+            bail!("a reference pass goes through encode_reference");
+        }
+        let l = (h / PATCH) * (w / PATCH);
+        let rows = batch * l;
+        let plane = CH * h * w * 4;
+        let (fi, m, nil) = (F as i64, rows as i32, std::ptr::null_mut());
+        let t = self.time(sigma, None, st)?;
+        let (x, tok) = self.embed(latent, batch, h, w, st)?;
         if let Some(p) = probe.as_mut() {
             p("x_embedder_out", &x, rows * F * 2);
         }
-
-        let a8 = DevBuf::alloc_async(rows * MLP, st)?;
-        let asc = DevBuf::alloc_async(rows * 4, st)?;
-        let qkv = DevBuf::alloc_async(rows * QKV * 2, st)?;
-        let attn = DevBuf::alloc_async(rows * F * 2, st)?;
-        let hid = DevBuf::alloc_async(rows * MLP * 2, st)?;
-        let a8y = DevBuf::alloc_async(ADALN, st)?;
-        let asy = DevBuf::alloc_async(4, st)?;
-        let y256 = DevBuf::alloc_async(ADALN * 2, st)?;
-        let cached = self.mods.remove(&sigma.to_bits());
-        let hit = cached.is_some();
-        if !hit && self.mods.len() >= MOD_CACHE {
-            self.mods.clear();
-        }
-        let modv = match cached {
-            Some(m) => m,
-            None => DevBuf::alloc(self.blocks.len() * 3 * MOD * 2)?,
-        };
-        // flash attention only needs a softmax scratch; int8 attention quantizes q, k and v into it
-        let ws_bytes = if self.int8_attn {
-            unsafe {
-                let b = batch as i32;
-                crate::ffi::gpu_int8_attn_workspace(b, H as i32, H as i32, l as i32, l as i32)
-                    .max(crate::ffi::gpu_int8_attn_workspace(b, H as i32, H as i32, l as i32, c.len as i32)) as usize
-            }
-        } else {
-            H * rows * 4
-        };
-        let ws = DevBuf::alloc_async(ws_bytes, st)?;
-        let xp = x.ptr();
-        let q = qkv.ptr();
-        let lc = c.len;
-
-        for b in 0..self.blocks.len() {
-            let base = self.blocks.acquire(b, st)?;
-            let lay = self.blocks.layouts[b].clone();
-            let wp = |key: &str| off(base, lay.off(key));
-            let bm = off(modv.ptr(), b * 3 * MOD * 2);
-            for j in (0..3).filter(|_| !hit) {
-                k!(gpu_int8_gemm(a8t.ptr(), wp(&format!("w_mod{j}_1")), ast.ptr(), wp(&format!("s_mod{j}_1")), null(), y256.ptr(), 1,
-                    ADALN as i64, fi, DT_BF16, s(st)))?;
-                k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, y256.ptr(), ADALN as i64, null(), 0, 0, null(), 0.0, null(), null(),
-                    a8y.ptr(), asy.ptr(), 1, ADALN as i32, 1, s(st)))?;
-                k!(gpu_int8_gemm(a8y.ptr(), wp(&format!("w_mod{j}_2")), asy.ptr(), wp(&format!("s_mod{j}_2")), null(),
-                    off(bm, j * MOD * 2), 1, MOD as i64, ADALN as i64, DT_BF16, s(st)))?;
-                k!(gpu_add_vec_bf16(off(bm, j * MOD * 2), off(bm, j * MOD * 2), lora.ptr(), 0, MOD as i32, s(st)))?;
-            }
-            let shift = |j: usize| off(bm, j * MOD * 2);
-            let scale = |j: usize| off(bm, (j * MOD + F) * 2);
-            let gate = |j: usize| off(bm, (j * MOD + 2 * F) * 2);
-
-            // self attention
-            k!(gpu_quant_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, scale(0), shift(0), a8.ptr(), asc.ptr(), m,
-                F as i32, 1, s(st)))?;
-            k!(gpu_int8_gemm(a8.ptr(), wp("w_self"), asc.ptr(), wp("s_self"), null(), q, rows as i64, QKV as i64, fi, DT_BF16, s(st)))?;
-            // the RoPE table is one image's
-            for i in 0..batch {
-                k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(q, i * l * QKV * 2), QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn_self"),
-                    wp("kn_self"), EPS, rope.ptr(), 2, l as i32, s(st)))?;
-            }
-            self.attention(q, off(q, F * 2), off(q, KV * 2), attn.ptr(), ws.ptr(), batch, l, l, QKV, QKV, false, st)?;
-            if b == 0 {
-                if let Some(p) = probe.as_mut() {
-                    p("block0_self_attn_raw", &attn, rows * F * 2);
-                }
-            }
-            k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m,
-                F as i32, 1, s(st)))?;
-            k!(gpu_int8_gemm_residual(a8.ptr(), wp("wo_self"), asc.ptr(), wp("so_self"), null(), gate(0), xp, xp, rows as i64, fi, fi,
-                DT_BF16, s(st)))?;
-
-            // cross attention, k and v come from the per-prompt cache
-            let kv = off(c.kv.ptr(), b * lc * KV * 2);
-            k!(gpu_quant_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, scale(1), shift(1), a8.ptr(), asc.ptr(), m,
-                F as i32, 1, s(st)))?;
-            k!(gpu_int8_gemm(a8.ptr(), wp("w_cq"), asc.ptr(), wp("s_cq"), null(), q, rows as i64, fi, fi, DT_BF16, s(st)))?;
-            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, q, fi, 0, 0, H as i32, 0, wp("qn_cross"), null(), EPS, null(), 0, m, s(st)))?;
-            self.attention(q, kv, off(kv, F * 2), attn.ptr(), ws.ptr(), batch, l, lc, F, KV, true, st)?;
-            k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m,
-                F as i32, 1, s(st)))?;
-            k!(gpu_int8_gemm_residual(a8.ptr(), wp("wo_cross"), asc.ptr(), wp("so_cross"), null(), gate(1), xp, xp, rows as i64, fi, fi,
-                DT_BF16, s(st)))?;
-
-            // MLP
-            k!(gpu_quant_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, scale(2), shift(2), a8.ptr(), asc.ptr(), m,
-                F as i32, 1, s(st)))?;
-            k!(gpu_int8_gemm(a8.ptr(), wp("w_l1"), asc.ptr(), wp("s_l1"), null(), hid.ptr(), rows as i64, MLP as i64, fi, DT_BF16, s(st)))?;
-            k!(gpu_quant_rows(DT_BF16, PRO_GELU, hid.ptr(), MLP as i64, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(),
-                m, MLP as i32, 1, s(st)))?;
-            k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_l2"), asc.ptr(), wp("s_l2"), null(), gate(2), xp, xp, rows as i64, fi, MLP as i64,
-                DT_BF16, s(st)))?;
-            self.blocks.release(b, st)?;
-            if let Some(p) = probe.as_mut() {
-                p(&format!("block{b}"), &x, rows * F * 2);
-            }
-        }
+        self.blocks(&x, batch, l, c, rope.ptr(), &t, Some(sigma), pass, st, &mut probe)?;
 
         // final layer: (1 + scale) * norm(x) + shift -> linear
+        let xp = x.ptr();
+        let normed = DevBuf::alloc_async(rows * F * 2, st)?;
         let ts = DevBuf::alloc_async(F * 2, st)?;
         let a256 = DevBuf::alloc_async(ADALN * 2, st)?;
         let fm = DevBuf::alloc_async(2 * F * 2, st)?;
-        k!(gpu_prologue_rows(DT_BF16, PRO_SILU, tn.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), ts.ptr(), fi, 1, F as i32,
+        k!(gpu_prologue_rows(DT_BF16, PRO_SILU, t.tn.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), ts.ptr(), fi, 1, F as i32,
             s(st)))?;
         k!(gpu_gemm(ts.ptr(), fi, self.g("fm1"), fi, a256.ptr(), ADALN as i64, nil, 1, ADALN as i64, fi, 1, DT_BF16, DT_BF16, 1.0, 0.0,
             s(st)))?;
         k!(gpu_gemm(a256.ptr(), ADALN as i64, self.g("fm2"), ADALN as i64, fm.ptr(), (2 * F) as i64, nil, 1, (2 * F) as i64,
             ADALN as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
-        k!(gpu_add_vec_bf16(fm.ptr(), fm.ptr(), lora.ptr(), 0, (2 * F) as i32, s(st)))?;
-        k!(gpu_prologue_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, off(fm.ptr(), F * 2), fm.ptr(), attn.ptr(), fi,
+        k!(gpu_add_vec_bf16(fm.ptr(), fm.ptr(), t.lora.ptr(), 0, (2 * F) as i32, s(st)))?;
+        k!(gpu_prologue_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, off(fm.ptr(), F * 2), fm.ptr(), normed.ptr(), fi,
             m, F as i32, s(st)))?;
         for i in 0..batch {
-            k!(gpu_gemm(off(attn.ptr(), i * l * F * 2), fi, self.g("fl"), fi, off(tok.ptr(), i * l * TOK * 2), TOK as i64, nil, l as i64,
+            k!(gpu_gemm(off(normed.ptr(), i * l * F * 2), fi, self.g("fl"), fi, off(tok.ptr(), i * l * TOK * 2), TOK as i64, nil, l as i64,
                 TOK as i64, fi, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
         }
         if let Some(p) = probe.as_mut() {
@@ -540,7 +510,290 @@ impl Dit {
             k!(gpu_unpatch_denoised(off(tok.ptr(), i * l * TOK * 2), TOK as i64, off(latent.ptr(), i * plane), off(den.ptr(), i * plane),
                 CH as i32, h as i32, w as i32, PATCH as i32, sigma, s(st)))?;
         }
-        self.mods.insert(sigma.to_bits(), modv);
+        Ok(())
+    }
+
+    /// SnapRef's reference stream for one reference (f32 [16, h, w] latent at model scale): sigma 0, the adapter's
+    /// "ref" LoRA and `mode`'s embedding, RoPE frame `ref_t` centred on a target of `target` latent pixels, prompted
+    /// by `c` (the caption). Every block's self-attention k and v go to `out` from row `row0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_reference(&mut self, latent: &DevBuf, h: usize, w: usize, target: (usize, usize), c: &Context, adapter: &Adapter,
+        mode: &str, out: &RefKv, row0: usize, st: &Stream) -> Result<()> {
+        if h % PATCH != 0 || w % PATCH != 0 {
+            bail!("reference latent size must be even");
+        }
+        let (ht, wt) = (h / PATCH, w / PATCH);
+        if row0 + ht * wt > out.rows || out.row_bytes != KV * 2 {
+            bail!("reference keys don't fit their cache");
+        }
+        let (h0, w0) = snapref::offset(target, (ht, wt));
+        let table = rope_positions(ht, wt, adapter.ref_t, h0, w0);
+        let rope = DevBuf::alloc_async(table.len() * 4, st)?;
+        rope.upload(0, &crate::st::f32_bytes(&table), st)?;
+        let t = self.time(0.0, adapter.mode_embed(mode, F)?, st)?;
+        let (x, _) = self.embed(latent, 1, h, w, st)?;
+        self.blocks(&x, 1, ht * wt, c, rope.ptr(), &t, None, &Pass::Reference { adapter, out, row0 }, st, &mut None)
+    }
+
+    /// The transformer blocks over `x` (bf16 [batch * l, F] tokens), in place. `sigma` keys the modulation cache; the
+    /// reference stream (`None`) computes its own. A reference pass stops once the last block's keys are recorded.
+    #[allow(clippy::too_many_arguments)]
+    fn blocks(&mut self, x: &DevBuf, batch: usize, l: usize, c: &Context, rope: PM, t: &TimeEmb, sigma: Option<f32>, pass: &Pass,
+        st: &Stream, probe: &mut Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<()> {
+        let rows = batch * l;
+        let (fi, m) = (F as i64, rows as i32);
+        let lora = pass.lora();
+        let read = match pass {
+            Pass::Target { read: Some((kv, r)), .. } => Some((*kv, *r)),
+            _ => None,
+        };
+
+        let a8 = DevBuf::alloc_async(rows * MLP, st)?;
+        let asc = DevBuf::alloc_async(rows * 4, st)?;
+        let qkv = DevBuf::alloc_async(rows * QKV * 2, st)?;
+        let attn = DevBuf::alloc_async(rows * F * 2, st)?;
+        let hid = DevBuf::alloc_async(rows * MLP * 2, st)?;
+        let a8y = DevBuf::alloc_async(ADALN, st)?;
+        let asy = DevBuf::alloc_async(4, st)?;
+        let y256 = DevBuf::alloc_async(ADALN * 2, st)?;
+        let cached = sigma.and_then(|sg| self.mods.remove(&sg.to_bits()));
+        let hit = cached.is_some();
+        if sigma.is_some() && !hit && self.mods.len() >= MOD_CACHE {
+            self.mods.clear();
+        }
+        let modv = match cached {
+            Some(m) => m,
+            None if sigma.is_some() => DevBuf::alloc(self.blocks.len() * 3 * MOD * 2)?,
+            None => DevBuf::alloc_async(self.blocks.len() * 3 * MOD * 2, st)?,
+        };
+
+        // SnapRef's LoRAs: their bf16 inputs, rank-wide intermediates and deltas
+        let lora_bufs = match lora {
+            Some((a, stream)) => {
+                let wide = if stream == LoraStream::Ref { MLP } else { QKV };
+                Some((DevBuf::alloc_async(rows * wide * 2, st)?, DevBuf::alloc_async(rows * 3 * a.max_rank.max(1) * 2, st)?,
+                    DevBuf::alloc_async(rows * wide * 2, st)?, DevBuf::alloc_async(rows * F * 2, st)?))
+            }
+            None => None,
+        };
+        // the references' keys: prepended in a copy of each image's (plain), or a group of their own each (biased)
+        let ref_rows = read.map_or(0, |(kv, _)| kv.rows);
+        let groups = read.filter(|(_, r)| !r.plain()).map(|(kv, r)| r.groups(&kv.sizes));
+        let cat = match read {
+            Some((kv, r)) if r.plain() => Some(DevBuf::alloc_async(batch * (kv.rows + l) * KV * 2, st)?),
+            _ => None,
+        };
+        let merge = match &groups {
+            Some(g) => {
+                let n = g.len() + 1;
+                if n > MERGE_GROUPS {
+                    bail!("SnapRef: {} references of different strengths (at most {})", g.len(), MERGE_GROUPS - 1);
+                }
+                Some((DevBuf::alloc_async(n * rows * F * 2, st)?, DevBuf::alloc_async(n * batch * H * l * 4, st)?))
+            }
+            None => None,
+        };
+
+        // flash attention only needs a softmax scratch; int8 attention quantizes q, k and v into it
+        let lk_self = l + if cat.is_some() { ref_rows } else { 0 };
+        let ws_bytes = if self.int8_attn {
+            unsafe {
+                let b = batch as i32;
+                crate::ffi::gpu_int8_attn_workspace(b, H as i32, H as i32, l as i32, lk_self as i32)
+                    .max(crate::ffi::gpu_int8_attn_workspace(b, H as i32, H as i32, l as i32, c.len as i32)) as usize
+            }
+        } else {
+            H * rows * 4
+        };
+        let ws = DevBuf::alloc_async(ws_bytes, st)?;
+        let xp = x.ptr();
+        let q = qkv.ptr();
+        let lc = c.len;
+        let nb = self.blocks.len();
+
+        for b in 0..nb {
+            let base = self.blocks.acquire(b, st)?;
+            let lay = self.blocks.layouts[b].clone();
+            let wp = |key: &str| off(base, lay.off(key));
+            let bm = off(modv.ptr(), b * 3 * MOD * 2);
+            for j in (0..3).filter(|_| !hit) {
+                k!(gpu_int8_gemm(t.a8t.ptr(), wp(&format!("w_mod{j}_1")), t.ast.ptr(), wp(&format!("s_mod{j}_1")), null(), y256.ptr(), 1,
+                    ADALN as i64, fi, DT_BF16, s(st)))?;
+                k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, y256.ptr(), ADALN as i64, null(), 0, 0, null(), 0.0, null(), null(),
+                    a8y.ptr(), asy.ptr(), 1, ADALN as i32, 1, s(st)))?;
+                k!(gpu_int8_gemm(a8y.ptr(), wp(&format!("w_mod{j}_2")), asy.ptr(), wp(&format!("s_mod{j}_2")), null(),
+                    off(bm, j * MOD * 2), 1, MOD as i64, ADALN as i64, DT_BF16, s(st)))?;
+                k!(gpu_add_vec_bf16(off(bm, j * MOD * 2), off(bm, j * MOD * 2), t.lora.ptr(), 0, MOD as i32, s(st)))?;
+            }
+            let shift = |j: usize| off(bm, j * MOD * 2);
+            let scale = |j: usize| off(bm, (j * MOD + F) * 2);
+            let gate = |j: usize| off(bm, (j * MOD + 2 * F) * 2);
+            let mat = |module: Module| lora.and_then(|(a, stream)| a.mat(stream, b, module).map(|mm| (a, mm)));
+            let lb = lora_bufs.as_ref().map(|(xn, lt, dl, yb)| (xn.ptr(), lt.ptr(), dl.ptr(), yb.ptr()));
+            // layer norm j's modulated output, as the projections' bf16 input
+            let normed = |j: usize, out: PM| -> Result<()> {
+                k!(gpu_prologue_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, scale(j), shift(j), out, fi, m, F as i32,
+                    s(st)))
+            };
+            // an output projection: gate * (W a + lora(a)) added to x
+            let out_proj = |module: Module, w: &str, sc: &str, j: usize, input: PM, width: usize| -> Result<()> {
+                k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, input, width as i64, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m,
+                    width as i32, 1, s(st)))?;
+                match (mat(module), lb) {
+                    (Some((a, mm)), Some((_, lt, dl, yb))) => {
+                        k!(gpu_int8_gemm(a8.ptr(), wp(w), asc.ptr(), wp(sc), null(), yb, rows as i64, fi, width as i64, DT_BF16, s(st)))?;
+                        lora_delta(a, mm, input, width, rows, lt, dl, F, st)?;
+                        k!(gpu_add_gated_bf16(yb, fi, dl, fi, null(), m, F as i32, s(st)))?;
+                        k!(gpu_add_gated_bf16(xp, fi, yb, fi, gate(j), m, F as i32, s(st)))
+                    }
+                    _ => k!(gpu_int8_gemm_residual(a8.ptr(), wp(w), asc.ptr(), wp(sc), null(), gate(j), xp, xp, rows as i64, fi,
+                        width as i64, DT_BF16, s(st))),
+                }
+            };
+
+            // self attention
+            k!(gpu_quant_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, scale(0), shift(0), a8.ptr(), asc.ptr(), m,
+                F as i32, 1, s(st)))?;
+            k!(gpu_int8_gemm(a8.ptr(), wp("w_self"), asc.ptr(), wp("s_self"), null(), q, rows as i64, QKV as i64, fi, DT_BF16, s(st)))?;
+            if let (Some((a, mm)), Some((xn, lt, dl, _))) = (mat(Module::SelfQkv), lb) {
+                normed(0, xn)?;
+                lora_delta(a, mm, xn, F, rows, lt, dl, QKV, st)?;
+                k!(gpu_add_gated_bf16(q, QKV as i64, dl, QKV as i64, null(), m, QKV as i32, s(st)))?;
+            }
+            // the RoPE table is one image's
+            for i in 0..batch {
+                k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(q, i * l * QKV * 2), QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn_self"),
+                    wp("kn_self"), EPS, rope, 2, l as i32, s(st)))?;
+            }
+            if let Pass::Reference { out, row0, .. } = pass {
+                cuda::memcpy_2d_d2d(off(out.block(b), row0 * KV * 2), KV * 2, off(q, F * 2), QKV * 2, KV * 2, rows, st)?;
+                if b + 1 == nb {
+                    // nothing after the last block's keys reaches them
+                    self.blocks.release(b, st)?;
+                    break;
+                }
+            }
+            match (read, &cat, &merge, &groups) {
+                (Some((kv, _)), Some(cat), _, _) => {
+                    let lk = kv.rows + l;
+                    for i in 0..batch {
+                        let dst = off(cat.ptr(), i * lk * KV * 2);
+                        cuda::memcpy_d2d(dst, kv.block(b), kv.rows * KV * 2, st)?;
+                        cuda::memcpy_2d_d2d(off(dst, kv.rows * KV * 2), KV * 2, off(q, (i * l * QKV + F) * 2), QKV * 2, KV * 2, l, st)?;
+                    }
+                    self.attention(q, cat.ptr(), off(cat.ptr(), F * 2), attn.ptr(), ws.ptr(), batch, l, lk, QKV, KV, false, st)?;
+                }
+                (Some((kv, _)), None, Some((outs, lses)), Some(groups)) => {
+                    let (hi, hs, sc, bi) = (H as i32, HD as i64, 1.0 / (HD as f32).sqrt(), batch as i32);
+                    let (qb, qr) = ((l * QKV) as i64, QKV as i64);
+                    let (ob, or) = ((l * F) as i64, F as i64);
+                    let o = |g: usize| off(outs.ptr(), g * rows * F * 2);
+                    let lse = |g: usize| off(lses.ptr(), g * batch * H * l * 4);
+                    let mut mg = MergeGroups { o: [null(); MERGE_GROUPS], lse: [null(); MERGE_GROUPS], bias: [0.0; MERGE_GROUPS] };
+                    // the image's own keys
+                    k!(gpu_flash_attn(q, off(q, F * 2), off(q, KV * 2), o(0), lse(0), bi, l as i32, l as i32, hi, hi, qb, qr,
+                        hs, qb, qr, hs, qb, qr, hs, ob, or, hs, sc, self.attn_variant, s(st)))?;
+                    (mg.o[0], mg.lse[0]) = (o(0) as P, lse(0) as P);
+                    for (g, &(start, size, bias)) in groups.iter().enumerate() {
+                        let kr = off(kv.block(b), start * KV * 2);
+                        let kvr = KV as i64;
+                        k!(gpu_flash_attn(q, kr, off(kr, F * 2), o(g + 1), lse(g + 1), bi, l as i32, size as i32, hi, hi, qb, qr, hs, 0,
+                            kvr, hs, 0, kvr, hs, ob, or, hs, sc, self.attn_variant, s(st)))?;
+                        (mg.o[g + 1], mg.lse[g + 1], mg.bias[g + 1]) = (o(g + 1) as P, lse(g + 1) as P, bias);
+                    }
+                    k!(gpu_attn_merge(&mg, (groups.len() + 1) as i32, attn.ptr(), bi, l as i32, hi, HD as i32, s(st)))?;
+                }
+                _ => self.attention(q, off(q, F * 2), off(q, KV * 2), attn.ptr(), ws.ptr(), batch, l, l, QKV, QKV, false, st)?,
+            }
+            if b == 0 {
+                if let Some(p) = probe.as_mut() {
+                    p("block0_self_attn_raw", &attn, rows * F * 2);
+                }
+            }
+            out_proj(Module::SelfOut, "wo_self", "so_self", 0, attn.ptr(), F)?;
+
+            // cross attention, k and v come from the per-prompt cache
+            let kv = off(c.kv.ptr(), b * lc * KV * 2);
+            k!(gpu_quant_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, scale(1), shift(1), a8.ptr(), asc.ptr(), m,
+                F as i32, 1, s(st)))?;
+            k!(gpu_int8_gemm(a8.ptr(), wp("w_cq"), asc.ptr(), wp("s_cq"), null(), q, rows as i64, fi, fi, DT_BF16, s(st)))?;
+            if let (Some((a, mm)), Some((xn, lt, dl, _))) = (mat(Module::CrossQ), lb) {
+                normed(1, xn)?;
+                lora_delta(a, mm, xn, F, rows, lt, dl, F, st)?;
+                k!(gpu_add_gated_bf16(q, fi, dl, fi, null(), m, F as i32, s(st)))?;
+            }
+            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, q, fi, 0, 0, H as i32, 0, wp("qn_cross"), null(), EPS, null(), 0, m, s(st)))?;
+            self.attention(q, kv, off(kv, F * 2), attn.ptr(), ws.ptr(), batch, l, lc, F, KV, true, st)?;
+            out_proj(Module::CrossOut, "wo_cross", "so_cross", 1, attn.ptr(), F)?;
+
+            // MLP
+            k!(gpu_quant_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, scale(2), shift(2), a8.ptr(), asc.ptr(), m,
+                F as i32, 1, s(st)))?;
+            k!(gpu_int8_gemm(a8.ptr(), wp("w_l1"), asc.ptr(), wp("s_l1"), null(), hid.ptr(), rows as i64, MLP as i64, fi, DT_BF16, s(st)))?;
+            if let (Some((a, mm)), Some((xn, lt, dl, _))) = (mat(Module::Mlp1), lb) {
+                normed(2, xn)?;
+                lora_delta(a, mm, xn, F, rows, lt, dl, MLP, st)?;
+                k!(gpu_add_gated_bf16(hid.ptr(), MLP as i64, dl, MLP as i64, null(), m, MLP as i32, s(st)))?;
+            }
+            match (mat(Module::Mlp2), lb) {
+                (Some((a, mm)), Some((g, lt, dl, yb))) => {
+                    k!(gpu_quant_rows(DT_BF16, PRO_GELU, hid.ptr(), MLP as i64, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(),
+                        asc.ptr(), m, MLP as i32, 1, s(st)))?;
+                    k!(gpu_int8_gemm(a8.ptr(), wp("w_l2"), asc.ptr(), wp("s_l2"), null(), yb, rows as i64, fi, MLP as i64, DT_BF16, s(st)))?;
+                    k!(gpu_prologue_rows(DT_BF16, PRO_GELU, hid.ptr(), MLP as i64, null(), 0, 0, null(), 0.0, null(), null(), g,
+                        MLP as i64, m, MLP as i32, s(st)))?;
+                    lora_delta(a, mm, g, MLP, rows, lt, dl, F, st)?;
+                    k!(gpu_add_gated_bf16(yb, fi, dl, fi, null(), m, F as i32, s(st)))?;
+                    k!(gpu_add_gated_bf16(xp, fi, yb, fi, gate(2), m, F as i32, s(st)))?;
+                }
+                _ => {
+                    k!(gpu_quant_rows(DT_BF16, PRO_GELU, hid.ptr(), MLP as i64, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(),
+                        asc.ptr(), m, MLP as i32, 1, s(st)))?;
+                    k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_l2"), asc.ptr(), wp("s_l2"), null(), gate(2), xp, xp, rows as i64, fi,
+                        MLP as i64, DT_BF16, s(st)))?;
+                }
+            }
+            self.blocks.release(b, st)?;
+            if let Some(p) = probe.as_mut() {
+                p(&format!("block{b}"), x, rows * F * 2);
+            }
+        }
+        if let Some(sg) = sigma {
+            self.mods.insert(sg.to_bits(), modv);
+        }
         Ok(())
     }
 }
+
+/// A projection's LoRA delta: `up(down(x)) * scale` into `out` (bf16, row stride `ldo`), each part into its own
+/// columns. `x` is bf16 [rows, k] with row stride `ldx`; `tmp` takes [rows, parts * rank].
+#[allow(clippy::too_many_arguments)]
+fn lora_delta(a: &Adapter, mm: &Mat, x: PM, ldx: usize, rows: usize, tmp: PM, out: PM, ldo: usize, st: &Stream) -> Result<()> {
+    let (r, pr) = (mm.rank, mm.parts * mm.rank);
+    k!(gpu_gemm(x, ldx as i64, a.at(mm.down), mm.k as i64, tmp, pr as i64, null(), rows as i64, pr as i64, mm.k as i64, 1, DT_BF16,
+        DT_BF16, 1.0, 0.0, s(st)))?;
+    for p in 0..mm.parts {
+        k!(gpu_gemm(off(tmp, p * r * 2), pr as i64, a.at(mm.up[p]), r as i64, off(out, p * mm.n * 2), ldo as i64, null(), rows as i64,
+            mm.n as i64, r as i64, 1, DT_BF16, DT_BF16, mm.scale, 0.0, s(st)))?;
+    }
+    Ok(())
+}
+
+/// Activation memory SnapRef adds to a target step of `l` tokens per image next to `ref_rows` reference tokens: the
+/// LoRA scratch, and the keys prepended (or their groups' outputs, `groups` of them).
+pub fn snapref_step_bytes(l: usize, ref_rows: usize, groups: usize) -> usize {
+    l * (QKV * 2 * 2 + F * 2 + 3 * 128 * 2) + (ref_rows + l) * KV * 2 * 2 + (groups + 1) * l * (F * 2 + H * 4)
+}
+
+/// Activation memory of SnapRef's reference stream over `l` reference tokens, the keys it keeps aside.
+pub fn reference_bytes(l: usize) -> usize {
+    step_activation_bytes(l) + l * (MLP * 2 * 2 + F * 2 + 3 * 256 * 2)
+}
+
+/// Bytes of the keys and values kept for `rows` reference tokens in a model of `blocks` blocks.
+pub fn ref_kv_bytes(blocks: usize, rows: usize) -> usize {
+    blocks * rows * KV * 2
+}
+
+/// Bytes of one reference row of [`RefKv`].
+pub const REF_ROW_BYTES: usize = KV * 2;

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use diffusion::h3;
 use diffusion::h3window;
-use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, Step};
+use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, SnapRefRequest, Step};
 use diffusion::pixal3d;
 use diffusion::preview;
 use diffusion::samplers::{self, CfgFunction, CfgTweaks, ModelSampling, SigmaRange};
@@ -352,6 +352,12 @@ fn reference_latents(c: &Conditioning, family: Family) -> EngineResult<(Vec<Refe
     Ok((out, timestep_zero))
 }
 
+/// A picture's RGB as f32 [h][w][3]: the node takes the first three channels as they are.
+fn rgb_f32(b: &ImageBatch) -> Vec<f32> {
+    let c = b.channels as usize;
+    b.frame_f32(0).chunks_exact(c).flat_map(|px| [px[0], px[1.min(c - 1)], px[2.min(c - 1)]]).collect()
+}
+
 /// The positive and negative prompts share one baked text encoder.
 fn check_text_encoder_loras(positive: &DeferredCond, negative: &DeferredCond) -> EngineResult<()> {
     if positive.loras != negative.loras {
@@ -379,6 +385,8 @@ struct ModelSettings {
     sparse: Option<h3::SparseAttn>,
     /// `MiniMaxH3ContextWindows`.
     windows: Option<h3window::ContextWindows>,
+    /// `SnapRef`, on Anima.
+    snapref: Option<Box<SnapRefPatch>>,
 }
 
 fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
@@ -389,7 +397,7 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::Moss => ModelSampling::Flow { shift: MOSS_SHIFT },
         Family::H3 => ModelSampling::Flow { shift: h3::SHIFT_VIDEO },
     };
-    let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None };
+    let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None, snapref: None };
     let mut sparse = None;
     for p in &model.patches {
         match p {
@@ -445,6 +453,18 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
             // Weighted prompts are refused in encode_text; with none this patch has no effect.
             ModelPatch::AttnTokenWeights { .. } | ModelPatch::Compile { .. } => {}
             ModelPatch::Lora { file, strength } => s.loras.push(Lora { path: file.path.clone(), strength: *strength }),
+            ModelPatch::SnapRef(p) => {
+                if family != Family::Anima {
+                    return Err(unsupported("SnapRef on this model (it is an Anima adapter)"));
+                }
+                if s.snapref.is_some() {
+                    return Err(unsupported("more than one SnapRef node on a model"));
+                }
+                if p.ref_guidance.is_some() {
+                    return Err(unsupported("SnapRef's ref_guidance_on (its extra model call per step)"));
+                }
+                s.snapref = Some(p.clone());
+            }
             other => {
                 let name = format!("{other:?}");
                 return Err(unsupported(format!("model option {}", name.split([' ', '{', '(']).next().unwrap_or("?"))));
@@ -743,13 +763,14 @@ impl NativeEngine {
         } else {
             Prompt::new(Vec::new())
         };
+        let snapref = settings.snapref.as_deref().map(|p| self.snapref_request(p, cond)).transpose()?;
         let mut gen = self.gen();
         gen.ensure_anima(&file.path).map_err(internal)?;
         gen.ensure_qwen3(text_encoder).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
         gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
-        let r = AnimaRequest { positive, negative, width: lw * 8, height: lh * 8, sampling, noise: plan.noise(req, batch, (16, lh, lw)) };
+        let r = AnimaRequest { positive, negative, width: lw * 8, height: lh * 8, sampling, noise: plan.noise(req, batch, (16, lh, lw)), snapref };
         let (latent, stats) = gen
             .sample_anima(&r, |step| report(mode, progress, batch, step, |x0| (preview::wan21(x0, lh, lw), lh, lw)), None)
             .map_err(internal)?;
@@ -758,6 +779,49 @@ impl NativeEngine {
     }
 
     /// Qwen Image 2.1's VAE on `pixels`, RGB or RGBA: the encoder pads RGB with opaque alpha, like ComfyUI.
+    /// The SnapRef node's pictures, encoded as it does (`_encode_image`, after `_stitch` with `multi_layout` stitch), and
+    /// its settings. `prompt` is the positive's conditioning, whose text encoder the caption must share.
+    fn snapref_request(&self, p: &SnapRefPatch, prompt: &DeferredCond) -> EngineResult<SnapRefRequest> {
+        let (cc, caption) = single_prompt(&p.caption, Family::Anima)?;
+        if cc.text_encoder != prompt.text_encoder {
+            return Err(unsupported("a SnapRef CLIP other than the prompt's text encoder"));
+        }
+        check_text_encoder_loras(prompt, cc)?;
+        if !matches!(p.mode.as_str(), "cs" | "char") {
+            return Err(EngineError::InvalidInput(format!("SnapRef mode {}", p.mode)));
+        }
+        if !(0.25..=2.0).contains(&p.ref_megapixels) {
+            return Err(EngineError::InvalidInput(format!("ref_megapixels {} (0.25 to 2)", p.ref_megapixels)));
+        }
+        let vae = p.vae.source.as_ref().ok_or_else(|| unsupported("SnapRef with the pixel-space VAE"))?;
+        if is_qwen21_vae(vae) || is_flux2_vae(vae) || is_h3_vae(vae) {
+            return Err(unsupported("SnapRef with a VAE other than Anima's"));
+        }
+        let mut pictures: Vec<(Vec<f32>, usize, usize)> =
+            p.references.iter().map(|(img, _)| (rgb_f32(img), img.width as usize, img.height as usize)).collect();
+        let mut weights: Vec<f64> = p.references.iter().map(|(_, w)| *w).collect();
+        if p.stitch && pictures.len() > 1 {
+            pictures = vec![diffusion::snapref::stitch(&pictures)];
+            weights = vec![1.0];
+        }
+        let mut gen = self.gen();
+        gen.ensure_vae(&vae.path).map_err(internal)?;
+        let mut references = Vec::with_capacity(pictures.len());
+        for (rgb, w, h) in &pictures {
+            let (rgb, w, h) = diffusion::snapref::shrink(rgb, *w, *h, p.ref_megapixels);
+            references.push(gen.encode_image(&rgb, w, h).map_err(internal)?);
+        }
+        Ok(SnapRefRequest {
+            adapter: p.adapter.path.clone(),
+            references,
+            biases: weights.iter().map(|w| (p.strength + w.ln()) as f32).collect(),
+            mode: p.mode.clone(),
+            caption,
+            in_uncond: p.ref_in_uncond,
+            uncond_bias: (p.fidelity < 1.0 && !p.ref_in_uncond).then(|| (1.0 - p.fidelity).max(1e-6).ln() as f32),
+        })
+    }
+
     fn encode_qwen21(&self, file: &ModelFile, pixels: &ImageBatch) -> EngineResult<Latent> {
         let c = pixels.channels as usize;
         if c < 3 {

@@ -63,6 +63,9 @@ pub enum ModelPatch {
     /// `AnimaLLLiteApply` (an Anima ControlNet-LLLite `MODEL_PATCH`). SwarmUI passes the
     /// generation's inpaint mask, if any.
     AnimaLLLite { patch: AddonHandle, image: ImageBatch, strength: f64, mask: Option<Mask>, start_percent: f64, end_percent: f64 },
+    /// `SnapRef` (ArcAnima's SnapRef node pack, which the SwarmUI-SnapRef extension emits): a reference adapter for
+    /// Anima that takes pictures of a character. See [`SnapRefPatch`].
+    SnapRef(Box<SnapRefPatch>),
     /// `SwarmReferenceOnly` (Use Reference Only): the latent batch is `[reference..., latent...]`
     /// (`batch` in total). In every self-attention, each sample's keys and values are extended
     /// with the queries of the first sample of its group of `batch`, so the generation attends to
@@ -93,6 +96,33 @@ pub enum ModelPatch {
     /// `SwarmModelTiling` (Seamless Tileable): circular padding in the diffusion model so the
     /// output tiles. Pairs with [`VaePatch::Tiling`].
     Tiling { axis: TileAxis },
+}
+
+/// The `SnapRef` node's inputs, resolved. The pictures are as the node takes them: one frame per input (every frame
+/// with `use_batch`), pictures of weight 0 dropped; the engine shrinks each to `ref_megapixels` and VAE-encodes it.
+#[derive(Clone, Debug)]
+pub struct SnapRefPatch {
+    /// The SnapRef weight file (`adapter`, from the LoRA folder).
+    pub adapter: ModelFile,
+    /// The VAE that encodes the pictures.
+    pub vae: VaeHandle,
+    /// `ref_caption` encoded by the node's CLIP: the reference stream's prompt.
+    pub caption: Conditioning,
+    /// Each picture (one frame) and its weight (`weight_1`..`weight_3`, a batch sharing its input's).
+    pub references: Vec<(ImageBatch, f64)>,
+    /// `cs` (character and style) or `char` (character only).
+    pub mode: String,
+    pub ref_in_uncond: bool,
+    pub ref_megapixels: f64,
+    /// `strength`: a log-scale bias on every reference key's attention logit (0 = as trained).
+    pub strength: f64,
+    /// Below 1 the negative prompt's evaluations read the references too, at `ln(1 - fidelity)`. Ignored with
+    /// `ref_in_uncond` or reference guidance.
+    pub fidelity: f64,
+    /// `multi_layout` `stitch`: several pictures side by side as one reference, instead of one each.
+    pub stitch: bool,
+    /// `ref_guidance_on`: `ref_guidance`, `correction` (`apg`, `rescale`, `none`) and `ref_end`. SwarmUI never sends it.
+    pub ref_guidance: Option<(f64, String, f64)>,
 }
 
 /// Which axes Seamless Tileable wraps around (`tile_axis`: `Both` / `X` / `Y`).

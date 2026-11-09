@@ -37,6 +37,6 @@ pub use engine::{DeviceInfo, Engine, EngineError, EngineInfo, EngineResult, Null
 pub use handles::{AddonHandle, AddonKind, ModelFile, ModelFolder, ModelHandle, Opaque, TextEncoderHandle, VaeHandle, WeightDtype};
 pub use latent::{Latent, LatentFormat, LatentSamples, LatentTensor, PixelInfo};
 pub use media::{AudioData, ImageBatch, Mask, PixelData, VideoClip};
-pub use patches::{LoraHook, ModelPatch, SparseAttention, SparseAttentionMethod, TextEncoderPatch, TileAxis, VaePatch};
+pub use patches::{LoraHook, ModelPatch, SnapRefPatch, SparseAttention, SparseAttentionMethod, TextEncoderPatch, TileAxis, VaePatch};
 pub use prompt::{ParsedPrompt, PromptLeaf, PromptNode};
 pub use requests::*;

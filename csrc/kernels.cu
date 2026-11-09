@@ -1281,3 +1281,47 @@ GPU_API int gpu_lora_add(int dtype, void* w, const void* d, float scale, int64_t
     KCHECK();
     return 0;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Attention over several key groups merged by their log-sum-exp (SnapRef's biased reference keys)
+// ---------------------------------------------------------------------------------------------
+#define MERGE_GROUPS 8
+struct MergeGroups {
+    const bf16* o[MERGE_GROUPS];
+    const float* lse[MERGE_GROUPS];
+    float bias[MERGE_GROUPS];
+};
+
+// out = sum_g w_g o_g / sum_g w_g with w_g = exp(lse_g + bias_g - max): softmax over the keys of every group, with
+// bias_g added to the logits of group g's keys. o_g and out bf16 [b, sq, h, d] contiguous; lse_g float [b, h, sq]
+// (FlashAttention's), in natural log units.
+__global__ void attn_merge_kernel(MergeGroups g, int n, bf16* out, int sq, int h, int d, int64_t total) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int hh = (int)((i / d) % h);
+    const int64_t row = i / ((int64_t)d * h);
+    const int s = (int)(row % sq);
+    const int64_t bi = row / sq;
+    const int64_t li = (bi * h + hh) * sq + s;
+    float l[MERGE_GROUPS];
+    float m = -INFINITY;
+    for (int k = 0; k < n; ++k) {
+        l[k] = g.lse[k][li] + g.bias[k];
+        m = fmaxf(m, l[k]);
+    }
+    float num = 0.f, den = 0.f;
+    for (int k = 0; k < n; ++k) {
+        const float w = expf(l[k] - m);
+        num += w * __bfloat162float(g.o[k][i]);
+        den += w;
+    }
+    out[i] = __float2bfloat16_rn(num / den);
+}
+
+GPU_API int gpu_attn_merge(const MergeGroups* groups, int n, void* out, int b, int sq, int h, int d, void* stream) {
+    if (n < 1 || n > MERGE_GROUPS) return -1;
+    const int64_t total = (int64_t)b * sq * h * d;
+    attn_merge_kernel<<<(unsigned)((total + 255) / 256), 256, 0, (cudaStream_t)stream>>>(*groups, n, (bf16*)out, sq, h, d, total);
+    KCHECK();
+    return 0;
+}

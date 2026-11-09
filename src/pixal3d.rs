@@ -173,7 +173,7 @@ pub fn pil_lanczos(src: &[u8], w: usize, h: usize, ch: usize, nw: usize, nh: usi
 }
 
 /// `comfy.utils.lanczos` on f32 values: truncated to u8 the way numpy's `astype` does, resized, then / 255.
-fn lanczos_f32(src: &[f32], w: usize, h: usize, ch: usize, nw: usize, nh: usize) -> Vec<f32> {
+pub fn lanczos_f32(src: &[f32], w: usize, h: usize, ch: usize, nw: usize, nh: usize) -> Vec<f32> {
     let u8s: Vec<u8> = src.iter().map(|v| (255.0f32 * v).clamp(0.0, 255.0) as u8).collect();
     pil_lanczos(&u8s, w, h, ch, nw, nh).into_iter().map(|v| v as f32 / 255.0).collect()
 }

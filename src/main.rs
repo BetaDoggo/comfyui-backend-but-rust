@@ -137,9 +137,25 @@ struct Args {
     /// LoRA file, `path`, `path:strength` or `path:strength:clip_strength`, in order (repeatable)
     #[arg(long)]
     lora: Vec<String>,
-    /// Krea 2: PNG for the text encoder, at its own size; SwarmUI scales these to about 384x384 (repeatable)
+    /// Krea 2: PNG for the text encoder, at its own size; SwarmUI scales these to about 384x384. Anima with
+    /// --snapref: a picture of the character (repeatable)
     #[arg(long)]
     image: Vec<PathBuf>,
+    /// Anima: a SnapRef weight file, the reference adapter that takes --image as pictures of the character
+    #[arg(long)]
+    snapref: Option<PathBuf>,
+    /// SnapRef: "cs" (character and style) or "char" (character only)
+    #[arg(long, default_value = "cs")]
+    snapref_mode: String,
+    /// SnapRef: how much the pictures count, 1 as trained
+    #[arg(long, default_value_t = 1.0)]
+    snapref_strength: f32,
+    /// SnapRef: below 1 the negative prompt reads the pictures too, weaker, so the prompt is followed more freely
+    #[arg(long, default_value_t = 1.0)]
+    snapref_fidelity: f32,
+    /// SnapRef: the pictures are shrunk (never enlarged) to this many megapixels
+    #[arg(long, default_value_t = 1.0)]
+    snapref_megapixels: f64,
     /// Krea 2: PNG for a reference latent, for edit LoRAs (repeatable)
     #[arg(long)]
     ref_image: Vec<PathBuf>,
@@ -302,6 +318,34 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     gen.ensure_anima(&dit)?;
     gen.ensure_qwen3(&te)?;
     apply_loras(&mut gen, args)?;
+    let snapref = match &args.snapref {
+        Some(adapter) => {
+            if args.image.is_empty() {
+                bail!("--snapref needs at least one --image");
+            }
+            let mut references = Vec::new();
+            for p in &args.image {
+                let img = read_png(p)?;
+                let (rgb, w, h) = diffusion::snapref::shrink(&img.rgb, img.width, img.height, args.snapref_megapixels);
+                references.push(gen.encode_image(&rgb, w, h)?);
+            }
+            let strength = args.snapref_strength;
+            if strength <= 0.0 {
+                bail!("--snapref-strength must be above 0");
+            }
+            let fidelity = args.snapref_fidelity;
+            Some(pipeline::SnapRefRequest {
+                adapter: adapter.clone(),
+                biases: vec![strength.ln(); references.len()],
+                references,
+                mode: args.snapref_mode.clone(),
+                caption: Prompt::new(diffusion::tokenizer::token_weights("", 1.0)),
+                in_uncond: false,
+                uncond_bias: (fidelity < 1.0).then(|| (1.0 - fidelity).max(1e-6).ln()),
+            })
+        }
+        None => None,
+    };
     let n = 16 * (args.height / 8) * (args.width / 8);
     for group in args.batches() {
         let r = pipeline::AnimaRequest {
@@ -311,6 +355,7 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             height: args.height,
             sampling: args.batch_sampling("er_sde", ModelSampling::Flow { shift }, group, (args.width / 8, args.height / 8))?,
             noise: args.noise(group, n)?,
+            snapref: snapref.clone(),
         };
         let mut dump = pipeline::Dump::new();
         let t0 = Instant::now();

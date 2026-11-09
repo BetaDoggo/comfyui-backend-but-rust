@@ -17,6 +17,7 @@ mod media;
 mod output;
 mod sampling;
 mod segment;
+mod snapref;
 mod three_d;
 mod video;
 mod vae;
@@ -137,6 +138,7 @@ impl NodeRegistry {
         controlnet::register(&mut r, env);
         custom_sampling::register(&mut r, env);
         three_d::register(&mut r, env);
+        snapref::register(&mut r, env);
         r
     }
 

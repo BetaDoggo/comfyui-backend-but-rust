@@ -1,0 +1,15 @@
+{
+  "4": { "class_type": "UNETLoader", "inputs": { "unet_name": "anima/anima-preview.safetensors", "weight_dtype": "default" } },
+  "100": { "class_type": "CLIPLoader", "inputs": { "clip_name": "qwen_3_600m.safetensors", "type": "stable_diffusion", "device": "default" } },
+  "101": { "class_type": "VAELoader", "inputs": { "vae_name": "qwen_image_vae.safetensors" } },
+  "2000": { "class_type": "LoraLoader", "inputs": { "model": ["4", 0], "clip": ["100", 0], "lora_name": "anima/flat_color_style.safetensors", "strength_model": 0.8, "strength_clip": 0.8 } },
+  "102": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": "$IMAGE_B64" } },
+  "103": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": "$IMAGE2_B64" } },
+  "104": { "class_type": "SnapRef", "inputs": { "model": ["2000", 0], "clip": ["2000", 1], "vae": ["101", 0], "adapter": "snapref_v2a.safetensors", "mode": "char", "ref_in_uncond": false, "ref_megapixels": 1.0, "ref_caption": "", "fidelity": 0.8, "image": ["102", 0], "weight_1": 1.25, "image_2": ["103", 0], "weight_2": 1.25 } },
+  "6": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["2000", 1], "text": "no humans, robot, sitting on a park bench" } },
+  "7": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["2000", 1], "text": "worst quality, low quality" } },
+  "5": { "class_type": "EmptySD3LatentImage", "inputs": { "batch_size": 1, "height": 1024, "width": 1024 } },
+  "10": { "class_type": "SwarmKSampler", "inputs": { "model": ["104", 0], "noise_seed": 777, "steps": 8, "cfg": 4.0, "sampler_name": "er_sde", "scheduler": "simple", "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0], "start_at_step": 0, "end_at_step": 10000, "return_with_leftover_noise": "disable", "add_noise": "enable", "var_seed": 0, "var_seed_strength": 0.0, "sigma_min": -1.0, "sigma_max": -1.0, "rho": 7.0, "previews": "default", "tile_sample": false, "tile_size": 1024, "model_negative": null } },
+  "8": { "class_type": "VAEDecode", "inputs": { "vae": ["101", 0], "samples": ["10", 0] } },
+  "9": { "class_type": "SwarmSaveImageWS", "inputs": { "images": ["8", 0], "bit_depth": "8bit" } }
+}

@@ -153,6 +153,19 @@ extern "C" {
     pub fn gpu_attn_prefix(q: P, q_stride: i64, k: P, v: P, kv_stride: i64, h: i32, lq: i32, offset: i32, out: PM, out_stride: i64,
         scale: f32, s: PM) -> i32;
     pub fn gpu_tanh_bf16(x: PM, n: i64, s: PM) -> i32;
+    pub fn gpu_attn_merge(groups: *const MergeGroups, n: i32, out: PM, b: i32, sq: i32, h: i32, d: i32, s: PM) -> i32;
+}
+
+/// Most key groups [`gpu_attn_merge`] takes.
+pub const MERGE_GROUPS: usize = 8;
+
+/// `gpu_attn_merge`'s groups: each one's attention output (bf16 [b, sq, h, d]), its log-sum-exp (f32 [b, h, sq]) and
+/// the bias on its keys' logits.
+#[repr(C)]
+pub struct MergeGroups {
+    pub o: [P; MERGE_GROUPS],
+    pub lse: [P; MERGE_GROUPS],
+    pub bias: [f32; MERGE_GROUPS],
 }
 
 /// Turn a launcher return code into an error naming the call.

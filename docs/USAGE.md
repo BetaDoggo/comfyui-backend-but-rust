@@ -22,6 +22,7 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--legacy-offload` | plan VRAM residency from estimates, the older offloading, instead of the default [ComfyUI memory management](TECHNICAL_OVERVIEW.md#comfyui-memory-management) |
 | `--resident-blocks N` | with `--legacy-offload`: force the number of diffusion blocks kept in VRAM |
 | `--anima`, `--moss`, `--qwen21`, `--h3` | pick the model family; the default is Krea 2 |
+| `--snapref file`, `--image a.png`, `--snapref-mode`, `--snapref-strength`, `--snapref-fidelity`, `--snapref-megapixels` | Anima: the SnapRef reference adapter with pictures of a character (repeatable `--image`); see [SnapRef](MODELS.md#snapref) |
 | `--image a.png` | Qwen Image 2.1 edits: each image goes to the text encoder and into the sequence as a reference latent (repeatable); the prompt then says what to change, as in `put the boat from picture 2 on the sea in picture 1`. Output is RGBA |
 | `--qwen21-vae-check ref.safetensors` | Qwen Image 2.1: compare the VAE with `tools/qwen21_ref.py --vae-only` |
 | `--flux2-vae-check ref.safetensors` | MOSS Image: compare the Flux 2 VAE encoder with `tools/flux2_vae_ref.py` |
@@ -101,7 +102,8 @@ Differences to know about:
 * Anima's text encoder keeps bf16 weights where ComfyUI computes in float32, so patched weights there are rounded to bf16.
 * Refused with an error: reshaped patches, which widen a model's inputs; text encoder patches to the vision tower, `embed_tokens` or
   norm weights this engine doesn't store as patchable; control images; different LoRAs on the positive and negative text encoders;
-  and LoRA hooks. Files for ComfyUI custom nodes, such as `anima_ref_kv`, match no key and change nothing, as in ComfyUI.
+  and LoRA hooks. Files for ComfyUI custom nodes, such as SnapRef's `anima_ref_kv`, match no key and change nothing, as in ComfyUI.
+  SnapRef files go to `--snapref` instead.
 
 ## Samplers
 

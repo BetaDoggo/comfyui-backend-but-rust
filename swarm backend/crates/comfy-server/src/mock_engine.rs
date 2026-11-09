@@ -300,6 +300,18 @@ impl Engine for MockEngine {
             req.variation,
             req.model.patches.iter().map(|p| match p {
                 ModelPatch::AttnTokenWeights { .. } => "AttnTokenWeights".to_string(),
+                ModelPatch::SnapRef(p) => format!(
+                    "SnapRef({} mode={} references={:?} strength={} fidelity={} megapixels={} in_uncond={} stitch={} guidance={:?})",
+                    p.adapter.name,
+                    p.mode,
+                    p.references.iter().map(|(img, w)| format!("{}x{} w{w}", img.width, img.height)).collect::<Vec<_>>(),
+                    p.strength,
+                    p.fidelity,
+                    p.ref_megapixels,
+                    p.ref_in_uncond,
+                    p.stitch,
+                    p.ref_guidance,
+                ),
                 other => format!("{other:?}"),
             }).collect::<Vec<_>>(),
         );

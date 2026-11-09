@@ -14,7 +14,7 @@ mod krea;
 mod moss;
 mod qwen21;
 
-pub use anima::AnimaRequest;
+pub use anima::{AnimaRequest, SnapRefRequest};
 pub use h3::{h3_tokens, H3Request};
 pub use krea::KreaRequest;
 pub use moss::{moss_tokens, MossRequest};

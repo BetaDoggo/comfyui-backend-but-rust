@@ -163,6 +163,44 @@ adapter output differs by about 1.7%, cause not yet found, so the same seed give
 
 Anima drifts towards explicit images even on neutral prompts, so choose prompts with care.
 
+### SnapRef
+
+[SnapRef](https://github.com/ArcAnima/SnapRef) is a reference adapter for Anima: pictures of a character, and a prompt
+that describes only the scene. SwarmUI's [SwarmUI-SnapRef](https://github.com/BetaDoggo/SwarmUI-SnapRef) extension sends
+its `SnapRef` node, which this backend runs natively ([`src/snapref.rs`](../src/snapref.rs)). Each picture is shrunk
+to `ref_megapixels`, VAE-encoded, and run once through the model at sigma 0 with the adapter's reference LoRA and mode
+embedding; every block's self-attention keys and values are kept (about 0.9 GB per 1 MP picture) and prepended in every
+target evaluation, which runs with the adapter's target LoRA. The keys are cached until the pictures, caption, mode,
+size, LoRAs or model change, and dropped when the backend goes idle.
+
+```bash
+target/release/diffusion.exe --anima --snapref Lora/snapref_v2a.safetensors --image robot.png -p "no humans, robot, sitting on a park bench, autumn leaves"
+```
+
+`--snapref-mode`, `--snapref-strength`, `--snapref-fidelity` and `--snapref-megapixels` are the extension's parameters.
+
+Compared with ComfyUI's own node (`tools/snapref_ref.py`, `tools/snapref_cmp.py`) on v2a, a 1024x1024 picture of a
+robot and an 8-step turbo run at 1024x1024, both engines start from this engine's reference latent:
+
+| | Relative error |
+|---|---|
+| Reference keys / values, first block | 0.17% / 0.04% |
+| Reference keys / values, last block | 0.55% / 1.3% |
+| Target first block, first evaluation (strength 1, strength 1.5, the negative at Fidelity 0.5 and CFG 3) | 1.2%, 1.2%, 1.3% |
+
+The VAE encode of that picture differs from ComfyUI's by 2.2%, which moves the first block's reference keys by 10%.
+Images are 17 to 18 dB from ComfyUI's, the same as this engine's int8 and flash attention are from each other (17.3 dB),
+and show the same character in the same pose. Only v2a was compared; v1a and v1b were not run.
+
+Speed at 1024x1024 with one 1 MP picture: encoding the picture's keys takes about 225 ms once. Each evaluation takes
+183 ms instead of 129 ms. A strength other than 1, or Fidelity below 1 on the negative, uses bf16 flash attention with a
+log-sum-exp merge, which takes 264 ms per evaluation.
+
+Refused: `ref_guidance_on`, which needs an extra model call per step (SwarmUI never sends it), a CLIP other than the
+prompt's, and more than one SnapRef node. `multi_layout` stitch, `use_batch` and the per-picture weights are implemented
+but were only run through the mock server, not on real output. The extension itself was not run in SwarmUI; the node
+was tested through `comfy-server` over HTTP and through the CLI.
+
 ## MOSS Image
 
 Runs int8 ConvRot MOSS Image checkpoints with fused q/k/v, the Qwen3.5 9B text encoder and the Flux 2 VAE. Both

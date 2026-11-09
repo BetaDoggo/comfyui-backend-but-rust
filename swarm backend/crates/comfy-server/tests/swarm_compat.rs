@@ -36,6 +36,7 @@ const MODEL_FILES: &[&str] = &[
     "VAE/QwenImage/qwen_image_2.1_vae_bf16.safetensors",
     "Lora/anima/flat_color_style.safetensors",
     "Lora/qwen21_style.safetensors",
+    "Lora/snapref_v2a.safetensors",
     "Embeddings/bad_hands.safetensors",
     "gligen/gligen_test.safetensors",
     "upscale_models/4x_test.safetensors",
@@ -251,7 +252,9 @@ async fn object_info_has_what_swarm_reads() {
     let unets: Vec<&str> = info["UNETLoader"]["input"]["required"]["unet_name"][0].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
     assert!(unets.contains(&"krea2/krea2_fp8_scaled.safetensors") && unets.contains(&"minimax_h3_fp8.safetensors"), "{unets:?}");
     let loras = &info["LoraLoader"]["input"]["required"]["lora_name"][0];
-    assert_eq!(loras, &json!(["anima/flat_color_style.safetensors", "qwen21_style.safetensors"]));
+    assert_eq!(loras, &json!(["anima/flat_color_style.safetensors", "qwen21_style.safetensors", "snapref_v2a.safetensors"]));
+    // SwarmUI-SnapRef enables its parameters when SnapRef is listed, and sends its weight file's name as `adapter`
+    assert_eq!(info["SnapRef"]["input"]["required"]["adapter"][0], json!(["snapref_v2a.safetensors"]));
     let samplers = &info["SwarmKSampler"]["input"]["required"]["sampler_name"][0];
     for s in ["euler", "er_sde", "res_multistep"] {
         assert!(samplers.as_array().unwrap().contains(&json!(s)));
@@ -1063,6 +1066,33 @@ async fn diffsynth_and_lllite_controlnets_patch_the_model() {
     let seen = engine.seen.lock().unwrap();
     let p = seen.model_patches.iter().find(|p| p.starts_with("AnimaLLLite")).expect("LLLite patch");
     assert!(p.contains("fake_anima_lllite.safetensors") && p.contains("strength: 0.6") && p.contains("mask: Some") && p.contains("start_percent: 0.2"), "{p}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapref_patches_the_model_like_the_swarm_extension() {
+    let engine = RecordingEngine::new();
+    let s = TestServer::start_engine(engine.clone(), 0, false).await;
+    let r = run_like_swarm(&s, fixture("anima_snapref.json"), |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    let seen = engine.seen.lock().unwrap();
+    let p = seen.model_patches.iter().find(|p| p.starts_with("SnapRef")).expect("SnapRef patch");
+    // the LoRA comes first, as the extension's step runs after the model loader
+    assert!(seen.model_patches[0].starts_with("Lora"), "{:?}", seen.model_patches);
+    for want in ["snapref_v2a.safetensors", "mode: \"char\"", "ImageBatch(300x200x3, 1 frame(s)", "ImageBatch(128x96x3, 1 frame(s)", "1.25)", "fidelity: 0.8",
+        "strength: 0.0", "ref_in_uncond: false", "stitch: false", "ref_guidance: None"] {
+        assert!(p.contains(want), "{want} missing from {p}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapref_refuses_when_every_weight_is_zero() {
+    let s = TestServer::start(0).await;
+    let mut w = fixture("anima_snapref.json");
+    w["104"]["inputs"]["weight_1"] = json!(0.0);
+    w["104"]["inputs"]["weight_2"] = json!(0.0);
+    let r = run_like_swarm(&s, w, |_| {}).await;
+    assert_eq!(r.status(), "error");
+    assert!(r.history.to_string().contains("every reference has weight 0"), "{:#}", r.history);
 }
 
 #[tokio::test(flavor = "multi_thread")]

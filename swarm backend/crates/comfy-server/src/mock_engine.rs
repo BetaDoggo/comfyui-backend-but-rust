@@ -595,6 +595,23 @@ impl Engine for MockEngine {
         Ok(tetrahedron_glb(mean))
     }
 
+    fn image_to_splat(&self, req: &ImageToSplatRequest, progress: &mut dyn ProgressSink) -> EngineResult<Vec<u8>> {
+        tracing::info!("[mock] image_to_splat {} {:?} seed {} gaussians {}", req.diffusion_model.name, req.image, req.seed, req.num_gaussians);
+        if req.mask.is_none() && !req.image.has_alpha() {
+            return Err(EngineError::InvalidInput("TripoSplat needs the object cut out: an image with transparency, or a mask".into()));
+        }
+        if req.num_gaussians % 32 != 0 || !(32_768..=1_048_576).contains(&req.num_gaussians) {
+            return Err(EngineError::InvalidInput("num_gaussians must be a multiple of 32 from 32768 to 1048576".into()));
+        }
+        progress.progress(1, 1);
+        // four gaussians at a tetrahedron's corners, coloured by the image's mean colour
+        let px = req.image.frame_f32(0);
+        let c = req.image.channels as usize;
+        let n = (px.len() / c).max(1) as f32;
+        let mean: [f32; 3] = std::array::from_fn(|k| px.chunks(c).map(|p| p[k.min(c - 1)]).sum::<f32>() / n);
+        Ok(tetrahedron_ply(mean))
+    }
+
     fn upscale_image(&self, req: &UpscaleImageRequest) -> EngineResult<ImageBatch> {
         // ESRGAN-style models are named by their factor ("4x_...", "2x_...").
         let name = &req.model.source.name;
@@ -721,6 +738,29 @@ impl Engine for MockEngine {
     fn free_memory(&self, unload_models: bool, free_memory: bool) {
         tracing::info!("[mock] free_memory unload_models={unload_models} free_memory={free_memory}");
     }
+}
+
+/// A 3DGS `.ply` of four gaussians at a tetrahedron's corners, of one colour.
+fn tetrahedron_ply(color: [f32; 3]) -> Vec<u8> {
+    let attrs = ["x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"];
+    let mut out = String::from("ply
+format binary_little_endian 1.0
+element vertex 4
+");
+    for a in attrs {
+        out.push_str(&format!("property float {a}
+"));
+    }
+    out.push_str("end_header
+");
+    let mut out = out.into_bytes();
+    // SH degree 0: colour = 0.5 + 0.28209479 * f_dc
+    let dc = color.map(|v| (v - 0.5) / 0.282_094_8);
+    for p in [[0.3f32, 0.3, 0.3], [0.3, -0.3, -0.3], [-0.3, 0.3, -0.3], [-0.3, -0.3, 0.3]] {
+        let row = [p[0], p[1], p[2], 0.0, 0.0, 0.0, dc[0], dc[1], dc[2], 4.0, -3.0, -3.0, -3.0, 1.0, 0.0, 0.0, 0.0];
+        row.iter().for_each(|v| out.extend_from_slice(&v.to_le_bytes()));
+    }
+    out
 }
 
 /// The smallest useful mesh output: a binary glTF tetrahedron with one vertex colour.

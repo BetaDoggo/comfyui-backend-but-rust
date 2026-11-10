@@ -1,5 +1,5 @@
 //! diffusion: Rust + CUDA reimplementation of ComfyUI's image generation, for quantized checkpoints of Krea 2, Anima, MOSS Image and MiniMax H3,
-//! and Pixal3D image to 3D.
+//! Pixal3D image to 3D, and TripoSplat / Idol image to gaussian splat.
 
 pub mod anima;
 pub mod birefnet;
@@ -33,6 +33,7 @@ pub mod te;
 pub mod tokenizer;
 pub mod trellis;
 pub mod trellis_vae;
+pub mod triposplat;
 pub mod vae;
 pub mod vae21;
 pub mod vision;

@@ -20,6 +20,7 @@ use diffusion::h3;
 use diffusion::h3window;
 use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, SnapRefRequest, Step};
 use diffusion::pixal3d;
+use diffusion::triposplat;
 use diffusion::preview;
 use diffusion::samplers::{self, CfgFunction, CfgTweaks, ModelSampling, SigmaRange};
 use diffusion::lora::{self, Lora};
@@ -1096,6 +1097,19 @@ fn pixal3d_inputs(req: &ImageTo3DRequest) -> EngineResult<(Vec<f32>, Vec<f32>, u
     Ok((rgb, mask, w, h))
 }
 
+/// Checks that each TripoSplat file is what its slot needs, before anything is unloaded for it.
+fn check_triposplat(req: &ImageToSplatRequest) -> EngineResult<()> {
+    let has = |f: &ModelFile, what: &str, test: fn(&dyn Fn(&str) -> bool) -> bool| -> EngineResult<()> {
+        let h = read_header(&f.path).map_err(|e| unsupported(format!("{}: not a readable safetensors file ({e})", f.name)))?;
+        if test(&|k| h.get(k).is_some()) { Ok(()) } else { Err(unsupported(format!("{}: not {what}", f.name))) }
+    };
+    has(&req.diffusion_model, "a TripoSplat or Idol diffusion model", |h| triposplat::is_triposplat(h))?;
+    has(&req.clip_vision, "DINOv3 ViT-H/16+ (dino_v3_vit_h)", |h| diffusion::dino3::is_dino3_vith(h))?;
+    has(&req.vae, "the Flux 2 VAE with its encoder", |h| h("bn.running_mean") && h("encoder.conv_in.weight"))?;
+    has(&req.decoder, "TripoSplat's octree gaussian decoder", |h| triposplat::is_decoder(h))?;
+    Ok(())
+}
+
 /// True for MiniMax H3's video or audio VAE, which load when they decode.
 fn is_h3_vae(file: &ModelFile) -> bool {
     read_header(&file.path).is_ok_and(|h| h.get("decoder.transformer_blocks.0.scale1").is_some() || h.get("pre_block.attn.zero_k_bias").is_some())
@@ -1477,6 +1491,58 @@ impl Engine for NativeEngine {
         let mesh = pixal3d::run(&paths, &rgb, &mask, w, h, &p, self.threads, &mut report).map_err(internal)?;
         drop(gen);
         Ok(pixal3d::glb(&mesh))
+    }
+
+    fn image_to_splat(&self, req: &ImageToSplatRequest, progress: &mut dyn ProgressSink) -> EngineResult<Vec<u8>> {
+        check_triposplat(req)?;
+        let n = req.num_gaussians as usize;
+        if !(triposplat::MIN_GAUSSIANS..=triposplat::MAX_GAUSSIANS).contains(&n) || n % 32 != 0 {
+            return Err(EngineError::InvalidInput("num_gaussians must be a multiple of 32 from 32768 to 1048576".into()));
+        }
+        if req.steps == 0 {
+            return Err(EngineError::InvalidInput("steps must be at least 1".into()));
+        }
+        let img = &req.image;
+        let (w, h) = (img.width as usize, img.height as usize);
+        let c = img.channels as usize;
+        if c < 3 {
+            return Err(unsupported("a greyscale image for TripoSplat"));
+        }
+        let frame = img.frame_f32(0);
+        let rgb: Vec<f32> = frame.chunks_exact(c).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let mask = match &req.mask {
+            Some(m) if (m.width as usize, m.height as usize) == (w, h) => m.data[..w * h].to_vec(),
+            Some(m) => return Err(unsupported(format!("a {}x{} mask on a {w}x{h} image", m.width, m.height))),
+            None if c == 4 => frame.chunks_exact(4).map(|p| p[3]).collect(),
+            None => return Err(EngineError::InvalidInput("TripoSplat needs the object cut out: an image with transparency, or a mask".into())),
+        };
+        let mut p = triposplat::Params::example(req.seed);
+        (p.steps, p.cfg, p.num_gaussians) = (req.steps as usize, req.cfg, n);
+        let paths = triposplat::Paths {
+            dit: req.diffusion_model.path.clone(),
+            dino: req.clip_vision.path.clone(),
+            flux_vae: req.vae.path.clone(),
+            decoder: req.decoder.path.clone(),
+        };
+        // the pipeline needs the whole GPU: the image models go, and load again when next used
+        let mut gen = self.gen();
+        gen.unload().map_err(internal)?;
+        // one bar: the encode, the sampler's steps, then the decode's levels, by rough share of the time
+        let shares = [("encode", 0.0, 0.1), ("sample", 0.1, 0.85), ("decode", 0.85, 1.0)];
+        let mut last = String::new();
+        let mut report = |stage: &str, i: usize, n: usize| -> anyhow::Result<()> {
+            if stage != last {
+                last = stage.to_string();
+                tracing::info!("triposplat: {stage}");
+            }
+            let (_, a, b) = shares.iter().find(|s| s.0 == stage).copied().unwrap_or(("", 0.0, 1.0));
+            let frac = a + (b - a) * i as f64 / n.max(1) as f64;
+            progress.progress((frac * 1000.0) as u32, 1000);
+            if progress.interrupted() { Err(Cancelled.into()) } else { Ok(()) }
+        };
+        let splat = triposplat::run(&paths, &rgb, &mask, w, h, &p, self.threads, &mut report).map_err(internal)?;
+        drop(gen);
+        Ok(triposplat::ply(&splat))
     }
 
     fn free_memory(&self, unload_models: bool, free_memory: bool) {

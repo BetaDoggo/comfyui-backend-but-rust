@@ -93,6 +93,13 @@ extern "C" {
     pub fn gpu_convrot_requant(dtype: i32, x: P, q: PM, s_: PM, n: i64, k: i32, seed: u64, s: PM) -> i32;
     pub fn gpu_lora_add(dtype: i32, w: PM, d: P, scale: f32, n: i64, s: PM) -> i32;
     pub fn gpu_w6_decode(q: P, s_rel: P, out: PM, n: i64, k: i32, g: i32, s: PM) -> i32;
+    pub fn gpu_int8_attn_f16(q: P, k: P, v: P, o: PM, ws: PM, b: i32, lq: i32, lk: i32, h: i32, hk: i32, d: i32, q_bs: i64, q_rs: i64,
+        q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64, v_hs: i64, o_bs: i64, o_rs: i64, o_hs: i64, scale: f32, s: PM) -> i32;
+    // TripoSplat / Idol (csrc/triposplat.cu)
+    pub fn gpu_ts_add_f16(x: PM, x_stride: i64, y: P, y_stride: i64, gate: P, rows: i64, cols: i32, s: PM) -> i32;
+    pub fn gpu_ts_repo_qk(buf: PM, row_stride: i64, k_off: i32, delta: P, delta_stride: i64, freqs: P, qw: P, kw: P, eps: f32, l: i32,
+        h: i32, do_k: i32, s: PM) -> i32;
+    pub fn gpu_ts_silu_mul_f16(x: P, x_stride: i64, out: PM, out_stride: i64, rows: i64, cols: i32, s: PM) -> i32;
     pub fn gpu_int8_attn_workspace_d(b: i32, h: i32, hk: i32, lq: i32, lk: i32, d: i32) -> i64;
     pub fn gpu_int8_attn_d(q: P, k: P, v: P, o: PM, ws: PM, b: i32, lq: i32, lk: i32, h: i32, hk: i32, d: i32, q_bs: i64, q_rs: i64, q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64,
         v_hs: i64, o_bs: i64, o_rs: i64, o_hs: i64, scale: f32, s: PM) -> i32;

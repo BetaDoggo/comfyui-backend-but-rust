@@ -158,6 +158,11 @@ pub trait Engine: Send + Sync + 'static {
         Err(EngineError::Unsupported("image to 3D (Pixal3DImageTo3D)".into()))
     }
 
+    /// See [`ImageToSplatRequest`]: the gaussian splat as a 3DGS `.ply` file. Default: unsupported.
+    fn image_to_splat(&self, _req: &ImageToSplatRequest, _progress: &mut dyn ProgressSink) -> EngineResult<Vec<u8>> {
+        Err(EngineError::Unsupported("image to gaussian splat (TripoSplatImageToSplat)".into()))
+    }
+
     /// See [`UpscaleImageRequest`]. Default: unsupported.
     fn upscale_image(&self, _req: &UpscaleImageRequest) -> EngineResult<ImageBatch> {
         Err(EngineError::Unsupported("model upscaling (ImageUpscaleWithModel)".into()))

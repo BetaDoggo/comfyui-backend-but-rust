@@ -1,4 +1,5 @@
-// Pixal3D tab: image in, GLB out, shown in a small WebGL2 viewer (no third-party code).
+// Pixal3D tab: image in, a GLB mesh (Pixal3D) or a PLY gaussian splat (Idol) out, shown in a small WebGL2 viewer
+// (no third-party code).
 
 /** Reads a binary glTF's first primitive: positions, linear vertex colours (if any) and indices. */
 function pixal3dParseGlb(buffer) {
@@ -53,7 +54,70 @@ function pixal3dParseGlb(buffer) {
     return { positions: pos.data, colors: colors, indices: indices, vertexCount: pos.count };
 }
 
-/** Orbit viewer of one mesh. Faces are flat-shaded from screen derivatives, so their winding doesn't matter. */
+/** Reads a binary little-endian 3DGS PLY: centres, colours (SH DC), opacities, and each gaussian's 3D covariance.
+ * Splat files are Y down, as ComfyUI writes them and most splat viewers expect, so they turn 180 degrees about X
+ * into this viewer's Y up frame. */
+function pixal3dParsePly(buffer) {
+    let bytes = new Uint8Array(buffer);
+    let head = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 65536)));
+    let end = head.indexOf('end_header\n');
+    if (!head.startsWith('ply') || end < 0) {
+        throw new Error('not a PLY file');
+    }
+    if (!head.includes('format binary_little_endian')) {
+        throw new Error('only binary little-endian PLY files are supported');
+    }
+    let count = 0, props = [], inVertex = false;
+    for (let line of head.substring(0, end).split('\n')) {
+        let w = line.trim().split(/\s+/);
+        if (w[0] == 'element') {
+            inVertex = w[1] == 'vertex';
+            if (inVertex) {
+                count = parseInt(w[2]);
+            }
+        }
+        else if (w[0] == 'property' && inVertex) {
+            if (w[1] != 'float' && w[1] != 'float32') {
+                throw new Error(`unsupported PLY property type ${w[1]}`);
+            }
+            props.push(w[2]);
+        }
+    }
+    let at = name => {
+        let i = props.indexOf(name);
+        if (i < 0) {
+            throw new Error(`the PLY has no ${name}: not a gaussian splat`);
+        }
+        return i;
+    };
+    let [ix, iy, iz, ir, ig, ib, io] = ['x', 'y', 'z', 'f_dc_0', 'f_dc_1', 'f_dc_2', 'opacity'].map(at);
+    let isc = [0, 1, 2].map(k => at(`scale_${k}`)), iro = [0, 1, 2, 3].map(k => at(`rot_${k}`));
+    let stride = props.length;
+    let data = new Float32Array(buffer.slice(end + 'end_header\n'.length, end + 'end_header\n'.length + count * stride * 4));
+    let centers = new Float32Array(count * 3), colors = new Float32Array(count * 4), cov = new Float32Array(count * 6);
+    const C0 = 0.28209479177387814;
+    for (let i = 0; i < count; i++) {
+        let r = data.subarray(i * stride, (i + 1) * stride);
+        centers.set([r[ix], -r[iy], -r[iz]], i * 3);
+        colors.set([0.5 + C0 * r[ir], 0.5 + C0 * r[ig], 0.5 + C0 * r[ib], 1 / (1 + Math.exp(-r[io]))].map(v => Math.max(0, Math.min(1, v))), i * 4);
+        let [w, x, y, z] = iro.map(k => r[k]);
+        let n = Math.hypot(w, x, y, z) || 1;
+        [w, x, y, z] = [w / n, x / n, y / n, z / n];
+        let R = [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+            2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+            2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)];
+        let sc = isc.map(k => Math.exp(r[k]));
+        // M = R S, covariance M M^T
+        let M = [0, 1, 2].flatMap(row => [0, 1, 2].map(c => R[row * 3 + c] * sc[c]));
+        let dot = (a, b) => M[a * 3] * M[b * 3] + M[a * 3 + 1] * M[b * 3 + 1] + M[a * 3 + 2] * M[b * 3 + 2];
+        // diag(1, -1, -1) on both sides
+        cov.set([dot(0, 0), -dot(0, 1), -dot(0, 2), dot(1, 1), dot(1, 2), dot(2, 2)], i * 6);
+    }
+    return { count: count, centers: centers, colors: colors, cov: cov };
+}
+
+/** Orbit viewer of one mesh or one gaussian splat. Faces are flat-shaded from screen derivatives, so their winding
+ * doesn't matter; splats are sorted back to front each frame and blended as screen-space gaussians. */
 class Pixal3DViewer {
     constructor(canvas) {
         this.canvas = canvas;
@@ -89,12 +153,84 @@ class Pixal3DViewer {
             }
             return s;
         };
-        this.program = gl.createProgram();
-        gl.attachShader(this.program, compile(gl.VERTEX_SHADER, vs));
-        gl.attachShader(this.program, compile(gl.FRAGMENT_SHADER, fs));
-        gl.linkProgram(this.program);
+        let link = (v, f) => {
+            let prog = gl.createProgram();
+            gl.attachShader(prog, compile(gl.VERTEX_SHADER, v));
+            gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, f));
+            gl.linkProgram(prog);
+            if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+                throw new Error(gl.getProgramInfoLog(prog));
+            }
+            return prog;
+        };
+        this.program = link(vs, fs);
         this.vao = gl.createVertexArray();
         this.buffers = [gl.createBuffer(), gl.createBuffer(), gl.createBuffer()];
+        // splats: per-gaussian data in float textures, read by the sorted index of each instance
+        let svs = `#version 300 es
+            precision highp float; precision highp int;
+            in vec2 aCorner; in uint aIndex;
+            uniform highp sampler2D uCenter, uCovA, uCovB, uColor;
+            uniform mat4 uView, uProj; uniform vec2 uViewport; uniform int uWidth;
+            out vec4 vColor; out vec2 vPos;
+            void main() {
+                ivec2 t = ivec2(int(aIndex) % uWidth, int(aIndex) / uWidth);
+                vec4 c = texelFetch(uCenter, t, 0), ca = texelFetch(uCovA, t, 0), cb = texelFetch(uCovB, t, 0);
+                vColor = texelFetch(uColor, t, 0);
+                vec4 cam = uView * vec4(c.xyz, 1.0);
+                vec4 clip = uProj * cam;
+                float lim = 1.2 * clip.w;
+                if (cam.z > -1e-4 || clip.x < -lim || clip.x > lim || clip.y < -lim || clip.y > lim) {
+                    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+                    return;
+                }
+                mat3 cov3 = mat3(ca.x, ca.y, ca.z, ca.y, ca.w, cb.x, ca.z, cb.x, cb.y);
+                vec2 focal = vec2(uProj[0][0], uProj[1][1]) * uViewport * 0.5;
+                float z = -cam.z;
+                mat3 J = mat3(focal.x / z, 0.0, 0.0, 0.0, focal.y / z, 0.0, focal.x * cam.x / (z * z), focal.y * cam.y / (z * z), 0.0);
+                mat3 W = mat3(uView);
+                mat3 T = J * W;
+                mat3 c2 = T * cov3 * transpose(T);
+                float a = c2[0][0] + 0.3, b = c2[0][1], d = c2[1][1] + 0.3;
+                float mid = 0.5 * (a + d), rad = length(vec2(0.5 * (a - d), b));
+                float l1 = mid + rad, l2 = mid - rad;
+                if (l2 <= 0.0) {
+                    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+                    return;
+                }
+                vec2 v1 = normalize(vec2(b, l1 - a) + vec2(1e-9, 0.0));
+                vec2 major = min(sqrt(2.0 * l1), 1024.0) * v1, minor = min(sqrt(2.0 * l2), 1024.0) * vec2(v1.y, -v1.x);
+                vPos = aCorner;
+                vec2 ndc = clip.xy / clip.w + (aCorner.x * major + aCorner.y * minor) * 2.0 / uViewport;
+                gl_Position = vec4(ndc, 0.0, 1.0);
+            }`;
+        let sfs = `#version 300 es
+            precision highp float;
+            in vec4 vColor; in vec2 vPos; out vec4 outColor;
+            void main() {
+                float A = -dot(vPos, vPos);
+                if (A < -4.0) discard;
+                float B = exp(A) * vColor.a;
+                outColor = vec4(B * vColor.rgb, B);
+            }`;
+        this.splatProgram = link(svs, sfs);
+        this.splatVao = gl.createVertexArray();
+        this.splatCorners = gl.createBuffer();
+        this.splatIndex = gl.createBuffer();
+        this.splatTextures = [gl.createTexture(), gl.createTexture(), gl.createTexture(), gl.createTexture()];
+        gl.bindVertexArray(this.splatVao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.splatCorners);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-2, -2, 2, -2, 2, 2, -2, 2]), gl.STATIC_DRAW);
+        let lc = gl.getAttribLocation(this.splatProgram, 'aCorner');
+        gl.enableVertexAttribArray(lc);
+        gl.vertexAttribPointer(lc, 2, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.splatIndex);
+        let li = gl.getAttribLocation(this.splatProgram, 'aIndex');
+        gl.enableVertexAttribArray(li);
+        gl.vertexAttribIPointer(li, 1, gl.UNSIGNED_INT, 0, 0);
+        gl.vertexAttribDivisor(li, 1);
+        gl.bindVertexArray(null);
+        this.splat = null;
         this.bindControls();
         new ResizeObserver(() => this.draw()).observe(canvas);
     }
@@ -147,12 +283,8 @@ class Pixal3DViewer {
         return [right, up, back];
     }
 
-    setMesh(mesh) {
-        let gl = this.gl;
-        if (!gl) {
-            return;
-        }
-        let p = mesh.positions;
+    /** Points the camera at the box around `p` (xyz triples). */
+    frame(p) {
         let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
         for (let i = 0; i < p.length; i += 3) {
             for (let k = 0; k < 3; k++) {
@@ -164,6 +296,16 @@ class Pixal3DViewer {
         let extent = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) || 1;
         this.distance = extent * 1.9;
         this.near = extent * 0.01;
+    }
+
+    setMesh(mesh) {
+        let gl = this.gl;
+        if (!gl) {
+            return;
+        }
+        let p = mesh.positions;
+        this.frame(p);
+        this.splat = null;
         let colors = new Float32Array(mesh.vertexCount * 3).fill(0.55);
         if (mesh.colors) {
             for (let i = 0; i < mesh.vertexCount; i++) {
@@ -189,6 +331,74 @@ class Pixal3DViewer {
         this.draw();
     }
 
+    setSplat(splat) {
+        let gl = this.gl;
+        if (!gl) {
+            return;
+        }
+        this.frame(splat.centers);
+        let n = splat.count;
+        let width = Math.min(n, 2048), height = Math.ceil(n / width);
+        let pack = (fill) => {
+            let a = new Float32Array(width * height * 4);
+            for (let i = 0; i < n; i++) {
+                fill(a, i);
+            }
+            return a;
+        };
+        let c = splat.centers, v = splat.cov, col = splat.colors;
+        let data = [
+            pack((a, i) => a.set([c[i * 3], c[i * 3 + 1], c[i * 3 + 2], 1], i * 4)),
+            pack((a, i) => a.set([v[i * 6], v[i * 6 + 1], v[i * 6 + 2], v[i * 6 + 3]], i * 4)),
+            pack((a, i) => a.set([v[i * 6 + 4], v[i * 6 + 5], 0, 0], i * 4)),
+            pack((a, i) => a.set([col[i * 4], col[i * 4 + 1], col[i * 4 + 2], col[i * 4 + 3]], i * 4))
+        ];
+        data.forEach((d, k) => {
+            gl.bindTexture(gl.TEXTURE_2D, this.splatTextures[k]);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, height, 0, gl.RGBA, gl.FLOAT, d);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        });
+        this.splat = { count: n, width: width, centers: c, order: new Uint32Array(n), depth: new Int32Array(n), sortedFor: null };
+        this.count = 0;
+        this.draw();
+    }
+
+    /** Orders the splats back to front along the view direction `back` (a counting sort over 16-bit depths). */
+    sortSplats(back) {
+        let sp = this.splat;
+        let key = back.map(v => v.toFixed(3)).join(',');
+        if (sp.sortedFor == key) {
+            return;
+        }
+        sp.sortedFor = key;
+        let c = sp.centers, n = sp.count, depth = sp.depth;
+        let lo = Infinity, hi = -Infinity;
+        for (let i = 0; i < n; i++) {
+            // larger is nearer the camera
+            let d = c[i * 3] * back[0] + c[i * 3 + 1] * back[1] + c[i * 3 + 2] * back[2];
+            depth[i] = d * 4096 | 0;
+            lo = Math.min(lo, depth[i]);
+            hi = Math.max(hi, depth[i]);
+        }
+        let scale = 65535 / Math.max(1, hi - lo);
+        let counts = new Uint32Array(65536);
+        for (let i = 0; i < n; i++) {
+            depth[i] = ((depth[i] - lo) * scale) | 0;
+            counts[depth[i]]++;
+        }
+        for (let i = 1; i < 65536; i++) {
+            counts[i] += counts[i - 1];
+        }
+        // ascending depth key: the farthest first
+        for (let i = n - 1; i >= 0; i--) {
+            sp.order[--counts[depth[i]]] = i;
+        }
+        let gl = this.gl;
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.splatIndex);
+        gl.bufferData(gl.ARRAY_BUFFER, sp.order, gl.DYNAMIC_DRAW);
+    }
+
     draw() {
         let gl = this.gl;
         if (!gl) {
@@ -203,7 +413,7 @@ class Pixal3DViewer {
         gl.viewport(0, 0, w, h);
         gl.clearColor(0.13, 0.13, 0.14, 1);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-        if (!this.count) {
+        if (!this.count && !this.splat) {
             return;
         }
         let [right, up, back] = this.basis();
@@ -223,6 +433,29 @@ class Pixal3DViewer {
                 }
                 mvp[c * 4 + r] = s;
             }
+        }
+        if (this.splat) {
+            this.sortSplats(back);
+            let sp = this.splat, prog = this.splatProgram;
+            gl.disable(gl.DEPTH_TEST);
+            gl.disable(gl.CULL_FACE);
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+            gl.useProgram(prog);
+            gl.uniformMatrix4fv(gl.getUniformLocation(prog, 'uView'), false, new Float32Array(view));
+            gl.uniformMatrix4fv(gl.getUniformLocation(prog, 'uProj'), false, new Float32Array(proj));
+            gl.uniform2f(gl.getUniformLocation(prog, 'uViewport'), w, h);
+            gl.uniform1i(gl.getUniformLocation(prog, 'uWidth'), sp.width);
+            ['uCenter', 'uCovA', 'uCovB', 'uColor'].forEach((name, k) => {
+                gl.activeTexture(gl.TEXTURE0 + k);
+                gl.bindTexture(gl.TEXTURE_2D, this.splatTextures[k]);
+                gl.uniform1i(gl.getUniformLocation(prog, name), k);
+            });
+            gl.bindVertexArray(this.splatVao);
+            gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, sp.count);
+            gl.bindVertexArray(null);
+            gl.disable(gl.BLEND);
+            return;
         }
         gl.enable(gl.DEPTH_TEST);
         gl.disable(gl.CULL_FACE);
@@ -256,7 +489,7 @@ class Pixal3DTab {
         this.ready = true;
         this.viewer = new Pixal3DViewer(this.el('canvas'));
         if (!this.viewer.gl) {
-            this.el('model_info').innerText = 'This browser has no WebGL2: download the GLB to view it.';
+            this.el('model_info').innerText = 'This browser has no WebGL2: download the model to view it.';
         }
         let drop = this.el('drop');
         drop.addEventListener('click', () => this.el('file').click());
@@ -285,6 +518,7 @@ class Pixal3DTab {
         this.el('cancel').addEventListener('click', () => this.cancel());
         this.el('refresh_models').addEventListener('click', () => this.loadModels());
         this.el('remove_background').addEventListener('change', () => this.updateNote());
+        this.el('model_type').addEventListener('change', () => this.setKind());
         this.el('bg_removal_name').addEventListener('change', () => this.updateNote());
         this.loadModels();
     }
@@ -299,9 +533,29 @@ class Pixal3DTab {
         this.el('progress_bar').style.width = `${Math.round(Math.max(0, Math.min(1, frac)) * 100)}%`;
     }
 
+    /** Shows the fields of the chosen model: Pixal3D's mesh, or Idol's splat. */
+    setKind() {
+        let kind = this.el('model_type').value;
+        this.el('root').dataset.kind = kind;
+        this.el('generate').innerText = kind == 'splat' ? 'Generate splat' : 'Generate 3D';
+    }
+
     loadModels() {
         genericRequest('Pixal3DListModels', {}, data => {
-            let prefer = { unet_name: /pixal3d(?!.*multiview).*convrot/i, clip_vision_name: /dino_v3/i, shape_vae_name: /shape_vae/i, texture_vae_name: /texture_vae/i, bg_removal_name: /birefnet/i };
+            let prefer = { unet_name: /pixal3d(?!.*multiview).*convrot/i, clip_vision_name: /dino_v3_L/i, shape_vae_name: /shape_vae/i, texture_vae_name: /texture_vae/i,
+                splat_unet_name: /idol|triposplat/i, splat_clip_vision_name: /dino_v3_vit_h/i, splat_vae_name: /flux2/i, splat_decoder_name: /idol_decoder|triposplat.*decoder|decoder/i,
+                bg_removal_name: /birefnet/i };
+            this.available = { mesh: data.has_pixal3d !== false, splat: !!data.has_splat };
+            for (let opt of this.el('model_type').options) {
+                opt.disabled = !this.available[opt.value];
+            }
+            if (!this.available[this.el('model_type').value]) {
+                let other = this.el('model_type').value == 'mesh' ? 'splat' : 'mesh';
+                if (this.available[other]) {
+                    this.el('model_type').value = other;
+                }
+            }
+            this.setKind();
             for (let key of Object.keys(prefer)) {
                 let select = this.el(key);
                 let previous = select.value;
@@ -312,7 +566,8 @@ class Pixal3DTab {
                     opt.innerText = name;
                     select.appendChild(opt);
                 }
-                let pick = (data[key] || []).find(n => n == previous) || (data[key] || []).find(n => prefer[key].test(n)) || (key == 'bg_removal_name' ? (data[key] || [])[0] : (data[key] || []).find(n => /pixal3d(?!.*multiview)/i.test(n)));
+                let fallback = { bg_removal_name: list => list[0], unet_name: list => list.find(n => /pixal3d(?!.*multiview)/i.test(n)) }[key];
+                let pick = (data[key] || []).find(n => n == previous) || (data[key] || []).find(n => prefer[key].test(n)) || (fallback ? fallback(data[key] || []) : null);
                 if (pick) {
                     select.value = pick;
                 }
@@ -373,7 +628,7 @@ class Pixal3DTab {
         } else if (remove) {
             text += this.cutOut ? ": the background will be removed, ignoring this image's transparency." : ': no transparent background, so the object is cut out with BiRefNet first.';
         } else if (!this.cutOut) {
-            text += ': this image has no transparent background and Pixal3D needs the object cut out.';
+            text += ': this image has no transparent background, and the object has to be cut out.';
             warn = true;
         }
         note.innerText = text;
@@ -382,7 +637,24 @@ class Pixal3DTab {
 
     params() {
         let num = id => parseFloat(this.el(id).value);
+        if (this.el('model_type').value == 'splat') {
+            return {
+                model_type: 'splat',
+                image: this.image,
+                seed: Math.round(num('seed')),
+                splat_num_gaussians: Math.round(num('splat_num_gaussians')),
+                splat_steps: Math.round(num('splat_steps')),
+                splat_cfg: num('splat_cfg'),
+                splat_unet_name: this.el('splat_unet_name').value,
+                splat_clip_vision_name: this.el('splat_clip_vision_name').value,
+                splat_vae_name: this.el('splat_vae_name').value,
+                splat_decoder_name: this.el('splat_decoder_name').value,
+                remove_background: this.el('remove_background').checked,
+                bg_removal_name: this.el('bg_removal_name').value
+            };
+        }
         return {
+            model_type: 'mesh',
             image: this.image,
             seed: Math.round(num('seed')),
             fov: num('fov'),
@@ -414,7 +686,11 @@ class Pixal3DTab {
             return;
         }
         let p = this.params();
-        if (!p.unet_name) {
+        if (p.model_type == 'splat' && !(p.splat_unet_name && p.splat_clip_vision_name && p.splat_vae_name && p.splat_decoder_name)) {
+            this.setStatus('The Idol models are missing on the backends: idol_fp16 (diffusion_models), dino_v3_vit_h_bf16 (clip_vision), flux2-vae and idol_decoder_fp16 (VAE). Check the model files, then Refresh models.', true);
+            return;
+        }
+        if (p.model_type == 'mesh' && !p.unet_name) {
             this.setStatus('No Pixal3D models found on the backends. Check the model files, then Refresh models.', true);
             return;
         }
@@ -461,6 +737,8 @@ class Pixal3DTab {
         link.href = path;
         link.style.display = '';
         link.setAttribute('download', path.split('/').pop());
+        let splat = path.toLowerCase().endsWith('.ply');
+        link.innerText = splat ? 'Download PLY' : 'Download GLB';
         this.el('model_info').innerText = 'Loading model...';
         fetch(path).then(r => {
             if (!r.ok) {
@@ -468,9 +746,17 @@ class Pixal3DTab {
             }
             return r.arrayBuffer();
         }).then(buf => {
-            let mesh = pixal3dParseGlb(buf);
-            this.viewer.setMesh(mesh);
-            this.el('model_info').innerText = `${mesh.vertexCount.toLocaleString()} vertices, ${(mesh.indices.length / 3).toLocaleString()} triangles, ${(buf.byteLength / 1048576).toFixed(1)} MB`;
+            let size = `${(buf.byteLength / 1048576).toFixed(1)} MB`;
+            if (splat) {
+                let s = pixal3dParsePly(buf);
+                this.viewer.setSplat(s);
+                this.el('model_info').innerText = `${s.count.toLocaleString()} gaussians, ${size}`;
+            }
+            else {
+                let mesh = pixal3dParseGlb(buf);
+                this.viewer.setMesh(mesh);
+                this.el('model_info').innerText = `${mesh.vertexCount.toLocaleString()} vertices, ${(mesh.indices.length / 3).toLocaleString()} triangles, ${size}`;
+            }
             this.renderHistory();
         }).catch(e => this.el('model_info').innerText = `Could not load the model: ${e}`);
     }

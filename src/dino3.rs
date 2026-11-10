@@ -1,18 +1,33 @@
-//! Pixal3D's image encoder: DINOv3 ViT-L/16 (f32, like ComfyUI runs it) and the NAF feature upsampler bundled in
-//! the same file (f16 in ComfyUI, emulated by rounding to f16 where it materializes a tensor).
+//! DINOv3 image encoders, in f32 like ComfyUI runs them: Pixal3D's ViT-L/16 with the NAF feature upsampler bundled
+//! in the same file (f16 in ComfyUI, emulated by rounding to f16 where it materializes a tensor), and TripoSplat's
+//! ViT-H/16+ (SwiGLU MLP), whose bf16 weights ComfyUI holds in f16.
 
 use crate::cuda::{DevBuf, Stream};
-use crate::ffi::{k, null, off, s, DT_F16, DT_F32, PM, PRO_LAYERNORM, PRO_LN_AFFINE};
+use crate::ffi::{k, null, off, s, DT_BF16, DT_F16, DT_F32, PM, PRO_LAYERNORM, PRO_LN_AFFINE, PRO_SWIGLU};
 use crate::offload::{plan, Layout, WeightSet};
 use crate::st::{f32_bytes, SafeTensors};
 use anyhow::{bail, Result};
 
+/// ViT-L's width (the NAF's value channels).
 const D: usize = 1024;
-const HEADS: usize = 16;
 const HD: usize = 64;
-const MLP: usize = 4096;
-const LAYERS: usize = 24;
 const PATCH: usize = 16;
+
+/// The shape of one DINOv3 checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Cfg {
+    d: usize,
+    heads: usize,
+    mlp: usize,
+    layers: usize,
+    /// SwiGLU MLP (gate_proj, up_proj) instead of GELU
+    gated: bool,
+    /// bf16 weights, which ComfyUI rounds to f16 and the GEMMs widen to f32 a layer at a time
+    bf16: bool,
+}
+
+const VIT_L: Cfg = Cfg { d: 1024, heads: 16, mlp: 4096, layers: 24, gated: false, bf16: false };
+const VIT_H: Cfg = Cfg { d: 1280, heads: 20, mlp: 5120, layers: 32, gated: true, bf16: true };
 /// CLS and four registers.
 pub const PREFIX: usize = 5;
 const EPS: f32 = 1e-5;
@@ -28,23 +43,44 @@ pub fn is_dino3_naf(has: impl Fn(&str) -> bool) -> bool {
     has("layer.23.layer_scale2.lambda1") && has("embeddings.register_tokens") && has("naf.image_encoder.rope.periods")
 }
 
-fn layer_layout(st: &SafeTensors, i: usize) -> Result<Layout> {
+/// True if `st` holds a DINOv3 ViT-H/16+ (TripoSplat's `dino_v3_vit_h`).
+pub fn is_dino3_vith(has: impl Fn(&str) -> bool) -> bool {
+    has("layer.0.mlp.gate_proj.weight") && has("layer.31.norm1.weight") && has("embeddings.register_tokens")
+}
+
+/// One layer's weights as stored in the file (f32 for ViT-L, bf16 for ViT-H); every entry has the file's dtype, so
+/// a bf16 layer widens to f32 as a whole, each offset doubling.
+fn layer_layout(st: &SafeTensors, i: usize, c: Cfg) -> Result<Layout> {
     let p = |x: &str| format!("layer.{i}.{x}");
+    let el = if c.bf16 { 2 } else { 4 };
     let mut l = Layout::new();
     l.raw(st, "qkv", &[p("attention.q_proj.weight"), p("attention.k_proj.weight"), p("attention.v_proj.weight")])?;
     // the key projection has no bias
     let mut bias = st.bytes(&p("attention.q_proj.bias"))?.to_vec();
-    bias.extend(vec![0u8; D * 4]);
+    bias.extend(vec![0u8; c.d * el]);
     bias.extend_from_slice(st.bytes(&p("attention.v_proj.bias"))?);
     l.bytes("qkvb", bias);
-    for (key, name) in [("o", "attention.o_proj.weight"), ("ob", "attention.o_proj.bias"), ("up", "mlp.up_proj.weight"),
-        ("upb", "mlp.up_proj.bias"), ("down", "mlp.down_proj.weight"), ("downb", "mlp.down_proj.bias"), ("n1w", "norm1.weight"),
-        ("n1b", "norm1.bias"), ("n2w", "norm2.weight"), ("n2b", "norm2.bias"), ("ls1", "layer_scale1.lambda1"),
-        ("ls2", "layer_scale2.lambda1")]
+    if c.gated {
+        // [gate | up] in one GEMM, then silu(gate) * up
+        l.raw(st, "up", &[p("mlp.gate_proj.weight"), p("mlp.up_proj.weight")])?;
+        l.raw(st, "upb", &[p("mlp.gate_proj.bias"), p("mlp.up_proj.bias")])?;
+    } else {
+        l.raw(st, "up", &[p("mlp.up_proj.weight")])?;
+        l.raw(st, "upb", &[p("mlp.up_proj.bias")])?;
+    }
+    for (key, name) in [("o", "attention.o_proj.weight"), ("ob", "attention.o_proj.bias"), ("down", "mlp.down_proj.weight"),
+        ("downb", "mlp.down_proj.bias"), ("n1w", "norm1.weight"), ("n1b", "norm1.bias"), ("n2w", "norm2.weight"),
+        ("n2b", "norm2.bias"), ("ls1", "layer_scale1.lambda1"), ("ls2", "layer_scale2.lambda1")]
     {
         l.raw(st, key, &[p(name)])?;
     }
     Ok(l)
+}
+
+/// A tensor as f32 bytes, through f16 where ComfyUI holds it in f16.
+fn f32_via(st: &SafeTensors, name: &str, f16: bool) -> Result<Vec<u8>> {
+    let v = st.f32_vec(name, false)?;
+    Ok(f32_bytes(&if f16 { v.into_iter().map(|x| half::f16::from_f32(x).to_f32()).collect() } else { v }))
 }
 
 /// The NAF weights, rounded to f16 as ComfyUI holds them, and its 3x3 kernels reordered to (out, ky, kx, in).
@@ -82,52 +118,76 @@ fn naf_layout(st: &SafeTensors) -> Result<Layout> {
     Ok(l)
 }
 
-/// One encode: the normalized final tokens (f32 [PREFIX + side * side, D]).
+/// One encode: the normalized final tokens (f32 [PREFIX + side * side, d]).
 pub struct Tokens {
     pub buf: DevBuf,
     pub side: usize,
+    /// width of a token
+    pub d: usize,
 }
 
 impl Tokens {
-    /// The patch grid (f32 [side * side, D], NHWC) starts after the prefix tokens.
+    /// The patch grid (f32 [side * side, d], NHWC) starts after the prefix tokens.
     pub fn patches(&self) -> PM {
-        self.buf.at(PREFIX * D * 4)
+        self.buf.at(PREFIX * self.d * 4)
     }
 }
 
 pub struct Dino3 {
+    cfg: Cfg,
     globals: DevBuf,
     gl: Layout,
     layers: Option<WeightSet>,
-    naf: DevBuf,
-    nl: Layout,
+    /// ViT-L's NAF upsampler
+    naf: Option<(DevBuf, Layout)>,
 }
 
 impl Dino3 {
+    /// Pixal3D's ViT-L with its NAF upsampler.
     pub fn load(st: &SafeTensors, threads: usize, s0: &Stream) -> Result<Self> {
         if !is_dino3_naf(|k| st.has(k)) {
             bail!("not a DINOv3 ViT-L with NAF weights");
         }
+        Self::load_cfg(st, VIT_L, threads, s0)
+    }
+
+    /// TripoSplat's ViT-H/16+.
+    pub fn load_vith(st: &SafeTensors, threads: usize, s0: &Stream) -> Result<Self> {
+        if !is_dino3_vith(|k| st.has(k)) {
+            bail!("not a DINOv3 ViT-H/16+");
+        }
+        Self::load_cfg(st, VIT_H, threads, s0)
+    }
+
+    fn load_cfg(st: &SafeTensors, cfg: Cfg, threads: usize, s0: &Stream) -> Result<Self> {
         let mut gl = Layout::new();
-        for (key, name) in [("pw", "embeddings.patch_embeddings.weight"), ("pb", "embeddings.patch_embeddings.bias"),
-            ("cls", "embeddings.cls_token"), ("reg", "embeddings.register_tokens")]
-        {
-            gl.raw(st, key, &[name.to_string()])?;
+        let mut globals_names = vec![("pw", "embeddings.patch_embeddings.weight"), ("pb", "embeddings.patch_embeddings.bias"),
+            ("cls", "embeddings.cls_token"), ("reg", "embeddings.register_tokens")];
+        if cfg.gated {
+            globals_names.extend([("nw", "norm.weight"), ("nb", "norm.bias")]);
+        }
+        for (key, name) in globals_names {
+            gl.bytes(key, f32_via(st, name, cfg.bf16)?);
         }
         let mut host = vec![0u8; gl.size];
         gl.pack(st, &mut host)?;
         let globals = DevBuf::alloc(gl.size)?;
         globals.upload(0, &host, s0)?;
-        let nl = naf_layout(st)?;
-        let mut nh = vec![0u8; nl.size];
-        nl.pack(st, &mut nh)?;
-        let naf = DevBuf::alloc(nl.size)?;
-        naf.upload(0, &nh, s0)?;
+        let naf = if cfg == VIT_L {
+            let nl = naf_layout(st)?;
+            let mut nh = vec![0u8; nl.size];
+            nl.pack(st, &mut nh)?;
+            let naf = DevBuf::alloc(nl.size)?;
+            naf.upload(0, &nh, s0)?;
+            Some((naf, nl))
+        } else {
+            None
+        };
         s0.sync()?;
-        let layouts = (0..LAYERS).map(|i| layer_layout(st, i)).collect::<Result<Vec<_>>>()?;
+        let layouts = (0..cfg.layers).map(|i| layer_layout(st, i, cfg)).collect::<Result<Vec<_>>>()?;
         let p = plan(&layouts, usize::MAX, 0);
         let layers = WeightSet::load("dinov3", st, layouts, p, threads)?;
-        Ok(Dino3 { globals, gl, layers: Some(layers), naf, nl })
+        Ok(Dino3 { cfg, globals, gl, layers: Some(layers), naf })
     }
 
     fn g(&self, key: &str) -> PM {
@@ -140,7 +200,8 @@ impl Dino3 {
     }
 
     fn n(&self, key: &str) -> PM {
-        self.naf.at(self.nl.off(key))
+        let (naf, nl) = self.naf.as_ref().expect("the NAF of DINOv3 ViT-L");
+        naf.at(nl.off(key))
     }
 
     /// `_dinov3_encode`: `rgb` is the composite already resized to `size` (f32 [size, size, 3] in [0, 1]).
@@ -173,16 +234,17 @@ impl Dino3 {
                 }
             }
         }
+        let Cfg { d, heads, mlp, layers: layers_n, gated, bf16 } = self.cfg;
         let pxd = DevBuf::alloc_async(px.len() * 4, st)?;
         pxd.upload(0, &f32_bytes(&px), st)?;
-        let x = DevBuf::alloc_async(l * D * 4, st)?;
-        crate::cuda::memcpy_d2d(x.ptr(), self.g("cls"), D * 4, st)?;
-        crate::cuda::memcpy_d2d(x.at(D * 4), self.g("reg"), 4 * D * 4, st)?;
-        k!(gpu_gemm(pxd.ptr(), kk as i64, self.g("pw"), kk as i64, x.at(PREFIX * D * 4), D as i64, self.g("pb"), np as i64, D as i64,
+        let x = DevBuf::alloc_async(l * d * 4, st)?;
+        crate::cuda::memcpy_d2d(x.ptr(), self.g("cls"), d * 4, st)?;
+        crate::cuda::memcpy_d2d(x.at(d * 4), self.g("reg"), 4 * d * 4, st)?;
+        k!(gpu_gemm(pxd.ptr(), kk as i64, self.g("pw"), kk as i64, x.at(PREFIX * d * 4), d as i64, self.g("pb"), np as i64, d as i64,
             kk as i64, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
         drop(pxd);
         if let Some(p) = probe.as_mut() {
-            p("embed", &x, l * D);
+            p("embed", &x, l * d);
         }
 
         // RoPE of the patches: 16 frequencies per axis, the first half of each head paired with the second
@@ -203,12 +265,12 @@ impl Dino3 {
         let rope_d = DevBuf::alloc_async(rope.len() * 4, st)?;
         rope_d.upload(0, &f32_bytes(&rope), st)?;
 
-        let h = DevBuf::alloc_async(l * D * 4, st)?;
-        let qkv = DevBuf::alloc_async(l * 3 * D * 4, st)?;
-        let attn = DevBuf::alloc_async(l * D * 4, st)?;
-        let y = DevBuf::alloc_async(l * MLP * 4, st)?;
+        let h = DevBuf::alloc_async(l * d * 4, st)?;
+        let qkv = DevBuf::alloc_async(l * 3 * d * 4, st)?;
+        let attn = DevBuf::alloc_async(l * d * 4, st)?;
+        let y = DevBuf::alloc_async(l * mlp * if gated { 2 } else { 1 } * 4, st)?;
         let scores = DevBuf::alloc_async(l * l * 4, st)?;
-        let (di, li) = (D as i64, l as i64);
+        let (di, li) = (d as i64, l as i64);
         let gemm = |a: PM, lda: usize, w: PM, ldb: usize, bias: PM, out: PM, ldd: usize, m: usize, n: usize, kd: usize, transb: i32|
             -> Result<()> {
             k!(gpu_gemm(a, lda as i64, w, ldb as i64, out, ldd as i64, bias, m as i64, n as i64, kd as i64, transb, DT_F32, DT_F32, 1.0,
@@ -216,51 +278,79 @@ impl Dino3 {
         };
         let nil = std::ptr::null_mut();
         let Some(layers) = self.layers.as_mut() else { bail!("the DINOv3 weights were freed") };
-        for i in 0..LAYERS {
+        // f16 staging and the f32 copy of one layer, for bf16 weights
+        let wide = DevBuf::alloc_async(if bf16 { layers.layouts.iter().map(|l| l.size).max().unwrap_or(0) * 3 } else { 1 }, st)?;
+        for i in 0..layers_n {
             let base = layers.acquire(i, st)?;
             let lay = layers.layouts[i].clone();
-            let w = |key: &str| off(base, lay.off(key));
+            let base = if bf16 {
+                // f16 values, as ComfyUI holds them, widened to f32: every offset doubles
+                let n = lay.size / 2;
+                k!(gpu_cast(DT_BF16, DT_F16, base, wide.ptr(), n as i64, s(st)))?;
+                k!(gpu_cast(DT_F16, DT_F32, wide.ptr(), off(wide.ptr(), n * 2), n as i64, s(st)))?;
+                off(wide.ptr(), n * 2)
+            } else {
+                base
+            };
+            let scale = if bf16 { 2 } else { 1 };
+            let w = |key: &str| off(base, lay.off(key) * scale);
             k!(gpu_prologue_rows_b(DT_F32, PRO_LN_AFFINE, x.ptr(), di, w("n1w"), w("n1b"), EPS, null(), null(), h.ptr(), di, l as i32,
-                D as i32, s(st)))?;
-            gemm(h.ptr(), D, w("qkv"), D, w("qkvb"), qkv.ptr(), 3 * D, l, 3 * D, D, 1)?;
+                d as i32, s(st)))?;
+            gemm(h.ptr(), d, w("qkv"), d, w("qkvb"), qkv.ptr(), 3 * d, l, 3 * d, d, 1)?;
             if i == 0 {
                 if let Some(p) = probe.as_mut() {
-                    p("dbg ln1", &h, l * D);
-                    p("dbg qkv", &qkv, l * 3 * D);
+                    p("dbg ln1", &h, l * d);
+                    p("dbg qkv", &qkv, l * 3 * d);
                 }
             }
             for part in 0..2 {
-                k!(gpu_rope_rows(off(qkv.ptr(), (PREFIX * 3 * D + part * D) * 4), (3 * D) as i64, rope_d.ptr(), np as i32, HEADS as i32,
+                k!(gpu_rope_rows(off(qkv.ptr(), (PREFIX * 3 * d + part * d) * 4), (3 * d) as i64, rope_d.ptr(), np as i32, heads as i32,
                     HD as i32, s(st)))?;
             }
-            for hh in 0..HEADS {
+            for hh in 0..heads {
                 let q = off(qkv.ptr(), hh * HD * 4);
-                gemm(q, 3 * D, off(q, D * 4), 3 * D, nil, scores.ptr(), l, l, l, HD, 1)?;
+                gemm(q, 3 * d, off(q, d * 4), 3 * d, nil, scores.ptr(), l, l, l, HD, 1)?;
                 k!(gpu_softmax_f32(scores.ptr(), l as i32, l as i32, 1.0 / (HD as f32).sqrt(), s(st)))?;
-                gemm(scores.ptr(), l, off(q, 2 * D * 4), 3 * D, nil, off(attn.ptr(), hh * HD * 4), D, l, HD, l, 0)?;
+                gemm(scores.ptr(), l, off(q, 2 * d * 4), 3 * d, nil, off(attn.ptr(), hh * HD * 4), d, l, HD, l, 0)?;
             }
             if i == 0 {
                 if let Some(p) = probe.as_mut() {
-                    p("dbg attn", &attn, l * D);
+                    p("dbg attn", &attn, l * d);
                 }
             }
-            gemm(attn.ptr(), D, w("o"), D, w("ob"), h.ptr(), D, l, D, D, 1)?;
-            k!(gpu_scaled_add_f32(x.ptr(), h.ptr(), w("ls1"), li, D as i32, s(st)))?;
+            gemm(attn.ptr(), d, w("o"), d, w("ob"), h.ptr(), d, l, d, d, 1)?;
+            k!(gpu_scaled_add_f32(x.ptr(), h.ptr(), w("ls1"), li, d as i32, s(st)))?;
             k!(gpu_prologue_rows_b(DT_F32, PRO_LN_AFFINE, x.ptr(), di, w("n2w"), w("n2b"), EPS, null(), null(), h.ptr(), di, l as i32,
-                D as i32, s(st)))?;
-            gemm(h.ptr(), D, w("up"), D, w("upb"), y.ptr(), MLP, l, MLP, D, 1)?;
-            k!(gpu_gelu_f32(y.ptr(), (l * MLP) as i64, 0, s(st)))?;
-            gemm(y.ptr(), MLP, w("down"), MLP, w("downb"), h.ptr(), D, l, D, MLP, 1)?;
-            k!(gpu_scaled_add_f32(x.ptr(), h.ptr(), w("ls2"), li, D as i32, s(st)))?;
+                d as i32, s(st)))?;
+            if gated {
+                gemm(h.ptr(), d, w("up"), d, w("upb"), y.ptr(), 2 * mlp, l, 2 * mlp, d, 1)?;
+                k!(gpu_prologue_rows(DT_F32, PRO_SWIGLU, y.ptr(), (2 * mlp) as i64, null(), 0, mlp as i64, null(), 0.0, null(),
+                    null(), y.ptr(), (2 * mlp) as i64, l as i32, mlp as i32, s(st)))?;
+                gemm(y.ptr(), 2 * mlp, w("down"), mlp, w("downb"), h.ptr(), d, l, d, mlp, 1)?;
+            } else {
+                gemm(h.ptr(), d, w("up"), d, w("upb"), y.ptr(), mlp, l, mlp, d, 1)?;
+                k!(gpu_gelu_f32(y.ptr(), (l * mlp) as i64, 0, s(st)))?;
+                gemm(y.ptr(), mlp, w("down"), mlp, w("downb"), h.ptr(), d, l, d, mlp, 1)?;
+            }
+            k!(gpu_scaled_add_f32(x.ptr(), h.ptr(), w("ls2"), li, d as i32, s(st)))?;
             layers.release(i, st)?;
             if let Some(p) = probe.as_mut() {
-                p(&format!("layer{i}"), &x, l * D);
+                p(&format!("layer{i}"), &x, l * d);
             }
         }
-        let out = DevBuf::alloc_async(l * D * 4, st)?;
-        k!(gpu_prologue_rows_b(DT_F32, PRO_LAYERNORM, x.ptr(), di, null(), null(), EPS, null(), null(), out.ptr(), di, l as i32, D as i32,
-            s(st)))?;
-        Ok(Tokens { buf: out, side })
+        let out = DevBuf::alloc_async(l * d * 4, st)?;
+        if gated {
+            // TripoSplat: the model's own norm, then a plain layer_norm on top (TripoSplatConditioning)
+            k!(gpu_prologue_rows_b(DT_F32, PRO_LN_AFFINE, x.ptr(), di, self.g("nw"), self.g("nb"), EPS, null(), null(), h.ptr(), di,
+                l as i32, d as i32, s(st)))?;
+            k!(gpu_prologue_rows_b(DT_F32, PRO_LAYERNORM, h.ptr(), di, null(), null(), EPS, null(), null(), out.ptr(), di, l as i32,
+                d as i32, s(st)))?;
+        } else {
+            // Pixal3D: skip_norm_elementwise
+            k!(gpu_prologue_rows_b(DT_F32, PRO_LAYERNORM, x.ptr(), di, null(), null(), EPS, null(), null(), out.ptr(), di, l as i32,
+                d as i32, s(st)))?;
+        }
+        Ok(Tokens { buf: out, side, d })
     }
 
     /// conv (1x1 or 3x3 reflect-padded) of an NHWC f32 image with f16-valued weights, rounded to f16.

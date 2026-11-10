@@ -1,14 +1,19 @@
 # Pixal3D for SwarmUI
 
-A SwarmUI extension that adds a **Pixal3D** tab: drop in a photo of an object, get a vertex-coloured 3D mesh (GLB) to
-orbit in the page and download. A photo without a transparent background is cut out first with BiRefNet.
+A SwarmUI extension that adds a **Pixal3D** tab: drop in a photo of an object, and get a 3D model to orbit in the page
+and download. Two models are offered:
 
-It runs Comfy-Org's Pixal3D example workflow as one ComfyUI node, `Pixal3DImageTo3D`, on one of SwarmUI's ComfyUI-type
-backends:
+* **Pixal3D** makes a vertex-coloured mesh (GLB).
+* **Idol** (Comfy-Org's fine-tune of TripoSplat) makes a 3D gaussian splat (PLY).
 
-* **comfy-rust** has the node natively (this repository's Rust engine).
-* A **ComfyUI self-start backend** gets it from this extension's `comfy_nodes` folder; restart the backend after
-  installing. It uses ComfyUI's own Pixal3D nodes, so ComfyUI must be new enough to have them.
+A photo without a transparent background is cut out first with BiRefNet.
+
+Each model runs its Comfy-Org example workflow as one ComfyUI node, `Pixal3DImageTo3D` or `TripoSplatImageToSplat`, on
+one of SwarmUI's ComfyUI-type backends:
+
+* **comfy-rust** has both nodes natively (this repository's Rust engine).
+* A **ComfyUI self-start backend** gets them from this extension's `comfy_nodes` folder; restart the backend after
+  installing. They use ComfyUI's own Pixal3D and TripoSplat nodes, so ComfyUI must be new enough to have them.
 
 ## Install
 
@@ -25,21 +30,35 @@ backends:
 | `VAE/` | `trellis_2_shape_vae_bf16.safetensors`, `trellis_2_texture_vae_bf16.safetensors` |
 | `background_removal/` | `birefnet.safetensors` from [Comfy-Org/BiRefNet](https://huggingface.co/Comfy-Org/BiRefNet), only for images without transparency |
 
+For Idol, download these from [Comfy-Org/Idol](https://huggingface.co/Comfy-Org/Idol):
+
+| Folder | File |
+|---|---|
+| `diffusion_models/` | `idol_fp16.safetensors` |
+| `clip_vision/` | `dino_v3_vit_h_bf16.safetensors` |
+| `VAE/` | `flux2-vae.safetensors` (the one MOSS Image and Flux 2 use), `idol_decoder_fp16.safetensors` |
+
+TripoSplat's own checkpoint uses the same nodes and slots, but only Idol has been tested.
+
 Subfolders are fine; the tab picks the files by name and lists them all under Advanced.
 
 ## Use
 
+* Choose **Model**: Pixal3D for a mesh, Idol for a gaussian splat. A model whose node no backend has is greyed out.
 * Drop an image on the tab, click it to choose a file, or paste one with Ctrl+V while the tab is showing.
 * A **transparent background** is the object's mask. An image without one has its background removed first, by
   ComfyUI's own `RemoveBackground` node with BiRefNet; **Remove background** is ticked for it on its own, and can be
   ticked for an image that has transparency too (its alpha is then ignored). The tab says so when no BiRefNet model is
   installed.
-* **Field of view** is the photo's horizontal field of view. 49 degrees suits most photos; ComfyUI's example estimates it
+* Pixal3D: **Field of view** is the photo's horizontal field of view. 49 degrees suits most photos; ComfyUI's example estimates it
   per image with MoGe, which this tab doesn't do.
-* **Resolution** is the voxel grid of the refined shape. 1024 takes about 40 s on an RTX 5070 with comfy-rust, and 1536
+* Pixal3D: **Resolution** is the voxel grid of the refined shape. 1024 takes about 40 s on an RTX 5070 with comfy-rust, and 1536
   about 110 s.
-* **Max triangles** simplifies the result (the full mesh at 1536 is about 16 million triangles); 0 keeps it all.
-* Models are saved to your output folder under `pixal3d/<date>/`.
+* Pixal3D: **Max triangles** simplifies the result (the full mesh at 1536 is about 16 million triangles); 0 keeps it all.
+* Idol: **Gaussians** sets the splat's density. 262144 matches the octree's point density; more oversamples the same
+  points, with no new detail. Steps (20) and CFG (3) are Comfy-Org's example settings, under Advanced.
+* Models are saved to your output folder under `pixal3d/<date>/`, meshes as `.glb` and splats as `.ply` (the standard 3D
+  gaussian splatting layout, which most splat viewers open).
 
 ## Files
 
@@ -47,13 +66,13 @@ Subfolders are fine; the tab picks the files by name and lists them all under Ad
 |---|---|
 | `Pixal3DExtension.cs` | Registers the tab's assets and API calls, and the ComfyUI node folder |
 | `Tabs/Text2Image/Pixal3D.html` | The tab |
-| `Assets/pixal3d.js`, `Assets/pixal3d.css` | Its logic, including a small WebGL2 GLB viewer, and styles |
-| `comfy_nodes/Pixal3D/` | The node for ComfyUI |
+| `Assets/pixal3d.js`, `Assets/pixal3d.css` | Its logic, including a small WebGL2 viewer of GLB meshes and PLY splats, and styles |
+| `comfy_nodes/Pixal3D/` | The nodes for ComfyUI |
 
-API calls: `Pixal3DListModels` reads the node's file lists, and the background removal models, from the first backend
-that has the node, and the websocket call `Pixal3DGenerateWS` claims a ComfyUI-type backend, runs the node (after
-`LoadBackgroundRemovalModel` and `RemoveBackground` when removing the background), streams progress and returns the
-saved GLB's path.
+API calls: `Pixal3DListModels` reads both nodes' file lists, and the background removal models, from the first backend
+that has either node, and the websocket call `Pixal3DGenerateWS` claims a ComfyUI-type backend, runs the chosen node
+(after `LoadBackgroundRemovalModel` and `RemoveBackground` when removing the background), streams progress and returns
+the saved model's path.
 
 ## License
 

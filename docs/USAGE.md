@@ -36,6 +36,8 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--remove-background image.png`, `--birefnet model.safetensors` | BiRefNet: the PNG with its background made transparent, written to `-o`; `--birefnet` is also the model `--pixal3d` cuts out with (default `background_removal/birefnet.safetensors`) |
 | `--birefnet-check ref.safetensors` | BiRefNet: the stage-by-stage comparison with `tools/birefnet_ref.py` |
 | `--fov`, `--resolution`, `--max-faces`, `--no-texture`, `--pixal3d-seeds a,b,c,d` | Pixal3D: the photo's field of view, the refine stage's voxel resolution, the triangle limit, a grey mesh, and the four samplers' seeds |
+| `--triposplat image.png` | TripoSplat / Idol: a gaussian splat (PLY) of the object in the PNG (its alpha is the mask; an opaque image is cut out with BiRefNet first), written to `-o`; `--dit`, `--clip-vision` and `--vae` pick the flow model, DINOv3 ViT-H and Flux 2 VAE, `--splat-decoder` the octree gaussian decoder; see [TripoSplat and Idol](MODELS.md#triposplat-and-idol) |
+| `--splat-steps`, `--splat-cfg`, `--gaussians`, `--decode-seed`, `--triposplat-check ref.safetensors` | TripoSplat: the sampler's steps (20) and CFG (3), the gaussians to decode (262144), the decode's point-sampling seed (default `--seed`), and the stage-by-stage comparison with `tools/triposplat_ref.py` |
 | `--clip-vision`, `--texture-vae`, `--pixal3d-check ref.safetensors` | Pixal3D's DINOv3 and texture VAE files (`--dit` and `--vae` are its diffusion model and shape VAE), and the stage-by-stage comparison with `tools/pixal3d_ref.py` |
 
 Set `PROFILE=1` to print the time of each stage per step and per decoded tile. Stages are timed with events on the compute

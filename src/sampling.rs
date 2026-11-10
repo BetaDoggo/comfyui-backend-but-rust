@@ -36,7 +36,7 @@ impl Mt19937 {
         y ^ (y >> 18)
     }
 
-    fn uniform_f32(&mut self) -> f32 {
+    pub(crate) fn uniform_f32(&mut self) -> f32 {
         ((self.next() & ((1 << 24) - 1)) as f64 * (1.0 / (1u64 << 24) as f64)) as f32
     }
 }
@@ -82,11 +82,28 @@ pub fn torch_randn(seed: u64, n: usize) -> Vec<f32> {
     d
 }
 
-/// Consecutive `torch.randn` calls on one generator, as ComfyUI draws noise for a nested latent.
+/// Consecutive `torch.randn` calls on one generator, as ComfyUI draws noise for a nested latent. Below 16 values torch
+/// draws each from `at::normal_distribution<double>`: Box-Muller on two 53-bit uniforms, caching the sine for the next.
 pub fn torch_randn_streams(seed: u64, sizes: &[usize]) -> Vec<Vec<f32>> {
     let mut g = Mt19937::new(seed);
+    let mut cached: Option<f64> = None;
     sizes.iter().map(|&n| {
-        assert!(n >= 16);
+        if n < 16 {
+            return (0..n).map(|_| {
+                if let Some(v) = cached.take() {
+                    return v as f32;
+                }
+                let mut uniform = || {
+                    let (hi, lo) = (g.next() as u64, g.next() as u64);
+                    ((hi << 32 | lo) & ((1u64 << 53) - 1)) as f64 * (1.0f64 / (1u64 << 53) as f64)
+                };
+                let (u1, u2) = (uniform(), uniform());
+                let r = (-2.0 * (-u2).ln_1p()).sqrt();
+                let theta = 2.0 * std::f64::consts::PI * u1;
+                cached = Some(r * theta.sin());
+                (r * theta.cos()) as f32
+            }).collect();
+        }
         let mut d: Vec<f32> = (0..n).map(|_| g.uniform_f32()).collect();
         let mut i = 0;
         while i + 16 <= n {

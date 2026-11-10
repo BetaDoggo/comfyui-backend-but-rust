@@ -43,11 +43,32 @@ extern "C" int64_t gpu_int8_attn_workspace(int b, int h, int hk, int lq, int lk)
     return gpu_int8_attn_workspace_d(b, h, hk, lq, lk, 128);
 }
 
+static int int8_attn(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk, int h, int hk,
+                     int D, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs, int64_t k_hs, int64_t v_bs,
+                     int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs, int64_t o_hs, float scale, int dt, void* stream);
+
 // q/k/v: bf16 [b, seq, heads, D] with element strides; o: bf16, same convention.
 extern "C" int gpu_int8_attn_d(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk,
                               int h, int hk, int D, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs,
                               int64_t k_hs, int64_t v_bs, int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs,
                               int64_t o_hs, float scale, void* stream) {
+    return int8_attn(q, k, v, o, ws, b, lq, lk, h, hk, D, q_bs, q_rs, q_hs, k_bs, k_rs, k_hs, v_bs, v_rs, v_hs, o_bs, o_rs, o_hs,
+                     scale, 2, stream);
+}
+
+// gpu_int8_attn_d with q/k/v/o in fp16 (TripoSplat).
+extern "C" int gpu_int8_attn_f16(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk,
+                                int h, int hk, int D, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs,
+                                int64_t k_hs, int64_t v_bs, int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs,
+                                int64_t o_hs, float scale, void* stream) {
+    return int8_attn(q, k, v, o, ws, b, lq, lk, h, hk, D, q_bs, q_rs, q_hs, k_bs, k_rs, k_hs, v_bs, v_rs, v_hs, o_bs, o_rs, o_hs,
+                     scale, 1, stream);
+}
+
+// dt: the sage dtype code of q/k/v and o, 1 fp16 or 2 bf16
+static int int8_attn(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk, int h, int hk,
+                     int D, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs, int64_t k_hs, int64_t v_bs,
+                     int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs, int64_t o_hs, float scale, int dt, void* stream) {
     try {
         cudaStream_t st = (cudaStream_t)stream;
         const int ck = cta_k_for(lk, D);
@@ -63,11 +84,11 @@ extern "C" int gpu_int8_attn_d(const void* q, const void* k, const void* v, void
         void* anchors = take((int64_t)b * hk * 4);
         // inputs are [B, H, L, D] views: (batch, head, seq) strides
         launch_quant_qk_per_thread_int8(q, qi, qs, k, ki, ks, b, h, lq, hk, lk, D, 128, 32, ck, ck, q_bs, q_hs, q_rs,
-                                        k_bs, k_hs, k_rs, 2, anchors, st);
-        launch_quant_v_int8_kernel(v, vi, vs, b, hk, lk, D, plk, v_bs, v_hs, v_rs, 2, st);
+                                        k_bs, k_hs, k_rs, dt, anchors, st);
+        launch_quant_v_int8_kernel(v, vi, vs, b, hk, lk, D, plk, v_bs, v_hs, v_rs, dt, st);
         const int64_t qh = (int64_t)lq * D, kh = (int64_t)lk * D, vh = (int64_t)D * plk;
         launch_sage_attn_kernel(qi, ki, vi, o, qs, ks, vs, nullptr, 0, 0, 0, 0, 0, ck, b, lq, lk, h, hk, D, h * qh, D,
-                                qh, hk * kh, D, kh, hk * vh, vh, plk, o_bs, (int)o_rs, o_hs, scale, 2, st, nullptr);
+                                qh, hk * kh, D, kh, hk * vh, vh, plk, o_bs, (int)o_rs, o_hs, scale, dt, st, nullptr);
     } catch (const std::exception& e) {
         fprintf(stderr, "int8 attention: %s\n", e.what());
         return -400;

@@ -57,6 +57,9 @@ const MODEL_FILES: &[&str] = &[
     "VAE/Pixal3D/trellis_2_shape_vae_bf16.safetensors",
     "VAE/Pixal3D/trellis_2_texture_vae_bf16.safetensors",
     "background_removal/birefnet.safetensors",
+    "diffusion_models/idol_fp16.safetensors",
+    "clip_vision/dino_v3_vit_h_bf16.safetensors",
+    "VAE/idol_decoder_fp16.safetensors",
 ];
 
 struct TestServer {
@@ -1457,6 +1460,53 @@ async fn pixal3d_image_to_3d_saves_a_glb() {
     assert!(required["unet_name"][0].as_array().unwrap().contains(&json!("Pixal3D/pixal3d_int8_convrot.safetensors")));
     assert_eq!(required["resolution"][1]["step"], 128);
     assert!(info["Pixal3DImageTo3D"]["input"]["optional"]["mask"].is_array());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn triposplat_image_to_splat_saves_a_ply() {
+    let s = TestServer::start(0).await;
+    let rgba: Vec<u8> = (0..64 * 64)
+        .flat_map(|i| {
+            let (x, y) = ((i % 64) as f32 - 31.5, (i / 64) as f32 - 31.5);
+            [40, 120, 200, if x * x + y * y < 400.0 { 255 } else { 0 }]
+        })
+        .collect();
+    let png = encode::png8(&ImageBatch::from_u8(1, 64, 64, 4, rgba), 0).unwrap();
+    // as the extension sends it: SwarmLoadImageB64's mask is 1 - alpha, so it is inverted first
+    let workflow = json!({
+        "1": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": base64::engine::general_purpose::STANDARD.encode(png) } },
+        "3": { "class_type": "InvertMask", "inputs": { "mask": ["1", 1] } },
+        "2": { "class_type": "TripoSplatImageToSplat", "inputs": {
+            "image": ["1", 0], "mask": ["3", 0],
+            "unet_name": "idol_fp16.safetensors", "clip_vision_name": "dino_v3_vit_h_bf16.safetensors",
+            "vae_name": "Flux/flux2-vae.safetensors", "decoder_name": "idol_decoder_fp16.safetensors",
+            "seed": 7, "steps": 20, "cfg": 3.0, "num_gaussians": 262144, "filename_prefix": "3d/idol"
+        } }
+    });
+    let r = run_like_swarm(&s, workflow.clone(), |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history_entry());
+    let saved = &r.history_entry()["outputs"]["2"]["3d"][0];
+    assert_eq!(saved["subfolder"], "3d");
+    let name = saved["filename"].as_str().unwrap();
+    assert!(name.ends_with(".ply"), "{name}");
+    let url = s.url(&format!("view?filename={name}&subfolder=3d&type=output"));
+    let bytes = s.http.get(url).send().await.unwrap().bytes().await.unwrap();
+    assert!(bytes.starts_with(b"ply
+format binary_little_endian 1.0
+"));
+
+    // the node's schema, as the extension reads it
+    let info = s.get("object_info/TripoSplatImageToSplat").await;
+    let required = &info["TripoSplatImageToSplat"]["input"]["required"];
+    assert!(required["unet_name"][0].as_array().unwrap().contains(&json!("idol_fp16.safetensors")));
+    assert!(required["decoder_name"][0].as_array().unwrap().contains(&json!("idol_decoder_fp16.safetensors")));
+    assert_eq!(required["num_gaussians"][1]["step"], 32);
+
+    // a count that isn't a multiple of 32 is refused, not rounded
+    let mut bad = workflow.clone();
+    bad["2"]["inputs"]["num_gaussians"] = json!(262_145);
+    let r = run_like_swarm(&s, bad, |_| {}).await;
+    assert_ne!(r.status(), "success");
 }
 
 #[tokio::test(flavor = "multi_thread")]

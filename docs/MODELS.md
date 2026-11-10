@@ -11,6 +11,7 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | MiniMax H3 | Video with audio | `res_multistep`, `simple` | `w6a8` only |
 | HyperFlow H3 Flash | Video with audio | `euler`, `hyperflow`, 6 steps | the int8 ConvRot diffusers folder only |
 | Pixal3D | A 3D mesh from one image | the example workflow's four `euler` samplers | int8 ConvRot (`pixal3d_int8_convrot`) only |
+| Idol (TripoSplat) | A 3D gaussian splat from one image | `dpmpp_2m`, `simple`, 20 steps, CFG 3 | Comfy-Org's fp16 files |
 
 ## Support matrix
 
@@ -501,3 +502,41 @@ copy (so the resizes before and after are checked too):
 The differences are the size of float16 rounding in ComfyUI. The image is always resized to 1024x1024, so a mask of an
 image with another aspect ratio comes from a squashed copy, as in ComfyUI. Not tested: other BiRefNet variants, and
 SwarmUI's own Remove Background parameter, which sends `SwarmRemBg` (rembg's U2-Net) and is still refused.
+
+## TripoSplat and Idol
+
+Idol, Comfy-Org's fine-tune of TripoSplat, turns one cut-out photo into a 3D gaussian splat: `--triposplat object.png`
+on the CLI, or the [Pixal3D extension's](../swarm%20backend/pixal3d-extension/README.md) tab in SwarmUI (Model: Idol),
+through the `TripoSplatImageToSplat` node. It follows Comfy-Org's Idol workflow: `TripoSplatPreprocessImage` (erode 1,
+1024), `TripoSplatConditioning` (DINOv3 ViT-H/16+ and the Flux 2 VAE), a `KSampler` over the nested latent (8192 shape
+tokens and a camera token) with `dpmpp_2m`, `simple`, 20 steps and CFG 3, and `VAEDecodeTripoSplat` with 262144
+gaussians. The splat is saved as `SaveGaussianSplat` writes a `.ply`. The workflow's live preview, its splat-to-mesh
+and video branches, and the separate decode seed aren't part of it: the decode takes the sampler's seed.
+
+```bash
+target/release/diffusion.exe --triposplat teapot.png --vae VAE/flux2-vae.safetensors -o teapot.ply
+```
+
+Warm files, on this machine, the teapot at the example's settings: the whole splat in 14.3 to 14.6 s, of which sampling
+is 11.3 to 11.6 s (40 model evaluations over 12,294 tokens). Through comfy-server's node over HTTP it took 15.6 s, and
+16.6 s for an opaque image cut out by BiRefNet first. ComfyUI ran the same workflow at 111 s/step in the headless
+reference script (`tools/triposplat_ref.py`, with comfy_aimdo on 12 GB); that isn't a tuned ComfyUI timing.
+
+Compared stage by stage with ComfyUI on its own inputs (`--triposplat-check` against the script's dump):
+
+| Stage | Difference |
+|---|---|
+| `TripoSplatPreprocessImage` | identical |
+| DINOv3 ViT-H tokens (float32) | 1.8e-6 relative |
+| Flux 2 VAE latent | 1.1e-2 relative, cosine 0.99994 |
+| First evaluation, uncond | 0.4% relative, cosine 0.99999 (the dump holds no cond evaluation) |
+| Sampled latent after 20 steps at CFG 3 | 9% relative, cosine 0.996 |
+| Gaussian decoder features, on ComfyUI's points | 2.6% relative, cosine 0.9997 |
+| Gaussians assembled from ComfyUI's features | identical positions and colours; scales and opacities within 1e-4; rotations the same up to sign |
+
+The model and decoder run in float16 like ComfyUI's, with int8 attention (there is no float16 or head-dim-64 FlashAttention
+build here to compare it with). Small differences grow over the 20 CFG steps, but the splats from the same seed look
+the same as ComfyUI's in the tab's viewer: shape, lid, spout, handle and glaze highlights. The octree's point sampling
+follows torch's CPU generator, and the token anchors torch's scrambled Sobol sequence, bit for bit.
+
+Not tested: TripoSplat's own checkpoint (only Idol was run), other image sizes than 1024, and running through SwarmUI.

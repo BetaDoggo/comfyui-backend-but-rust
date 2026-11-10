@@ -76,7 +76,8 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Krea 2 | Model Attention Backend | int8 and flash, per request. flash not yet run through the server. |
 | P1 | Pixal3D | Image to 3D | Real meshes from the CLI and through comfy-server's `Pixal3DImageTo3D` node: 40 s at 1024, 110 s at 1536. Each stage compared with ComfyUI. Not yet run through SwarmUI. |
 | P1 | Pixal3D | Background removal (BiRefNet) | Cut-outs from the CLI and through comfy-server's stock `LoadBackgroundRemovalModel` and `RemoveBackground` nodes, compared with ComfyUI. An opaque image went on through them to a mesh over HTTP. Not yet run through SwarmUI, and SwarmUI's own Remove Background parameter (`SwarmRemBg`, rembg) is still refused. |
-| P1 | Pixal3D | SwarmUI tab (the Pixal3D extension) | Compiles against SwarmUI. The tab and its viewer ran in a browser with the server calls stubbed, including the background removal choice, and the ComfyUI node ran headless on ComfyUI's code. Not yet run in SwarmUI. |
+| P1 | Idol (TripoSplat) | Image to gaussian splat | Real splats from the CLI and through comfy-server's `TripoSplatImageToSplat` node, from an alpha mask and from BiRefNet's: 14.4 s per splat. Each stage compared with ComfyUI; the splats look the same. TripoSplat's own checkpoint not tested. Not yet run through SwarmUI. |
+| P1 | Pixal3D | SwarmUI tab (the Pixal3D extension) | Compiles against SwarmUI. The tab and its viewer ran in a browser with the server calls stubbed, including the background removal choice and the Idol model with its splat viewer (ComfyUI's and this engine's splats rendered), and the ComfyUI node ran headless on ComfyUI's code. Not yet run in SwarmUI. |
 
 ## Plumbing
 

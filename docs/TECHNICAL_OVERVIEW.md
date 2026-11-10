@@ -89,6 +89,7 @@ the baked weights match ComfyUI's bit for bit. Sampling then runs the normal int
 | Qwen Image 2.1 | `src/qwen21.rs`, int8 ConvRot | Qwen3-VL 8B, `src/te.rs` and `src/vision.rs` | RGBA Wan 2.2 layout, `src/vae21.rs` |
 | MiniMax H3 | `src/h3.rs`, w6a8 | Qwen3-VL 32B, `src/h3te.rs` | Video and audio, `src/h3vae.rs` |
 | Pixal3D | `src/trellis.rs`, int8 ConvRot | DINOv3 ViT-L and NAF, `src/dino3.rs` | Sparse convolution shape and texture decoders, `src/trellis_vae.rs` |
+| TripoSplat / Idol | `src/triposplat.rs`, fp16 | DINOv3 ViT-H, `src/dino3.rs`, and the Flux 2 VAE's encoder | Octree gaussian decoder, `src/triposplat.rs` |
 
 Each model is written directly against its checkpoint, with no general layer or graph abstraction. That is what allows
 operations to be fused and work to be cached. For example, Anima's cross-attention k and v are computed once per prompt,
@@ -240,6 +241,19 @@ checkpoint: a Swin-L backbone whose window attention is one kernel per (window, 
 decoder whose deformable convolutions gather bilinear samples into columns for one GEMM. Convolutions are im2col plus
 a float32 GEMM in chunks, with BatchNorm folded into the weights when they load.
 
+### TripoSplat and Idol
+
+[`src/triposplat.rs`](../src/triposplat.rs) follows Comfy-Org's Idol workflow: `TripoSplatPreprocessImage` (Pillow's
+premultiplied RGBA Lanczos, as `comfy.utils.lanczos` gets it), DINOv3 ViT-H in f32 with its bf16 weights rounded to f16
+as ComfyUI holds them, the Flux 2 VAE's encoder, a `KSampler` over the nested latent (8192 shape tokens and a camera
+token, sampled as one vector), and the octree gaussian decoder. The flow model and the decoder run in fp16 like ComfyUI,
+with int8 attention in fp16 (`gpu_int8_attn_f16`), so neither needs another dtype's kernels; the fp16 element-wise ops
+are in `csrc/triposplat.cu`. RePo's rotary angles come from the hidden states at every block, so the rotation and the
+q/k RMS norms that follow it are one kernel. The context refiner doesn't depend on the timestep, so it runs once per cond
+and uncond rather than every evaluation. The token anchors are torch's scrambled Sobol sequence, reproduced bit for bit,
+and the octree's point sampling uses torch's CPU generator the same way. Assembling the gaussians from the decoder's
+features, and the PLY, run on the CPU.
+
 ### MiniMax H3
 
 Offloading is the lazy kind in [`src/offload.rs`](../src/offload.rs): nothing is read at load, reader threads fill up to four pinned staging buffers ahead of compute, taken only when a unit needs one and returned when the set parks. Pages read once leave the process right after, which took a H3 run's peak working set from 52 GB to 32 GB.
@@ -259,6 +273,7 @@ csrc/attn.cu        FlashAttention-2 forward wrapper (only the needed variants i
 csrc/attn_int8.cu   optional INT8 attention wrapper
 csrc/h3.cu          MiniMax H3 kernels
 csrc/trellis.cu     Pixal3D: per-head QK norm, voxel hashing and sparse-conv gathers, NAF attention, feature sampling
+csrc/triposplat.cu  TripoSplat: fp16 gated adds, RePo rotary + q/k RMS norm, SiLU gating
 csrc/birefnet.cu    BiRefNet: im2col, deformable-conv columns, Swin window gather and attention, bilinear resize
 csrc/wddm.cu        VRAM queries under Windows
 csrc/sparse_attn.cu block-sparse attention over the vendored Sol-Attn kernels, and the SLA top-k threshold

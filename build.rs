@@ -70,6 +70,7 @@ fn main() {
         Unit { src: csrc.join("gemm.cu"), fast_math: false, quiet: true },
         Unit { src: csrc.join("h3.cu"), fast_math: false, quiet: false },
         Unit { src: csrc.join("trellis.cu"), fast_math: false, quiet: false },
+        Unit { src: csrc.join("triposplat.cu"), fast_math: false, quiet: false },
         Unit { src: csrc.join("birefnet.cu"), fast_math: false, quiet: false },
         Unit { src: csrc.join("qwen21.cu"), fast_math: false, quiet: false },
         Unit { src: csrc.join("vendor/w6a8_requant.cu"), fast_math: false, quiet: true },

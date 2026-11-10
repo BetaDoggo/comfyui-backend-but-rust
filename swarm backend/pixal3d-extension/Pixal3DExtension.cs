@@ -13,14 +13,18 @@ using SwarmUI.WebAPI;
 
 namespace KreaRust.Pixal3D;
 
-/// <summary>A tab that turns a photo of an object into a 3D model with Pixal3D. It runs the <c>Pixal3DImageTo3D</c> node on a
-/// ComfyUI-type backend: comfy-rust has it natively, and ComfyUI self-start backends get it from <c>comfy_nodes</c>. An image
-/// without a transparent background is first cut out by ComfyUI's own <c>RemoveBackground</c> node and a BiRefNet model.</summary>
+/// <summary>A tab that turns a photo of an object into a 3D model: a mesh with Pixal3D (the <c>Pixal3DImageTo3D</c> node), or
+/// a gaussian splat with Idol or TripoSplat (<c>TripoSplatImageToSplat</c>). Either runs on a ComfyUI-type backend: comfy-rust
+/// has both natively, and ComfyUI self-start backends get them from <c>comfy_nodes</c>. An image without a transparent
+/// background is first cut out by ComfyUI's own <c>RemoveBackground</c> node and a BiRefNet model.</summary>
 public class Pixal3DExtension : Extension
 {
     public static PermInfo PermGenerate = Permissions.Register(new("pixal3d_generate", "Pixal3D Generate", "Allows generating 3D models in the Pixal3D tab.", PermissionDefault.USER, Permissions.GroupUser, PermSafetyLevel.SAFE));
 
     public const string NodeClass = "Pixal3DImageTo3D";
+
+    /// <summary>The gaussian splat node, for Idol and TripoSplat.</summary>
+    public const string SplatNodeClass = "TripoSplatImageToSplat";
 
     /// <summary>ComfyUI's background removal loader, which lists the BiRefNet files.</summary>
     public const string BackgroundLoaderClass = "LoadBackgroundRemovalModel";
@@ -28,7 +32,7 @@ public class Pixal3DExtension : Extension
     public override void OnPreInit()
     {
         ExtensionName = "Pixal3D";
-        Description = "Image to 3D with Pixal3D, in its own tab.";
+        Description = "Image to 3D with Pixal3D (mesh) or Idol (gaussian splat), in its own tab.";
         License = "GPL-3.0";
         ScriptFiles.Add("Assets/pixal3d.js");
         StyleSheetFiles.Add("Assets/pixal3d.css");
@@ -60,8 +64,10 @@ public class Pixal3DExtension : Extension
 
     static List<string> Options(JObject info, string input) => info?["input"]?["required"]?[input]?[0] is JArray a ? [.. a.Select(v => $"{v}")] : [];
 
-    [API.APIDescription("The model files the Pixal3D node can use, read from the first backend that has it.", """
+    [API.APIDescription("The model files the Pixal3D and splat nodes can use, read from the first backend that has either.", """
         "unet_name": ["Pixal3D/pixal3d_int8_convrot.safetensors", ...], "clip_vision_name": [...], "shape_vae_name": [...], "texture_vae_name": [...],
+        "splat_unet_name": ["idol_fp16.safetensors", ...], "splat_clip_vision_name": [...], "splat_vae_name": [...], "splat_decoder_name": [...],
+        "has_pixal3d": true, "has_splat": true,  // which nodes the backend has
         "bg_removal_name": ["birefnet.safetensors", ...]  // empty where the backend has no background removal
         """)]
     public static async Task<JObject> Pixal3DListModels(Session session)
@@ -69,7 +75,8 @@ public class Pixal3DExtension : Extension
         foreach (ComfyUIAPIAbstractBackend backend in Program.Backends.RunningBackendsOfType<ComfyUIAPIAbstractBackend>())
         {
             JObject info = await NodeInfo(backend);
-            if (info is not null)
+            JObject splat = await NodeInfo(backend, SplatNodeClass);
+            if (info is not null || splat is not null)
             {
                 return new JObject()
                 {
@@ -77,20 +84,28 @@ public class Pixal3DExtension : Extension
                     ["clip_vision_name"] = JArray.FromObject(Options(info, "clip_vision_name")),
                     ["shape_vae_name"] = JArray.FromObject(Options(info, "shape_vae_name")),
                     ["texture_vae_name"] = JArray.FromObject(Options(info, "texture_vae_name")),
+                    ["splat_unet_name"] = JArray.FromObject(Options(splat, "unet_name")),
+                    ["splat_clip_vision_name"] = JArray.FromObject(Options(splat, "clip_vision_name")),
+                    ["splat_vae_name"] = JArray.FromObject(Options(splat, "vae_name")),
+                    ["splat_decoder_name"] = JArray.FromObject(Options(splat, "decoder_name")),
+                    ["has_pixal3d"] = info is not null,
+                    ["has_splat"] = splat is not null,
                     ["bg_removal_name"] = JArray.FromObject(Options(await NodeInfo(backend, BackgroundLoaderClass), "bg_removal_name"))
                 };
             }
         }
-        return new JObject() { ["error"] = $"No running backend has the {NodeClass} node. Use the comfy-rust backend, or a ComfyUI self-start backend (restart it after installing this extension)." };
+        return new JObject() { ["error"] = $"No running backend has the {NodeClass} or {SplatNodeClass} node. Use the comfy-rust backend, or a ComfyUI self-start backend (restart it after installing this extension)." };
     }
 
     static readonly string[] IntInputs = ["seed", "resolution", "structure_steps", "shape_steps", "refine_steps", "texture_steps", "max_faces"];
     static readonly string[] FileInputs = ["unet_name", "clip_vision_name", "shape_vae_name", "texture_vae_name"];
+    static readonly string[] SplatIntInputs = ["steps", "num_gaussians"];
+    static readonly string[] SplatFileInputs = ["unet_name", "clip_vision_name", "vae_name", "decoder_name"];
 
-    [API.APIDescription("Turns an image into a 3D model: its transparent background is the mask, or with remove_background a BiRefNet model (bg_removal_name) cuts the object out first. Sends progress updates, then the saved GLB.", """
+    [API.APIDescription("Turns an image into a 3D model: a mesh with Pixal3D, or with model_type \"splat\" a gaussian splat with Idol or TripoSplat (from the splat_ inputs). Its transparent background is the mask, or with remove_background a BiRefNet model (bg_removal_name) cuts the object out first. Sends progress updates, then the saved GLB or PLY.", """
         "progress": 0.5  // repeated, 0 to 1
         "status": "..."  // repeated
-        "model": "View/local/pixal3d/2026-01-02/0304-42.glb"  // last
+        "model": "View/local/pixal3d/2026-01-02/0304-42.glb", "kind": "mesh"  // last; "kind": "splat" for a .ply
         """)]
     public static async Task<JObject> Pixal3DGenerateWS(WebSocket socket, Session session, JObject raw)
     {
@@ -103,33 +118,63 @@ public class Pixal3DExtension : Extension
         {
             return new JObject() { ["error"] = "No image given." };
         }
+        bool splat = $"{raw["model_type"]}" == "splat";
+        string nodeClass = splat ? SplatNodeClass : NodeClass;
+        string extension = splat ? "ply" : "glb";
         JObject inputs = new()
         {
             ["image"] = new JArray("1", 0),
             ["mask"] = new JArray("1", 1),
-            ["filename_prefix"] = "3d/pixal3d"
+            ["filename_prefix"] = splat ? "3d/idol" : "3d/pixal3d"
         };
-        foreach (string name in FileInputs)
+        if (raw.TryGetValue("seed", out JToken seedToken))
         {
-            inputs[name] = $"{raw[name]}";
+            inputs["seed"] = seedToken.Value<long>();
         }
-        foreach (string name in IntInputs)
+        if (splat)
         {
-            if (raw.TryGetValue(name, out JToken v))
+            // SwarmLoadImageB64's mask is 1 - alpha, and TripoSplat takes 1 on the object
+            inputs["mask"] = new JArray("5", 0);
+            foreach (string name in SplatFileInputs)
             {
-                inputs[name] = v.Value<long>();
+                inputs[name] = $"{raw[$"splat_{name}"]}";
+            }
+            foreach (string name in SplatIntInputs)
+            {
+                if (raw.TryGetValue($"splat_{name}", out JToken v))
+                {
+                    inputs[name] = v.Value<long>();
+                }
+            }
+            if (raw.TryGetValue("splat_cfg", out JToken cfg))
+            {
+                inputs["cfg"] = cfg.Value<double>();
             }
         }
-        foreach (string name in new[] { "fov", "cfg" })
+        else
         {
-            if (raw.TryGetValue(name, out JToken v))
+            foreach (string name in FileInputs)
             {
-                inputs[name] = v.Value<double>();
+                inputs[name] = $"{raw[name]}";
             }
-        }
-        if (raw.TryGetValue("texture", out JToken tex))
-        {
-            inputs["texture"] = tex.Value<bool>();
+            foreach (string name in IntInputs)
+            {
+                if (raw.TryGetValue(name, out JToken v))
+                {
+                    inputs[name] = v.Value<long>();
+                }
+            }
+            foreach (string name in new[] { "fov", "cfg" })
+            {
+                if (raw.TryGetValue(name, out JToken v))
+                {
+                    inputs[name] = v.Value<double>();
+                }
+            }
+            if (raw.TryGetValue("texture", out JToken tex))
+            {
+                inputs["texture"] = tex.Value<bool>();
+            }
         }
         long seed = inputs.Value<long?>("seed") ?? -1;
         if (seed < 0)
@@ -146,8 +191,12 @@ public class Pixal3DExtension : Extension
         JObject workflow = new()
         {
             ["1"] = new JObject() { ["class_type"] = "SwarmLoadImageB64", ["inputs"] = new JObject() { ["image_base64"] = image } },
-            ["2"] = new JObject() { ["class_type"] = NodeClass, ["inputs"] = inputs }
+            ["2"] = new JObject() { ["class_type"] = nodeClass, ["inputs"] = inputs }
         };
+        if (splat)
+        {
+            workflow["5"] = new JObject() { ["class_type"] = "InvertMask", ["inputs"] = new JObject() { ["mask"] = new JArray("1", 1) } };
+        }
         if (removeBackground)
         {
             // ComfyUI's own nodes: the model's foreground mask replaces the (all-opaque) image's alpha
@@ -181,9 +230,9 @@ public class Pixal3DExtension : Extension
         await send(new JObject() { ["status"] = "Waiting for a backend..." });
         using T2IBackendAccess access = await Program.Backends.GetNextT2IBackend(TimeSpan.FromMinutes(30), null, null, b => b.Backend is ComfyUIAPIAbstractBackend, session, null, cancel.Token);
         ComfyUIAPIAbstractBackend backend = access.Backend as ComfyUIAPIAbstractBackend;
-        if (await NodeInfo(backend) is null)
+        if (await NodeInfo(backend, nodeClass) is null)
         {
-            return new JObject() { ["error"] = $"The backend at {backend.APIAddress} has no {NodeClass} node." };
+            return new JObject() { ["error"] = $"The backend at {backend.APIAddress} has no {nodeClass} node." };
         }
         if (removeBackground && await NodeInfo(backend, BackgroundLoaderClass) is null)
         {
@@ -255,20 +304,20 @@ public class Pixal3DExtension : Extension
         {
             return new JObject() { ["error"] = "The backend finished without a model." };
         }
-        byte[] glb = await Http.GetByteArrayAsync($"{backend.APIAddress}/view?filename={Uri.EscapeDataString($"{saved["filename"]}")}&subfolder={Uri.EscapeDataString($"{saved["subfolder"]}")}&type=output");
+        byte[] model = await Http.GetByteArrayAsync($"{backend.APIAddress}/view?filename={Uri.EscapeDataString($"{saved["filename"]}")}&subfolder={Uri.EscapeDataString($"{saved["subfolder"]}")}&type=output");
         await Http.PostAsync($"{backend.APIAddress}/history", new StringContent(new JObject() { ["delete"] = new JArray(promptId) }.ToString()));
 
         string rel = $"pixal3d/{DateTime.Now:yyyy-MM-dd}/{DateTime.Now:HHmmss}-{seed}";
         string full = Path.GetFullPath(UserImageHistoryHelper.GetRealPathFor(session.User, $"{session.User.OutputDirectory}/{rel}"));
         Directory.CreateDirectory(Path.GetDirectoryName(full));
         int n = 0;
-        while (File.Exists($"{full}{(n == 0 ? "" : $"-{n}")}.glb"))
+        while (File.Exists($"{full}{(n == 0 ? "" : $"-{n}")}.{extension}"))
         {
             n++;
         }
         string suffix = n == 0 ? "" : $"-{n}";
-        await File.WriteAllBytesAsync($"{full}{suffix}.glb", glb);
+        await File.WriteAllBytesAsync($"{full}{suffix}.{extension}", model);
         string prefix = Program.ServerSettings.Paths.AppendUserNameToOutputPath ? $"View/{session.User.UserID}/" : "Output/";
-        return new JObject() { ["model"] = $"{prefix}{rel}{suffix}.glb", ["seed"] = seed, ["bytes"] = glb.Length };
+        return new JObject() { ["model"] = $"{prefix}{rel}{suffix}.{extension}", ["kind"] = splat ? "splat" : "mesh", ["seed"] = seed, ["bytes"] = model.Length };
     }
 }

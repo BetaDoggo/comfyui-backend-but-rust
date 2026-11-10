@@ -2,7 +2,7 @@
 
 A ComfyUI-API-compatible server that SwarmUI can use as a normal **"ComfyUI API By URL"** backend,
 fronting a native Rust generation engine. It ships with two engines: **native**, which really generates Krea 2
-Turbo, Anima, MOSS Image and Qwen Image 2.1 images, MiniMax H3 video and Pixal3D meshes with the Rust + CUDA pipelines
+Turbo, Anima, MOSS Image and Qwen Image 2.1 images, MiniMax H3 video, Pixal3D meshes and Idol gaussian splats with the Rust + CUDA pipelines
 in the parent repository, and the
 **mock engine**, which returns placeholder images/video/audio of the correct shapes for every other model family.
 
@@ -158,6 +158,10 @@ The `Pixal3DImageTo3D` node runs Pixal3D's whole example workflow as one engine 
 GLB under `output/3d/`, reported as `{"3d": [...]}` in the history like ComfyUI's `SaveGLB`. `/view` serves it as
 `model/gltf-binary`. It isn't a stock ComfyUI node: the [Pixal3D extension](pixal3d-extension/README.md) sends it from
 its own SwarmUI tab, and brings a Python version for ComfyUI backends. The mock engine answers it with a tetrahedron.
+
+The `TripoSplatImageToSplat` node does the same for Comfy-Org's Idol workflow (TripoSplat and its fine-tune Idol), as one
+call to `Engine::image_to_splat`, and saves the gaussian splat as a 3DGS `.ply` under `output/3d/`, reported the same way.
+`/view` serves it as `application/octet-stream`. The mock engine answers it with four gaussians.
 
 An image without transparency is cut out first by ComfyUI's own `LoadBackgroundRemovalModel` and `RemoveBackground` nodes
 (`Engine::background_mask`), which read BiRefNet from the `background_removal` model folder and give the foreground mask

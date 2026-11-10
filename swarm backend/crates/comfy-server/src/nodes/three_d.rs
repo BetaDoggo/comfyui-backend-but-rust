@@ -1,8 +1,9 @@
-//! Image to 3D: the Pixal3D extension's node, which runs ComfyUI's Pixal3D example workflow as one engine call
-//! and saves the mesh like `SaveGLB`.
+//! Image to 3D: the Pixal3D extension's nodes. `Pixal3DImageTo3D` runs ComfyUI's Pixal3D example workflow as one
+//! engine call and saves the mesh like `SaveGLB`; `TripoSplatImageToSplat` runs the Idol example workflow and saves the
+//! gaussian splat like `SaveGaussianSplat` (`.ply`).
 
 use serde_json::json;
-use swarm_engine_api::{ImageTo3DRequest, ModelFolder};
+use swarm_engine_api::{ImageTo3DRequest, ImageToSplatRequest, ModelFolder};
 
 use super::loaders::resolve;
 use super::output::output_slot;
@@ -65,6 +66,50 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
             let (target, subfolder, stem, counter) = output_slot(&ctx.env.output_dir, i.string("filename_prefix")?)?;
             let filename = format!("{stem}_{counter:05}_.glb");
             std::fs::write(target.join(&filename), glb).map_err(anyhow::Error::from)?;
+            Ok(NodeOutput { values: Vec::new(), ui: Some(json!({ "3d": [{ "filename": filename, "subfolder": subfolder, "type": "output" }] })) })
+        },
+    );
+    r.add(
+        env,
+        |env| {
+            let vaes = env.models.list(ModelFolder::Vae);
+            NodeSchema::new("TripoSplatImageToSplat", "TripoSplat / Idol Image to Splat", "3d")
+                .describe("Comfy-Org's Idol example workflow in one node: TripoSplatPreprocessImage, TripoSplatConditioning (DINOv3 ViT-H and the Flux 2 VAE), the sampler and VAEDecodeTripoSplat. Saves a 3D gaussian splat (.ply). Works for TripoSplat and Idol.")
+                .input(link("image", "IMAGE"))
+                .input(combo("unet_name", &env.models.list(ModelFolder::DiffusionModels)))
+                .input(combo("clip_vision_name", &env.models.list(ModelFolder::ClipVision)))
+                .input(combo("vae_name", &vaes).tooltip("The Flux 2 VAE, which encodes the image."))
+                .input(combo("decoder_name", &vaes).tooltip("TripoSplat's octree gaussian decoder."))
+                .input(int("seed", 0, 0, MAX_SEED))
+                .input(int("steps", 20, 1, 200))
+                .input(float("cfg", 3.0, 1.0, 30.0, 0.1))
+                .input(int_step("num_gaussians", 262_144, 32_768, 1_048_576, 32).tooltip("Gaussians to decode. 262144 matches the octree's point density; more oversamples the same points."))
+                .input(string("filename_prefix", "3d/idol", false))
+                .input(link("mask", "MASK").optional().tooltip("The object's mask, 1 on the object. Without one, the image's alpha."))
+                .output_node()
+        },
+        |i, ctx| {
+            let file = |name: &str, folder: ModelFolder| resolve(ctx.env, &[folder], i.string(name)?);
+            let positive = |name: &str| -> Result<u32, super::NodeError> { Ok(i.int(name)?.clamp(0, u32::MAX as i64) as u32) };
+            let req = ImageToSplatRequest {
+                diffusion_model: file("unet_name", ModelFolder::DiffusionModels)?,
+                clip_vision: file("clip_vision_name", ModelFolder::ClipVision)?,
+                vae: file("vae_name", ModelFolder::Vae)?,
+                decoder: file("decoder_name", ModelFolder::Vae)?,
+                image: i.image("image")?.clone(),
+                mask: i.opt_mask("mask")?.cloned(),
+                seed: i.int("seed")? as u64,
+                steps: positive("steps")?,
+                cfg: i.float("cfg")?,
+                num_gaussians: positive("num_gaussians")?,
+            };
+            if req.image.count == 0 {
+                return Err(input_err("TripoSplatImageToSplat needs an image"));
+            }
+            let ply = ctx.engine.image_to_splat(&req, ctx)?;
+            let (target, subfolder, stem, counter) = output_slot(&ctx.env.output_dir, i.string("filename_prefix")?)?;
+            let filename = format!("{stem}_{counter:05}_.ply");
+            std::fs::write(target.join(&filename), ply).map_err(anyhow::Error::from)?;
             Ok(NodeOutput { values: Vec::new(), ui: Some(json!({ "3d": [{ "filename": filename, "subfolder": subfolder, "type": "output" }] })) })
         },
     );

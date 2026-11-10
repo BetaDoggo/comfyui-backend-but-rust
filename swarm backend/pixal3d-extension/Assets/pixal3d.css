@@ -127,3 +127,7 @@
 .pixal3d-history button.pixal3d-current {
     outline: 2px solid var(--emphasis, #4af);
 }
+.pixal3d-root[data-kind="mesh"] .pixal3d-splat-only,
+.pixal3d-root[data-kind="splat"] .pixal3d-mesh-only {
+    display: none;
+}

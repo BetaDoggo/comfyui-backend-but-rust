@@ -1,4 +1,4 @@
-<div class="pixal3d-root">
+<div class="pixal3d-root" id="pixal3d_root" data-kind="mesh">
     <div class="pixal3d-side">
         <div class="pixal3d-drop" id="pixal3d_drop" title="Drop an image here, or click to choose one">
             <img id="pixal3d_image_preview" class="pixal3d-image-preview" alt="" style="display:none" />
@@ -7,16 +7,35 @@
         </div>
         <div id="pixal3d_image_note" class="pixal3d-note"></div>
         <div class="pixal3d-fields">
+            <label>Model <select id="pixal3d_model_type" title="Pixal3D makes a vertex-coloured mesh; Idol (or TripoSplat) makes a 3D gaussian splat">
+                <option value="mesh">Pixal3D (mesh)</option><option value="splat">Idol (gaussian splat)</option>
+            </select></label>
             <label>Seed <input type="number" id="pixal3d_seed" value="-1" title="-1 for a random seed" /></label>
+            <div class="pixal3d-splat-only">
+                <label>Gaussians <select id="pixal3d_splat_num_gaussians" title="Splat density: 262144 matches the octree's point density; more oversamples the same points">
+                    <option>65536</option><option>131072</option><option selected>262144</option><option>524288</option><option>1048576</option>
+                </select></label>
+            </div>
+            <div class="pixal3d-mesh-only">
             <label>Field of view <input type="number" id="pixal3d_fov" value="49.13" min="1" max="170" step="0.01" title="Horizontal field of view of the photo, in degrees" /></label>
             <label>Resolution <select id="pixal3d_resolution" title="Voxel resolution of the refined shape: higher is finer and slower">
                 <option>1024</option><option>1152</option><option>1280</option><option>1408</option><option selected>1536</option><option>1664</option><option>1792</option><option>1920</option><option>2048</option>
             </select></label>
             <label>Max triangles <input type="number" id="pixal3d_max_faces" value="700000" min="0" step="10000" title="Simplify the mesh to at most this many triangles; 0 keeps every one" /></label>
             <label class="pixal3d-check"><input type="checkbox" id="pixal3d_texture" checked /> Texture</label>
+            </div>
             <label class="pixal3d-check" title="Cut the object out with a BiRefNet model. On by default for images without a transparent background"><input type="checkbox" id="pixal3d_remove_background" /> Remove background</label>
             <details class="pixal3d-advanced">
                 <summary>Advanced</summary>
+                <div class="pixal3d-splat-only">
+                <label>Steps <input type="number" id="pixal3d_splat_steps" value="20" min="1" max="200" /></label>
+                <label>CFG <input type="number" id="pixal3d_splat_cfg" value="3" min="1" max="30" step="0.1" /></label>
+                <label>Diffusion model <select id="pixal3d_splat_unet_name"></select></label>
+                <label>DINOv3 <select id="pixal3d_splat_clip_vision_name"></select></label>
+                <label>Flux 2 VAE <select id="pixal3d_splat_vae_name"></select></label>
+                <label>Splat decoder <select id="pixal3d_splat_decoder_name"></select></label>
+                </div>
+                <div class="pixal3d-mesh-only">
                 <label>CFG <input type="number" id="pixal3d_cfg" value="7.5" min="1" max="30" step="0.1" title="CFG of the geometry samplers; the texture sampler runs at 1" /></label>
                 <label>Structure steps <input type="number" id="pixal3d_structure_steps" value="12" min="1" max="200" /></label>
                 <label>Shape steps <input type="number" id="pixal3d_shape_steps" value="20" min="1" max="200" /></label>
@@ -26,6 +45,7 @@
                 <label>DINOv3 <select id="pixal3d_clip_vision_name"></select></label>
                 <label>Shape VAE <select id="pixal3d_shape_vae_name"></select></label>
                 <label>Texture VAE <select id="pixal3d_texture_vae_name"></select></label>
+                </div>
                 <label>Background removal <select id="pixal3d_bg_removal_name" title="A BiRefNet model from the background_removal folder"></select></label>
                 <button class="basic-button" id="pixal3d_refresh_models">Refresh models</button>
             </details>
@@ -41,7 +61,7 @@
         <canvas id="pixal3d_canvas" class="pixal3d-canvas"></canvas>
         <div class="pixal3d-viewer-bar">
             <span id="pixal3d_model_info" class="pixal3d-hint">No model yet. Drag to orbit, scroll to zoom, right-drag to pan.</span>
-            <a id="pixal3d_download" class="basic-button" style="display:none" download>Download GLB</a>
+            <a id="pixal3d_download" class="basic-button" style="display:none" download>Download</a>
         </div>
         <div id="pixal3d_history" class="pixal3d-history"></div>
     </div>

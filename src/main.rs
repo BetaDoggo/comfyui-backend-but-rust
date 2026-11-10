@@ -190,6 +190,28 @@ struct Args {
     /// the first three, --seed + 1 for the texture)
     #[arg(long)]
     pixal3d_seeds: Option<String>,
+    /// TripoSplat / Idol: an RGBA PNG whose alpha masks the object, turned into a gaussian splat written to --output
+    /// (PLY). --dit, --clip-vision and --vae pick the flow model, DINOv3 ViT-H and Flux 2 VAE
+    #[arg(long)]
+    triposplat: Option<PathBuf>,
+    /// TripoSplat: the octree gaussian decoder
+    #[arg(long)]
+    splat_decoder: Option<PathBuf>,
+    /// TripoSplat: sampler steps
+    #[arg(long, default_value_t = 20)]
+    splat_steps: usize,
+    /// TripoSplat: CFG
+    #[arg(long, default_value_t = 3.0)]
+    splat_cfg: f64,
+    /// TripoSplat: gaussians to decode, a multiple of 32 from 32768 to 1048576
+    #[arg(long, default_value_t = 262_144)]
+    gaussians: usize,
+    /// TripoSplat: seed of the octree's point sampler (default: --seed)
+    #[arg(long)]
+    decode_seed: Option<u64>,
+    /// TripoSplat: compare every stage with a dump of tools/triposplat_ref.py instead of generating
+    #[arg(long)]
+    triposplat_check: Option<PathBuf>,
     /// Background removal: write the PNG with its background made transparent to --output (needs the BiRefNet file)
     #[arg(long)]
     remove_background: Option<PathBuf>,
@@ -273,6 +295,9 @@ const PIXAL_DIT: &str = "diffusion_models/Pixal3D/pixal3d_int8_convrot.safetenso
 const PIXAL_DINO: &str = "clip_vision/dino_v3_L_naf_fp32.safetensors";
 const PIXAL_SHAPE_VAE: &str = "VAE/Pixal3D/trellis_2_shape_vae_bf16.safetensors";
 const PIXAL_TEX_VAE: &str = "VAE/Pixal3D/trellis_2_texture_vae_bf16.safetensors";
+const SPLAT_DIT: &str = "diffusion_models/idol_fp16.safetensors";
+const SPLAT_DINO: &str = "clip_vision/dino_v3_vit_h_bf16.safetensors";
+const SPLAT_DECODER: &str = "VAE/idol_decoder_fp16.safetensors";
 
 impl Args {
     fn sampling(&self, default: &str, ms: ModelSampling, seed: u64, latent: (usize, usize)) -> Result<pipeline::Sampling> {
@@ -735,8 +760,50 @@ fn run_pixal3d(args: &Args, image: &Path) -> Result<()> {
     Ok(())
 }
 
+fn run_triposplat(args: &Args, image: &Path) -> Result<()> {
+    diffusion::cuda::init(0)?;
+    let paths = diffusion::triposplat::Paths {
+        dit: args.model(&args.dit, SPLAT_DIT),
+        dino: args.model(&args.clip_vision, SPLAT_DINO),
+        flux_vae: args.model(&args.vae, MOSS_VAE),
+        decoder: args.model(&args.splat_decoder, SPLAT_DECODER),
+    };
+    let (mut rgba, w, h) = read_rgba(image)?;
+    let mut p = diffusion::triposplat::Params::example(args.seed);
+    (p.steps, p.cfg, p.num_gaussians) = (args.splat_steps, args.splat_cfg, args.gaussians);
+    p.decode_seed = args.decode_seed.unwrap_or(args.seed);
+    if let Some(r) = &args.triposplat_check {
+        return diffusion::triposplat::check(&paths, &rgba, w, h, r, &p, args.threads);
+    }
+    let mut last = String::new();
+    let mut progress = |stage: &str, _i: usize, _n: usize| -> Result<()> {
+        if stage != last {
+            eprintln!("[triposplat] {stage}");
+            last = stage.to_string();
+        }
+        Ok(())
+    };
+    if rgba.chunks_exact(4).all(|px| px[3] == 255) {
+        let model = args.model(&args.birefnet, BIREFNET);
+        if !model.exists() {
+            bail!("{} has no transparency: give --triposplat an RGBA PNG, or --birefnet the background removal model ({} not found)", image.display(), model.display());
+        }
+        eprintln!("[triposplat] removing the background with {}", model.display());
+        rgba = cut_out(&model, &rgba, w, h)?;
+    }
+    let (rgb, mask) = diffusion::pixal3d::split_rgba(&rgba);
+    let splat = diffusion::triposplat::run(&paths, &rgb, &mask, w, h, &p, args.threads, &mut progress)?;
+    let out = if args.out.extension().is_some_and(|e| e == "ply") { args.out.clone() } else { args.out.with_extension("ply") };
+    std::fs::write(&out, diffusion::triposplat::ply(&splat))?;
+    eprintln!("saved {}", out.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(image) = &args.triposplat {
+        return run_triposplat(&args, image);
+    }
     if let Some(image) = &args.pixal3d {
         return run_pixal3d(&args, image);
     }

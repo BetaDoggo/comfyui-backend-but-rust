@@ -438,3 +438,28 @@ pub struct ImageTo3DRequest {
     /// Simplify the mesh to at most this many triangles; 0 keeps the full one.
     pub max_faces: u32,
 }
+
+/// `TripoSplatImageToSplat` (the gaussian splat node of the Pixal3D SwarmUI extension): an image and its object mask to
+/// a 3D gaussian splat, following Comfy-Org's Idol example workflow from `TripoSplatPreprocessImage` to
+/// `VAEDecodeTripoSplat`. Works for TripoSplat and its fine-tune Idol.
+#[derive(Clone, Debug)]
+pub struct ImageToSplatRequest {
+    /// `diffusion_models`: a TripoSplat or Idol flow model
+    pub diffusion_model: ModelFile,
+    /// `clip_vision`: DINOv3 ViT-H/16+
+    pub clip_vision: ModelFile,
+    /// `vae`: the Flux 2 VAE, which encodes the image
+    pub vae: ModelFile,
+    /// `vae`: the octree gaussian decoder
+    pub decoder: ModelFile,
+    /// The first image of the batch is used.
+    pub image: ImageBatch,
+    /// The object's mask, 1 on the object, as `TripoSplatPreprocessImage` takes it. Without one the image's alpha.
+    pub mask: Option<Mask>,
+    /// Seed of the sampler and of the decode's point sampling.
+    pub seed: u64,
+    pub steps: u32,
+    pub cfg: f64,
+    /// Gaussians to decode: a multiple of 32 from 32768 to 1048576.
+    pub num_gaussians: u32,
+}

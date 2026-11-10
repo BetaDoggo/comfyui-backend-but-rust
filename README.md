@@ -11,7 +11,7 @@
 A Rust and CUDA backend that speaks ComfyUI's API and replaces the ComfyUI features SwarmUI uses most, so SwarmUI can
 generate without Python or ComfyUI. The goal is speed first.
 
-It really generates with five image and video model families and one image-to-3D model, from specific quantized checkpoints only:
+It really generates with five image and video model families and two image-to-3D models, from specific checkpoints only:
 
 | Family | Generates | 1024x1024 sampling here | ComfyUI |
 |---|---|---|---|
@@ -22,6 +22,7 @@ It really generates with five image and video model families and one image-to-3D
 | MiniMax H3 | Text to video with audio | 0.24 s/step, 5 frames at 512x512 | 1.59 s/step |
 | HyperFlow H3 Flash | Text to video with audio, 6 steps | 0.49 s/step, 22 frames at 512x512 | needs custom nodes, not timed |
 | Pixal3D | Image to a vertex-coloured 3D mesh (GLB), cutting the object out first with BiRefNet | 40 s per mesh at resolution 1024, 110 s at 1536 | not timed |
+| Idol (TripoSplat) | Image to a 3D gaussian splat (PLY), cutting the object out first with BiRefNet | 14.4 s per splat, 0.57 s/step at CFG 3 | 111 s/step headless here, not tuned |
 
 All of them take every ComfyUI sampler and scheduler, and all of them take LoRAs. Init images, inpainting and refiners work on the image
 models. ControlNet and every other model family don't work yet. The server accepts far more of SwarmUI's features than that, but they only reach a
@@ -66,6 +67,10 @@ and `VAE/Pixal3D/trellis_2_shape_vae_bf16.safetensors` with `trellis_2_texture_v
 [Comfy-Org/Pixal3D](https://huggingface.co/Comfy-Org/Pixal3D). An image without a transparent background is cut out
 first by BiRefNet, `background_removal/birefnet.safetensors` from [Comfy-Org/BiRefNet](https://huggingface.co/Comfy-Org/BiRefNet).
 In SwarmUI it runs from its own tab, the [Pixal3D extension](swarm%20backend/pixal3d-extension/README.md).
+
+Idol uses `diffusion_models/idol_fp16.safetensors`, `clip_vision/dino_v3_vit_h_bf16.safetensors`, and
+`VAE/idol_decoder_fp16.safetensors` with the Flux 2 VAE (`flux2-vae.safetensors`, anywhere in `VAE/`), all from
+[Comfy-Org/Idol](https://huggingface.co/Comfy-Org/Idol). It runs from the same tab, as its second model.
 
 ### Generate from the command line
 

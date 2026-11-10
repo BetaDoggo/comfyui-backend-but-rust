@@ -1,13 +1,15 @@
 //! MiniMax H3 text encoder: Qwen3-VL 32B language model cut to 50 layers (nvfp4 AWQ weights), fp32
 //! activations like ComfyUI's full_precision_mm path. Conditioning is the hidden state after the
 //! last layer, with no final norm. Weights are decoded to f32 for each use, so the encoder only
-//! needs VRAM for one layer and streams the rest.
+//! needs VRAM for one layer and streams the rest. Pictures come from the vision tower in the same file: their tokens
+//! take the place of `<|image_pad|>` ids, with MRoPE positions and DeepStack features, as in Qwen3-VL.
 
-use crate::cuda::{DevBuf, Stream};
+use crate::cuda::{memcpy_d2d, DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_F32, P, PM, PRO_RMS, PRO_SWIGLU};
 use crate::offload::{Layout, Plan, WeightSet};
 use crate::st::SafeTensors;
 use crate::te::{position_ids, rope_table};
+use crate::vision::Embeds;
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,6 +23,10 @@ const QKV: usize = (HQ + 2 * HK) * HD; // 10240
 const LAYERS: usize = 50;
 const EPS: f32 = 1e-6;
 const PRE: &str = "model.";
+pub const VISION_START: u32 = 151652;
+pub const VISION_END: u32 = 151653;
+/// stands for one picture's tokens in the ids
+pub const IMAGE_PAD: u32 = 151655;
 const MODULES: [&str; 7] = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"];
 
 pub struct TextEncoder {
@@ -66,14 +72,28 @@ impl TextEncoder {
         Ok(TextEncoder { st, ws, scales })
     }
 
-    /// ids -> hidden states f32 [len, 5120].
-    pub fn encode(&mut self, ids: &[u32], st: &Stream) -> Result<DevBuf> {
+    /// The ids with each `IMAGE_PAD` grown to its picture's tokens.
+    pub fn expand(ids: &[u32], images: &[&Embeds]) -> Vec<u32> {
+        let mut out = Vec::with_capacity(ids.len());
+        let mut next = images.iter();
+        for &t in ids {
+            let n = if t == IMAGE_PAD { next.next().map_or(1, |e| e.tokens) } else { 1 };
+            out.extend(std::iter::repeat_n(t, n));
+        }
+        out
+    }
+
+    /// ids -> hidden states f32 [len, 5120], `images` in place of the `IMAGE_PAD` ids in order, where len counts each
+    /// picture's tokens ([`Self::expand`]).
+    pub fn encode(&mut self, ids: &[u32], images: &[&Embeds], st: &Stream) -> Result<DevBuf> {
+        let pads: Vec<usize> = ids.iter().enumerate().filter(|(_, &t)| t == IMAGE_PAD).map(|(i, _)| i).collect();
+        anyhow::ensure!(pads.len() == images.len(), "{} pictures for {} image pads", images.len(), pads.len());
         self.ws.replan(Plan { resident: 0, slots: 2 })?;
-        let l = ids.len();
+        let l0 = ids.len();
         let emb = self.st.bytes(&format!("{PRE}embed_tokens.weight"))?;
         let emb_s = self.st.bytes(&format!("{PRE}embed_tokens.weight_scale"))?;
-        let mut q = Vec::with_capacity(l * D);
-        let mut sc = Vec::with_capacity(l * 4);
+        let mut q = Vec::with_capacity(l0 * D);
+        let mut sc = Vec::with_capacity(l0 * 4);
         for &t in ids {
             let t = t as usize;
             q.extend_from_slice(&emb[t * D..(t + 1) * D]);
@@ -83,10 +103,42 @@ impl TextEncoder {
         q_d.upload(0, &q, st)?;
         let s_d = DevBuf::alloc_async(sc.len(), st)?;
         s_d.upload(0, &sc, st)?;
-        let x = DevBuf::alloc_async(l * D * 4, st)?;
+        let text = DevBuf::alloc_async(l0 * D * 4, st)?;
         // the table is plain int8 here: no ConvRot, unlike the other encoders
-        k!(gpu_dequant_i8(q_d.ptr(), s_d.ptr(), x.ptr(), l as i64, D as i64, s(st)))?;
-        let rope = rope_table(&position_ids(l, &[]));
+        k!(gpu_dequant_i8(q_d.ptr(), s_d.ptr(), text.ptr(), l0 as i64, D as i64, s(st)))?;
+        // the pictures' tokens in place of their pads, and where they went
+        let mut spans = Vec::with_capacity(images.len());
+        let mut grown = 0;
+        for (&pad, img) in pads.iter().zip(images) {
+            spans.push((pad + grown, img.tokens, img.grid));
+            grown += img.tokens - 1;
+        }
+        let l = l0 + grown;
+        let row = D * 4;
+        let x = DevBuf::alloc_async(l * row, st)?;
+        let (mut from, mut to) = (0, 0);
+        for (&pad, img) in pads.iter().zip(images) {
+            memcpy_d2d(off(x.ptr(), to * row), off(text.ptr(), from * row), (pad - from) * row, st)?;
+            to += pad - from;
+            memcpy_d2d(off(x.ptr(), to * row), img.merged.ptr(), img.tokens * row, st)?;
+            to += img.tokens;
+            from = pad + 1;
+        }
+        memcpy_d2d(off(x.ptr(), to * row), off(text.ptr(), from * row), (l0 - from) * row, st)?;
+        drop(text);
+        // DeepStack: features added at the picture tokens after each of the first layers
+        let mut deepstack = Vec::new();
+        if !images.is_empty() {
+            for d in 0..images[0].deepstack.len() {
+                let b = DevBuf::alloc_async(l * row, st)?;
+                b.upload(0, &vec![0u8; l * row], st)?;
+                for (&(start, size, _), img) in spans.iter().zip(images) {
+                    memcpy_d2d(off(b.ptr(), start * row), img.deepstack[d].ptr(), size * row, st)?;
+                }
+                deepstack.push(b);
+            }
+        }
+        let rope = rope_table(&position_ids(l, &spans));
         let rope_d = DevBuf::alloc_async(rope.len() * 4, st)?;
         rope_d.upload(0, &crate::st::f32_bytes(&rope), st)?;
 
@@ -122,6 +174,10 @@ impl TextEncoder {
             k!(gpu_prologue_rows(DT_F32, PRO_SWIGLU, gu.ptr(), (2 * FF) as i64, null(), 0, FF as i64, null(), 0.0, null(), null(), act.ptr(), FF as i64, m, FF as i32, s(st)))?;
             lin(act.ptr(), 6, w("pre_d") as P, D, FF, xp, D, 1.0)?;
             self.ws.release(i, st)?;
+            if let Some(d) = deepstack.get(i) {
+                let (p, c) = ([xp as P, d.ptr() as P], [1.0f32, 1.0]);
+                k!(gpu_lincomb(xp, (l * D) as i64, 2, p.as_ptr(), c.as_ptr(), s(st)))?;
+            }
         }
         st.sync()?;
         self.ws.replan(Plan { resident: 0, slots: 0 })?;

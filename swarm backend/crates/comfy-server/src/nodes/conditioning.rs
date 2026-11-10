@@ -2,7 +2,8 @@
 
 use swarm_engine_api::requests::minimax_h3;
 use swarm_engine_api::{
-    AddonKind, CondMask, GligenBox, MiniMaxKeyframe, MiniMaxReferences, ParsedPrompt, SwarmTextEncode, TextEncodeMode, TextEncodeRequest, VaeEncodeRequest,
+    AddonKind, CondMask, EmptyLatentKind, EmptyLatentRequest, GligenBox, MiniMaxKeyframe, MiniMaxRefStyle, MiniMaxReferences, ParsedPrompt, SwarmTextEncode,
+    TextEncodeMode, TextEncodeRequest, VaeEncodeRequest,
 };
 
 use super::{NodeOutput, NodeRegistry};
@@ -23,6 +24,58 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
         |i, ctx| {
             let req = TextEncodeRequest { text_encoder: i.clip("clip")?.clone(), mode: TextEncodeMode::Plain { text: i.string("text")?.to_string() } };
             Ok(NodeOutput::one(Value::Conditioning(ctx.engine.encode_text(&req)?)))
+        },
+    );
+
+    r.add(
+        env,
+        |_| {
+            NodeSchema::new("MiniMaxH3ImageConditioning", "MiniMax H3 Image Conditioning", "model/conditioning/minimax")
+                .describe("Text-to-image, or with images an edit guided by them. The prompt refers to them as <Picture 1>, <Picture 2>, ...")
+                .input(link("clip", "CLIP"))
+                .input(link("vae", "VAE").optional().null_default())
+                .input(string("prompt", "", true).no_default())
+                .input(int_step("width", 0, 0, MAX_RESOLUTION, 32).tooltip("0 uses the width of image_1 after its reference scaling, or 2048 without images"))
+                .input(int_step("height", 0, 0, MAX_RESOLUTION, 32).tooltip("0 uses the height of image_1 after its reference scaling, or 2048 without images"))
+                .input(autogrow("images", "image_", 0, 100, link("image", "IMAGE")).optional())
+                .output("CONDITIONING", "positive")
+                .output("LATENT", "LATENT")
+        },
+        |i, ctx| {
+            // image_1 is the picture to edit; the engine sizes them all
+            let mut images: Vec<_> = i.group("images").into_iter().filter_map(|(n, v)| if let Value::Image(b) = v { Some((n, b.slice(0, 1))) } else { None }).collect();
+            images.sort_by_key(|(n, _)| *n);
+            // 0 is image_1's size after its VAE scaling, or the model's 2048 without images
+            let size = images.first().map_or((2048, 2048), |(_, b)| minimax_h3::size_short_edge(b.width, b.height, 1024, 2048));
+            let (width, height) = match (i.uint("width")?, i.uint("height")?) {
+                (w, h) => (if w == 0 { size.0 } else { w }, if h == 0 { size.1 } else { h }),
+            };
+            if width % 32 != 0 || height % 32 != 0 {
+                return Err(super::input_err(format!("MiniMax-H3-Image: {width}x{height} isn't a multiple of 32")));
+            }
+            let text = i.string("prompt")?.to_string();
+            let mode = if images.is_empty() {
+                TextEncodeMode::Plain { text }
+            } else {
+                let refs = MiniMaxReferences {
+                    style: MiniMaxRefStyle::Image,
+                    vae: i.opt_vae("vae")?.cloned(),
+                    audio_vae: None,
+                    width,
+                    height,
+                    length: 1,
+                    ref_image_size: "match".into(),
+                    images: images.into_iter().map(|(_, b)| b).collect(),
+                    videos: Vec::new(),
+                    audios: Vec::new(),
+                };
+                TextEncodeMode::MiniMax { text, refs }
+            };
+            let req = TextEncodeRequest { text_encoder: i.clip("clip")?.clone(), mode };
+            let cond = ctx.engine.encode_text(&req)?;
+            let mut latent = ctx.engine.empty_latent(&EmptyLatentRequest { kind: EmptyLatentKind::MiniMaxH3Image { width, height }, batch_size: 1 })?;
+            latent.empty = true;
+            Ok(NodeOutput::values(vec![Value::Conditioning(cond), Value::Latent(latent)]))
         },
     );
 
@@ -225,8 +278,9 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
                 })
                 .collect();
             Ok(NodeOutput::one(Value::MiniMaxRefs(MiniMaxReferences {
-                vae: i.vae("vae")?.clone(),
-                audio_vae: i.vae("audio_vae")?.clone(),
+                style: MiniMaxRefStyle::Video,
+                vae: Some(i.vae("vae")?.clone()),
+                audio_vae: Some(i.vae("audio_vae")?.clone()),
                 width: i.uint("width")?,
                 height: i.uint("height")?,
                 length: i.uint("length")?,

@@ -43,11 +43,51 @@ pub fn forces_uncond(sampler: &str) -> bool {
     sampler.ends_with("_cfg_pp")
 }
 
-/// `ModelSamplingDiscreteFlow` with multiplier 1, or `ModelSamplingFlux`.
+/// `ModelSamplingDiscreteFlow` with multiplier 1, `ModelSamplingFlux`, or a flow model whose timestep walks an explicit
+/// sigma grid.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ModelSampling {
     Flow { shift: f64 },
     Flux { shift: f64 },
+    Grid(SigmaGrid),
+}
+
+/// `MiniMaxH3ImageModelSampling`: sigma is linear in the grid index, so the stock schedulers at the grid's step count
+/// land on the grid points.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SigmaGrid {
+    /// ascending, from sigma 0 to 1
+    points: [f32; 17],
+    /// intervals: `points[..=n]` are used
+    n: usize,
+}
+
+impl SigmaGrid {
+    /// A grid from its sigmas in either order, at most 16 intervals.
+    pub fn new(sigmas: &[f32]) -> Result<Self> {
+        let n = sigmas.len().saturating_sub(1);
+        if !(1..=16).contains(&n) {
+            bail!("a sigma grid of {} points (2 to 17 are supported)", sigmas.len());
+        }
+        let mut points = [0f32; 17];
+        points[..=n].copy_from_slice(sigmas);
+        if points[0] > points[n] {
+            points[..=n].reverse();
+        }
+        Ok(SigmaGrid { points, n })
+    }
+
+    /// The grid's sigmas from 1 down to 0.
+    pub fn descending(&self) -> V {
+        self.points[..=self.n].iter().rev().copied().collect()
+    }
+
+    fn sigma(&self, t: f32) -> f32 {
+        let pos = t.clamp(0.0, 1.0) * self.n as f32;
+        let i = (pos.floor() as usize).min(self.n - 1);
+        let (a, b) = (self.points[i], self.points[i + 1]);
+        a + (pos - i as f32) * (b - a)
+    }
 }
 
 fn flux_shift(mu: f64, t: f32) -> f32 {
@@ -61,6 +101,7 @@ impl ModelSampling {
             ModelSampling::Flow { shift } if shift == 1.0 => t,
             ModelSampling::Flow { shift } => shift as f32 * t / (1.0 + (shift - 1.0) as f32 * t),
             ModelSampling::Flux { shift } => flux_shift(shift, t),
+            ModelSampling::Grid(g) => g.sigma(t),
         }
     }
 
@@ -70,7 +111,7 @@ impl ModelSampling {
     }
 
     fn table_len(self) -> usize {
-        if matches!(self, ModelSampling::Flow { .. }) { 1000 } else { 10000 }
+        if matches!(self, ModelSampling::Flux { .. }) { 10000 } else { 1000 }
     }
 
     /// `model_sampling.sigma_min`: the table's first entry.
@@ -86,10 +127,14 @@ impl ModelSampling {
             return 0.0;
         }
         let t = 1.0 - percent;
+        if let ModelSampling::Grid(g) = self {
+            return g.sigma(t as f32);
+        }
         (match self {
             ModelSampling::Flow { shift } if shift == 1.0 => t,
             ModelSampling::Flow { shift } => shift * t / (1.0 + (shift - 1.0) * t),
             ModelSampling::Flux { shift } => shift.exp() / (shift.exp() + (1.0 / t - 1.0)),
+            ModelSampling::Grid(_) => unreachable!(),
         }) as f32
     }
 }

@@ -96,6 +96,9 @@ struct Args {
     /// Run MiniMax H3 (text to video with audio); --dit and --te then default to its files
     #[arg(long)]
     h3: bool,
+    /// Run MiniMax-H3-Image (text to image); --dit, --te and --vae then default to its files, --steps to its 6
+    #[arg(long)]
+    h3_image: bool,
     /// MiniMax H3: block-sparse attention, "sol" (Sol-Attn's adaptive threshold) or "sla" (top-k), as ComfyUI's
     /// BlockSparseAttention node
     #[arg(long)]
@@ -138,7 +141,8 @@ struct Args {
     #[arg(long)]
     lora: Vec<String>,
     /// Krea 2: PNG for the text encoder, at its own size; SwarmUI scales these to about 384x384. Anima with
-    /// --snapref: a picture of the character (repeatable)
+    /// --snapref: a picture of the character. MiniMax-H3-Image: a picture to edit or refer to, <Picture n> in the
+    /// prompt. MiniMax H3: a reference picture, <Picture n>, scaled to the clip's area (repeatable)
     #[arg(long)]
     image: Vec<PathBuf>,
     /// Anima: a SnapRef weight file, the reference adapter that takes --image as pictures of the character
@@ -159,6 +163,12 @@ struct Args {
     /// Krea 2: PNG for a reference latent, for edit LoRAs (repeatable)
     #[arg(long)]
     ref_image: Vec<PathBuf>,
+    /// MiniMax H3: PNG anchored as the clip's first frame, stretched to its size
+    #[arg(long)]
+    first_frame: Option<PathBuf>,
+    /// MiniMax H3: PNG anchored as the clip's last frame, stretched to its size
+    #[arg(long)]
+    last_frame: Option<PathBuf>,
     /// Krea 2: how reference latents are used, "index" or "index_timestep_zero"
     #[arg(long, default_value = "index")]
     ref_method: String,
@@ -499,11 +509,88 @@ const H3_DIT: &str = "Stable-diffusion/minimax_h3_fl2va_pruned_w6a8.safetensors"
 const H3_TE: &str = "clip/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors";
 const H3_VAE: &str = "VAE/MiniMaxH3/minimax_h3_video_vae_int8_convrot.safetensors";
 const H3_AUDIO_VAE: &str = "VAE/MiniMaxH3/minimax_h3_audio_vae_fp32.safetensors";
+const H3_IMAGE_DIT: &str = "Stable-diffusion/minimax_h3_image_pruned_int8_convrot.safetensors";
+const H3_IMAGE_VAE: &str = "VAE/MiniMaxH3/minimax_h3_image_vae_fp16.safetensors";
+
+/// MiniMax-H3-Image: one image from H3's transformer without its audio, on the sigma grid its heads were distilled on.
+fn run_h3_image(args: &Args, load: pipeline::LoadOptions, dit: PathBuf, te: PathBuf) -> Result<()> {
+    use diffusion::h3;
+    let t_all = Instant::now();
+    if args.width % 32 != 0 || args.height % 32 != 0 {
+        bail!("MiniMax-H3-Image needs a width and height in multiples of 32");
+    }
+    let grid: Vec<f32> = h3::image_sigmas(&st::SafeTensors::open(&dit)?)?.iter().map(|g| *g as f32).collect();
+    let ms = ModelSampling::Grid(diffusion::samplers::SigmaGrid::new(&grid)?);
+    let shape = h3::Shape::image(args.width, args.height);
+    let mut gen = pipeline::Generator::new(&load)?;
+    let t0 = Instant::now();
+    gen.ensure_h3(&dit)?;
+    gen.ensure_h3_te(&te)?;
+    eprintln!("MiniMax-H3-Image ready in {:.1}s", t0.elapsed().as_secs_f64());
+    let (model, _) = parse_loras(args)?;
+    gen.set_loras(&model)?;
+    let noise = match &args.ref_noise {
+        Some(p) => st::SafeTensors::open(p)?.f32_vec("noise", false)?,
+        None => diffusion::sampling::torch_randn(args.seed, shape.video_len()),
+    };
+    // the heads are distilled for their grid's steps: --steps left at its default takes them
+    let steps = if args.steps == 8 { grid.len() - 1 } else { args.steps };
+    let sampling = pipeline::Sampling::new(args.sampler.as_deref().unwrap_or("euler"), &args.scheduler, ms, steps, args.cfg, args.seed, (args.width / 16, args.height / 16))?;
+    // MiniMaxH3ImageConditioning's edit pictures, through the image VAE
+    let images = args.image.iter().map(|p| read_png(p)).collect::<Result<Vec<_>>>()?;
+    let conds = pipeline::H3Conds {
+        label: "Picture {}: ".into(),
+        pictures: pipeline::image_pictures(&images, true),
+        vae: Some(args.model(&args.vae, H3_IMAGE_VAE)),
+        keyframes: Vec::new(),
+    };
+    let r = pipeline::H3Request {
+        prompt: Prompt::text(&args.prompt),
+        negative: Prompt::text(&args.negative),
+        shape,
+        sampling,
+        shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO),
+        noise,
+        sparse: None,
+        windows: None,
+        conds,
+        seed: args.seed,
+    };
+    let mut dump = pipeline::Dump::new();
+    let t0 = Instant::now();
+    let (latent, _) = gen.sample_h3(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
+    eprintln!("sampled in {:.2}s", t0.elapsed().as_secs_f64());
+    dump.insert("samples".into(), ("F32".into(), vec![latent.len()], st::f32_bytes(&latent).to_vec()));
+    let t1 = Instant::now();
+    let img = gen.decode_h3(&args.model(&args.vae, H3_IMAGE_VAE), &latent, shape, 1)?;
+    eprintln!("decoded in {:.2}s", t1.elapsed().as_secs_f64());
+    let (h, w) = (img.h, img.w);
+    let mut rgb = vec![0u8; h * w * 3];
+    let mut hwc = vec![0f32; h * w * 3];
+    for c in 0..3 {
+        for i in 0..h * w {
+            let v = img.data[c * h * w + i];
+            hwc[i * 3 + c] = v;
+            rgb[i * 3 + c] = (v * 255.0).round() as u8;
+        }
+    }
+    dump.insert("image".into(), ("F32".into(), vec![1, h, w, 3], st::f32_bytes(&hwc).to_vec()));
+    if let Some(d) = &args.dump {
+        write_safetensors(d, &dump)?;
+    }
+    std::fs::write(&args.out, pipeline::encode_png(w, h, &rgb)?)?;
+    eprintln!("saved {} (seed {}), {:.1}s in all", args.out.display(), args.seed, t_all.elapsed().as_secs_f64());
+    Ok(())
+}
 
 fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     use diffusion::h3;
     let t_all = Instant::now();
     let (dit, te) = (args.model(&args.dit, H3_DIT), args.model(&args.te, H3_TE));
+    if args.h3_image || h3::is_h3_image(|k| st::SafeTensors::open(&dit).is_ok_and(|f| f.has(k))) {
+        let dit = if args.h3_image { args.model(&args.dit, H3_IMAGE_DIT) } else { dit };
+        return run_h3_image(args, load, dit, te);
+    }
     let frames = h3::align_frames(args.frames);
     if args.width % 32 != 0 || args.height % 32 != 0 {
         bail!("MiniMax H3 needs a width and height in multiples of 32");
@@ -555,7 +642,35 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         extra_tokens: args.sparse_extra_tokens,
         verbose: true,
     });
-    let r = pipeline::H3Request { prompt: Prompt::text(&args.prompt), negative: Prompt::text(&args.negative), shape, sampling, shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO), noise, sparse, windows };
+    // reference pictures as MiniMaxH3ReferenceToVideo's "match" sizes them, and keyframes as SwarmUI's node stretches
+    // them, all through the video VAE
+    let vae = args.model(&args.vae, H3_VAE);
+    let images = args.image.iter().map(|p| read_png(p)).collect::<Result<Vec<_>>>()?;
+    let mut keyframes = Vec::new();
+    for (path, index) in [(&args.first_frame, 0), (&args.last_frame, frames - 1)] {
+        if let Some(p) = path {
+            let img = pipeline::h3_resize(&read_png(p)?, args.width, args.height);
+            keyframes.push((index, gen.encode_h3(&vae, &img)?));
+        }
+    }
+    let conds = pipeline::H3Conds {
+        label: "<Picture {}>: ".into(),
+        pictures: pipeline::ref2va_pictures(&images, (args.width, args.height), false, true),
+        vae: Some(vae),
+        keyframes,
+    };
+    let r = pipeline::H3Request {
+        prompt: Prompt::text(&args.prompt),
+        negative: Prompt::text(&args.negative),
+        shape,
+        sampling,
+        shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO),
+        noise,
+        sparse,
+        windows,
+        conds,
+        seed: args.seed,
+    };
     let mut dump = pipeline::Dump::new();
     let t0 = Instant::now();
     let (latent, _) = gen.sample_h3(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
@@ -841,7 +956,7 @@ fn main() -> Result<()> {
         int8_attn,
         comfy_memory: (!args.legacy_offload).then(|| args.reserve_vram.unwrap_or(diffusion::comfy_memory::DEFAULT_HEADROOM_MB)),
     };
-    if args.h3 {
+    if args.h3 || args.h3_image {
         return run_h3(&args, load);
     }
     if args.anima {

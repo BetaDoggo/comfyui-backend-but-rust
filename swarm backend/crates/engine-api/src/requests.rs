@@ -149,6 +149,8 @@ pub enum TextEncodeMode {
     /// `SwarmTextEncodeAdvanced`. Krea 2 always uses this; Anima/H3 use it when the prompt
     /// has tags or parentheses, and H3 always uses it when references are attached.
     Swarm(SwarmTextEncode),
+    /// `MiniMaxH3ImageConditioning`: a plain prompt with pictures shown before it (MiniMax-H3-Image edits).
+    MiniMax { text: String, refs: MiniMaxReferences },
 }
 
 #[derive(Clone, Debug)]
@@ -189,13 +191,25 @@ pub struct ClipVisionEncodeRequest {
     pub crop: String,
 }
 
-/// Output of `SwarmMiniMaxH3CollectReferences`. The server collects the raw media;
-/// encoding them (video VAE for images/videos, audio VAE for audio, Qwen3-VL for the
-/// prompt side) is the engine's job inside `encode_text`.
+/// How MiniMax H3 reference pictures are sized and labelled for the text encoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MiniMaxRefStyle {
+    /// `SwarmMiniMaxH3CollectReferences` (`MiniMaxH3ReferenceToVideo`): `<Picture i>: `, sized by `ref_image_size`,
+    /// the same copy for the text encoder and the VAE.
+    Video,
+    /// `MiniMaxH3ImageConditioning`: `Picture i: `, a 1024 short edge for the text encoder and 1024 to 2048 for the VAE.
+    Image,
+}
+
+/// Output of `SwarmMiniMaxH3CollectReferences`, or the pictures of `MiniMaxH3ImageConditioning`. The server collects
+/// the raw media; encoding them (the H3 VAE for images/videos, audio VAE for audio, Qwen3-VL for the prompt side) is
+/// the engine's job, from `encode_text` on.
 #[derive(Clone, Debug)]
 pub struct MiniMaxReferences {
-    pub vae: VaeHandle,
-    pub audio_vae: VaeHandle,
+    pub style: MiniMaxRefStyle,
+    /// Without it the pictures only condition the text encoder.
+    pub vae: Option<VaeHandle>,
+    pub audio_vae: Option<VaeHandle>,
     pub width: u32,
     pub height: u32,
     /// Generation length in frames (refs videos get cropped to this).
@@ -229,12 +243,22 @@ pub enum EmptyLatentKind {
     Flux2 { width: u32, height: u32 },
     /// `SwarmEmptyMiniMaxH3LatentAV`: joint video `[1, 24, T, H/16, W/16]` + audio `[1, 32, 2, A]`.
     MiniMaxH3AudioVideo { width: u32, height: u32, length: u32 },
+    /// `MiniMaxH3ImageConditioning`'s latent for MiniMax-H3-Image: one frame, `[1, 24, 1, H/16, W/16]`.
+    MiniMaxH3Image { width: u32, height: u32 },
 }
 
 /// MiniMax H3 temporal layout helpers, matching `SwarmModels.py::temporal_shape`.
 pub mod minimax_h3 {
     pub const FPS: u32 = 24;
     pub const AUDIO_LATENT_FPS: f64 = 40.0;
+
+    /// `_size_short_edge`: an aspect-kept size whose short edge is within [low, high], each side rounded to 32.
+    pub fn size_short_edge(width: u32, height: u32, low: u32, high: u32) -> (u32, u32) {
+        let short = width.min(height) as f64;
+        let scale = short.clamp(low as f64, high as f64) / short;
+        let side = |v: u32| ((v as f64 * scale / 32.0).round_ties_even() as u32 * 32).max(32);
+        (side(width), side(height))
+    }
 
     /// Rounds a frame count up to the `17k + 5` grid (1 and 2 frames are special-cased).
     pub fn align_frames(n: u32) -> u32 {

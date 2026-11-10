@@ -15,7 +15,7 @@ mod moss;
 mod qwen21;
 
 pub use anima::{AnimaRequest, SnapRefRequest};
-pub use h3::{h3_tokens, H3Request};
+pub use h3::{h3_presentation, h3_tokens, image_pictures, ref2va_pictures, ref2va_size, resize as h3_resize, size_short_edge, H3Conds, H3Picture, H3Request};
 pub use krea::KreaRequest;
 pub use moss::{moss_tokens, MossRequest};
 pub use qwen21::Qwen21Request;

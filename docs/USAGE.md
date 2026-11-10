@@ -21,9 +21,10 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--slots N` | cast buffers for streamed blocks (default 2, ComfyUI's offload streams); the streaming ring's slots with `--legacy-offload` |
 | `--legacy-offload` | plan VRAM residency from estimates, the older offloading, instead of the default [ComfyUI memory management](TECHNICAL_OVERVIEW.md#comfyui-memory-management) |
 | `--resident-blocks N` | with `--legacy-offload`: force the number of diffusion blocks kept in VRAM |
-| `--anima`, `--moss`, `--qwen21`, `--h3` | pick the model family; the default is Krea 2 |
+| `--anima`, `--moss`, `--qwen21`, `--h3`, `--h3-image` | pick the model family; the default is Krea 2. `--h3` with a MiniMax-H3-Image `--dit` runs it too; see [MiniMax-H3-Image](MODELS.md#minimax-h3-image) |
 | `--snapref file`, `--image a.png`, `--snapref-mode`, `--snapref-strength`, `--snapref-fidelity`, `--snapref-megapixels` | Anima: the SnapRef reference adapter with pictures of a character (repeatable `--image`); see [SnapRef](MODELS.md#snapref) |
 | `--image a.png` | Qwen Image 2.1 edits: each image goes to the text encoder and into the sequence as a reference latent (repeatable); the prompt then says what to change, as in `put the boat from picture 2 on the sea in picture 1`. Output is RGBA |
+| `--image a.png`, `--first-frame a.png`, `--last-frame b.png` | MiniMax H3: reference pictures, `<Picture n>` in the prompt (repeatable), and keyframes stretched to the clip. MiniMax-H3-Image: pictures to edit or refer to. See [reference pictures](MODELS.md#reference-pictures-and-keyframes) |
 | `--qwen21-vae-check ref.safetensors` | Qwen Image 2.1: compare the VAE with `tools/qwen21_ref.py --vae-only` |
 | `--flux2-vae-check ref.safetensors` | MOSS Image: compare the Flux 2 VAE encoder with `tools/flux2_vae_ref.py` |
 | `--frames N` | H3 video length, snapped up to the 17k + 5 grid (default 5) |

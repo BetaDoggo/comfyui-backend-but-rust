@@ -34,7 +34,7 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | Live previews | Yes | Yes | Yes | Not tested | First frame only | - |
 | LoRAs | Yes | Yes | Yes | Yes | Yes (the turbo LoRA's ComfyUI file) | - |
 | Text encoder LoRAs | Yes | Yes | Yes | Not tested (the code is shared with Krea 2) | Not tested | - |
-| Prompt Images and reference images | Yes | Refused | Refused | Yes (one and two tested) | Refused | The input itself |
+| Prompt Images and reference images | Yes | Refused | Refused | Yes (one and two tested) | Not tested (pictures and keyframes) | The input itself |
 | Prompt weights | Refused | Yes | Yes | Refused | Yes | - |
 | `<break>` | Yes | Refused | Yes | Refused | Refused | - |
 | `<alternate>`, `<fromto>` | Refused | Refused | Refused | Refused | Refused | - |
@@ -337,13 +337,38 @@ The audio hasn't been listened to or judged by ear. `tools/h3_ref.py` and `tools
 
 The LoRA's diffusers file, `minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors`, matches no key here or in ComfyUI. Use the `_comfyui` file.
 
-SwarmUI's Sigma Shift, CFG, every sampler and LoRAs work. These are refused with an error: Rescale CFG, Renorm CFG, CFG Zero Star and TCFG, `<break>`, first and last frame or reference conditioning, and VAE tile sizes other than 256 / 64.
+SwarmUI's Sigma Shift, CFG, every sampler and LoRAs work. These are refused with an error: Rescale CFG, Renorm CFG, CFG Zero Star and TCFG, `<break>`, reference videos and audio, and VAE tile sizes other than 256 / 64.
 
 Single image mode (1 frame) samples one latent frame and decodes it as ComfyUI does: a chunk of five copies through the
 video decoder, keeping the first real frame. A 768x512 still at 20 steps and CFG 5 took about 1 s per step once warm, through
 `comfy-server` over HTTP; not compared with ComfyUI's picture, and not run through SwarmUI itself.
 
-Not done: the video and audio encoders.
+### Reference pictures and keyframes
+
+These were tried through SwarmUI, where the maintainer found them working. Which modes were tried wasn't recorded, nothing
+was measured, and nothing was compared with ComfyUI. They follow ComfyUI's code:
+
+* **Pictures** go through the 32B text encoder's vision tower (the 8B's tower with a 5120-wide merger, under `visual.`),
+  shown as `<Picture i>: ` then the vision block, before the prompt, with Qwen3-VL's MRoPE positions and DeepStack. The
+  vision tokens, with their start and end tokens, take the video modality's modulation in the DiT. With a VAE, each
+  picture is also encoded and packed as reference rows between the text and the targets, as `PackedLayout` does.
+  SwarmUI's references (`SwarmMiniMaxH3CollectReferences`) are scaled to the clip's area (`match`) or a 2048 short edge
+  (`max`), with lanczos, to multiples of 32. Its Prompt Images on `SwarmTextEncodeAdvanced` only reach the text encoder.
+* **Keyframes** (`SwarmMiniMaxH3AddKeyframes`: Image To Video's first frame, Video End Frame) are encoded by the video
+  VAE and packed on the target's grid at their frame's time.
+* Both kinds of rows run at time `max(t, 0.999)` and are mixed with 0.1% of noise from the sampler's seed, as ComfyUI's
+  `_cond_video_rows` does.
+* The VAE encoder ([`h3vae::Encoder`](../src/h3vae.rs)) runs one frame: each causal conv becomes a 2D conv with its last
+  temporal tap, with reflect padding and per-frame GroupNorm, in fp16 on 256px tiles blended on the host, as ComfyUI's
+  `tiled_encode` does. The video VAE takes the posterior's mean. MiniMax-H3-Image's VAE samples it with seed 42, as
+  ComfyUI does.
+
+On the CLI, `--image` adds a reference picture and `--first-frame` and `--last-frame` add keyframes (stretched to the
+clip). Refused with an error: reference videos and audio (they need the video-block vision path and the audio encoder),
+references or keyframes with context windows, sparse attention or HyperFlow H3 Flash, pictures on the negative prompt,
+and SwarmUI Prompt Images together with references.
+
+Not done: the audio encoder, and encoding clips longer than one frame.
 
 ### Sparse attention
 
@@ -426,6 +451,65 @@ the decoders park them. Video decode took 1.9 s and audio decode 0.2 s. Reading 
 The maintainer reports it works through SwarmUI, but it's a bit janky there: SwarmUI expects one file per model, not a
 folder of diffusers shards. It hasn't been compared with HyperFlow's own pipeline or tried above 22 frames or 512x512,
 and its audio hasn't been listened to.
+
+## MiniMax-H3-Image
+
+[MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image) is text to image on H3's transformer without its
+audio stream, step-distilled to 6 steps. It runs from `--h3-image` on the CLI, or from `comfy-server` with ComfyUI's
+`MiniMaxH3ImageConditioning` node. It uses the int8 ConvRot release, H3's nvfp4 text encoder, and its own VAE.
+
+```bash
+target/release/diffusion.exe --h3-image --width 2048 --height 2048 -p "a stone lighthouse on a sea cliff at dawn, waves crashing on the rocks below, soft golden light, no people" -o image.png
+```
+
+`--steps` defaults to the model's 6 there, with `euler`, `simple` and CFG 1, as the release asks. It reuses H3's code:
+
+* The blocks are ComfyUI's int8 ConvRot, run like HyperFlow's int8 linears. The token refiner is plain bf16 and goes
+  through HyperFlow's bf16 refiner path. The packing, rope and modulation are H3's, with no audio rows.
+* The output head is a bank of 6 PDD heads, each distilled for one interval of the sigma grid in the file's metadata. A
+  step takes the dt-weighted mean of the heads its interval spans, as ComfyUI's `_pdd_head` does. That head is combined
+  on the host and cached while the interval stays the same.
+* The model's sampling walks that grid (`ModelSampling::Grid`, ComfyUI's `MiniMaxH3ImageModelSampling`), so the stock
+  schedulers at 6 steps land on it.
+* The VAE decoder is H3's ViT decoder at half the width (1024, 16 heads, 24 layers), with fp16 weights run as bf16, one
+  frame per latent, and rope over height and width. It decodes in H3's 256px tiles, with exact attention, as ComfyUI does
+  for this unquantized decoder. The file has no latent statistics, so ComfyUI's constants are used.
+
+Compared with ComfyUI on the same noise at 1024x1024 (`tools/h3_image_ref.py`), the context is within 8.6e-4, the first
+evaluation within 2.5%, the final latent within 4.6%, and the images are 30.6 dB apart with the same composition.
+
+Warm, on this machine's 12 GB card, which holds 23 of the 50 blocks and streams the rest:
+
+| Size | Here | ComfyUI |
+|---|---|---|
+| 1024x1024, per step | 0.86 s | 0.68 s |
+| 2048x2048, per step | 1.22 s | 1.34 s |
+| 2048x2048, VAE decode | 2.8 s | 0.93 s |
+
+At 1024 both are bound by the block uploads, and here 0.58 s of the step is that wait. Through `comfy-server` over HTTP, a
+warm 2048x2048 graph took 10.6 s in all and a 1024x1024 one 6.1 s.
+
+**Edits.** `MiniMaxH3ImageConditioning`'s pictures, and `--image` on the CLI, are shown to the text encoder as
+`Picture i: ` at a 1024 short edge and, with the VAE, packed as reference rows at a short edge between 1024 and 2048, as
+described under [reference pictures](#reference-pictures-and-keyframes). With pictures, the node's width and height of
+0 take the first picture's VAE size. Edits were tried through SwarmUI (below) and found working, but not compared with
+ComfyUI. `tools/h3_image_ref.py --image` dumps ComfyUI's reference latents (`ref0`, ...) to compare with `--dump`.
+
+Refused with an error: LoRAs, init images, noise masks, `<break>`, context windows and sparse attention. The bf16 and
+w4a8 releases are refused too.
+SwarmUI doesn't recognise the model yet: it tells H3 by its audio projection, which this checkpoint lacks. Until it
+does, the engine works around that ([`swarm_h3_image.rs`](../swarm%20backend/crates/native-engine/src/swarm_h3_image.rs),
+and the hooks marked `SWARM WORKAROUND` in the native engine), to be removed once SwarmUI supports the model:
+
+* With the model's class left unknown, SwarmUI sends its default graph. `CheckpointLoaderSimple` then hands back H3's
+  text encoder and the image VAE, found in the checkpoint's models folder, and the sampler widens the 4-channel
+  placeholder latent to the model's one frame. Set Steps to 6 and CFG Scale to 1.
+* With the class set to MiniMax H3, SwarmUI sends H3's graph: its Sigma Shift is ignored with a warning, the joint
+  latent's video half must be one frame (Text2Video Frames 1), and the picture comes back with silent audio. Pick the
+  image VAE. Its Prompt Images arrive as the video model's references and are used as this model's edit pictures.
+  SwarmUI's default sampler for H3, `res_multistep`, oversaturates this model's pictures: use `euler`.
+
+Only `euler` and `simple`, and only 1024x1024 and 2048x2048, were compared with ComfyUI.
 
 ## Pixal3D
 

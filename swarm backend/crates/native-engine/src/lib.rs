@@ -1,7 +1,7 @@
 //! [`Engine`] implementation on the diffusion library: text-to-image for int8 ConvRot checkpoints of
 //! Krea 2, Anima, MOSS Image and Qwen Image 2.1 and text-to-video with audio for MiniMax H3, with every ComfyUI
 //! sampler and scheduler, any CFG and LoRAs, plus the prompt images and reference
-//! latents of Krea 2 and of Qwen Image 2.1's edits. The image models also sample partially, from
+//! latents of Krea 2 and of Qwen Image 2.1's edits, and MiniMax H3's reference pictures and keyframes. The image models also sample partially, from
 //! a latent and with a noise mask: init images, refiners and inpainting. Each
 //! file's architecture is read from its keys, so one backend serves them all.
 //!
@@ -11,6 +11,8 @@
 
 mod latent;
 mod noise;
+// SWARM WORKAROUND (until SwarmUI knows MiniMax-H3-Image): MiniMax-H3-Image before SwarmUI knows it
+mod swarm_h3_image;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -18,7 +20,9 @@ use std::sync::{Arc, Mutex};
 
 use diffusion::h3;
 use diffusion::h3window;
-use diffusion::pipeline::{AnimaRequest, Cancelled, Generator, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, SnapRefRequest, Step};
+use diffusion::pipeline::{
+    AnimaRequest, Cancelled, Generator, H3Conds, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, SnapRefRequest, Step,
+};
 use diffusion::pixal3d;
 use diffusion::triposplat;
 use diffusion::preview;
@@ -54,6 +58,8 @@ enum Family {
     Anima,
     Moss,
     H3,
+    /// MiniMax-H3-Image: H3's transformer without audio, on its own sigma grid
+    H3Image,
     Qwen21,
 }
 
@@ -112,10 +118,12 @@ struct DeferredCond {
     text_encoder: PathBuf,
     /// `<break>` chunks of (text, weight) segments; a Krea 2 chunk is one segment of weight 1.
     prompt: Result<Vec<Vec<(String, f32)>>, String>,
-    /// Krea 2: prompt images for the vision tower.
+    /// Krea 2, Qwen Image 2.1 and MiniMax H3: prompt images for the vision tower.
     images: Vec<PromptImage>,
     /// `LoraLoader`'s clip half.
     loras: Vec<Lora>,
+    /// MiniMax H3: reference pictures, sized and encoded when the model they're for samples.
+    minimax: Option<MiniMaxReferences>,
 }
 
 /// Sampled latents, `[B, 16, H/8, W/8]`, or `[B, 128, H/16, W/16]` for MOSS Image.
@@ -175,6 +183,12 @@ fn check_dit(file: &ModelFile) -> EngineResult<Family> {
         }
         return Ok(Family::Moss);
     }
+    if h3::is_h3_image(|k| h.get(k).is_some()) {
+        if h["blocks.0.attn.qkv_proj.weight"]["dtype"] != "I8" || h.get("blocks.0.attn.qkv_proj.weight_scale").is_none() {
+            return Err(unsupported(format!("{}: this backend only runs the int8 ConvRot MiniMax-H3-Image release", file.name)));
+        }
+        return Ok(Family::H3Image);
+    }
     if h3::is_h3(|k| h.get(k).is_some()) {
         if h.get("blocks.0.attn.qkv_proj.weight_s_rel").is_none() {
             return Err(unsupported(format!("{}: this backend only runs w6a8 MiniMax H3 checkpoints", file.name)));
@@ -183,7 +197,7 @@ fn check_dit(file: &ModelFile) -> EngineResult<Family> {
     }
     // The keys SwarmUI's `isKrea2` tests.
     if ["txtfusion.projector.weight", "blocks.0.attn.gate.weight", "blocks.0.mod.lin"].iter().any(|k| h.get(k).is_none()) {
-        return Err(unsupported(format!("{}: this backend only runs Krea 2, Anima, MOSS Image, Qwen Image 2.1 and MiniMax H3 models", file.name)));
+        return Err(unsupported(format!("{}: this backend only runs Krea 2, Anima, MOSS Image, Qwen Image 2.1, MiniMax H3 and MiniMax-H3-Image models", file.name)));
     }
     if h.get("blocks.0.attn.gate.weight_scale").is_none() {
         return Err(unsupported(format!("{}: this backend only runs W8A8 (ConvRot int8) Krea 2 checkpoints", file.name)));
@@ -218,7 +232,7 @@ fn prompt_chunks(p: &ParsedPrompt, steps: u32, family: Family) -> Result<Vec<Vec
         return Err("<alternate> and <fromto> prompts".into());
     }
     let chunks = p.chunks(0, steps.max(1));
-    if chunks.len() != 1 && matches!(family, Family::Anima | Family::H3 | Family::Qwen21) {
+    if chunks.len() != 1 && matches!(family, Family::Anima | Family::H3 | Family::H3Image | Family::Qwen21) {
         return Err("<break> in prompts".into());
     }
     chunks.iter().map(|leaves| chunk_segments(leaves, family)).collect()
@@ -260,11 +274,13 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<Vec<(St
         // MOSSImageTokenizer trims a plain prompt; SwarmTextEncodeAdvanced's leaves skip that.
         TextEncodeMode::Plain { text } if family == Family::Moss => Ok(vec![vec![(text.trim().to_string(), 1.0)]]),
         TextEncodeMode::Plain { text } => Ok(vec![vec![(text.clone(), 1.0)]]),
+        TextEncodeMode::MiniMax { text, .. } if family == Family::H3 => Ok(vec![vec![(text.clone(), 1.0)]]),
+        TextEncodeMode::MiniMax { .. } => Err("MiniMax H3 pictures on another text encoder".into()),
         TextEncodeMode::Swarm(s) => {
-            if s.images.is_some() && !family.one_piece() {
+            if s.images.is_some() && !family.one_piece() && family != Family::H3 {
                 return Err("Prompt Images".into());
             }
-            if s.minimax_refs.is_some() || s.clip_vision.is_some() {
+            if s.minimax_refs.is_some() && family != Family::H3 || s.clip_vision.is_some() {
                 return Err("image references".into());
             }
             if s.lora_hooks.as_ref().is_some_and(|h| !h.is_empty()) {
@@ -286,6 +302,84 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<Vec<(St
             Ok(chunks)
         }
     }
+}
+
+/// The first frame of a batch as RGB, its alpha dropped as `image[..., :3]` does.
+fn first_rgb(b: &ImageBatch) -> PromptImage {
+    let channels = b.channels as usize;
+    let rgb = b.frame_f32(0).chunks_exact(channels).flat_map(|px| [0, 1, 2].map(|c| px[c.min(channels - 1)])).collect();
+    PromptImage { width: b.width as usize, height: b.height as usize, rgb }
+}
+
+/// True for an H3 VAE file with the encoder, which both the video and the image VAE carry.
+fn has_h3_encoder(file: &ModelFile) -> bool {
+    is_h3_vae(file) && read_header(&file.path).is_ok_and(|h| h.get("encoder.conv_in.weight").is_some())
+}
+
+/// The reference pictures and keyframes of a MiniMax H3 prompt for a target of shape `sh`.
+fn h3_conds(cond: &DeferredCond, meta: &CondMeta, family: Family, sh: &h3::Shape) -> EngineResult<H3Conds> {
+    let mut out = H3Conds::default();
+    if !cond.images.is_empty() {
+        // SwarmTextEncodeAdvanced's images: shown to the text encoder as they are, with no reference latents
+        if cond.minimax.is_some() {
+            return Err(unsupported("Prompt Images and MiniMax H3 references at once"));
+        }
+        if family != Family::H3 {
+            return Err(unsupported("Prompt Images on MiniMax-H3-Image (it takes MiniMaxH3ImageConditioning's pictures)"));
+        }
+        out.label = "<Picture {}>: ".into();
+        out.pictures = cond.images.iter().map(|img| diffusion::pipeline::H3Picture { vision: img.clone(), latent: None }).collect();
+    }
+    if let Some(r) = &cond.minimax {
+        if !r.videos.is_empty() || !r.audios.is_empty() {
+            return Err(unsupported("reference videos and audio on MiniMax H3 (only pictures)"));
+        }
+        if r.ref_image_size != "match" && r.ref_image_size != "max" {
+            return Err(unsupported(format!("MiniMax H3 ref_image_size {:?}", r.ref_image_size)));
+        }
+        let vae = match &r.vae {
+            Some(v) => {
+                let file = v.source.as_ref().ok_or_else(|| unsupported("the pixel-space VAE for MiniMax H3 reference pictures"))?;
+                if !has_h3_encoder(file) {
+                    return Err(unsupported(format!("{} for MiniMax H3 reference pictures (it takes an H3 VAE)", file.name)));
+                }
+                Some(file.path.clone())
+            }
+            None => None,
+        };
+        let images: Vec<PromptImage> = r.images.iter().filter(|b| b.count > 0).map(first_rgb).collect();
+        let mut style = r.style;
+        // SWARM WORKAROUND (until SwarmUI knows MiniMax-H3-Image): SwarmUI's H3 class sends prompt images as the video model's references
+        if family == Family::H3Image {
+            style = MiniMaxRefStyle::Image;
+        }
+        (out.label, out.pictures) = match (family, style) {
+            (Family::H3, MiniMaxRefStyle::Video) => {
+                ("<Picture {}>: ".into(), diffusion::pipeline::ref2va_pictures(&images, (r.width as usize, r.height as usize), r.ref_image_size == "max", vae.is_some()))
+            }
+            (Family::H3Image, MiniMaxRefStyle::Image) => ("Picture {}: ".into(), diffusion::pipeline::image_pictures(&images, vae.is_some())),
+            (Family::H3Image, _) => return Err(unsupported("SwarmUI's MiniMax H3 references on MiniMax-H3-Image (it takes MiniMaxH3ImageConditioning's pictures)")),
+            _ => return Err(unsupported("MiniMaxH3ImageConditioning's pictures on the MiniMax H3 video model")),
+        };
+        out.vae = vae;
+    }
+    // the clip's frames on the 17k + 5 grid, or one for a still
+    let frames = if sh.t == 1 { 1 } else { (sh.t.max(2) - 2) / 5 * 17 + 5 };
+    for k in &meta.minimax_keyframes {
+        if family != Family::H3 {
+            return Err(unsupported("keyframes on MiniMax-H3-Image"));
+        }
+        let LatentSamples::Single(t) = &k.latent.samples else { return Err(unsupported("an audio/video keyframe latent")) };
+        if t.shape != [1, 24, 1, sh.h, sh.w] {
+            return Err(unsupported(format!("a keyframe latent of shape {:?} for a {}x{} clip", t.shape, sh.w * 16, sh.h * 16)));
+        }
+        if k.frame_index as usize >= frames {
+            return Err(unsupported(format!("a keyframe at frame {} of a {frames} frame clip", k.frame_index)));
+        }
+        let z = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("a keyframe latent this engine didn't encode"))?;
+        out.keyframes.push((k.frame_index as usize, z.data.clone()));
+    }
+    Ok(out)
 }
 
 /// RGB frames of a batch, with alpha over white as SwarmTextEncodeAdvanced does.
@@ -323,6 +417,15 @@ fn single_prompt(c: &Conditioning, family: Family) -> EngineResult<(&DeferredCon
     let cond = e.embedding.downcast_ref::<DeferredCond>().ok_or_else(|| unsupported("conditioning from another text encoder"))?;
     let chunks = cond.prompt.clone().map_err(unsupported)?;
     Ok((cond, Prompt { chunks, scale: if m.zeroed { 0.0 } else { m.multiplier as f32 } }))
+}
+
+/// MiniMax H3's negative prompt, which takes no pictures or keyframes.
+fn h3_negative(c: &Conditioning, family: Family) -> EngineResult<Prompt> {
+    let (cond, prompt) = single_prompt(c, family)?;
+    if cond.minimax.is_some() || !cond.images.is_empty() {
+        return Err(unsupported("pictures on the negative prompt of MiniMax H3"));
+    }
+    Ok(prompt)
 }
 
 /// A conditioning's reference latents of `channels` channels, and whether they use `index_timestep_zero`. Krea 2's model
@@ -390,8 +493,16 @@ struct ModelSettings {
     snapref: Option<Box<SnapRefPatch>>,
 }
 
+/// MiniMax-H3-Image's `MiniMaxH3ImageModelSampling`: the sigma grid its heads were distilled on, from the file.
+fn h3_image_sampling(path: &Path) -> EngineResult<ModelSampling> {
+    let st = diffusion::st::SafeTensors::open(path).map_err(internal)?;
+    let grid: Vec<f32> = h3::image_sigmas(&st).map_err(|e| unsupported(e.to_string()))?.iter().map(|g| *g as f32).collect();
+    Ok(ModelSampling::Grid(samplers::SigmaGrid::new(&grid).map_err(internal)?))
+}
+
 fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
     let model_sampling = match family {
+        Family::H3Image => h3_image_sampling(&model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?.path)?,
         Family::Krea2 => ModelSampling::Flux { shift: KREA2_SHIFT },
         Family::Qwen21 => ModelSampling::Flux { shift: QWEN21_SHIFT },
         Family::Anima => ModelSampling::Flow { shift: ANIMA_SHIFT },
@@ -407,6 +518,10 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
             }
             ModelPatch::SamplingAuraFlow { shift, sampling } if family != Family::Krea2 && sampling == "flow" => {
                 s.model_sampling = ModelSampling::Flow { shift: *shift }
+            }
+            // SWARM WORKAROUND (until SwarmUI knows MiniMax-H3-Image): SwarmUI's H3 class always sends its Sigma Shift
+            ModelPatch::MiniMaxH3Shift { .. } if family == Family::H3Image => {
+                tracing::warn!("MiniMax-H3-Image: ignoring ModelSamplingMiniMaxH3, the model samples on its own sigma grid");
             }
             ModelPatch::MiniMaxH3Shift { shift_video, shift_audio } if family == Family::H3 => {
                 s.model_sampling = ModelSampling::Flow { shift: *shift_video };
@@ -699,6 +814,7 @@ impl NativeEngine {
             Family::Anima => (self.gen().ensure_anima(&file.path), "anima"),
             Family::Moss => (self.gen().ensure_moss(&file.path), "moss-image"),
             Family::H3 => (self.gen().ensure_h3(&file.path), "minimax-h3"),
+            Family::H3Image => (self.gen().ensure_h3(&file.path), "minimax-h3-image"),
             Family::Qwen21 => (self.gen().ensure_qwen21(&file.path), "qwen-image-2.1"),
         };
         family.map_err(internal)?;
@@ -953,8 +1069,8 @@ impl NativeEngine {
         if t < 1 || lh % 2 != 0 || lw % 2 != 0 {
             return Err(unsupported("MiniMax H3 needs at least 1 video frame and a width and height in multiples of 32"));
         }
-        if req.positive.entries.iter().any(|e| !e.meta.minimax_keyframes.is_empty()) {
-            return Err(unsupported("first and last frame conditioning on MiniMax H3 (no VAE encoder yet)"));
+        if req.negative.entries.iter().any(|e| !e.meta.minimax_keyframes.is_empty()) {
+            return Err(unsupported("keyframes on the negative prompt of MiniMax H3"));
         }
         let partial = req.start_at_step != 0 || req.end_at_step < req.steps || !req.add_noise || req.denoise != 1.0;
         if partial || req.latent.noise_mask.is_some() || req.latent.audio_noise_mask.is_some() || !video.data.is_none() || !audio.data.is_none() {
@@ -971,10 +1087,11 @@ impl NativeEngine {
         }
         let (cond, prompt) = single_prompt(&req.positive, Family::H3)?;
         let shape = h3::Shape { t, h: lh, w: lw, audio_t };
+        let conds = h3_conds(cond, &req.positive.entries[0].meta, Family::H3, &shape)?;
         let sigmas = schedule(req, settings, (lh, lw))?.ok_or_else(|| EngineError::InvalidInput("no steps to sample".into()))?;
         let plan = Plan { sigmas, latent: None, mask: None, differential: None };
         let sampling = sampling(req, settings, &plan, 1)?;
-        let negative = if sampling.uses_negative() { single_prompt(&req.negative, Family::H3)?.1 } else { Prompt::new(Vec::new()) };
+        let negative = if sampling.uses_negative() { h3_negative(&req.negative, Family::H3)? } else { Prompt::new(Vec::new()) };
         let ModelSampling::Flow { shift } = settings.model_sampling else { unreachable!("H3 is a flow model") };
         let mut gen = self.gen();
         gen.ensure_h3(&file.path).map_err(internal)?;
@@ -986,7 +1103,18 @@ impl NativeEngine {
             // the sampler's seed, as ComfyUI's sampler wrapper reads it
             w.freenoise(&mut noise, &shape, req.noise_seed);
         }
-        let r = H3Request { prompt, negative, shape, sampling, shifts: (shift, settings.audio_shift), noise, sparse: settings.sparse.clone(), windows: settings.windows.clone() };
+        let r = H3Request {
+            prompt,
+            negative,
+            shape,
+            sampling,
+            shifts: (shift, settings.audio_shift),
+            noise,
+            sparse: settings.sparse.clone(),
+            windows: settings.windows.clone(),
+            conds,
+            seed: req.noise_seed,
+        };
         let (mut latent, stats) = gen
             .sample_h3(&r, |step| report(mode, progress, 1, step, |x0| (preview::h3(x0, t, lh, lw), lh, lw)), None)
             .map_err(internal)?;
@@ -996,6 +1124,88 @@ impl NativeEngine {
             video: LatentTensor { format: video.format, shape: video.shape.clone(), data: Opaque::new(HostLatent { data: latent }) },
             audio: LatentTensor { format: audio.format, shape: audio.shape.clone(), data: Opaque::new(HostLatent { data: audio_data }) },
         }))
+    }
+
+    /// A MiniMax-H3-Image picture from `MiniMaxH3ImageConditioning`'s latent.
+    fn sample_h3_image(&self, req: &SampleRequest, settings: &ModelSettings, progress: &mut dyn ProgressSink) -> EngineResult<Latent> {
+        let mode = self.preview_mode(req);
+        let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
+        // SWARM WORKAROUND (until SwarmUI knows MiniMax-H3-Image): SwarmUI's EmptyLatentImage placeholder
+        // and the H3 class's joint audio/video latent, of which the video half is sampled
+        let av_audio = match &req.latent.samples {
+            LatentSamples::AudioVideo { video, audio } => Some((swarm_h3_image::still(video)?, audio.clone())),
+            _ => None,
+        };
+        let widened = match &req.latent.samples {
+            LatentSamples::Single(t) => swarm_h3_image::widen(t, req.latent.empty)?.map(|(t, pixel)| Latent { samples: LatentSamples::Single(t), pixel, ..req.latent.clone() }),
+            LatentSamples::AudioVideo { video, .. } => Some(Latent { samples: LatentSamples::Single(video.clone()), ..req.latent.clone() }),
+        };
+        let latent = widened.as_ref().unwrap_or(&req.latent);
+        let LatentSamples::Single(tensor) = &latent.samples else {
+            return Err(unsupported("MiniMax-H3-Image with an audio/video latent"));
+        };
+        let &[1, 24, 1, lh, lw] = tensor.shape.as_slice() else {
+            return Err(unsupported(format!("MiniMax-H3-Image latents of shape {:?} (it takes MiniMaxH3ImageConditioning's)", tensor.shape)));
+        };
+        if lh % 2 != 0 || lw % 2 != 0 {
+            return Err(unsupported("MiniMax-H3-Image needs a width and height in multiples of 32"));
+        }
+        let partial = req.start_at_step != 0 || req.end_at_step < req.steps || !req.add_noise || req.denoise != 1.0;
+        if partial || latent.noise_mask.is_some() || !tensor.data.is_none() {
+            return Err(unsupported("init images, refiners and noise masks on MiniMax-H3-Image"));
+        }
+        if !settings.loras.is_empty() {
+            return Err(unsupported("LoRAs on MiniMax-H3-Image (not supported yet)"));
+        }
+        let (cond, prompt) = single_prompt(&req.positive, Family::H3Image)?;
+        let shape = h3::Shape::image(lw * 16, lh * 16);
+        let conds = h3_conds(cond, &req.positive.entries[0].meta, Family::H3Image, &shape)?;
+        let sigmas = schedule(req, settings, (lh, lw))?.ok_or_else(|| EngineError::InvalidInput("no steps to sample".into()))?;
+        let plan = Plan { sigmas, latent: None, mask: None, differential: None };
+        let sampling = sampling(req, settings, &plan, 1)?;
+        let negative = if sampling.uses_negative() { h3_negative(&req.negative, Family::H3Image)? } else { Prompt::new(Vec::new()) };
+        let mut gen = self.gen();
+        gen.ensure_h3(&file.path).map_err(internal)?;
+        gen.ensure_h3_te(&cond.text_encoder).map_err(internal)?;
+        gen.set_int8_attention(settings.int8_attention);
+        gen.set_loras(&settings.loras).map_err(internal)?;
+        let noise = plan.noise(req, 1, (24, lh, lw));
+        let r = H3Request { prompt, negative, shape, sampling, shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO), noise, sparse: None, windows: None, conds, seed: req.noise_seed };
+        let (out, stats) = gen
+            .sample_h3(&r, |step| report(mode, progress, 1, step, |x0| (preview::h3(x0, 1, lh, lw), lh, lw)), None)
+            .map_err(internal)?;
+        tracing::info!("h3 image: text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
+        let video = LatentTensor { format: tensor.format, shape: tensor.shape.clone(), data: Opaque::new(HostLatent { data: out }) };
+        if let Some((_, audio)) = av_audio {
+            // silent audio beside the picture
+            let data = vec![0.0; audio.shape.iter().product()];
+            return Ok(req.latent.with_samples(LatentSamples::AudioVideo { video, audio: LatentTensor { data: Opaque::new(HostLatent { data }), ..audio } }));
+        }
+        Ok(latent.with_samples(LatentSamples::Single(video)))
+    }
+
+    /// One picture through an H3 VAE's encoder (keyframes), cropped to multiples of 16 about its centre as
+    /// `vae_encode_crop_pixels` does.
+    fn encode_h3(&self, file: &ModelFile, pixels: &ImageBatch) -> EngineResult<Latent> {
+        if !has_h3_encoder(file) {
+            return Err(unsupported(format!("VAE encoding with {} (it has no encoder)", file.name)));
+        }
+        if pixels.count != 1 {
+            return Err(unsupported("encoding more than one frame with MiniMax H3's VAE (only single pictures)"));
+        }
+        let img = first_rgb(pixels);
+        let (w, h) = (img.width / 16 * 16, img.height / 16 * 16);
+        if w == 0 || h == 0 {
+            return Err(EngineError::InvalidInput(format!("a {}x{} picture for MiniMax H3's VAE", img.width, img.height)));
+        }
+        let (x0, y0) = ((img.width % 16) / 2, (img.height % 16) / 2);
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            rgb.extend_from_slice(&img.rgb[((y0 + y) * img.width + x0) * 3..][..w * 3]);
+        }
+        let z = self.gen().encode_h3(&file.path, &PromptImage { width: w, height: h, rgb }).map_err(internal)?;
+        let tensor = LatentTensor { format: LatentFormat::MiniMaxH3Video, shape: vec![1, 24, 1, h / 16, w / 16], data: Opaque::new(HostLatent { data: z }) };
+        Ok(Latent::single(tensor, PixelInfo::image(w as u32, h as u32, 1)))
     }
 
     fn decode_h3(&self, req: &VaeDecodeRequest, t: &LatentTensor) -> EngineResult<ImageBatch> {
@@ -1135,6 +1345,16 @@ impl Engine for NativeEngine {
     }
 
     fn load_checkpoint(&self, req: &LoadCheckpoint) -> EngineResult<(ModelHandle, TextEncoderHandle, VaeHandle)> {
+        // SWARM WORKAROUND (until SwarmUI knows MiniMax-H3-Image): SwarmUI takes an unknown model's CLIP and VAE from this loader
+        // (with the H3 class SwarmUI loads its own CLIP and VAE, so missing companions only fail when they're used)
+        if check_dit(&req.file)? == Family::H3Image {
+            let model = self.load_model(&req.file)?;
+            if let Ok((te, vae)) = swarm_h3_image::companions(&req.file) {
+                return Ok((model, swarm_h3_image::text_encoder(te, MINIMAX_ENCODER), swarm_h3_image::vae(vae)));
+            }
+            return Ok((model, TextEncoderHandle { sources: vec![], encoder_type: String::new(), device: "default".into(), engine: Opaque::none(), patches: vec![] },
+                VaeHandle::new(None, Opaque::none())));
+        }
         // SwarmUI picks this loader for anything in its Stable-Diffusion folder, by folder alone.
         // The file holds only the diffusion model; SwarmUI adds its own CLIPLoader and VAELoader.
         Ok((
@@ -1209,14 +1429,19 @@ impl Engine for NativeEngine {
             t => return Err(unsupported(format!("text encoder type {t}"))),
         };
         let images = match &req.mode {
-            TextEncodeMode::Swarm(s) if family.one_piece() => s.images.as_ref().map(prompt_images).unwrap_or_default(),
+            TextEncodeMode::Swarm(s) if family.one_piece() || family == Family::H3 => s.images.as_ref().map(prompt_images).unwrap_or_default(),
             _ => Vec::new(),
         };
         let loras = req.text_encoder.patches.iter().filter_map(|p| match p {
             TextEncoderPatch::Lora { file, strength } => Some(Lora { path: file.path.clone(), strength: *strength }),
             _ => None,
         }).collect();
-        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), images, loras };
+        let minimax = match &req.mode {
+            TextEncodeMode::Swarm(s) => s.minimax_refs.clone(),
+            TextEncodeMode::MiniMax { refs, .. } => Some(refs.clone()),
+            TextEncodeMode::Plain { .. } => None,
+        };
+        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), images, loras, minimax };
         Ok(Conditioning::single(Opaque::new(cond), CondMeta::default()))
     }
 
@@ -1231,6 +1456,12 @@ impl Engine for NativeEngine {
             };
             let pixel = PixelInfo { frames, fps: Some(24.0), audio_seconds: Some(audio_t as f64 / 40.0), ..PixelInfo::image(width, height, 1) };
             return Ok(Latent { samples, pixel, noise_mask: None, audio_noise_mask: None, batch_index: None, empty: false });
+        }
+        if let EmptyLatentKind::MiniMaxH3Image { width, height } = req.kind {
+            return Ok(Latent::single(
+                LatentTensor { format: LatentFormat::MiniMaxH3Video, shape: vec![1, 24, 1, height as usize / 16, width as usize / 16], data: Opaque::none() },
+                PixelInfo::image(width, height, 1),
+            ));
         }
         if let EmptyLatentKind::Flux2 { width, height } = req.kind {
             let (b, h, w) = (req.batch_size as usize, height as usize / 16, width as usize / 16);
@@ -1268,6 +1499,9 @@ impl Engine for NativeEngine {
         if family == Family::H3 {
             return self.sample_h3(req, &settings, progress);
         }
+        if family == Family::H3Image {
+            return self.sample_h3_image(req, &settings, progress);
+        }
         // SwarmUI sends Qwen Image 2.1 a half-size 4-channel placeholder, as ComfyUI widens it
         let widened = if family == Family::Qwen21 { req.latent.conform_empty(LatentFormat::QwenImage21, family.latent().0, family.latent().1 as u32) } else { None };
         let latent = widened.as_ref().unwrap_or(&req.latent);
@@ -1299,7 +1533,7 @@ impl Engine for NativeEngine {
             Family::Anima => self.sample_anima(req, shape, &settings, &plan, progress)?,
             Family::Moss => self.sample_moss(req, shape, &settings, &plan, progress)?,
             Family::Qwen21 => self.sample_qwen21(req, shape, &settings, &plan, progress)?,
-            Family::H3 => unreachable!("H3 samples above"),
+            Family::H3 | Family::H3Image => unreachable!("H3 samples above"),
         })
     }
 
@@ -1359,7 +1593,7 @@ impl Engine for NativeEngine {
             return self.encode_flux2(file, &req.pixels);
         }
         if is_h3_vae(file) {
-            return Err(unsupported("VAE encoding with MiniMax H3's VAE"));
+            return self.encode_h3(file, &req.pixels);
         }
         let mut gen = self.gen();
         gen.ensure_vae(&file.path).map_err(internal)?;

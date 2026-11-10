@@ -230,6 +230,11 @@ impl Engine for MockEngine {
                 );
                 (hash_of(&s.prompt.raw), s.guidance)
             }
+            TextEncodeMode::MiniMax { text, refs } => {
+                tracing::info!("[mock] encode_text minimax type={} text={text:?} pictures={} style={:?} vae={}", req.text_encoder.encoder_type, refs.images.len(), refs.style,
+                    refs.vae.is_some());
+                (hash_of(text), None)
+            }
         };
         if !req.text_encoder.patches.is_empty() {
             tracing::info!("[mock]   text encoder patches: {:?}", req.text_encoder.patches);
@@ -253,6 +258,10 @@ impl Engine for MockEngine {
             EmptyLatentKind::Flux2 { width, height } => Latent::single(
                 LatentTensor { format: LatentFormat::Flux2, shape: vec![b, 128, height as usize / 16, width as usize / 16], data },
                 PixelInfo::image(width, height, req.batch_size),
+            ),
+            EmptyLatentKind::MiniMaxH3Image { width, height } => Latent::single(
+                LatentTensor { format: LatentFormat::MiniMaxH3Video, shape: vec![1, 24, 1, height as usize / 16, width as usize / 16], data },
+                PixelInfo::image(width, height, 1),
             ),
             EmptyLatentKind::MiniMaxH3AudioVideo { width, height, length } => {
                 let (frames, lt, at) = minimax_h3::temporal_shape(length);

@@ -1,6 +1,6 @@
 //! Qwen3-VL vision tower for prompt images: patch embedding, attention blocks with 2D RoPE, a merger to the
 //! text encoder's width, and the three DeepStack mergers. Krea 2's 4B has 24 blocks of 1024 features, Qwen Image
-//! 2.1's 8B has 27 of 1152. Each image runs on its own, in f32 like ComfyUI, with its bf16 weights streamed
+//! 2.1's 8B has 27 of 1152, and MiniMax H3's 32B the 8B's tower with a wider merger (under `visual.`). Each image runs on its own, in f32 like ComfyUI, with its bf16 weights streamed
 //! from pinned RAM.
 
 use crate::cuda::{DevBuf, Stream};
@@ -17,7 +17,8 @@ const FRAME: usize = 3 * PATCH * PATCH;
 const POS_SIDE: usize = 48;
 const EPS: f32 = 1e-6;
 const THETA: f32 = 10000.0;
-const PRE: &str = "model.visual.";
+/// where the tower sits: the 4B and 8B files, then MiniMax H3's 32B
+const PREFIXES: [&str; 2] = ["model.visual.", "visual."];
 // bounds of process_qwen2vl_images
 const MIN_PIXELS: usize = 3136;
 const MAX_PIXELS: usize = 12845056;
@@ -35,15 +36,25 @@ pub struct Spec {
 
 pub const QWEN3VL_4B: Spec = Spec { d: 1024, ff: 4096, depth: 24, deepstack: [5, 11, 17], out: 2560 };
 pub const QWEN3VL_8B: Spec = Spec { d: 1152, ff: 4304, depth: 27, deepstack: [8, 16, 24], out: 4096 };
+pub const QWEN3VL_32B: Spec = Spec { out: 5120, ..QWEN3VL_8B };
 
 impl Spec {
-    /// The tower in `st`, read from its patch embedding.
-    pub fn detect(st: &SafeTensors) -> Result<Spec> {
-        match st.info(&format!("{PRE}patch_embed.proj.weight"))?.shape[0] {
-            d if d == QWEN3VL_4B.d => Ok(QWEN3VL_4B),
-            d if d == QWEN3VL_8B.d => Ok(QWEN3VL_8B),
-            d => bail!("a vision tower of {d} features, which is neither Qwen3-VL 4B's nor 8B's"),
+    /// The tower in `st` and its prefix, read from its patch embedding and merger.
+    pub fn detect(st: &SafeTensors) -> Result<(Spec, &'static str)> {
+        let Some(pre) = PREFIXES.into_iter().find(|p| st.has(&format!("{p}patch_embed.proj.weight"))) else {
+            bail!("this text encoder file has no vision tower");
+        };
+        let out = st.info(&format!("{pre}merger.linear_fc2.weight"))?.shape[0];
+        let spec = match st.info(&format!("{pre}patch_embed.proj.weight"))?.shape[0] {
+            d if d == QWEN3VL_4B.d => QWEN3VL_4B,
+            d if d == QWEN3VL_8B.d && out == QWEN3VL_32B.out => QWEN3VL_32B,
+            d if d == QWEN3VL_8B.d => QWEN3VL_8B,
+            d => bail!("a vision tower of {d} features, which is neither Qwen3-VL 4B's, 8B's nor 32B's"),
+        };
+        if spec.out != out {
+            bail!("a Qwen3-VL vision tower merging to {out} features");
         }
+        Ok((spec, pre))
     }
 
     fn hd(&self) -> usize {
@@ -203,6 +214,7 @@ fn rope_table(gh: usize, gw: usize, hd: usize) -> Vec<f32> {
 
 pub struct Vision {
     spec: Spec,
+    pre: &'static str,
     st: SafeTensors,
     ws: WeightSet,
     pos: Vec<f32>,
@@ -210,8 +222,8 @@ pub struct Vision {
 }
 
 /// fc1 + fc2 of a merger, and its norm.
-fn merger_layout(st: &SafeTensors, p: &str) -> Result<Layout> {
-    let n = |x: &str| format!("{PRE}{p}.{x}");
+fn merger_layout(st: &SafeTensors, pre: &str, p: &str) -> Result<Layout> {
+    let n = |x: &str| format!("{pre}{p}.{x}");
     let mut l = Layout::new();
     l.f32(st, "nw", &n("norm.weight"), 0.0)?;
     l.f32(st, "nb", &n("norm.bias"), 0.0)?;
@@ -222,8 +234,8 @@ fn merger_layout(st: &SafeTensors, p: &str) -> Result<Layout> {
     Ok(l)
 }
 
-fn block_layout(st: &SafeTensors, i: usize) -> Result<Layout> {
-    let n = |x: &str| format!("{PRE}blocks.{i}.{x}");
+fn block_layout(st: &SafeTensors, pre: &str, i: usize) -> Result<Layout> {
+    let n = |x: &str| format!("{pre}blocks.{i}.{x}");
     let mut l = Layout::new();
     l.f32(st, "n1w", &n("norm1.weight"), 0.0)?;
     l.f32(st, "n1b", &n("norm1.bias"), 0.0)?;
@@ -241,8 +253,8 @@ fn block_layout(st: &SafeTensors, i: usize) -> Result<Layout> {
 }
 
 /// The Conv3d weight of two identical frames, as one matrix `[d, 3 * 16 * 16]`: its slices add up.
-fn patch_matrix(st: &SafeTensors, d: usize) -> Result<Vec<f32>> {
-    let name = format!("{PRE}patch_embed.proj.weight");
+fn patch_matrix(st: &SafeTensors, pre: &str, d: usize) -> Result<Vec<f32>> {
+    let name = format!("{pre}patch_embed.proj.weight");
     let v = st.f32_vec(&name, false)?;
     let mut out = vec![0f32; d * FRAME];
     for o in 0..d {
@@ -260,34 +272,31 @@ fn patch_matrix(st: &SafeTensors, d: usize) -> Result<Vec<f32>> {
 
 impl Vision {
     pub fn load(st: SafeTensors, threads: usize, s0: &Stream) -> Result<Self> {
-        if !st.has(&format!("{PRE}patch_embed.proj.weight")) {
-            bail!("this text encoder file has no vision tower");
-        }
-        let spec = Spec::detect(&st)?;
+        let (spec, pre) = Spec::detect(&st)?;
         // streamed units have to be in the order they run
         let mut patch = Layout::new();
-        patch.bytes("w", f32_bytes(&patch_matrix(&st, spec.d)?));
-        patch.f32(&st, "b", &format!("{PRE}patch_embed.proj.bias"), 0.0)?;
+        patch.bytes("w", f32_bytes(&patch_matrix(&st, pre, spec.d)?));
+        patch.f32(&st, "b", &format!("{pre}patch_embed.proj.bias"), 0.0)?;
         let mut layouts = vec![patch];
         for b in 0..spec.depth {
-            layouts.push(block_layout(&st, b)?);
+            layouts.push(block_layout(&st, pre, b)?);
             if let Some(i) = spec.deepstack.iter().position(|&l| l == b) {
-                layouts.push(merger_layout(&st, &format!("deepstack_merger_list.{i}"))?);
+                layouts.push(merger_layout(&st, pre, &format!("deepstack_merger_list.{i}"))?);
             }
         }
-        layouts.push(merger_layout(&st, "merger")?);
+        layouts.push(merger_layout(&st, pre, "merger")?);
         let p = plan(&layouts, 0, 2);
         let ws = WeightSet::load("vision tower", &st, layouts, p, threads)?;
-        let pos = st.f32_vec(&format!("{PRE}pos_embed.weight"), false)?;
+        let pos = st.f32_vec(&format!("{pre}pos_embed.weight"), false)?;
         let zeros = DevBuf::alloc(spec.merged() * 4)?;
         zeros.upload(0, &vec![0u8; spec.merged() * 4], s0)?;
         s0.sync()?;
-        Ok(Vision { spec, st, ws, pos, zeros })
+        Ok(Vision { spec, pre, st, ws, pos, zeros })
     }
 
     /// The tokens of one image.
     pub fn encode(&mut self, img: &PromptImage, st: &Stream, mut probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<Embeds> {
-        let _ = &self.st;
+        let _ = (&self.st, self.pre);
         let Spec { d: dm, ff: ff_w, depth, deepstack, out: out_w } = self.spec;
         let (hd, merged_w) = (self.spec.hd(), self.spec.merged());
         let (gh, gw) = patch_grid(img.height, img.width);

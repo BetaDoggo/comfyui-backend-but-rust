@@ -110,6 +110,8 @@ extern "C" {
     pub fn gpu_conv_t1d(x: P, w: P, bias: P, out: PM, b: i32, ci: i32, co: i32, t: i32, k: i32, u: i32, pad: i32, s: PM) -> i32;
     pub fn gpu_aa_snake(x: PM, alpha: P, beta: P, up: P, down: P, tmp: PM, b: i32, c: i32, t: i32, s: PM) -> i32;
     pub fn gpu_group_norm(x: P, out: PM, w: P, b: P, stats: PM, p: i64, c: i32, groups: i32, eps: f32, silu: i32, s: PM) -> i32;
+    pub fn gpu_h3_im2col3(inp: P, h: i32, w: i32, c: i32, stride: i32, y0: i32, rows: i32, out: PM, s: PM) -> i32;
+    pub fn gpu_h3_group_norm_f16(x: P, out: PM, w: P, b: P, p: i64, c: i32, g: i32, eps: f32, silu: i32, scratch: PM, s: PM) -> i32;
 
     // Trellis 2 / Pixal3D (csrc/trellis.cu and the LayerNorm prologues of kernels.cu)
     pub fn gpu_quant_rows_b(dtype: i32, prologue: i32, x: P, x_stride: i64, norm_w: P, norm_b: P, eps: f32, mod_scale: P,

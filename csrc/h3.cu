@@ -213,3 +213,80 @@ GPU_API int gpu_aa_snake(void* x, const void* alpha, const void* beta, const voi
     KCHECK();
     return 0;
 }
+
+// ---------------------------------------------------------------------------------------------
+// The VAE encoder on one frame, NHWC f16 like ComfyUI's fp16 run: a causal conv on one frame is a 2D conv with the
+// kernel's last temporal tap, its spatial padding reflects, and GroupNorm takes its statistics per frame.
+// ---------------------------------------------------------------------------------------------
+__device__ __forceinline__ int reflect_at(int i, int n) {
+    if (i < 0) return -i;
+    if (i >= n) return 2 * n - 2 - i;
+    return i;
+}
+
+// 3x3 patches of output rows [y0, y0 + rows): out[(y - y0) * Wo + x, (ky * 3 + kx) * C + c]. Stride 1 pads one pixel
+// on every side; stride 2 pads one on the right and bottom only (Downsample3D), both by reflection.
+__global__ void h3_im2col3_kernel(const __half* in, int H, int W, int C, int stride, int y0, int rows, __half* out) {
+    const int Wo = stride == 1 ? W : W / 2, pad = stride == 1 ? 1 : 0;
+    const int64_t per = 9 * (int64_t)C;
+    const int64_t t = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (int64_t)rows * Wo * per) return;
+    const int64_t p = t / per;
+    const int rest = (int)(t % per);
+    const int k = rest / C, c = rest % C;
+    const int y = y0 + (int)(p / Wo), x = (int)(p % Wo);
+    const int sy = reflect_at(y * stride + k / 3 - pad, H), sx = reflect_at(x * stride + k % 3 - pad, W);
+    out[t] = in[((int64_t)sy * W + sx) * C + c];
+}
+
+GPU_API int gpu_h3_im2col3(const void* in, int H, int W, int C, int stride, int y0, int rows, void* out, void* stream) {
+    const int Wo = stride == 1 ? W : W / 2;
+    const int64_t total = (int64_t)rows * Wo * 9 * C;
+    h3_im2col3_kernel<<<(unsigned)((total + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const __half*)in, H, W, C, stride, y0, rows, (__half*)out);
+    KCHECK();
+    return 0;
+}
+
+// sums and sums of squares per group, in double: acc [2 * G]
+__global__ void h3_gn_stats_kernel(const __half* x, int64_t P, int C, int G, double* acc) {
+    const int g = blockIdx.y, cpg = C / G;
+    double s = 0.0, q = 0.0;
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < P * cpg; i += (int64_t)gridDim.x * blockDim.x) {
+        const double v = __half2float(x[(i / cpg) * C + g * cpg + i % cpg]);
+        s += v;
+        q += v * v;
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        s += __shfl_xor_sync(0xffffffff, s, o);
+        q += __shfl_xor_sync(0xffffffff, q, o);
+    }
+    if ((threadIdx.x & 31) == 0) {
+        atomicAdd(&acc[g], s);
+        atomicAdd(&acc[G + g], q);
+    }
+}
+
+// the normed value rounds to f16, then SiLU of it rounds again, as two fp16 ops do
+__global__ void h3_gn_apply_kernel(const __half* x, __half* out, int64_t P, int C, int G, const double* acc, const __half* w, const __half* b, float eps,
+                                   int silu) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= P * C) return;
+    const int c = (int)(i % C), g = c / (C / G);
+    const double n = (double)P * (C / G);
+    const double mean = acc[g] / n;
+    const float var = (float)fmax(acc[G + g] / n - mean * mean, 0.0);
+    const float v = __half2float(__float2half_rn((__half2float(x[i]) - (float)mean) * rsqrtf(var + eps) * __half2float(w[c]) + __half2float(b[c])));
+    out[i] = __float2half_rn(silu ? silu_f(v) : v);
+}
+
+// GroupNorm (then SiLU) over one NHWC f16 image [P, C]; scratch is 2 * G doubles.
+GPU_API int gpu_h3_group_norm_f16(const void* x, void* out, const void* w, const void* b, int64_t P, int C, int G, float eps, int silu, double* scratch,
+                                  void* stream) {
+    cudaStream_t st = (cudaStream_t)stream;
+    if (cudaMemsetAsync(scratch, 0, 2 * G * sizeof(double), st) != cudaSuccess) return -2;
+    h3_gn_stats_kernel<<<dim3(128, G), 256, 0, st>>>((const __half*)x, P, C, G, scratch);
+    h3_gn_apply_kernel<<<(unsigned)((P * C + 255) / 256), 256, 0, st>>>((const __half*)x, (__half*)out, P, C, G, scratch, (const __half*)w, (const __half*)b, eps,
+                                                                        silu);
+    KCHECK();
+    return 0;
+}

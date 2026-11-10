@@ -56,6 +56,8 @@ pub struct SafeTensors {
     pub tensors: HashMap<String, TensorInfo>,
     /// The diffusers `config.json` next to a sharded model.
     pub config: Option<serde_json::Value>,
+    /// The `__metadata__` strings of the files, merged.
+    pub metadata: HashMap<String, String>,
 }
 
 /// The index and config of a diffusers model stored in shards, if `path` is one of its shards.
@@ -74,7 +76,7 @@ impl SafeTensors {
     /// One safetensors file, or every shard of a diffusers model when `path` is one of them.
     pub fn open(path: &Path) -> Result<Self> {
         let Some((index, config)) = diffusers_shards(path) else {
-            let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), config: None };
+            let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), config: None, metadata: HashMap::new() };
             st.add_file(path)?;
             return Ok(st);
         };
@@ -84,7 +86,7 @@ impl SafeTensors {
         files.sort_unstable();
         files.dedup();
         let config = serde_json::from_slice(&std::fs::read(&config)?).with_context(|| format!("reading {}", config.display()))?;
-        let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), config: Some(config) };
+        let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), config: Some(config), metadata: HashMap::new() };
         let dir = index.parent().unwrap();
         for f in files {
             st.add_file(&dir.join(f))?;
@@ -101,6 +103,11 @@ impl SafeTensors {
         let base = 8 + n;
         for (k, v) in header.as_object().ok_or_else(|| anyhow!("bad header"))? {
             if k == "__metadata__" {
+                for (mk, mv) in v.as_object().into_iter().flatten() {
+                    if let Some(s) = mv.as_str() {
+                        self.metadata.insert(mk.clone(), s.to_string());
+                    }
+                }
                 continue;
             }
             let dtype = match v["dtype"].as_str().unwrap_or("") {

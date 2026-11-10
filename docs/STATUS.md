@@ -19,7 +19,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | Server | Model folder scanning | Uses Swarm's and ComfyUI's folder names, including Stable-diffusion, clip and VAE. |
 | P0 | Server | Start script | start-backend.bat builds, starts the server and prints the connection steps. |
 | P0 | Engine core | Low-memory block streaming | Packed blocks in pinned RAM, streamed through VRAM slots on a copy stream. |
-| P0 | Engine core | Cancelling and Free VRAM | Interrupt stops at the next step. Free VRAM unloads models, and they reload on next use. |
+| P0 | Engine core | Cancelling and Free VRAM | Interrupt stops at the next step. Free VRAM unloads models, and they reload on next use. `/free` with `free_memory` alone moves the weights to RAM and keeps the models loaded: tested on Krea 2 through a direct workflow, not through SwarmUI. |
 | P0 | Engine core | Sampler: er_sde | Anima and MOSS Image, generated through SwarmUI. Noise follows torch's CUDA Philox layout on this GPU. Other GPUs untested. |
 | P0 | Krea 2 | Turbo text-to-image | W8A8 int8 DiT, 4.65 s at 1024. Pixel-identical to the CLI through SwarmUI. |
 | P0 | Krea 2 | Seed parity with SwarmKSampler | Per-image seeds match Swarm's noise code. Batches confirmed against single renders. |

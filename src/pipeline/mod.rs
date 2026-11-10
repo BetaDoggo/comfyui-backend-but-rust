@@ -774,10 +774,28 @@ impl Generator {
         cuda::trim_pool()
     }
 
-    /// Give back cached VRAM without unloading anything.
-    pub fn trim(&mut self) -> Result<()> {
+    /// Move the loaded models' weights out of VRAM into RAM now, keeping the models, LoRAs and prompts loaded: the
+    /// next generation copies them back instead of reading the files again. Under ComfyUI's memory management every
+    /// streamed unit goes (diffusion model, text encoders, vision towers); under `--legacy-offload` the diffusion
+    /// model's blocks do, as after five idle minutes, unless `--resident-blocks` fixes them in VRAM. Small weights
+    /// outside the streamed units, the VAE and encoded prompts stay in VRAM.
+    pub fn release_vram(&mut self) -> Result<()> {
         self.env.st.sync()?;
-        cuda::trim_pool()
+        let before = cuda::device_free()?;
+        let forced = !self.env.comfy && !self.env.dynamic;
+        if !forced {
+            if let Some(f) = self.family.state() {
+                f.idle()?;
+            }
+        }
+        if self.env.comfy {
+            crate::comfy_memory::release_all()?;
+        }
+        cuda::trim_pool()?;
+        let after = cuda::device_free()?;
+        eprintln!("released {} MB of VRAM to RAM ({} MB free){}", after.saturating_sub(before) / MB, after / MB,
+            if forced { "; --resident-blocks keeps the diffusion blocks in VRAM" } else { "" });
+        Ok(())
     }
 
     /// Before an encoder or decoder runs: demote the loaded diffusion model's blocks until `need` bytes fit.

@@ -1784,7 +1784,8 @@ impl Engine for NativeEngine {
         let r = if unload_models {
             gen.unload()
         } else if free_memory {
-            gen.trim()
+            // weights leave VRAM for RAM; the models stay loaded
+            gen.release_vram()
         } else {
             Ok(())
         };

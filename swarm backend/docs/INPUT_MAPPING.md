@@ -384,7 +384,7 @@ when `progress.interrupted()` turns true (SwarmUI's cancel button → `POST /int
 | `POST /prompt` `{prompt, client_id}` | generate | ✔ Comfy-shaped validation errors (HTTP 400) |
 | `GET /history/{id}`, `POST /history {delete}` | after each job | ✔ |
 | `POST /queue {delete}`, `POST /interrupt {prompt_id}` | cancel | ✔ |
-| `POST /free {unload_models, free_memory}` | "Free VRAM" | ✔ → `Engine::free_memory`, drops loader cache |
+| `POST /free {unload_models, free_memory}` | "Free VRAM" | ✔ → `Engine::free_memory`. `unload_models` drops the models and the loader cache; `free_memory` alone moves the weights from VRAM to RAM and keeps the models loaded |
 | `POST /upload/image`, `GET /view` | fallback when Swarm nodes are missing / `SaveImage` | ✔ |
 | `/api/*` aliases | "EnableFrontendDev" setting | ✔ |
 

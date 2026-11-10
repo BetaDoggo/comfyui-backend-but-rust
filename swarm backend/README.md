@@ -173,6 +173,16 @@ Diffusion blocks stay in VRAM between prompts, as in ComfyUI, until an allocatio
 With `--legacy-offload`, after 5 minutes with no work the engine moves them to RAM instead, so other applications get
 the VRAM, and the next generation takes them back. `IDLE_RELEASE_SECS` changes the wait, and 0 turns this off.
 
+`POST /free` with `{"free_memory": true}` and no `unload_models` does this at once, in either memory mode: the weights
+leave VRAM for their copies in RAM, and the models, LoRAs and encoded prompts stay loaded. Under the default memory
+management that is every streamed model (diffusion model, text encoders, vision towers); under `--legacy-offload` the
+diffusion blocks, unless `--resident-blocks` fixes them in VRAM. The VAE, small weights outside the streamed blocks and
+encoded prompts stay in VRAM. `{"unload_models": true}` drops the models as before.
+
+Measured on Krea 2 (RTX 5070, 768x768, 8 steps): VRAM in use went from 10.1 GB to 2.1 GB, and the next generation took
+3.0 s with nothing read from disk, against 100 s for the first, cold one. Not measured on the other families or under
+`--legacy-offload`.
+
 ## Test
 
 ```bash

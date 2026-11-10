@@ -496,6 +496,24 @@ pub fn node_done() -> Result<()> {
     with(|st| st.reset_casts())
 }
 
+/// Take every model's units out of VRAM, with the cast buffers, and give the pool back. Each unit keeps its host copy
+/// (pinned, or the file's mapping for a lazy set), so the next use faults it back in from RAM. Units in use stay.
+/// Watermarks are left alone: a model may fault every unit in again. Returns the bytes freed.
+pub fn release_all() -> Result<usize> {
+    with(|st| {
+        cuda::device_sync()?;
+        let mut freed = 0;
+        for i in 0..st.vbars.len() {
+            for u in 0..st.vbars[i].units.len() {
+                freed += st.evict(i, u);
+            }
+        }
+        st.reset_casts()?;
+        cuda::trim_pool()?;
+        Ok(freed)
+    })
+}
+
 /// Print each model's residency since it was last prioritized.
 pub fn log_residency() {
     if let Some(st) = lock().as_ref() {

@@ -212,6 +212,7 @@ pub trait Engine: Send + Sync + 'static {
     /// No work has arrived for a while. Default: nothing to do.
     fn idle(&self) {}
 
-    /// `POST /free`. SwarmUI calls this from its "Free VRAM" buttons.
+    /// `POST /free`. SwarmUI calls this from its "Free VRAM" buttons. `unload_models` drops the models;
+    /// `free_memory` alone moves weights out of VRAM and keeps the models loaded.
     fn free_memory(&self, _unload_models: bool, _free_memory: bool) {}
 }

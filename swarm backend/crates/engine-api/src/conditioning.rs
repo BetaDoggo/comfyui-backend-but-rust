@@ -54,6 +54,18 @@ pub struct CondMeta {
     /// the control hints on this entry, oldest first (ComfyUI chains each onto the previous one).
     /// SwarmUI applies the same hints to the positive and negative prompts.
     pub controls: Vec<ControlHint>,
+    /// `SeedVR2Conditioning`: the picture to restore, VAE-encoded (ComfyUI's `condition`), and which of the model's
+    /// two stored prompts this entry carries. The engine takes the prompt from the model, so the entry's embedding is
+    /// empty.
+    pub seedvr2: Option<SeedVr2Condition>,
+}
+
+/// See [`CondMeta::seedvr2`].
+#[derive(Clone, Debug)]
+pub struct SeedVr2Condition {
+    pub latent: Latent,
+    /// The model's `negative_conditioning` rather than its `positive_conditioning`.
+    pub negative: bool,
 }
 
 /// One applied ControlNet.
@@ -164,6 +176,7 @@ impl Default for CondMeta {
             embedding_ops: Vec::new(),
             unclip: Vec::new(),
             controls: Vec::new(),
+            seedvr2: None,
         }
     }
 }

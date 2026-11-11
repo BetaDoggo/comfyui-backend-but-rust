@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex};
 use diffusion::h3;
 use diffusion::h3window;
 use diffusion::pipeline::{
-    AnimaRequest, Cancelled, Generator, H3Conds, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, SnapRefRequest, Step,
+    AnimaRequest, Cancelled, Generator, H3Conds, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, SeedVrRequest, SnapRefRequest,
+    Step,
 };
 use diffusion::pixal3d;
 use diffusion::triposplat;
@@ -61,6 +62,8 @@ enum Family {
     /// MiniMax-H3-Image: H3's transformer without audio, on its own sigma grid
     H3Image,
     Qwen21,
+    /// SeedVR2 3B, the restoration model SwarmUI's SeedVR stage runs
+    SeedVr2,
 }
 
 impl Family {
@@ -83,6 +86,9 @@ impl Family {
         matches!(self, Family::Krea2 | Family::Qwen21)
     }
 }
+
+/// Why a SeedVR2 batch is refused.
+const SEEDVR_BATCH: &str = "SeedVR2 on more than one picture: ComfyUI restores a batch (or a video) as one clip, which this backend doesn't do yet; use Batch Size 1";
 
 /// The VRAM ComfyUI keeps free without `--reserve-vram`.
 pub const COMFY_HEADROOM_MB: usize = diffusion::comfy_memory::DEFAULT_HEADROOM_MB;
@@ -165,6 +171,15 @@ fn check_dit(file: &ModelFile) -> EngineResult<Family> {
         return Ok(Family::H3);
     }
     let h = read_header(&file.path).map_err(|e| unsupported(format!("{}: not a readable safetensors file ({e})", file.name)))?;
+    if diffusion::seedvr::is_seedvr2_7b(|k| h.get(k).is_some()) {
+        return Err(unsupported(format!("{}: SeedVR2 7B (this backend runs the 3B int8 ConvRot release)", file.name)));
+    }
+    if diffusion::seedvr::is_seedvr2(|k| h.get(k).is_some()) {
+        if h.get("blocks.0.attn.proj_qkv.vid.weight_scale").is_none() || h["blocks.0.attn.proj_qkv.vid.weight"]["dtype"] != "I8" {
+            return Err(unsupported(format!("{}: this backend only runs the int8 ConvRot SeedVR2 3B release", file.name)));
+        }
+        return Ok(Family::SeedVr2);
+    }
     if let Some(p) = diffusion::qwen21::key_prefix(|k| h.get(k).is_some()) {
         if h.get(format!("{p}transformer_blocks.0.img_mlp.gate_up.weight_scale")).is_none() {
             return Err(unsupported(format!("{}: this backend only runs int8 ConvRot Qwen Image 2.1 checkpoints", file.name)));
@@ -508,6 +523,8 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::Anima => ModelSampling::Flow { shift: ANIMA_SHIFT },
         Family::Moss => ModelSampling::Flow { shift: MOSS_SHIFT },
         Family::H3 => ModelSampling::Flow { shift: h3::SHIFT_VIDEO },
+        // ComfyUI's SeedVR2 sampling_settings
+        Family::SeedVr2 => ModelSampling::Flow { shift: 1.0 },
     };
     let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None, snapref: None };
     let mut sparse = None;
@@ -797,6 +814,77 @@ impl NativeEngine {
         Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads })
     }
 
+    /// SeedVR2's restore of the picture `SeedVR2Conditioning` carries. ComfyUI restores a batch as one video, which
+    /// this backend doesn't run, so one picture at a time.
+    fn sample_seedvr(&self, req: &SampleRequest, settings: &ModelSettings, progress: &mut dyn ProgressSink) -> EngineResult<Latent> {
+        let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
+        if !settings.loras.is_empty() {
+            return Err(unsupported("LoRAs on SeedVR2"));
+        }
+        let LatentSamples::Single(tensor) = &req.latent.samples else {
+            return Err(unsupported("SeedVR2 on an audio/video latent"));
+        };
+        let &[batch, 16, lh, lw] = tensor.shape.as_slice() else {
+            return Err(unsupported(format!("SeedVR2 on a latent of shape {:?}", tensor.shape)));
+        };
+        if batch != 1 {
+            return Err(unsupported(SEEDVR_BATCH));
+        }
+        if tensor.format != LatentFormat::SeedVr2 {
+            return Err(unsupported("SeedVR2 on a latent its VAE didn't encode"));
+        }
+        let condition = seedvr_condition(&req.positive, (lh, lw))?.to_vec();
+        let finish = |data| {
+            let t = LatentTensor { format: LatentFormat::SeedVr2, shape: tensor.shape.clone(), data: Opaque::new(HostLatent { data }) };
+            Ok(req.latent.with_samples(LatentSamples::Single(t)))
+        };
+        let Some(sigmas) = schedule(req, settings, (lh, lw))? else {
+            let plan = Plan::new(Vec::new(), &req.latent, tensor, settings)?;
+            return finish(plan.latent.unwrap_or_else(|| vec![0.0; 16 * lh * lw]));
+        };
+        let plan = Plan::new(sigmas, &req.latent, tensor, settings)?;
+        let sampling = sampling(req, settings, &plan, 1)?;
+        if sampling.uses_negative() && seedvr_condition(&req.negative, (lh, lw))? != condition.as_slice() {
+            return Err(unsupported("different pictures on SeedVR2's positive and negative conditioning"));
+        }
+        let r = SeedVrRequest { width: lw * 8, height: lh * 8, noise: plan.noise(req, 1, (16, lh, lw)), sampling, condition };
+        let mut gen = self.gen();
+        gen.ensure_seedvr(&file.path).map_err(internal)?;
+        gen.set_int8_attention(settings.int8_attention);
+        // SeedVR2's latents have no preview colours in ComfyUI
+        let (latent, stats) = gen.sample_seedvr(&r, |step| report(PreviewMode::None, progress, 1, step, |_| (Vec::new(), 0, 0))).map_err(internal)?;
+        tracing::info!("seedvr2: {}x{}: sampling {:.0} ms", r.width, r.height, stats.sample_ms);
+        finish(latent)
+    }
+
+    fn encode_seedvr(&self, file: &ModelFile, pixels: &ImageBatch) -> EngineResult<Latent> {
+        if pixels.count != 1 {
+            return Err(unsupported(SEEDVR_BATCH));
+        }
+        let (w, h) = (pixels.width as usize, pixels.height as usize);
+        if w % 16 != 0 || h % 16 != 0 {
+            return Err(unsupported(format!("SeedVR2 VAE encode of a {w}x{h} picture (SeedVR2Preprocess pads to multiples of 16)")));
+        }
+        let mut gen = self.gen();
+        gen.ensure_seedvr_vae(&file.path).map_err(internal)?;
+        let data = gen.encode_seedvr(&rgb_f32(pixels), w, h).map_err(internal)?;
+        let tensor = LatentTensor { format: LatentFormat::SeedVr2, shape: vec![1, 16, h / 8, w / 8], data: Opaque::new(HostLatent { data }) };
+        Ok(Latent::single(tensor, PixelInfo::image(w as u32, h as u32, 1)))
+    }
+
+    fn decode_seedvr(&self, vae: &VaeHandle, t: &LatentTensor, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        let &[1, 16, lh, lw] = t.shape.as_slice() else {
+            return Err(unsupported(format!("SeedVR2 decode of a latent of shape {:?}", t.shape)));
+        };
+        let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("decoding a latent this engine didn't sample"))?;
+        let file = vae.source.as_ref().ok_or_else(|| unsupported("the pixel-space VAE"))?;
+        let mut gen = self.gen();
+        gen.ensure_seedvr_vae(&file.path).map_err(internal)?;
+        let rgb = gen.decode_seedvr(&latent.data, lw * 8, lh * 8).map_err(internal)?;
+        progress.progress(1, 1);
+        Ok(ImageBatch::from_f32(1, (lh * 8) as u32, (lw * 8) as u32, 3, rgb))
+    }
+
     /// SwarmUI always asks for previews, so the server's option decides.
     fn preview_mode(&self, req: &SampleRequest) -> PreviewMode {
         if self.live_previews { req.previews } else { PreviewMode::None }
@@ -816,6 +904,7 @@ impl NativeEngine {
             Family::H3 => (self.gen().ensure_h3(&file.path), "minimax-h3"),
             Family::H3Image => (self.gen().ensure_h3(&file.path), "minimax-h3-image"),
             Family::Qwen21 => (self.gen().ensure_qwen21(&file.path), "qwen-image-2.1"),
+            Family::SeedVr2 => (self.gen().ensure_seedvr(&file.path), "seedvr2"),
         };
         family.map_err(internal)?;
         Ok(ModelHandle::new(Some(file.clone()), Some(name.into()), Opaque::none()))
@@ -1325,6 +1414,34 @@ fn is_h3_vae(file: &ModelFile) -> bool {
     read_header(&file.path).is_ok_and(|h| h.get("decoder.transformer_blocks.0.scale1").is_some() || h.get("pre_block.attn.zero_k_bias").is_some())
 }
 
+/// True for SeedVR2's VAE.
+fn is_seedvr2_vae(file: &ModelFile) -> bool {
+    read_header(&file.path).is_ok_and(|h| diffusion::seedvr::is_seedvr2_vae(|k| h.get(k).is_some()))
+}
+
+/// The `SeedVR2Conditioning` an entry list carries: its picture's latent, one image of [16, lh, lw].
+fn seedvr_condition(c: &Conditioning, (lh, lw): (usize, usize)) -> EngineResult<&[f32]> {
+    let [entry] = c.entries.as_slice() else {
+        return Err(unsupported("SeedVR2 with other conditioning than one SeedVR2Conditioning"));
+    };
+    let Some(cond) = &entry.meta.seedvr2 else {
+        return Err(unsupported("SeedVR2 without SeedVR2Conditioning (it restores a picture and takes no prompt)"));
+    };
+    let m = &entry.meta;
+    if m.multiplier != 1.0 || m.zeroed || m.mask.is_some() || !m.reference_latents.is_empty() || m.inpaint.is_some() || !m.controls.is_empty()
+        || !m.embedding_ops.is_empty() || !m.gligen.is_empty() || !m.unclip.is_empty() || m.start_percent != 0.0 || m.end_percent != 1.0 {
+        return Err(unsupported("conditioning changes on SeedVR2's conditioning"));
+    }
+    let LatentSamples::Single(t) = &cond.latent.samples else {
+        return Err(unsupported("SeedVR2Conditioning of an audio/video latent"));
+    };
+    if t.shape != [1, 16, lh, lw] {
+        return Err(unsupported(format!("a SeedVR2 condition of shape {:?} for a latent of {lw}x{lh}", t.shape)));
+    }
+    let h = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("a SeedVR2 condition this engine didn't encode"))?;
+    Ok(&h.data)
+}
+
 /// True for the Flux 2 VAE, which MOSS Image uses.
 fn is_flux2_vae(file: &ModelFile) -> bool {
     read_header(&file.path).is_ok_and(|h| h.get("bn.running_mean").is_some())
@@ -1401,6 +1518,10 @@ impl Engine for NativeEngine {
     }
 
     fn load_vae(&self, req: &LoadVae) -> EngineResult<VaeHandle> {
+        if is_seedvr2_vae(&req.file) {
+            self.gen().ensure_seedvr_vae(&req.file.path).map_err(internal)?;
+            return Ok(VaeHandle::new(Some(req.file.clone()), Opaque::none()));
+        }
         if is_h3_vae(&req.file) {
             return Ok(VaeHandle::new(Some(req.file.clone()), Opaque::none()));
         }
@@ -1502,6 +1623,9 @@ impl Engine for NativeEngine {
         if family == Family::H3Image {
             return self.sample_h3_image(req, &settings, progress);
         }
+        if family == Family::SeedVr2 {
+            return self.sample_seedvr(req, &settings, progress);
+        }
         // SwarmUI sends Qwen Image 2.1 a half-size 4-channel placeholder, as ComfyUI widens it
         let widened = if family == Family::Qwen21 { req.latent.conform_empty(LatentFormat::QwenImage21, family.latent().0, family.latent().1 as u32) } else { None };
         let latent = widened.as_ref().unwrap_or(&req.latent);
@@ -1533,7 +1657,7 @@ impl Engine for NativeEngine {
             Family::Anima => self.sample_anima(req, shape, &settings, &plan, progress)?,
             Family::Moss => self.sample_moss(req, shape, &settings, &plan, progress)?,
             Family::Qwen21 => self.sample_qwen21(req, shape, &settings, &plan, progress)?,
-            Family::H3 | Family::H3Image => unreachable!("H3 samples above"),
+            Family::H3 | Family::H3Image | Family::SeedVr2 => unreachable!("H3 and SeedVR2 sample above"),
         })
     }
 
@@ -1542,6 +1666,18 @@ impl Engine for NativeEngine {
             LatentSamples::AudioVideo { video, .. } => return self.decode_h3(req, video),
             LatentSamples::Single(t) if t.format == LatentFormat::MiniMaxH3Video => return self.decode_h3(req, t),
             _ => {}
+        }
+        let seedvr_vae = req.vae.source.as_ref().is_some_and(is_seedvr2_vae);
+        if let LatentSamples::Single(t) = &req.latent.samples {
+            if seedvr_vae != (t.format == LatentFormat::SeedVr2) {
+                return Err(unsupported(if seedvr_vae { "SeedVR2's VAE on another model's latent" } else { "a SeedVR2 latent through another VAE" }));
+            }
+            if seedvr_vae {
+                if req.tiling.is_some() {
+                    return Err(unsupported("VAE tiling on SeedVR2"));
+                }
+                return self.decode_seedvr(&req.vae, t, progress);
+            }
         }
         if req.tiling.is_some() {
             return Err(unsupported("VAE tiling"));
@@ -1586,6 +1722,9 @@ impl Engine for NativeEngine {
             return Err(unsupported("VAE tiling"));
         }
         let file = req.vae.source.as_ref().ok_or_else(|| unsupported("the pixel-space VAE"))?;
+        if is_seedvr2_vae(file) {
+            return self.encode_seedvr(file, &req.pixels);
+        }
         if is_qwen21_vae(file) {
             return self.encode_qwen21(file, &req.pixels);
         }
@@ -1645,7 +1784,9 @@ impl Engine for NativeEngine {
             .map_err(internal)?;
         }
         if let Some(f) = req.vae.source.as_ref().filter(|f| !is_h3_vae(f)) {
-            if is_qwen21_vae(f) {
+            if is_seedvr2_vae(f) {
+                gen.ensure_seedvr_vae(&f.path)
+            } else if is_qwen21_vae(f) {
                 gen.ensure_vae21(&f.path)
             } else if is_flux2_vae(f) {
                 gen.ensure_flux2_vae(&f.path)

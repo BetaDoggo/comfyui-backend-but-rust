@@ -432,3 +432,22 @@ checkpoint, and resolutions off the 1024 to 2048 grid of 128. `RemoveBackground`
 checkpoint. The extension then reads `history/<id>` for the saved file,
 fetches it through `/view` and saves it in the SwarmUI user's output folder.
 
+## 11. SeedVR2 (SeedVR Model)
+
+SwarmUI's SeedVR stage (and a SeedVR2 refiner model) restores the current picture. Its `CreateSeedVR2Restore` sends:
+
+| Node | Inputs | Engine |
+|---|---|---|
+| `ImageScale` | only with SeedVR Upscale / Pre-Downscale, `pixel-*` methods | server |
+| `SeedVR2Preprocess` | `resized_images` | server: RGB, clamped, zero-padded right and bottom to multiples of 16; a batch is one clip padded to 4n + 1 frames |
+| `UNETLoader` / `CheckpointLoaderSimple`, `VAELoader` | the SeedVR model by folder; `SeedVR2/seedvr2_ema_vae_fp16.safetensors` | `ensure_seedvr`, `ensure_seedvr_vae` |
+| `VAEEncode` | the padded picture, SeedVR2's VAE | a `LatentFormat::SeedVr2` latent `[1, 16, H/8, W/8]` |
+| `SeedVR2Conditioning` | `model`, `vae_conditioning` | server: positive and negative entries with `CondMeta::seedvr2` (the latent, and which stored prompt) and no embedding |
+| `SwarmKSampler` | steps 1, CFG 1, `euler`, `simple` unless the SeedVR section sets them; seed = Seed + 9 | `Engine::sample`: the model's own stored prompts, the latent as `condition` |
+| `VAEDecode` | SeedVR2's VAE | f32 RGB |
+| `SeedVR2PostProcessing` | `images`, `original_resized_images`, `color_correction_method` (`lab` default, `wavelet`, `adain`, `none`) | server: cropped to the picture, colour matched, alpha put back, sides cut to even |
+
+The engine tiles SeedVR2's VAE by itself when a picture doesn't fit, as ComfyUI does. It refuses more than one picture
+(ComfyUI's `SeedVR2Preprocess` makes a batch one video), `VAEDecodeTiled` / `VAEEncodeTiled` (VAE Tile Size), LoRAs,
+and other formats of the model. SeedVR Split Latent's `SeedVR2TemporalChunk` and `SeedVR2TemporalMerge` aren't
+registered.

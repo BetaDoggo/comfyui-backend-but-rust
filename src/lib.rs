@@ -27,6 +27,8 @@ pub mod qwen3;
 pub mod qwen35;
 pub mod samplers;
 pub mod sampling;
+pub mod seedvr;
+pub mod seedvr_vae;
 pub mod snapref;
 pub mod st;
 pub mod te;

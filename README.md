@@ -70,6 +70,9 @@ and `VAE/Pixal3D/trellis_2_shape_vae_bf16.safetensors` with `trellis_2_texture_v
 first by BiRefNet, `background_removal/birefnet.safetensors` from [Comfy-Org/BiRefNet](https://huggingface.co/Comfy-Org/BiRefNet).
 In SwarmUI it runs from its own tab, the [Pixal3D extension](swarm%20backend/pixal3d-extension/README.md).
 
+SeedVR2, SwarmUI's restoration stage (SeedVR Model), uses `diffusion_models/SeedVR2/seedvr2_3b_int8_convrot.safetensors` and
+`VAE/SeedVR2/seedvr2_ema_vae_fp16.safetensors`, from [Comfy-Org/SeedVR2](https://huggingface.co/Comfy-Org/SeedVR2).
+
 Idol uses `diffusion_models/idol_fp16.safetensors`, `clip_vision/dino_v3_vit_h_bf16.safetensors`, and
 `VAE/idol_decoder_fp16.safetensors` with the Flux 2 VAE (`flux2-vae.safetensors`, anywhere in `VAE/`), all from
 [Comfy-Org/Idol](https://huggingface.co/Comfy-Org/Idol). It runs from the same tab, as its second model.

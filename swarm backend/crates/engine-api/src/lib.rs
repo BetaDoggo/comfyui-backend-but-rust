@@ -31,7 +31,7 @@ pub mod requests;
 pub use custom::{CustomNodeRequest, NodeValue};
 pub use custom_sampling::{CustomSampleOutput, CustomSampleRequest, Guider, NoiseSource, SamplerChoice, ScheduleRequest, Sigmas};
 pub use conditioning::{
-    ClipVisionOutput, CondEntry, ControlHint, CondMask, CondMeta, Conditioning, EmbeddingOp, GligenBox, InpaintConcat, MiniMaxKeyframe, StyleStrength, UnclipInput,
+    ClipVisionOutput, CondEntry, ControlHint, CondMask, CondMeta, Conditioning, EmbeddingOp, GligenBox, InpaintConcat, MiniMaxKeyframe, SeedVr2Condition, StyleStrength, UnclipInput,
 };
 pub use engine::{DeviceInfo, Engine, EngineError, EngineInfo, EngineResult, NullProgress, PreviewImage, ProgressSink};
 pub use handles::{AddonHandle, AddonKind, ModelFile, ModelFolder, ModelHandle, Opaque, TextEncoderHandle, VaeHandle, WeightDtype};

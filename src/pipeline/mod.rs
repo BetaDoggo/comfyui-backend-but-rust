@@ -13,12 +13,14 @@ mod h3;
 mod krea;
 mod moss;
 mod qwen21;
+mod seedvr;
 
 pub use anima::{AnimaRequest, SnapRefRequest};
 pub use h3::{h3_presentation, h3_tokens, image_pictures, ref2va_pictures, ref2va_size, resize as h3_resize, size_short_edge, H3Conds, H3Picture, H3Request};
 pub use krea::KreaRequest;
 pub use moss::{moss_tokens, MossRequest};
 pub use qwen21::Qwen21Request;
+pub use seedvr::SeedVrRequest;
 pub use crate::samplers::Inpaint;
 
 use crate::cuda::{self, DevBuf, Event, Stream};
@@ -640,6 +642,9 @@ pub struct Generator {
     te: Option<SharedTe>,
     vae: Option<(PathBuf, vae::Vae)>,
     family: Family,
+    /// SeedVR2, which restores any family's pictures: kept beside the family (see [`seedvr`]).
+    seedvr: Option<seedvr::Model>,
+    seedvr_vae: Option<(PathBuf, crate::seedvr_vae::Vae)>,
 }
 
 impl Generator {
@@ -670,7 +675,7 @@ impl Generator {
             dynamic: o.resident_blocks.is_none() && o.comfy_memory.is_none(),
             comfy: o.comfy_memory.is_some(),
         };
-        Ok(Generator { env, te: None, vae: None, family: Family::None })
+        Ok(Generator { env, te: None, vae: None, family: Family::None, seedvr: None, seedvr_vae: None })
     }
 
     /// The stream the models run on.
@@ -746,6 +751,7 @@ impl Generator {
         if let Some(f) = self.family.state() {
             f.set_int8_attention(on);
         }
+        self.seedvr_int8_attention(on);
     }
 
     /// Drop every model and give their VRAM and pinned RAM back. `ensure_*` loads them again.
@@ -754,6 +760,8 @@ impl Generator {
         self.family = Family::None;
         self.te = None;
         self.vae = None;
+        self.seedvr = None;
+        self.seedvr_vae = None;
         cuda::trim_pool()
     }
 
@@ -767,6 +775,7 @@ impl Generator {
             if let Some(f) = self.family.state() {
                 f.idle()?;
             }
+            self.seedvr_idle()?;
         }
         if self.env.comfy {
             crate::comfy_memory::node_done()?;
@@ -786,6 +795,9 @@ impl Generator {
         if !forced {
             if let Some(f) = self.family.state() {
                 f.idle()?;
+            }
+            if !self.env.comfy {
+                self.seedvr_idle()?;
             }
         }
         if self.env.comfy {

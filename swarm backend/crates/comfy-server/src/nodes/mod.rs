@@ -16,6 +16,7 @@ mod masks;
 mod media;
 mod output;
 mod sampling;
+mod seedvr;
 mod segment;
 mod snapref;
 mod three_d;
@@ -139,6 +140,7 @@ impl NodeRegistry {
         custom_sampling::register(&mut r, env);
         three_d::register(&mut r, env);
         snapref::register(&mut r, env);
+        seedvr::register(&mut r, env);
         r
     }
 

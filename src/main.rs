@@ -240,6 +240,9 @@ struct Args {
     /// MOSS Image: compare the Flux 2 VAE's encoder with a dump of tools/flux2_vae_ref.py instead of generating
     #[arg(long)]
     flux2_vae_check: Option<PathBuf>,
+    /// SeedVR2: compare each stage with a dump of tools/seedvr_ref.py (with --dit and --vae) instead of generating
+    #[arg(long)]
+    seedvr_check: Option<PathBuf>,
 }
 
 /// RGB f32 [height, width, 3], 0 to 1.
@@ -297,6 +300,8 @@ const ANIMA_TE: &str = "clip/qwen_3_600m.safetensors";
 const MOSS_DIT: &str = "Stable-diffusion/moss_image_sft_int8_convrot_attn.safetensors";
 const MOSS_TE: &str = "clip/qwen3.5_9b_int8_convrot.safetensors";
 const MOSS_VAE: &str = "VAE/flux2-vae.safetensors";
+const SEEDVR_DIT: &str = "diffusion_models/SeedVR2/seedvr2_3b_int8_convrot.safetensors";
+const SEEDVR_VAE: &str = "VAE/SeedVR2/seedvr2_ema_vae_fp16.safetensors";
 const QWEN21_DIT: &str = "Stable-diffusion/rayQwen21_v1Int8Convrot.safetensors";
 const QWEN21_TE: &str = "clip/qwen3vl_8b_int8_convrot.safetensors";
 const QWEN21_VAE: &str = "VAE/QwenImage/qwen_image_2.1_vae_bf16.safetensors";
@@ -927,6 +932,9 @@ fn main() -> Result<()> {
     }
     if let Some(reference) = &args.qwen21_vae_check {
         return diffusion::vae21::check(&args.model(&args.vae, QWEN21_VAE), reference);
+    }
+    if let Some(reference) = &args.seedvr_check {
+        return diffusion::seedvr::check(&args.model(&args.dit, SEEDVR_DIT), &args.model(&args.vae, SEEDVR_VAE), reference);
     }
     if let Some(reference) = &args.flux2_vae_check {
         return diffusion::flux2vae::check(&args.model(&args.vae, MOSS_VAE), reference);

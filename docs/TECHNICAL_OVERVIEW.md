@@ -89,6 +89,7 @@ the baked weights match ComfyUI's bit for bit. Sampling then runs the normal int
 | Qwen Image 2.1 | `src/qwen21.rs`, int8 ConvRot | Qwen3-VL 8B, `src/te.rs` and `src/vision.rs` | RGBA Wan 2.2 layout, `src/vae21.rs` |
 | MiniMax H3 | `src/h3.rs`, w6a8 | Qwen3-VL 32B, `src/h3te.rs` | Video and audio, `src/h3vae.rs` |
 | Pixal3D | `src/trellis.rs`, int8 ConvRot | DINOv3 ViT-L and NAF, `src/dino3.rs` | Sparse convolution shape and texture decoders, `src/trellis_vae.rs` |
+| SeedVR2 3B | `src/seedvr.rs`, int8 ConvRot | none: a fixed prompt stored in the checkpoint | Causal video VAE on one frame, `src/seedvr_vae.rs` |
 | TripoSplat / Idol | `src/triposplat.rs`, fp16 | DINOv3 ViT-H, `src/dino3.rs`, and the Flux 2 VAE's encoder | Octree gaussian decoder, `src/triposplat.rs` |
 
 Each model is written directly against its checkpoint, with no general layer or graph abstraction. That is what allows
@@ -99,7 +100,8 @@ The generator ([`src/pipeline/`](../src/pipeline/mod.rs)) holds one family at a 
 struct for its diffusion model, the encoders and decoders only it uses, and every prompt cache it keeps. The same file
 drops those caches when a LoRA or a text encoder changes. Loading any part of another family drops the current one. Two
 parts outlive a switch: the Qwen3-VL text encoder, shared by Krea 2 and Qwen Image 2.1, and the Wan 2.1 VAE, shared by
-Krea 2 and Anima.
+Krea 2 and Anima. SeedVR2 isn't a family: it restores any family's picture in the same job, so it is held beside the
+loaded one ([`src/pipeline/seedvr.rs`](../src/pipeline/seedvr.rs)), and the memory management moves weights between them.
 
 ## Why it is faster than ComfyUI
 

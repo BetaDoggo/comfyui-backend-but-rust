@@ -8,14 +8,14 @@ This covers every parameter SwarmUI exposes, every prompt-syntax feature, and ev
 
 It was measured, not guessed. `tools/probe_swarm_params.py` drove a live SwarmUI that was pointed at comfy-server. For each parameter it generated the workflow with and without that parameter, for each of the five target models, and diffed the two. Each case that changed the workflow was then run end to end through SwarmUI on the mock engine (the **Ran** column).
 
-**241 parameters probed:** 132 work natively, 27 work through the generic `custom_node` route, 0 are blocked, and the rest never reach the backend for these models (handled inside SwarmUI, or they only act together with another parameter).
+**241 parameters probed:** 136 work natively, 23 work through the generic `custom_node` route, 0 are blocked, and the rest never reach the backend for these models (handled inside SwarmUI, or they only act together with another parameter).
 
 ## Native and generic support
 
 Every node class SwarmUI can emit is either implemented natively or has a schema here, so every workflow SwarmUI builds validates and runs:
 
 - **Native**: the server implements the node, lowering it to typed engine requests, patches and metadata (see [INPUT_MAPPING.md](INPUT_MAPPING.md)). This covers everything SwarmUI does with the five target models.
-- **Generic** (92 node classes, listed below): other model families' stock ComfyUI nodes and third-party node packs. The schemas live in [`crates/comfy-server/src/todo_nodes.json`](../crates/comfy-server/src/todo_nodes.json). Stock schemas come from a real ComfyUI dump; third-party ones are written in `tools/third_party_schemas.py`. At startup the server asks `Engine::supports_custom_node(class)` for each. Claimed classes are registered with that schema and listed in `/object_info`, which makes SwarmUI enable the matching features. They execute through `Engine::custom_node`, with their resolved inputs and with model-file combos resolved to files. The mock engine claims all of them and returns typed placeholder outputs; run it with `--mock-native-only` to turn that off.
+- **Generic** (89 node classes, listed below): other model families' stock ComfyUI nodes and third-party node packs. The schemas live in [`crates/comfy-server/src/todo_nodes.json`](../crates/comfy-server/src/todo_nodes.json). Stock schemas come from a real ComfyUI dump; third-party ones are written in `tools/third_party_schemas.py`. At startup the server asks `Engine::supports_custom_node(class)` for each. Claimed classes are registered with that schema and listed in `/object_info`, which makes SwarmUI enable the matching features. They execute through `Engine::custom_node`, with their resolved inputs and with model-file combos resolved to files. The mock engine claims all of them and returns typed placeholder outputs; run it with `--mock-native-only` to turn that off.
 - An unclaimed class fails validation before anything runs. The `missing_node_type` error names the node, its area and the parameters behind it, and SwarmUI shows it to the user. `--advertise-todo-nodes` lists unclaimed schemas in `/object_info` anyway, for inspecting workflows; running them still fails validation.
 - To make a node native: register it under `crates/comfy-server/src/nodes/` (a native schema always wins), remove it from `tools/todo_catalog.py`, then regenerate (see the end of this file).
 
@@ -27,7 +27,7 @@ Every node class SwarmUI can emit is either implemented natively or has a schema
 
 ## Generic-route nodes by area
 
-### Other model architectures (63)
+### Other model architectures (60)
 
 SwarmUI features: Stock ComfyUI nodes for model families beyond the five targets (SD1/SDXL, SD3, Flux, Wan, LTX-V, Hunyuan, Cosmos, ...). Routed to Engine::custom_node when the engine claims them.
 
@@ -73,9 +73,6 @@ SwarmUI features: Stock ComfyUI nodes for model families beyond the five targets
 | `PiDConditioning` | new arch | Pixel decoders (Pixel Decoder Model / &lt;pixeldecoder&gt;) | (not observed with these models; WorkflowGenerator.cs:3002, WorkflowGeneratorSteps.cs:1404) |
 | `QuadrupleCLIPLoader` | new arch | HiDream | (not observed with these models; WorkflowGeneratorModelSupport.cs:938) |
 | `SVD_img2vid_Conditioning` | new arch | Stable Video Diffusion | (not observed with these models; WorkflowGenerator.cs:1536) |
-| `SeedVR2Conditioning` | new arch | SeedVR2 restoration (SeedVR Model param) | SeedVR Model |
-| `SeedVR2PostProcessing` | new arch | SeedVR2 restoration (SeedVR Model param) | SeedVR Model |
-| `SeedVR2Preprocess` | new arch | SeedVR2 restoration (SeedVR Model param) | SeedVR Model |
 | `SeedVR2TemporalChunk` | new arch | SeedVR2 restoration (SeedVR Model param) | SeedVR Split Latent |
 | `SeedVR2TemporalMerge` | new arch | SeedVR2 restoration (SeedVR Model param) | SeedVR Split Latent |
 | `SenseNovaSamplingOptions` | new arch | SenseNova | (not observed with these models; WorkflowGeneratorModelSupport.cs:938) |
@@ -276,12 +273,12 @@ Model keys: `krea2` = Krea 2, `anima` = Anima, `minimax_h3` = MiniMax H3, `moss`
 
 | Parameter | Status | Models | Via custom_node | Reaches | Ran | Notes |
 |---|---|---|---|---|---|---|
-| SeedVR Model (`seedvrmodel`) | Generic | all | `SeedVR2Conditioning`, `SeedVR2PostProcessing`, `SeedVR2Preprocess` | `VAEEncode` | yes |  |
-| SeedVR Pre-Downscale (`seedvrpredownscale`) | Generic | all | `SeedVR2Conditioning`, `SeedVR2PostProcessing`, `SeedVR2Preprocess` | `ImageScale` | yes |  |
-| SeedVR Upscale (`seedvrupscale`) | Generic | all | `SeedVR2Conditioning`, `SeedVR2PostProcessing`, `SeedVR2Preprocess` | `ImageScale` | yes |  |
+| SeedVR Model (`seedvrmodel`) | Works | all |  | `SeedVR2Conditioning`, `SeedVR2PostProcessing`, `SeedVR2Preprocess`, `VAEEncode` | yes |  |
+| SeedVR Pre-Downscale (`seedvrpredownscale`) | Works | all |  | `ImageScale` | yes |  |
+| SeedVR Upscale (`seedvrupscale`) | Works | all |  | `ImageScale` | yes |  |
 | SeedVR Upscale Method (`seedvrupscalemethod`) | Needs other params |  |  |  |  | With SeedVR Model. |
-| SeedVR Color Correction Behavior (`seedvrcolorcorrectionbehavior`) | Generic | all | `SeedVR2Conditioning`, `SeedVR2PostProcessing`, `SeedVR2Preprocess` | `SeedVR2PostProcessing.color_correction_method` | yes |  |
-| SeedVR Split Latent (`seedvrsplitlatent`) | Generic | all | `SeedVR2Conditioning`, `SeedVR2PostProcessing`, `SeedVR2Preprocess`, `SeedVR2TemporalChunk`, `SeedVR2TemporalMerge` |  | yes |  |
+| SeedVR Color Correction Behavior (`seedvrcolorcorrectionbehavior`) | Works | all |  | `SeedVR2PostProcessing.color_correction_method` | yes |  |
+| SeedVR Split Latent (`seedvrsplitlatent`) | Generic | all | `SeedVR2TemporalChunk`, `SeedVR2TemporalMerge` |  | yes |  |
 | SeedVR Temporal Video Overlap (`seedvrtemporalvideooverlap`) | Needs other params |  |  |  |  | SeedVR on video. |
 
 ### ControlNet

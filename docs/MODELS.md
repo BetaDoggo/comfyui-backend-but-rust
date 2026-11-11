@@ -12,6 +12,7 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | HyperFlow H3 Flash | Video with audio | `euler`, `hyperflow`, 6 steps | the int8 ConvRot diffusers folder only |
 | Pixal3D | A 3D mesh from one image | the example workflow's four `euler` samplers | int8 ConvRot (`pixal3d_int8_convrot`) only |
 | Idol (TripoSplat) | A 3D gaussian splat from one image | `dpmpp_2m`, `simple`, 20 steps, CFG 3 | Comfy-Org's fp16 files |
+| SeedVR2 3B | A restored copy of a picture (SwarmUI's SeedVR stage) | `euler`, `simple`, 1 step, CFG 1 | int8 ConvRot (`seedvr2_3b_int8_convrot`) only |
 
 ## Support matrix
 
@@ -624,3 +625,81 @@ the same as ComfyUI's in the tab's viewer: shape, lid, spout, handle and glaze h
 follows torch's CPU generator, and the token anchors torch's scrambled Sobol sequence, bit for bit.
 
 Not tested: TripoSplat's own checkpoint (only Idol was run), other image sizes than 1024, and running through SwarmUI.
+
+## SeedVR2
+
+ByteDance's one-step restoration model, run as SwarmUI's SeedVR stage does: SwarmUI sends `SeedVR2Preprocess` (pad to
+multiples of 16), `VAEEncode` with SeedVR2's VAE, `SeedVR2Conditioning`, one `euler` step at CFG 1, `VAEDecode` and
+`SeedVR2PostProcessing` (colour matched to the picture, CIELAB by default). The DiT is [`src/seedvr.rs`](../src/seedvr.rs):
+32 MM-DiT blocks with a fixed text prompt stored in the checkpoint, attending in windows of about 400 tokens that
+alternate with half-shifted ones. On one frame the causal video VAE is a 2D VAE with each conv's temporal taps summed
+([`src/seedvr_vae.rs`](../src/seedvr_vae.rs)). The pre- and post-processing nodes run in the server. SeedVR2 is held
+beside the loaded family, so the model that made the picture stays loaded (its weights only move to RAM for room).
+
+Files: `diffusion_models/SeedVR2/seedvr2_3b_int8_convrot.safetensors` and `VAE/SeedVR2/seedvr2_ema_vae_fp16.safetensors`
+(the path SwarmUI downloads its SeedVR2 VAE to), from [Comfy-Org/SeedVR2](https://huggingface.co/Comfy-Org/SeedVR2).
+
+Warm, on this machine, a 512 picture upscaled to the size shown, against ComfyUI running the same nodes headless
+(`tools/seedvr_ref.py`):
+
+| Size | VAE encode | DiT (one evaluation) | VAE decode | ComfyUI sampling | ComfyUI decode |
+|---|---|---|---|---|---|
+| 1024x1024 | 134 ms | 145 ms | 234 ms | 235 ms | 276 ms |
+| 2048x2048 | 705 ms | 568 ms | 1119 ms | 855 ms | 2631 ms (tiled) |
+
+The whole 1024 job through `comfy-server` over HTTP, image loading and two PNG saves included, took 0.79 s warm; the
+colour correction is 136 ms of it, on the CPU. ComfyUI's encode wasn't timed.
+
+Compared with ComfyUI on its own inputs (`--seedvr-check` against the script's dump), at 1024:
+
+| Stage | Difference |
+|---|---|
+| VAE latent | 1.4% relative, cosine 0.99990 |
+| ComfyUI's latent through our decoder | 63 dB from ComfyUI's decode |
+| Block 0 / block 9 image tokens | 0.5% / 1.0% relative |
+| Denoised latent after 32 blocks | 7.7% relative, cosine 0.997 |
+| Decoded picture | 44.5 dB from ComfyUI's (int8 and flash attention here are 44.1 dB apart) |
+| Final picture through `comfy-server`, colour correction included | 44.3 dB from ComfyUI's (the input changes by 27 dB) |
+
+At 2048 the denoised latent is again at cosine 0.997, and the decoded picture 40.2 dB from ComfyUI's, which tiles its
+decode at this size on 12 GB (its own latent through our untiled decoder: 41.4 dB).
+
+The VAE tiles itself when a picture doesn't fit, as ComfyUI's does: square tiles overlapping by a quarter, blended with
+cosine ramps, sized by ComfyUI's `preferred_decode_tile` (256 to 768 pixels) from the free VRAM plus the weights the
+memory management can move to RAM. When to tile is decided by this engine's own estimate, about half of ComfyUI's, so
+pictures it tiles can stay whole here (2048x2048 does on 12 GB; ComfyUI tiles it). Decoding ComfyUI's 2048 latent in
+ComfyUI's 768 pixel tiles comes out 62.6 dB from ComfyUI's tiled decode. ComfyUI tiles its encode only after running out
+of memory, in 256 pixel tiles; here the encode tiles like the decode. A tiled encode decodes back 38.0 dB from the
+picture at 2048, against 39.3 dB for a whole one: the encoder's attention spans the picture, so any tiling changes it.
+`SEEDVR_VAE_TILE=<latent pixels>` forces a tile size, 0 none.
+
+`--max-side` doesn't bound SeedVR2: its VAE tiles and its DiT attends in windows, so memory grows linearly with the
+picture. Through `comfy-server`, a 1024 picture restored at 4096x4096 took 15.7 s warm: encode 3.5 s and decode 6.3 s in
+768 pixel tiles, the DiT 2.3 s. 3328x4864 took 17.8 s cold, the same stages at 3.5, 2.4 and 6.4 s. A 2560x1440
+restore, untiled, took 3.0 s. ComfyUI wasn't timed at these sizes. Above 2900 squared the DiT runs its MLP in chunks of
+32768 rows. Nothing larger than 4096x4096 was tried.
+
+The maintainer has run it through SwarmUI, up to 3328x4864.
+
+### What SeedVR2 is missing here
+
+Each of these is refused with an error SwarmUI shows, unless marked untested:
+
+| SwarmUI setting | Through ComfyUI | Here |
+|---|---|---|
+| Batch Size above 1, video input (Video SeedVR) | restored as one clip of 4n + 1 frames | **Refused**: the temporal VAE and the DiT's frame windows aren't implemented. Use Batch Size 1 |
+| SeedVR Split Latent, Temporal Video Overlap | `SeedVR2TemporalChunk` / `SeedVR2TemporalMerge` | **Refused** (not registered); they only matter for video |
+| SeedVR Model: 7B, 7B sharp, the 3B's fp16, fp8, mxfp8 and nvfp4 files | all run | **Refused**: only the 3B int8 ConvRot file runs |
+| SeedVR Upscale Method `model-*` (ESRGAN and the like) | `ImageUpscaleWithModel` | **Refused**: the engine runs no upscale models yet, for any family |
+| SeedVR Upscale Method `pidmodel-*` | a pixel decoder | **Refused** |
+| SeedVR Upscale Method `latent-*` | `LatentUpscaleBy` | Should work (latent upscale works on the image models); **untested** with SeedVR |
+| VAE Tile Size (`VAEDecodeTiled`, `VAEEncodeTiled`) | tiles at that size | **Refused**; the VAE tiles by itself instead |
+| LoRAs on the SeedVR model | apply | **Refused** |
+| SeedVR2 as the Refiner Model | runs the same stage | **Untested** (same code path) |
+| SeedVR CFG above 1 | the model's stored negative prompt | **Untested** |
+| Colour correction wavelet, AdaIN, none | GPU | Implemented on the CPU; only CIELAB compared with ComfyUI, the others have unit tests |
+| Live previews | none for SeedVR2's latents | none either |
+
+The `pixel-*` upscale methods resize with the Rust `image` crate's filters, not PIL's, so SeedVR's input differs a
+little from ComfyUI's when SwarmUI upscales before it. The encoder's stride 2 convolutions run as stride 1 convolutions
+whose odd samples are kept, which wastes about a tenth of the encode.

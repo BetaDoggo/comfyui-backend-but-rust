@@ -11,6 +11,7 @@ Rules and context for people and coding agents. The [README](README.md) covers s
   characters. This covers reference dumps, benchmarks, SwarmUI tests and tool defaults. Anima can drift explicit on
   neutral prompts. Delete anything inappropriate at once and tell the maintainer.
 * **Commit or push only when asked.** Don't add AI co-author or attribution lines to commits.
+* **Never use branches.** Commit straight to `master`.
 * **Refuse, don't ignore.** A feature the engine can't honour returns `EngineError::Unsupported`, which SwarmUI shows to
   the user. Never drop a parameter silently.
 * **Don't call something working until real output has been tested.** See [Keeping the docs true](#keeping-the-docs-true).

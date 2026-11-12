@@ -1,0 +1,3 @@
+# Store text with LF, check it out with CRLF (the project is Windows-only). Tools that write either ending then
+# produce real diffs only.
+* text=auto eol=crlf

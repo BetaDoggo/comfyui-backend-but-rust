@@ -28,6 +28,8 @@ const MODEL_FILES: &[&str] = &[
     "VAE/qwen_image_vae.safetensors",
     "VAE/minimax_h3_video_vae_int8.safetensors",
     "VAE/minimax_h3_audio_vae.safetensors",
+    "diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors",
+    "VAE/MiniMaxH3/minimax_h3_image_vae_fp16.safetensors",
     "diffusion_models/moss_image_sft_int8.safetensors",
     "diffusion_models/qwen_image_2.1_fp8.safetensors",
     "text_encoders/qwen3.5_9b_int8_convrot.safetensors",
@@ -337,6 +339,17 @@ async fn minimax_h3_text_to_video_with_audio() {
 #[tokio::test(flavor = "multi_thread")]
 async fn minimax_h3_image_to_video_with_references() {
     check_h3_video("minimax_h3_i2v_refs.json").await;
+}
+
+/// SwarmUI's MiniMax H3 Image class: a one-frame latent, Prompt Images through
+/// `SwarmMiniMaxH3ImageCollectReferences`, and a separate CLIP and image VAE.
+#[tokio::test(flavor = "multi_thread")]
+async fn minimax_h3_image_with_prompt_image() {
+    let s = TestServer::start(0).await;
+    let r = run_like_swarm(&s, fixture("minimax_h3_image_refs.json"), |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    assert_eq!(r.outputs.len(), 1);
+    assert_eq!(png_dims(&r.outputs[0].bytes), (1024, 1024));
 }
 
 #[tokio::test(flavor = "multi_thread")]

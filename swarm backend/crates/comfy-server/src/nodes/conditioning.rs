@@ -295,6 +295,34 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
     r.add(
         env,
         |_| {
+            NodeSchema::new("SwarmMiniMaxH3ImageCollectReferences", "Swarm MiniMax H3 Image Collect References", "SwarmUI/conditioning")
+                .describe("Collects MiniMax H3 Image references for SwarmTextEncodeAdvanced.")
+                .input(link("vae", "VAE"))
+                .input(autogrow("ref_images", "ref_image_", 0, 100, link("ref_image", "IMAGE")).optional())
+                .output("MiniMaxReferences", "MiniMax References")
+        },
+        |i, _| {
+            // labelled `Picture i: ` in the order SwarmUI numbers them, and sized like MiniMaxH3ImageConditioning's
+            let mut images: Vec<_> = i.group("ref_images").into_iter().filter_map(|(n, v)| if let Value::Image(b) = v { Some((n, b.clone())) } else { None }).collect();
+            images.sort_by_key(|(n, _)| *n);
+            Ok(NodeOutput::one(Value::MiniMaxRefs(MiniMaxReferences {
+                style: MiniMaxRefStyle::Image,
+                vae: Some(i.vae("vae")?.clone()),
+                audio_vae: None,
+                width: 0,
+                height: 0,
+                length: 1,
+                ref_image_size: "match".into(),
+                images: images.into_iter().map(|(_, b)| b).collect(),
+                videos: Vec::new(),
+                audios: Vec::new(),
+            })))
+        },
+    );
+
+    r.add(
+        env,
+        |_| {
             NodeSchema::new("SwarmMiniMaxH3AddKeyframes", "Swarm MiniMax H3 Add Keyframes", "SwarmUI/video")
                 .input(link("vae", "VAE"))
                 .input(link("latent", "LATENT"))

@@ -260,8 +260,8 @@ impl Engine for MockEngine {
                 PixelInfo::image(width, height, req.batch_size),
             ),
             EmptyLatentKind::MiniMaxH3Image { width, height } => Latent::single(
-                LatentTensor { format: LatentFormat::MiniMaxH3Video, shape: vec![1, 24, 1, height as usize / 16, width as usize / 16], data },
-                PixelInfo::image(width, height, 1),
+                LatentTensor { format: LatentFormat::MiniMaxH3Video, shape: vec![b, 24, 1, height as usize / 16, width as usize / 16], data },
+                PixelInfo::image(width, height, req.batch_size),
             ),
             EmptyLatentKind::MiniMaxH3AudioVideo { width, height, length } => {
                 let (frames, lt, at) = minimax_h3::temporal_shape(length);

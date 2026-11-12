@@ -11,8 +11,6 @@
 
 mod latent;
 mod noise;
-// SWARM WORKAROUND (until SwarmUI knows MiniMax-H3-Image): MiniMax-H3-Image before SwarmUI knows it
-mod swarm_h3_image;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -363,17 +361,12 @@ fn h3_conds(cond: &DeferredCond, meta: &CondMeta, family: Family, sh: &h3::Shape
             None => None,
         };
         let images: Vec<PromptImage> = r.images.iter().filter(|b| b.count > 0).map(first_rgb).collect();
-        let mut style = r.style;
-        // SWARM WORKAROUND (until SwarmUI knows MiniMax-H3-Image): SwarmUI's H3 class sends prompt images as the video model's references
-        if family == Family::H3Image {
-            style = MiniMaxRefStyle::Image;
-        }
-        (out.label, out.pictures) = match (family, style) {
+        (out.label, out.pictures) = match (family, r.style) {
             (Family::H3, MiniMaxRefStyle::Video) => {
                 ("<Picture {}>: ".into(), diffusion::pipeline::ref2va_pictures(&images, (r.width as usize, r.height as usize), r.ref_image_size == "max", vae.is_some()))
             }
             (Family::H3Image, MiniMaxRefStyle::Image) => ("Picture {}: ".into(), diffusion::pipeline::image_pictures(&images, vae.is_some())),
-            (Family::H3Image, _) => return Err(unsupported("SwarmUI's MiniMax H3 references on MiniMax-H3-Image (it takes MiniMaxH3ImageConditioning's pictures)")),
+            (Family::H3Image, _) => return Err(unsupported("MiniMax H3 video references on MiniMax-H3-Image: set the model's class to MiniMax H3 Image in SwarmUI")),
             _ => return Err(unsupported("MiniMaxH3ImageConditioning's pictures on the MiniMax H3 video model")),
         };
         out.vae = vae;
@@ -535,10 +528,6 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
             }
             ModelPatch::SamplingAuraFlow { shift, sampling } if family != Family::Krea2 && sampling == "flow" => {
                 s.model_sampling = ModelSampling::Flow { shift: *shift }
-            }
-            // SWARM WORKAROUND (until SwarmUI knows MiniMax-H3-Image): SwarmUI's H3 class always sends its Sigma Shift
-            ModelPatch::MiniMaxH3Shift { .. } if family == Family::H3Image => {
-                tracing::warn!("MiniMax-H3-Image: ignoring ModelSamplingMiniMaxH3, the model samples on its own sigma grid");
             }
             ModelPatch::MiniMaxH3Shift { shift_video, shift_audio } if family == Family::H3 => {
                 s.model_sampling = ModelSampling::Flow { shift: *shift_video };
@@ -1215,26 +1204,19 @@ impl NativeEngine {
         }))
     }
 
-    /// A MiniMax-H3-Image picture from `MiniMaxH3ImageConditioning`'s latent.
+    /// A MiniMax-H3-Image picture from `MiniMaxH3ImageConditioning`'s or `SwarmEmptyMiniMaxH3ImageLatent`'s latent.
     fn sample_h3_image(&self, req: &SampleRequest, settings: &ModelSettings, progress: &mut dyn ProgressSink) -> EngineResult<Latent> {
         let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
-        // SWARM WORKAROUND (until SwarmUI knows MiniMax-H3-Image): SwarmUI's EmptyLatentImage placeholder
-        // and the H3 class's joint audio/video latent, of which the video half is sampled
-        let av_audio = match &req.latent.samples {
-            LatentSamples::AudioVideo { video, audio } => Some((swarm_h3_image::still(video)?, audio.clone())),
-            _ => None,
-        };
-        let widened = match &req.latent.samples {
-            LatentSamples::Single(t) => swarm_h3_image::widen(t, req.latent.empty)?.map(|(t, pixel)| Latent { samples: LatentSamples::Single(t), pixel, ..req.latent.clone() }),
-            LatentSamples::AudioVideo { video, .. } => Some(Latent { samples: LatentSamples::Single(video.clone()), ..req.latent.clone() }),
-        };
-        let latent = widened.as_ref().unwrap_or(&req.latent);
+        let latent = &req.latent;
         let LatentSamples::Single(tensor) = &latent.samples else {
-            return Err(unsupported("MiniMax-H3-Image with an audio/video latent"));
+            return Err(unsupported("MiniMax-H3-Image with an audio/video latent: set the model's class to MiniMax H3 Image in SwarmUI"));
         };
         let &[1, 24, 1, lh, lw] = tensor.shape.as_slice() else {
-            return Err(unsupported(format!("MiniMax-H3-Image latents of shape {:?} (it takes MiniMaxH3ImageConditioning's)", tensor.shape)));
+            if let [b, 24, 1, _, _] = tensor.shape.as_slice() {
+                return Err(unsupported(format!("batches of {b} on MiniMax-H3-Image (use Images instead of Batch Size)")));
+            }
+            return Err(unsupported(format!("MiniMax-H3-Image latents of shape {:?} (it takes SwarmEmptyMiniMaxH3ImageLatent's or MiniMaxH3ImageConditioning's)", tensor.shape)));
         };
         if lh % 2 != 0 || lw % 2 != 0 {
             return Err(unsupported("MiniMax-H3-Image needs a width and height in multiples of 32"));
@@ -1265,11 +1247,6 @@ impl NativeEngine {
             .map_err(internal)?;
         tracing::info!("h3 image: text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
         let video = LatentTensor { format: tensor.format, shape: tensor.shape.clone(), data: Opaque::new(HostLatent { data: out }) };
-        if let Some((_, audio)) = av_audio {
-            // silent audio beside the picture
-            let data = vec![0.0; audio.shape.iter().product()];
-            return Ok(req.latent.with_samples(LatentSamples::AudioVideo { video, audio: LatentTensor { data: Opaque::new(HostLatent { data }), ..audio } }));
-        }
         Ok(latent.with_samples(LatentSamples::Single(video)))
     }
 
@@ -1462,16 +1439,6 @@ impl Engine for NativeEngine {
     }
 
     fn load_checkpoint(&self, req: &LoadCheckpoint) -> EngineResult<(ModelHandle, TextEncoderHandle, VaeHandle)> {
-        // SWARM WORKAROUND (until SwarmUI knows MiniMax-H3-Image): SwarmUI takes an unknown model's CLIP and VAE from this loader
-        // (with the H3 class SwarmUI loads its own CLIP and VAE, so missing companions only fail when they're used)
-        if check_dit(&req.file)? == Family::H3Image {
-            let model = self.load_model(&req.file)?;
-            if let Ok((te, vae)) = swarm_h3_image::companions(&req.file) {
-                return Ok((model, swarm_h3_image::text_encoder(te, MINIMAX_ENCODER), swarm_h3_image::vae(vae)));
-            }
-            return Ok((model, TextEncoderHandle { sources: vec![], encoder_type: String::new(), device: "default".into(), engine: Opaque::none(), patches: vec![] },
-                VaeHandle::new(None, Opaque::none())));
-        }
         // SwarmUI picks this loader for anything in its Stable-Diffusion folder, by folder alone.
         // The file holds only the diffusion model; SwarmUI adds its own CLIPLoader and VAELoader.
         Ok((
@@ -1580,8 +1547,8 @@ impl Engine for NativeEngine {
         }
         if let EmptyLatentKind::MiniMaxH3Image { width, height } = req.kind {
             return Ok(Latent::single(
-                LatentTensor { format: LatentFormat::MiniMaxH3Video, shape: vec![1, 24, 1, height as usize / 16, width as usize / 16], data: Opaque::none() },
-                PixelInfo::image(width, height, 1),
+                LatentTensor { format: LatentFormat::MiniMaxH3Video, shape: vec![req.batch_size as usize, 24, 1, height as usize / 16, width as usize / 16], data: Opaque::none() },
+                PixelInfo::image(width, height, req.batch_size),
             ));
         }
         if let EmptyLatentKind::Flux2 { width, height } = req.kind {

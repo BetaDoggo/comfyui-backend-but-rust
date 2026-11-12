@@ -493,22 +493,19 @@ warm 2048x2048 graph took 10.6 s in all and a 1024x1024 one 6.1 s.
 **Edits.** `MiniMaxH3ImageConditioning`'s pictures, and `--image` on the CLI, are shown to the text encoder as
 `Picture i: ` at a 1024 short edge and, with the VAE, packed as reference rows at a short edge between 1024 and 2048, as
 described under [reference pictures](#reference-pictures-and-keyframes). With pictures, the node's width and height of
-0 take the first picture's VAE size. Edits were tried through SwarmUI (below) and found working, but not compared with
+0 take the first picture's VAE size. Edits were tried through SwarmUI's graph (below) and found working, but not compared with
 ComfyUI. `tools/h3_image_ref.py --image` dumps ComfyUI's reference latents (`ref0`, ...) to compare with `--dump`.
 
 Refused with an error: LoRAs, init images, noise masks, `<break>`, context windows and sparse attention. The bf16 and
 w4a8 releases are refused too.
-SwarmUI doesn't recognise the model yet: it tells H3 by its audio projection, which this checkpoint lacks. Until it
-does, the engine works around that ([`swarm_h3_image.rs`](../swarm%20backend/crates/native-engine/src/swarm_h3_image.rs),
-and the hooks marked `SWARM WORKAROUND` in the native engine), to be removed once SwarmUI supports the model:
 
-* With the model's class left unknown, SwarmUI sends its default graph. `CheckpointLoaderSimple` then hands back H3's
-  text encoder and the image VAE, found in the checkpoint's models folder, and the sampler widens the 4-channel
-  placeholder latent to the model's one frame. Set Steps to 6 and CFG Scale to 1.
-* With the class set to MiniMax H3, SwarmUI sends H3's graph: its Sigma Shift is ignored with a warning, the joint
-  latent's video half must be one frame (Text2Video Frames 1), and the picture comes back with silent audio. Pick the
-  image VAE. Its Prompt Images arrive as the video model's references and are used as this model's edit pictures.
-  SwarmUI's default sampler for H3, `res_multistep`, oversaturates this model's pictures: use `euler`.
+In SwarmUI the model has its own class, MiniMax H3 Image. SwarmUI loads H3's text encoder and the image VAE with their
+own loaders, makes the latent with `SwarmEmptyMiniMaxH3ImageLatent`, and passes Prompt Images through
+`SwarmMiniMaxH3ImageCollectReferences` to `SwarmTextEncodeAdvanced`, labelled `Picture i: ` and sized as
+`MiniMaxH3ImageConditioning` sizes them. Set Steps to 6 and CFG Scale to 1. Batch Size above 1 is refused; use Images
+instead. Through `comfy-server` over HTTP, that graph made a 1024x1024 picture in 6.0 s warm, and an edit of it from one
+Prompt Image in 45 s, 37 s of it encoding the prompt with the picture on its first run. Both were checked by eye, not compared with ComfyUI,
+and not yet run from SwarmUI itself.
 
 Only `euler` and `simple`, and only 1024x1024 and 2048x2048, were compared with ComfyUI.
 

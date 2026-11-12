@@ -134,6 +134,19 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
     r.add(
         env,
         |_| {
+            NodeSchema::new("SwarmEmptyMiniMaxH3ImageLatent", "Swarm Empty MiniMax H3 Image Latent", "SwarmUI/latent")
+                .describe("One-frame latent for MiniMax-H3-Image: [B, 24, 1, H/16, W/16].")
+                .input(int_step("width", 2048, 32, MAX_RESOLUTION, 32))
+                .input(int_step("height", 2048, 32, MAX_RESOLUTION, 32))
+                .input(int("batch_size", 1, 1, 4096))
+                .output("LATENT", "LATENT")
+        },
+        |i, ctx| empty_latent(ctx, EmptyLatentKind::MiniMaxH3Image { width: i.uint("width")?, height: i.uint("height")? }, i.uint("batch_size")?),
+    );
+
+    r.add(
+        env,
+        |_| {
             NodeSchema::new("LTXVSeparateAVLatent", "Separate AV Latent", "model/latent/ltxv")
                 .describe("Split a joint AV latent into its video and audio latents (any AV model, e.g. LTXV or MiniMax H3).")
                 .input(link("av_latent", "LATENT"))

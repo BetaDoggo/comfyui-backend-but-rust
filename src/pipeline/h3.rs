@@ -419,16 +419,15 @@ impl Generator {
         let f = self.family.h3().context("no H3 model")?;
         let shifts = (r.shifts.0 as f32, r.shifts.1 as f32);
         let dit = &mut f.model.as_mut().context("no H3 model")?.dit;
-        // its time embedding reads where each step ends, which only euler's steps are sure to
-        if dit.is_hyperflow() && r.sampling.sampler != "euler" {
-            bail!("the {} sampler on HyperFlow H3 Flash (only euler for now)", r.sampling.sampler);
+        if dit.is_hyperflow() && !h3::hyperflow_sampler_ok(&r.sampling.sampler) {
+            bail!("the {} sampler on HyperFlow H3 Flash (only euler and res_multistep)", r.sampling.sampler);
         }
         dit.shifts = shifts;
         dit.sparse = r.sparse.clone();
         let c = &r.conds;
         let conditioned = !c.keyframes.is_empty() || c.pictures.iter().any(|p| p.latent.is_some());
-        if conditioned && (r.windows.as_ref().is_some_and(|w| w.applies(&r.shape)) || r.sparse.is_some() || dit.is_hyperflow()) {
-            bail!("keyframes and reference pictures with context windows, sparse attention or HyperFlow H3 Flash");
+        if conditioned && (r.windows.as_ref().is_some_and(|w| w.applies(&r.shape)) || r.sparse.is_some()) {
+            bail!("keyframes and reference pictures with context windows or sparse attention");
         }
         let neg_key = if r.sampling.uses_negative() { Some(f.context(&r.negative, "", &[], env.threads, st, None)?) } else { None };
         let vision: Vec<PromptImage> = c.pictures.iter().map(|p| p.vision.clone()).collect();

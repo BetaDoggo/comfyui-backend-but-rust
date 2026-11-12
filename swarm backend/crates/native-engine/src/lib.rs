@@ -1171,9 +1171,8 @@ impl NativeEngine {
             return Err(unsupported("init videos, refiners and noise masks on MiniMax H3"));
         }
         if h3::hyperflow_config(&file.path).is_some() {
-            // its time embedding reads where each step ends, which only euler's steps are sure to
-            if req.sampler != "euler" {
-                return Err(unsupported(format!("the {} sampler on HyperFlow H3 Flash (only euler for now)", req.sampler)));
+            if !h3::hyperflow_sampler_ok(&req.sampler) {
+                return Err(unsupported(format!("the {} sampler on HyperFlow H3 Flash (only euler and res_multistep)", req.sampler)));
             }
             if !settings.loras.is_empty() {
                 return Err(unsupported("LoRAs on HyperFlow H3 Flash (its layers are pruned and factorized)"));

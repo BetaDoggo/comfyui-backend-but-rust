@@ -27,7 +27,7 @@ It really generates with these image, video and image-to-3D models, from specifi
 | SeedVR2 3B | Restores a picture, as SwarmUI's SeedVR stage | 0.79 s per 1024 restore, DiT 145 ms | DiT 235 ms |
 
 The image and video models take every ComfyUI sampler and scheduler and LoRAs, with exceptions listed in
-[Models](docs/MODELS.md): HyperFlow H3 Flash samples with `euler` only, and it and MiniMax-H3-Image refuse LoRAs. Init
+[Models](docs/MODELS.md): HyperFlow H3 Flash samples with `euler` and `res_multistep` only, and it and MiniMax-H3-Image refuse LoRAs. Init
 images, inpainting and refiners work on the image models. ControlNet and every other model family don't work yet. The
 server accepts far more of SwarmUI's features than that, but they only reach a mock engine, so run this beside a normal
 ComfyUI backend. [Status](docs/STATUS.md) lists what works and what's left, in priority order.
@@ -63,7 +63,7 @@ Put your models in one folder, keeping these subfolders, and point `MODELS_ROOT`
 | MOSS Image | `moss_image_sft_int8_convrot_attn.safetensors` | `qwen3.5_9b_int8_convrot.safetensors` | `flux2-vae.safetensors` |
 | Qwen Image 2.1 | `rayQwen21_v1Int8Convrot.safetensors` | `qwen3vl_8b_int8_convrot.safetensors` | `QwenImage/qwen_image_2.1_vae_bf16.safetensors` |
 | MiniMax H3 | `minimax_h3_fl2va_pruned_w6a8.safetensors` | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `MiniMaxH3/minimax_h3_video_vae_int8_convrot.safetensors`, `MiniMaxH3/minimax_h3_audio_vae_fp32.safetensors` |
-| HyperFlow H3 Flash | a folder holding `fl2va_int8_convrot/` from [its repository](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash); pick any shard | as MiniMax H3 | as MiniMax H3 |
+| HyperFlow H3 Flash | `minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors` from `ref2va_int8_convrot_comfyui/` in [its repository](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash), or a folder holding `fl2va_int8_convrot/` (pick any shard) | as MiniMax H3 | as MiniMax H3 |
 | MiniMax-H3-Image | `minimax_h3_image_pruned_int8_convrot.safetensors` | as MiniMax H3 | `MiniMaxH3/minimax_h3_image_vae_fp16.safetensors` |
 
 Pixal3D uses other folders: `diffusion_models/Pixal3D/pixal3d_int8_convrot.safetensors`, `clip_vision/dino_v3_L_naf_fp32.safetensors`,

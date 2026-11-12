@@ -220,16 +220,74 @@ fn row_bytes(st: &SafeTensors, name: &str) -> Result<Vec<u8>> {
     Ok(f32_bytes(&st.f32_vec(name, false)?))
 }
 
-/// True for HyperFlow H3 Flash: H3 conditioned on the step's endpoint as well as its time, in diffusers form.
+/// True for HyperFlow H3 Flash: H3 conditioned on the step's endpoint as well as its time, in diffusers form or in
+/// ComfyUI's single file.
 pub fn is_hyperflow(has: impl Fn(&str) -> bool) -> bool {
-    has("endpoint_time_embedder.linear_1.weight")
+    has("endpoint_time_embedder.linear_1.weight") || is_hyperflow_comfy(has)
 }
 
-/// The `config.json` of a HyperFlow H3 Flash model, if `path` is one of its shards.
+/// True if HyperFlow H3 Flash can sample with `sampler`. Its time embedding reads where each step ends, taken as the
+/// schedule's next sigma (as HyperFlow's ComfyUI node takes it), so a sampler must evaluate only at the schedule's
+/// sigmas and land on the next one: euler and res_multistep do; ancestral, SDE and midpoint samplers don't.
+pub fn hyperflow_sampler_ok(sampler: &str) -> bool {
+    matches!(sampler, "euler" | "res_multistep" | "res_multistep_cfg_pp")
+}
+
+/// HyperFlow H3 Flash in ComfyUI's tensor layout, as `ComfyUI-HyperFlow-Flash` reads it.
+fn is_hyperflow_comfy(has: impl Fn(&str) -> bool) -> bool {
+    has("endpoint_time_embedder.proj_in.weight")
+}
+
+/// What a HyperFlow H3 Flash model says of itself, if `path` is one: the `config.json` beside its diffusers shards, or
+/// for ComfyUI's single file its `hyperflow` metadata in the same terms (`quantization.method`, `num_layers`,
+/// `dropped_blocks`), plus `variant` (`fl2va` or `ref2va`) and `layout: "comfyui"`.
 pub fn hyperflow_config(path: &std::path::Path) -> Option<serde_json::Value> {
-    let (_, config) = crate::st::diffusers_shards(path)?;
-    let c: serde_json::Value = serde_json::from_slice(&std::fs::read(config).ok()?).ok()?;
-    (c["_class_name"] == "HyperFlowH3FlashTransformer3DModel").then_some(c)
+    if let Some((_, config)) = crate::st::diffusers_shards(path) {
+        let c: serde_json::Value = serde_json::from_slice(&std::fs::read(config).ok()?).ok()?;
+        return (c["_class_name"] == "HyperFlowH3FlashTransformer3DModel").then_some(c);
+    }
+    hyperflow_comfy_config(&comfy_metadata(path)?)
+}
+
+/// The `__metadata__` of a safetensors file, read from its header alone.
+fn comfy_metadata(path: &std::path::Path) -> Option<std::collections::HashMap<String, String>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut n = [0u8; 8];
+    f.read_exact(&mut n).ok()?;
+    let n = u64::from_le_bytes(n);
+    if n > 64 << 20 {
+        return None;
+    }
+    let mut h = vec![0u8; n as usize];
+    f.read_exact(&mut h).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&h).ok()?;
+    serde_json::from_value(v.get("__metadata__")?.clone()).ok()
+}
+
+/// ComfyUI-HyperFlow-Flash's `hyperflow` metadata, in the terms of the diffusers `config.json`.
+fn hyperflow_comfy_config(meta: &std::collections::HashMap<String, String>) -> Option<serde_json::Value> {
+    let m: serde_json::Value = serde_json::from_str(meta.get("hyperflow")?).ok()?;
+    let blocks = m["blocks"].as_u64()?;
+    let dropped = m["dropped_blocks"].as_array().cloned().unwrap_or_default();
+    Some(serde_json::json!({
+        "_class_name": "HyperFlowH3FlashTransformer3DModel",
+        "layout": "comfyui",
+        "format": m["format"],
+        "variant": m["variant"],
+        "quantization": { "method": m["weights"], "group": m["convrot_groupsize"] },
+        "num_layers": blocks + dropped.len() as u64,
+        "dropped_blocks": dropped,
+    }))
+}
+
+/// The layout version of ComfyUI-HyperFlow-Flash's files that this reads.
+const HYPERFLOW_COMFY_FORMAT: u64 = 1;
+
+/// True if `quant` is ComfyUI's int8 ConvRot with 256-wide groups, which these kernels run.
+fn is_convrot256(st: &SafeTensors, quant: &str) -> bool {
+    let q = st.bytes(quant).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
+    q.is_some_and(|q| q["format"] == "int8_tensorwise" && q["convrot"] == true && q["convrot_groupsize"] == 256)
 }
 
 /// Name the halves of HyperFlow's fused SwiGLU inputs. Diffusers stores them `[value; gate]`; the kernels here read
@@ -279,6 +337,26 @@ impl Unit {
     }
 }
 
+/// Linear `m` of a block as low-rank pairs, one per part (`<part>.down.weight`, `<part>.up.weight`).
+fn low_rank_layout(st: &SafeTensors, l: &mut Layout, u: &mut Unit, m: usize, parts: &[String]) -> Result<()> {
+    u.lins[m] = Lin::LowRank;
+    // ranks padded with zeros to multiples of 8 for aligned GEMMs; q, k and v share one down GEMM
+    let mut downs = Vec::new();
+    for (j, x) in parts.iter().enumerate() {
+        let slot = RANK_SLOT[m] + j;
+        let (down, up) = (format!("{x}.down.weight"), format!("{x}.up.weight"));
+        let (di, ui) = (st.info(&down)?, st.info(&up)?);
+        if di.dtype != Dt::BF16 || ui.dtype != Dt::BF16 {
+            bail!("{down}: low-rank pairs must be bf16");
+        }
+        let r = di.shape[0].next_multiple_of(RANK_ALIGN);
+        u.ranks[slot] = r;
+        downs.push((down, r, di.shape[1]));
+        l.padded(st, &format!("up{slot}"), &[(up, ui.shape[0], r)])?;
+    }
+    l.padded(st, &format!("dn{}", RANK_SLOT[m]), &downs)
+}
+
 fn hf_block_layout(st: &SafeTensors, i: usize) -> Result<(Layout, Unit)> {
     let n = |x: &str| format!("transformer_blocks.{i}.{x}");
     let mut l = Layout::new();
@@ -295,22 +373,7 @@ fn hf_block_layout(st: &SafeTensors, i: usize) -> Result<(Layout, Unit)> {
             l.raw(st, &format!("w_{key}"), &pick("qweight"))?;
             l.raw(st, &format!("c_{key}"), &pick("wscale"))?;
         } else if names.iter().all(|x| st.has(&format!("{}.down.weight", n(x)))) {
-            u.lins[m] = Lin::LowRank;
-            // ranks padded with zeros to multiples of 8 for aligned GEMMs; q, k and v share one down GEMM
-            let mut downs = Vec::new();
-            for (j, x) in names.iter().enumerate() {
-                let slot = RANK_SLOT[m] + j;
-                let (down, up) = (format!("{}.down.weight", n(x)), format!("{}.up.weight", n(x)));
-                let (di, ui) = (st.info(&down)?, st.info(&up)?);
-                if di.dtype != Dt::BF16 || ui.dtype != Dt::BF16 {
-                    bail!("{down}: low-rank pairs must be bf16");
-                }
-                let r = di.shape[0].next_multiple_of(RANK_ALIGN);
-                u.ranks[slot] = r;
-                downs.push((down, r, di.shape[1]));
-                l.padded(st, &format!("up{slot}"), &[(up, ui.shape[0], r)])?;
-            }
-            l.padded(st, &format!("dn{}", RANK_SLOT[m]), &downs)?;
+            low_rank_layout(st, &mut l, &mut u, m, &names.iter().map(|x| n(x)).collect::<Vec<_>>())?;
         } else {
             bail!("{}: neither int8 ConvRot nor low-rank in every part", n(names[0]));
         }
@@ -361,6 +424,60 @@ fn hf_globals_layout(st: &SafeTensors, ids: &[usize]) -> Result<Layout> {
     Ok(g)
 }
 
+/// The parts of each linear when ComfyUI's HyperFlow file stores it low-rank: q, k and v stay apart there.
+const HFC_LOW_RANK: [&[&str]; 4] = [&["attn.q_proj", "attn.k_proj", "attn.v_proj"], &["attn.out_proj"], &["mlp.fc1"], &["mlp.fc2"]];
+
+/// A block of HyperFlow's ComfyUI file: each linear int8 ConvRot under ComfyUI's names (q, k and v joined, the SwiGLU
+/// input already `[gate; value]`), or low-rank pairs.
+fn hfc_block_layout(st: &SafeTensors, i: usize) -> Result<(Layout, Unit)> {
+    let n = |x: &str| format!("blocks.{i}.{x}");
+    let mut l = Layout::new();
+    let mut u = Unit { lins: [Lin::Int8; 4], ranks: [0; 6] };
+    for (m, ((key, module), parts)) in MODULES.iter().zip(HFC_LOW_RANK).enumerate() {
+        let w = n(&format!("{module}.weight"));
+        if st.has(&w) {
+            if st.info(&w)?.dtype != Dt::I8 || !is_convrot256(st, &n(&format!("{module}.comfy_quant"))) {
+                bail!("{w}: HyperFlow H3 Flash's dense linears must be int8 ConvRot with 256-wide groups");
+            }
+            l.raw(st, &format!("w_{key}"), &[w])?;
+            l.raw(st, &format!("c_{key}"), &[n(&format!("{module}.weight_scale"))])?;
+        } else if parts.iter().all(|x| st.has(&n(&format!("{x}.down.weight")))) {
+            low_rank_layout(st, &mut l, &mut u, m, &parts.iter().map(|x| n(x)).collect::<Vec<_>>())?;
+        } else {
+            bail!("{}: neither int8 ConvRot nor low-rank", n(module));
+        }
+    }
+    l.bf16(st, "n1", &[n("norm1.weight")])?;
+    l.bf16(st, "n2", &[n("norm2.weight")])?;
+    l.f32(st, "qn", &n("attn.q_norm.weight"), 0.0)?;
+    l.f32(st, "kn", &n("attn.k_norm.weight"), 0.0)?;
+    Ok((l, u))
+}
+
+/// The small tensors of HyperFlow's ComfyUI file: H3's names, with float32 patch projections and heads.
+fn hfc_globals_layout(st: &SafeTensors, blocks: usize) -> Result<Layout> {
+    let mut g = Layout::new();
+    for (key, name) in [("vid_w", "video_patch_proj.weight"), ("vid_b", "video_patch_proj.bias"), ("aud_w", "audio_patch_proj.weight"), ("aud_b", "audio_patch_proj.bias"),
+        ("ao_w", "final_layer.audio_out.weight"), ("ao_b", "final_layer.audio_out.bias"), ("vo_w", "final_layer.video_out.weight"), ("vo_b", "final_layer.video_out.bias")]
+    {
+        if st.info(name)?.dtype != Dt::F32 {
+            bail!("{name}: expected float32");
+        }
+        g.raw(st, key, &[name.to_string()])?;
+    }
+    g.bf16(st, "cond_w", &["condition_proj.weight".to_string()])?;
+    g.bf16(st, "cond_b", &["condition_proj.bias".to_string()])?;
+    g.bf16(st, "fn", &["final_layer.norm.weight".to_string()])?;
+    g.f32(st, "rn", "token_refiner.final_norm.weight", 0.0)?;
+    g.bytes("fa_w", row_bytes(st, "final_layer.adaln_proj.linear.weight")?);
+    g.bytes("fa_b", row_bytes(st, "final_layer.adaln_proj.linear.bias")?);
+    for i in 0..blocks {
+        g.bytes(&format!("a{i}_w"), row_bytes(st, &format!("blocks.{i}.adaln_proj.linear.weight"))?);
+        g.bytes(&format!("a{i}_b"), row_bytes(st, &format!("blocks.{i}.adaln_proj.linear.bias"))?);
+    }
+    Ok(g)
+}
+
 /// Diffusers' `Timesteps(256, flip_sin_to_cos=True)` then `TimestepEmbedding`, in float32 on the host.
 struct TimeMlp {
     w1: Vec<f32>,
@@ -372,9 +489,11 @@ struct TimeMlp {
 const FREQ: usize = 256;
 
 impl TimeMlp {
+    /// `p`'s two linears, `linear_1` and `linear_2` in diffusers, `proj_in` and `proj_out` in ComfyUI's `TimeEmbedder`.
     fn load(st: &SafeTensors, p: &str) -> Result<Self> {
+        let (a, b) = if st.has(&format!("{p}.proj_in.weight")) { ("proj_in", "proj_out") } else { ("linear_1", "linear_2") };
         let v = |x: &str| st.f32_vec(&format!("{p}.{x}"), false);
-        let m = TimeMlp { w1: v("linear_1.weight")?, b1: v("linear_1.bias")?, w2: v("linear_2.weight")?, b2: v("linear_2.bias")? };
+        let m = TimeMlp { w1: v(&format!("{a}.weight"))?, b1: v(&format!("{a}.bias"))?, w2: v(&format!("{b}.weight"))?, b2: v(&format!("{b}.bias"))? };
         if m.w1.len() != m.b1.len() * FREQ || m.w2.len() != m.b2.len() * m.b1.len() {
             bail!("{p}: unexpected shapes");
         }
@@ -408,6 +527,8 @@ struct Hyper {
     gate: f32,
     te: TimeMlp,
     ee: TimeMlp,
+    /// ComfyUI's model rounds `temb` to bf16 before the SiLU; diffusers keeps it in float32
+    round_temb: bool,
     /// by the bits of (t, r): a schedule repeats its pairs every run, and CFG asks twice per step
     cache: std::collections::HashMap<(u32, u32), Vec<f32>>,
 }
@@ -415,12 +536,13 @@ struct Hyper {
 impl Hyper {
     /// What the AdaLN projections read: `silu(temb)`, rounded to their bf16.
     fn adaln_input(&mut self, t: f32, r: f32) -> Vec<f32> {
-        let (te, ee, gate) = (&self.te, &self.ee, self.gate);
+        let (te, ee, gate, round) = (&self.te, &self.ee, self.gate, self.round_temb);
+        let rnd = |v: f32| bf16::from_f32(v).to_f32();
         self.cache
             .entry((t.to_bits(), r.to_bits()))
             .or_insert_with(|| {
                 let (a, b) = (te.at(t), ee.at(r));
-                a.iter().zip(&b).map(|(a, b)| bf16::from_f32(silu(a + gate * (b - a))).to_f32()).collect()
+                a.iter().zip(&b).map(|(a, b)| a + gate * (b - a)).map(|e| rnd(silu(if round { rnd(e) } else { e }))).collect()
             })
             .clone()
     }
@@ -710,6 +832,8 @@ pub struct Dit {
     pdd: Option<Pdd>,
     /// the token refiner is plain bf16
     dense_refiner: bool,
+    /// a low-rank SwiGLU input's up rows are diffusers' `[value; gate]`, not ComfyUI's `[gate; value]`
+    fc1_value_first: bool,
     pub prof: crate::prof::Prof,
 }
 
@@ -718,8 +842,38 @@ impl Dit {
     /// file as they are used.
     pub fn load(st: &Arc<SafeTensors>, threads: usize, s0: &Stream) -> Result<Self> {
         let (gl, layouts, units, ref_layouts, table, inv_freq, tdim, hyper, block_ids);
-        let (mut pdd, mut dense_refiner) = (None, false);
-        if is_hyperflow(|k| st.has(k)) {
+        let (mut pdd, mut dense_refiner, mut fc1_value_first) = (None, false, false);
+        if is_hyperflow_comfy(|k| st.has(k)) {
+            dense_refiner = true;
+            let cfg = hyperflow_comfy_config(&st.metadata).context("HyperFlow H3 Flash: no `hyperflow` metadata in the file")?;
+            if cfg["format"].as_u64().is_none_or(|f| f > HYPERFLOW_COMFY_FORMAT) {
+                bail!("HyperFlow H3 Flash: layout {} of ComfyUI-HyperFlow-Flash's files; this reads up to {HYPERFLOW_COMFY_FORMAT}", cfg["format"]);
+            }
+            let q = &cfg["quantization"];
+            if q["method"] != "int8_convrot" || q["group"] != 256 {
+                bail!("HyperFlow H3 Flash: only the int8 ConvRot release (group 256) runs here, not {q}");
+            }
+            // dropped blocks are left out and the rest renumbered, as ComfyUI counts them
+            let n = (0..).take_while(|i| st.has(&format!("blocks.{i}.norm1.weight"))).count();
+            let blocks = cfg["num_layers"].as_u64().unwrap_or(0) as usize - cfg["dropped_blocks"].as_array().map_or(0, |a| a.len());
+            if n != blocks {
+                bail!("HyperFlow H3 Flash: {n} blocks in the file, {blocks} in its metadata");
+            }
+            let gate = *st.f32_vec("hyperflow_gate", false)?.first().context("HyperFlow H3 Flash: an empty hyperflow_gate")?;
+            let (te, ee) = (TimeMlp::load(st, "time_embedder")?, TimeMlp::load(st, "endpoint_time_embedder")?);
+            tdim = te.b2.len();
+            if ee.b2.len() != tdim {
+                bail!("HyperFlow H3 Flash: the two time embedders differ in width");
+            }
+            hyper = Some(Hyper { gate, te, ee, round_temb: true, cache: Default::default() });
+            gl = hfc_globals_layout(st, n)?;
+            block_ids = (0..n).collect();
+            (layouts, units) = (0..n).map(|i| hfc_block_layout(st, i)).collect::<Result<Vec<_>>>()?.into_iter().unzip();
+            ref_layouts = (0..REFINER).map(|i| bf16_refiner_layout(st, i)).collect::<Result<Vec<_>>>()?;
+            table = Vec::new();
+            inv_freq = st.f32_vec("rope.inv_freq", false)?;
+        } else if is_hyperflow(|k| st.has(k)) {
+            fc1_value_first = true;
             dense_refiner = true;
             let cfg = st.config.as_ref().context("HyperFlow H3 Flash needs the config.json next to its shards")?;
             let q = &cfg["quantization"];
@@ -742,7 +896,7 @@ impl Dit {
             if ee.b2.len() != tdim {
                 bail!("HyperFlow H3 Flash: the two time embedders differ in width");
             }
-            hyper = Some(Hyper { gate, te, ee, cache: Default::default() });
+            hyper = Some(Hyper { gate, te, ee, round_temb: false, cache: Default::default() });
             gl = hf_globals_layout(st, &ids)?;
             block_ids = ids.clone();
             (layouts, units) = ids.iter().map(|&i| hf_block_layout(st, i)).collect::<Result<Vec<_>>>()?.into_iter().unzip();
@@ -797,7 +951,8 @@ impl Dit {
         let refiner = WeightSet::lazy("h3 refiner", st.clone(), ref_layouts, Plan { resident: 0, slots: 0 }, threads)?;
         refiner.once_per_prompt();
         Ok(Dit { globals, gl, blocks, units, refiner, table, inv_freq, tdim, hyper, mid_width, int8_attn: true, attn_variant: 0,
-            sparse: None, sparse_logged: Vec::new(), block_ids, shifts: (SHIFT_VIDEO as f32, SHIFT_AUDIO as f32), pdd, dense_refiner, prof: crate::prof::Prof::new() })
+            sparse: None, sparse_logged: Vec::new(), block_ids, shifts: (SHIFT_VIDEO as f32, SHIFT_AUDIO as f32), pdd, dense_refiner, fc1_value_first,
+            prof: crate::prof::Prof::new() })
     }
 
     /// MiniMax-H3-Image, which samples one image without audio.
@@ -926,9 +1081,6 @@ impl Dit {
     /// The embedded rows of keyframe and reference latents `[24, t, h, w]`, in the order they pack, bf16 `[rows, F]`:
     /// `_cond_video_rows`, which mixes each latent's rows with noise from the sampler's `seed`, the same for every one.
     pub fn cond_rows(&self, latents: &[(&[f32], usize, usize, usize)], seed: u64, st: &Stream) -> Result<DevBuf> {
-        if self.hyper.is_some() {
-            bail!("keyframes and reference pictures on HyperFlow H3 Flash");
-        }
         let mut rows = Vec::new();
         for &(v, t, h, w) in latents {
             anyhow::ensure!(h % 2 == 0 && w % 2 == 0 && v.len() == VCH * t * h * w, "a condition latent of {t}x{h}x{w}");
@@ -1072,8 +1224,8 @@ impl Dit {
         // [t, c, ...] -> rows of (c, y2, x2)
         let rows = patchify(vx, sh.t, sh.h, sh.w);
         let nc = pack.cond.map_or(0, |(_, e)| e.rows(sh));
-        if nc > 0 && (self.hyper.is_some() || self.sparse.is_some()) {
-            bail!("keyframes and reference pictures with HyperFlow H3 Flash or sparse attention");
+        if nc > 0 && self.sparse.is_some() {
+            bail!("keyframes and reference pictures with sparse attention");
         }
         let mut arows = vec![0f32; ar * ACH];
         for ch in 0..2 {
@@ -1094,9 +1246,13 @@ impl Dit {
         let curve: Vec<f32> = match &mut self.hyper {
             None => [self.curve(t_v), self.curve(t_a), self.curve(t_v.max(COND_T))].concat(),
             // text follows video; audio's endpoint is on its own schedule, as its time is
+            // keyframe and reference rows have no endpoint of their own: HyperFlow's node looks their time up among the
+            // targets' and, not finding it, gives them r = t
             Some(h) => {
                 let next = sigma_next.clamp(0.0, 1.0);
-                [h.adaln_input(t_v, 1.0 - next), h.adaln_input(t_a, 1.0 - audio_sigma(next, self.shifts))].concat()
+                let (r_v, t_c) = (1.0 - next, t_v.max(COND_T));
+                let r_c = if t_c == t_v { r_v } else { t_c };
+                [h.adaln_input(t_v, r_v), h.adaln_input(t_a, 1.0 - audio_sigma(next, self.shifts)), h.adaln_input(t_c, r_c)].concat()
             }
         };
         let td = self.tdim;
@@ -1254,9 +1410,10 @@ impl Dit {
             modulate(2, 1)?;
             self.prof.mark("quant", st)?;
             if u.lins[2] == Lin::LowRank {
-                // diffusers' up rows are [value; gate]; the SwiGLU kernels read [gate; value]
+                // the SwiGLU kernels read [gate; value]; diffusers' up rows are [value; gate]
                 let half = |first: usize, out: PM| Up { col: 0, rank: r[4], w: up(4), first, rows: FFN, out, ldo: 2 * FFN };
-                low_rank(attn.ptr(), F, F, dn(4), r[4], &[half(0, off(hid.ptr(), FFN * 2)), half(FFN, hid.ptr())], mid, l, st)?;
+                let (gate_row, value_row) = if self.fc1_value_first { (FFN, 0) } else { (0, FFN) };
+                low_rank(attn.ptr(), F, F, dn(4), r[4], &[half(gate_row, hid.ptr()), half(value_row, off(hid.ptr(), FFN * 2))], mid, l, st)?;
                 self.prof.mark("lowrank", st)?;
             } else {
                 let w = weight(2, 2 * FFN, F)?;

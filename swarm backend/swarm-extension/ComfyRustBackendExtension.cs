@@ -4,6 +4,7 @@ using FreneticUtilities.FreneticDataSyntax;
 using SwarmUI.Backends;
 using SwarmUI.Builtin_ComfyUIBackend;
 using SwarmUI.Core;
+using SwarmUI.Text2Image;
 using SwarmUI.Utils;
 
 namespace KreaRust.ComfyRustBackend;
@@ -22,6 +23,13 @@ public class ComfyRustBackendExtension : Extension
     public override void OnInit()
     {
         Program.Backends.RegisterBackendType<ComfyRustSelfStartBackend>("comfy_rust_selfstart", "comfy-rust Self-Starting", "The native Rust engine, automatically launched and managed by this UI server.", isStandard: true);
+        // HyperFlow H3 Flash drops blocks, so SwarmUI's own MiniMax H3 check (which needs block 49) misses it.
+        // As MiniMax H3's compat class it gets H3's workflow, references included.
+        T2IModelClassSorter.Register(new() { ID = "minimax-h3/hyperflow", CompatClass = T2IModelClassSorter.CompatMiniMaxH3, Name = "HyperFlow H3 Flash", StandardWidth = 960, StandardHeight = 960, IsThisModelOfClass = (m, h) =>
+        {
+            bool has(string key) => h.ContainsKey(key) || h.ContainsKey($"diffusion_model.{key}") || h.ContainsKey($"model.diffusion_model.{key}");
+            return has("video_patch_proj.weight") && has("audio_patch_proj.weight") && has("endpoint_time_embedder.proj_in.weight");
+        }});
         Program.ModelPathsChangedEvent += OnModelPathsChanged;
     }
 

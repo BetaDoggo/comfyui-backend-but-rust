@@ -643,7 +643,7 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     if let Some(w) = &windows {
         w.freenoise(&mut noise, &shape, args.seed);
     }
-    // HyperFlow H3 Flash runs euler only, and reads each step's endpoint
+    // HyperFlow H3 Flash was distilled with euler; res_multistep also runs on it
     let default = if h3::hyperflow_config(&dit).is_some() { "euler" } else { "res_multistep" };
     let sampling = args.sampling(default, ModelSampling::Flow { shift: h3::SHIFT_VIDEO }, args.seed, (args.width / 16, args.height / 16))?;
     let ms = ModelSampling::Flow { shift: h3::SHIFT_VIDEO };

@@ -19,6 +19,8 @@ const REGISTERS: usize = 4;
 const SUFFIX: usize = REGISTERS + 1;
 const TILE: usize = 256;
 const TILE_OVERLAP: usize = 64;
+/// Tiles the image decoder runs through its layers at once: about 10 MB of activations each.
+const TILE_BATCH: usize = 32;
 const RATIO: usize = 16;
 
 /// One of the ViT decoders.
@@ -308,57 +310,73 @@ impl VideoDecoder {
         self.globals.at(self.gl.off(key))
     }
 
-    /// Raw decoder output of latents [24, t, h, w].
-    fn pixels(&mut self, z: &Clip, st: &Stream) -> Result<Clip> {
+    /// Raw decoder output of latents [24, t, h, w]. Clips of one size go through the layers together, each attending
+    /// within itself; the int8 decoder takes them one at a time.
+    fn pixels(&mut self, zs: &[Clip], st: &Stream) -> Result<Vec<Clip>> {
+        let a = self.arch;
+        if a.int8 && zs.len() > 1 {
+            return zs.iter().map(|z| Ok(self.pixels(std::slice::from_ref(z), st)?.remove(0))).collect();
+        }
         self.prof.mark("start", st)?;
         let t0 = std::time::Instant::now();
-        let (t, h, w) = (z.t, z.h, z.w);
+        let nb = zs.len();
+        let (t, h, w) = (zs[0].t, zs[0].h, zs[0].w);
+        anyhow::ensure!(zs.iter().all(|z| (z.t, z.h, z.w) == (t, h, w)), "tiles of different sizes in one batch");
         let n = t * h * w;
         let l = n + SUFFIX;
-        let mut rows = vec![0f32; n * C];
-        for c in 0..C {
-            for f in 0..t {
-                for y in 0..h {
-                    for x in 0..w {
-                        rows[((f * h + y) * w + x) * C + c] = z.data[z.at(c, f, y, x)];
+        let rows_all = nb * l;
+        let mut bytes = Vec::with_capacity(nb * n * C * 2);
+        for z in zs {
+            let mut rows = vec![0f32; n * C];
+            for c in 0..C {
+                for f in 0..t {
+                    for y in 0..h {
+                        for x in 0..w {
+                            rows[((f * h + y) * w + x) * C + c] = z.data[z.at(c, f, y, x)];
+                        }
                     }
                 }
             }
-        }
-        // post_quant_conv, 1 x 1 x 1
-        let mut conv = vec![0f32; n * C];
-        for (o, r) in conv.chunks_exact_mut(C).zip(rows.chunks_exact(C)) {
-            for (c, v) in o.iter_mut().enumerate() {
-                *v = self.post_bias[c] + (0..C).map(|j| self.post[c * C + j] * r[j]).sum::<f32>();
+            // post_quant_conv, 1 x 1 x 1
+            for r in rows.chunks_exact(C) {
+                for c in 0..C {
+                    let v = self.post_bias[c] + (0..C).map(|j| self.post[c * C + j] * r[j]).sum::<f32>();
+                    bytes.extend_from_slice(&bf16::from_f32(v).to_le_bytes());
+                }
             }
         }
-        let bytes: Vec<u8> = conv.iter().flat_map(|v| bf16::from_f32(*v).to_le_bytes()).collect();
         let up = DevBuf::alloc_async(bytes.len(), st)?;
         up.upload(0, &bytes, st)?;
-        let a = self.arch;
         let (d, heads, qkvn, ff, out_n) = (a.d, a.heads, a.qkv(), a.ff(), a.out());
-        let x = DevBuf::alloc_async(l * d * 2, st)?;
+        let x = DevBuf::alloc_async(rows_all * d * 2, st)?;
         let di = d as i64;
-        k!(gpu_gemm(up.ptr(), C as i64, self.g("emb_w"), C as i64, x.ptr(), di, self.g("emb_b"), n as i64, di, C as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
-        crate::cuda::memcpy_d2d(off(x.ptr(), n * d * 2), self.g("regs"), REGISTERS * d * 2, st)?;
-        x.upload((n + REGISTERS) * d * 2, &vec![0u8; d * 2], st)?;
-        let table = rope(t, h, w, a.axes);
+        // each clip's embedding is its own GEMM, as it is when it decodes alone: cuBLAS picks its algorithm by the rows
+        for i in 0..nb {
+            let xi = off(x.ptr(), i * l * d * 2);
+            k!(gpu_gemm(off(up.ptr(), i * n * C * 2), C as i64, self.g("emb_w"), C as i64, xi, di, self.g("emb_b"), n as i64, di, C as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0,
+                s(st)))?;
+            crate::cuda::memcpy_d2d(off(xi, n * d * 2), self.g("regs"), REGISTERS * d * 2, st)?;
+            x.upload((i * l + n + REGISTERS) * d * 2, &vec![0u8; d * 2], st)?;
+        }
+        // the rope kernel reads a row of the table per token, so every clip gets its copy
+        let table = rope(t, h, w, a.axes).repeat(nb);
         let rd = DevBuf::alloc_async(table.len() * 4, st)?;
         rd.upload(0, &f32_bytes(&table), st)?;
         self.prof.host("prep", t0);
         self.prof.mark("embed", st)?;
 
-        let m = l as i32;
-        let qkv = DevBuf::alloc_async(l * qkvn * 2, st)?;
-        let attn = DevBuf::alloc_async(l * d * 2, st)?;
-        let hid = DevBuf::alloc_async(l * 2 * ff * 2, st)?;
+        let m = rows_all as i32;
+        let qkv = DevBuf::alloc_async(rows_all * qkvn * 2, st)?;
+        let attn = DevBuf::alloc_async(rows_all * d * 2, st)?;
+        let hid = DevBuf::alloc_async(rows_all * 2 * ff * 2, st)?;
         let (xp, q) = (x.ptr(), qkv.ptr());
         if !a.int8 {
-            // bf16 GEMMs and exact attention, q, k and v each across all heads
-            let hb = DevBuf::alloc_async(l * ff * 2, st)?;
-            let y = DevBuf::alloc_async(l * d * 2, st)?;
+            // bf16 GEMMs and exact attention (FlashAttention-2), q, k and v each across all heads
+            let hb = DevBuf::alloc_async(rows_all * ff * 2, st)?;
+            let y = DevBuf::alloc_async(rows_all * d * 2, st)?;
+            let lse = DevBuf::alloc_async(nb * heads * l * 4, st)?;
             let gemm = |x: PM, k: usize, w: PM, bias: PM, out: PM, nn: usize| -> Result<()> {
-                k!(gpu_gemm(x, k as i64, w, k as i64, out, nn as i64, bias, l as i64, nn as i64, k as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))
+                k!(gpu_gemm(x, k as i64, w, k as i64, out, nn as i64, bias, rows_all as i64, nn as i64, k as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))
             };
             for b in 0..a.layers {
                 let base = self.ws.acquire(b, st)?;
@@ -369,8 +387,9 @@ impl VideoDecoder {
                 gemm(hb.ptr(), d, wp("w_qkv"), wp("b_qkv"), q, qkvn)?;
                 k!(gpu_rope_bf16(q, qkvn as i64, DH as i64, null(), EPS, rd.ptr(), m, heads as i32, DH as i32, a.pairs() as i32, s(st)))?;
                 k!(gpu_rope_bf16(off(q, d * 2), qkvn as i64, DH as i64, null(), EPS, rd.ptr(), m, heads as i32, DH as i32, a.pairs() as i32, s(st)))?;
-                k!(gpu_attn_small(DT_BF16, q, qkvn as i64, off(q, d * 2), off(q, 2 * d * 2), qkvn as i64, heads as i32, heads as i32, DH as i32, m, m, attn.ptr(), di,
-                    1.0 / (DH as f32).sqrt(), 0, s(st)))?;
+                let (bs, rs, hs) = ((l * qkvn) as i64, qkvn as i64, DH as i64);
+                k!(gpu_flash_attn_d(q, off(q, d * 2), off(q, 2 * d * 2), attn.ptr(), lse.ptr(), nb as i32, l as i32, l as i32, heads as i32, heads as i32, DH as i32, bs, rs, hs,
+                    bs, rs, hs, bs, rs, hs, (l * d) as i64, di, hs, 1.0 / (DH as f32).sqrt(), 0, s(st)))?;
                 self.prof.mark("attn", st)?;
                 gemm(attn.ptr(), d, wp("w_o"), wp("b_o"), y.ptr(), d)?;
                 k!(gpu_add_gated_bf16(xp, di, y.ptr(), di, wp("s1"), m, d as i32, s(st)))?;
@@ -419,15 +438,21 @@ impl VideoDecoder {
             self.prof.mark("gemm", st)?;
             self.ws.release(b, st)?;
         }
-        k!(gpu_prologue_rows(DT_BF16, PRO_LAYERNORM, xp, di, null(), 0, 0, self.g("no_w"), EPS, null(), null(), attn.ptr(), di, n as i32, d as i32, s(st)))?;
-        k!(gpu_add_gated_bf16(attn.ptr(), di, self.g("no_b"), 0, null(), n as i32, d as i32, s(st)))?;
-        let outb = DevBuf::alloc_async(n * out_n * 2, st)?;
-        k!(gpu_gemm(attn.ptr(), di, self.g("proj_w"), di, outb.ptr(), out_n as i64, self.g("proj_b"), n as i64, out_n as i64, di, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
+        // the suffix rows are normed too and never read
+        k!(gpu_prologue_rows(DT_BF16, PRO_LAYERNORM, xp, di, null(), 0, 0, self.g("no_w"), EPS, null(), null(), attn.ptr(), di, m, d as i32, s(st)))?;
+        k!(gpu_add_gated_bf16(attn.ptr(), di, self.g("no_b"), 0, null(), m, d as i32, s(st)))?;
+        let outb = DevBuf::alloc_async(nb * n * out_n * 2, st)?;
+        for i in 0..nb {
+            k!(gpu_gemm(off(attn.ptr(), i * l * d * 2), di, self.g("proj_w"), di, off(outb.ptr(), i * n * out_n * 2), out_n as i64, self.g("proj_b"), n as i64, out_n as i64, di, 1,
+                DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
+        }
         self.prof.mark("head", st)?;
         let t0 = std::time::Instant::now();
-        let mut raw = vec![0u8; n * out_n * 2];
-        outb.download(0, &mut raw, st)?;
+        let mut all = vec![0u8; nb * n * out_n * 2];
+        outb.download(0, &mut all, st)?;
         let ratio_t = a.ratio_t;
+        let mut clips = Vec::with_capacity(nb);
+        for raw in all.chunks_exact(n * out_n * 2) {
         let mut o = Clip::new(3, t * ratio_t, h * RATIO, w * RATIO);
         let val = |i: usize| bf16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]).to_f32();
         // one plane per channel and frame, a share of them per thread
@@ -456,9 +481,11 @@ impl VideoDecoder {
                 });
             }
         });
+        clips.push(o);
+        }
         self.prof.host("unpatch", t0);
-        self.prof.report("tile", st)?;
-        Ok(o)
+        self.prof.report("tiles", st)?;
+        Ok(clips)
     }
 
     /// `tiled_decode`
@@ -469,13 +496,22 @@ impl VideoDecoder {
         let mut canvas: Option<Clip> = None;
         let mut strip: Option<Clip> = None;
         let mut out_y = 0;
-        for (i, ypos) in ys.iter().enumerate() {
+        // the tiles in the order they are blended, decoded a batch ahead
+        let places: Vec<(usize, usize)> = ys.iter().flat_map(|y| xs.iter().map(move |x| (*y, *x))).collect();
+        let batch = if self.arch.int8 { 1 } else { TILE_BATCH };
+        let mut decoded = std::collections::VecDeque::new();
+        for (i, _) in ys.iter().enumerate() {
             let mut new_strip: Option<Clip> = None;
             let mut left: Option<Clip> = None;
             let (mut out_x, mut tile_h) = (0, 0);
             for (j, xpos) in xs.iter().enumerate() {
-                let part = z.crop((0, z.t), (ypos / RATIO, ylen / RATIO), (xpos / RATIO, xlen / RATIO));
-                let mut tile = self.pixels(&part, st)?;
+                if decoded.is_empty() {
+                    let first = i * xs.len() + j;
+                    let parts: Vec<Clip> = places[first..(first + batch).min(places.len())].iter()
+                        .map(|(y, x)| z.crop((0, z.t), (y / RATIO, ylen / RATIO), (x / RATIO, xlen / RATIO))).collect();
+                    decoded.extend(self.pixels(&parts, st)?);
+                }
+                let mut tile: Clip = decoded.pop_front().unwrap();
                 if i > 0 {
                     let above = strip.as_ref().unwrap().crop((0, tile.t), (0, yo[i - 1]), (*xpos, xlen));
                     tile = blend(&above, &tile, yo[i - 1], 2);

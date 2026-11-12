@@ -183,12 +183,34 @@ impl SafeTensors {
 
     /// Tensor converted to bf16 little-endian bytes.
     pub fn bf16_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; self.packed_len(name, Dt::BF16)?];
+        self.bf16_into(name, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Self::bf16_bytes`] written straight to `dst`, with no vector of floats in between: whole models load
+    /// through here.
+    pub fn bf16_into(&self, name: &str, dst: &mut [u8]) -> Result<()> {
         let i = self.info(name)?;
-        if i.dtype == Dt::BF16 {
-            return Ok(self.bytes(name)?.to_vec());
+        let b = self.bytes(name)?;
+        if dst.len() != i.numel() * 2 {
+            bail!("{name}: {} bytes for {} bf16 values", dst.len(), i.numel());
         }
-        let v = self.f32_vec(name, false)?;
-        Ok(v.iter().flat_map(|x| bf16::from_f32(*x).to_le_bytes()).collect())
+        match i.dtype {
+            Dt::BF16 => dst.copy_from_slice(b),
+            Dt::F32 => {
+                for (o, c) in dst.chunks_exact_mut(2).zip(b.chunks_exact(4)) {
+                    o.copy_from_slice(&bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes());
+                }
+            }
+            Dt::F16 => {
+                for (o, c) in dst.chunks_exact_mut(2).zip(b.chunks_exact(2)) {
+                    o.copy_from_slice(&bf16::from_f32(f16::from_le_bytes([c[0], c[1]]).to_f32()).to_le_bytes());
+                }
+            }
+            d => bail!("{name}: not a float tensor ({d:?})"),
+        }
+        Ok(())
     }
 
     /// Byte length of a tensor once packed in `dt`.
@@ -198,15 +220,27 @@ impl SafeTensors {
 }
 
 pub fn f32_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    let mut out = vec![0u8; v.len() * 4];
+    for (o, x) in out.chunks_exact_mut(4).zip(v) {
+        o.copy_from_slice(&x.to_le_bytes());
+    }
+    out
 }
 
 /// `v` rounded to bf16, as little-endian bytes for an upload.
 pub fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| bf16::from_f32(*x).to_le_bytes()).collect()
+    let mut out = vec![0u8; v.len() * 2];
+    for (o, x) in out.chunks_exact_mut(2).zip(v) {
+        o.copy_from_slice(&bf16::from_f32(*x).to_le_bytes());
+    }
+    out
 }
 
 /// `v` rounded to f16, as little-endian bytes for an upload.
 pub fn f16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| f16::from_f32(*x).to_le_bytes()).collect()
+    let mut out = vec![0u8; v.len() * 2];
+    for (o, x) in out.chunks_exact_mut(2).zip(v) {
+        o.copy_from_slice(&f16::from_f32(*x).to_le_bytes());
+    }
+    out
 }

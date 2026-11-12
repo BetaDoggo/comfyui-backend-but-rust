@@ -176,6 +176,8 @@ pub struct Flow {
     gl: Layout,
     pub blocks: WeightSet,
     pub attn_variant: i32,
+    /// INT8 attention for the self-attention, as on the other families; the 5-key cross-attention stays bf16.
+    pub int8_attn: bool,
 }
 
 /// What one stage's conditioning contributes to every evaluation.
@@ -203,7 +205,7 @@ impl Flow {
         }
         let p = plan(&layouts, budget, 2);
         let blocks = WeightSet::load(&format!("pixal3d {stage:?}"), st, layouts, p, threads)?;
-        Ok(Flow { stage, globals, gl, blocks, attn_variant: 0 })
+        Ok(Flow { stage, globals, gl, blocks, attn_variant: 0, int8_attn: true })
     }
 
     fn g(&self, key: &str) -> PM {
@@ -296,6 +298,12 @@ impl Flow {
         let h = DevBuf::alloc_async(n * F * 2, st)?;
         let hid = DevBuf::alloc_async(n * MLP * 2, st)?;
         let lse = DevBuf::alloc_async(H * n * 4, st)?;
+        let int8_ws = if self.int8_attn {
+            let bytes = unsafe { crate::ffi::gpu_int8_attn_workspace(1, H as i32, H as i32, n as i32, n as i32) };
+            Some(DevBuf::alloc_async(bytes as usize, st)?)
+        } else {
+            None
+        };
         let modv = DevBuf::alloc_async(MOD * 2, st)?;
         let xp = x.ptr();
         let kv_all = if uncond { &c.kv_uncond } else { &c.kv };
@@ -315,7 +323,13 @@ impl Flow {
             k!(gpu_qk_rms_heads(qkv.ptr(), QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn"), wp("kn"), RMS_EPS, rope.ptr(), m,
                 s(st)))?;
             let q = qkv.ptr();
-            self.flash(q, QKV, off(q, F * 2), off(q, KV * 2), QKV, attn.ptr(), lse.ptr(), n, n, st)?;
+            if let Some(ws) = &int8_ws {
+                let (bs, rs, hs) = ((n * QKV) as i64, QKV as i64, HD as i64);
+                k!(gpu_int8_attn(q, off(q, F * 2), off(q, KV * 2), attn.ptr(), ws.ptr(), 1, m, m, H as i32, H as i32, bs, rs, hs, bs, rs, hs,
+                    bs, rs, hs, (n * F) as i64, fi, hs, 1.0 / (HD as f32).sqrt(), s(st)))?;
+            } else {
+                self.flash(q, QKV, off(q, F * 2), off(q, KV * 2), QKV, attn.ptr(), lse.ptr(), n, n, st)?;
+            }
             k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m,
                 F as i32, 1, s(st)))?;
             k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_o"), asc.ptr(), wp("s_o"), wp("b_o"), gate_msa, xp, xp, n as i64, fi, fi,

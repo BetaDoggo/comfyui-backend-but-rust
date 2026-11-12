@@ -45,6 +45,7 @@ pub struct Dit {
     pub blocks: WeightSet,
     pub attn_variant: i32,
     pub int8_attn: bool,
+    pub prof: crate::prof::Prof,
     /// bf16 [blocks][3][shift | scale | gate] by sigma bits: it depends on nothing else, and
     /// repeated schedules skip 250 small kernels per step.
     mods: HashMap<u32, DevBuf>,
@@ -252,7 +253,7 @@ impl Dit {
         let layouts = (0..n_blocks(st)?).map(|i| block_layout(st, i)).collect::<Result<Vec<_>>>()?;
         let p = plan(&layouts, block_budget, slots);
         let blocks = WeightSet::load("anima blocks", st, layouts, p, threads)?;
-        Ok(Dit { prefix: prefix(st)?.to_string(), globals, gl, blocks, attn_variant: 0, int8_attn: true, mods: HashMap::new() })
+        Ok(Dit { prefix: prefix(st)?.to_string(), globals, gl, blocks, attn_variant: 0, int8_attn: true, mods: HashMap::new(), prof: crate::prof::Prof::new() })
     }
 
     fn g(&self, key: &str) -> PM {
@@ -477,8 +478,10 @@ impl Dit {
         let rows = batch * l;
         let plane = CH * h * w * 4;
         let (fi, m, nil) = (F as i64, rows as i32, std::ptr::null_mut());
+        self.prof.mark("start", st)?;
         let t = self.time(sigma, None, st)?;
         let (x, tok) = self.embed(latent, batch, h, w, st)?;
+        self.prof.mark("embed", st)?;
         if let Some(p) = probe.as_mut() {
             p("x_embedder_out", &x, rows * F * 2);
         }
@@ -510,6 +513,8 @@ impl Dit {
             k!(gpu_unpatch_denoised(off(tok.ptr(), i * l * TOK * 2), TOK as i64, off(latent.ptr(), i * plane), off(den.ptr(), i * plane),
                 CH as i32, h as i32, w as i32, PATCH as i32, sigma, s(st)))?;
         }
+        self.prof.mark("head", st)?;
+        self.prof.report("step", st)?;
         Ok(())
     }
 
@@ -613,6 +618,7 @@ impl Dit {
 
         for b in 0..nb {
             let base = self.blocks.acquire(b, st)?;
+            self.prof.mark("stream", st)?;
             let lay = self.blocks.layouts[b].clone();
             let wp = |key: &str| off(base, lay.off(key));
             let bm = off(modv.ptr(), b * 3 * MOD * 2);
@@ -652,19 +658,23 @@ impl Dit {
             };
 
             // self attention
+            self.prof.mark("mod", st)?;
             k!(gpu_quant_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, scale(0), shift(0), a8.ptr(), asc.ptr(), m,
                 F as i32, 1, s(st)))?;
+            self.prof.mark("quant", st)?;
             k!(gpu_int8_gemm(a8.ptr(), wp("w_self"), asc.ptr(), wp("s_self"), null(), q, rows as i64, QKV as i64, fi, DT_BF16, s(st)))?;
             if let (Some((a, mm)), Some((xn, lt, dl, _))) = (mat(Module::SelfQkv), lb) {
                 normed(0, xn)?;
                 lora_delta(a, mm, xn, F, rows, lt, dl, QKV, st)?;
                 k!(gpu_add_gated_bf16(q, QKV as i64, dl, QKV as i64, null(), m, QKV as i32, s(st)))?;
             }
+            self.prof.mark("gemm qkv", st)?;
             // the RoPE table is one image's
             for i in 0..batch {
                 k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(q, i * l * QKV * 2), QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn_self"),
                     wp("kn_self"), EPS, rope, 2, l as i32, s(st)))?;
             }
+            self.prof.mark("rope", st)?;
             if let Pass::Reference { out, row0, .. } = pass {
                 cuda::memcpy_2d_d2d(off(out.block(b), row0 * KV * 2), KV * 2, off(q, F * 2), QKV * 2, KV * 2, rows, st)?;
                 if b + 1 == nb {
@@ -705,31 +715,40 @@ impl Dit {
                 }
                 _ => self.attention(q, off(q, F * 2), off(q, KV * 2), attn.ptr(), ws.ptr(), batch, l, l, QKV, QKV, false, st)?,
             }
+            self.prof.mark("self attn", st)?;
             if b == 0 {
                 if let Some(p) = probe.as_mut() {
                     p("block0_self_attn_raw", &attn, rows * F * 2);
                 }
             }
             out_proj(Module::SelfOut, "wo_self", "so_self", 0, attn.ptr(), F)?;
+            self.prof.mark("out proj", st)?;
 
             // cross attention, k and v come from the per-prompt cache
             let kv = off(c.kv.ptr(), b * lc * KV * 2);
             k!(gpu_quant_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, scale(1), shift(1), a8.ptr(), asc.ptr(), m,
                 F as i32, 1, s(st)))?;
+            self.prof.mark("quant", st)?;
             k!(gpu_int8_gemm(a8.ptr(), wp("w_cq"), asc.ptr(), wp("s_cq"), null(), q, rows as i64, fi, fi, DT_BF16, s(st)))?;
+            self.prof.mark("gemm cq", st)?;
             if let (Some((a, mm)), Some((xn, lt, dl, _))) = (mat(Module::CrossQ), lb) {
                 normed(1, xn)?;
                 lora_delta(a, mm, xn, F, rows, lt, dl, F, st)?;
                 k!(gpu_add_gated_bf16(q, fi, dl, fi, null(), m, F as i32, s(st)))?;
             }
             k!(gpu_qk_norm_rope(DT_BF16, HD as i32, q, fi, 0, 0, H as i32, 0, wp("qn_cross"), null(), EPS, null(), 0, m, s(st)))?;
+            self.prof.mark("rope", st)?;
             self.attention(q, kv, off(kv, F * 2), attn.ptr(), ws.ptr(), batch, l, lc, F, KV, true, st)?;
+            self.prof.mark("cross attn", st)?;
             out_proj(Module::CrossOut, "wo_cross", "so_cross", 1, attn.ptr(), F)?;
+            self.prof.mark("out proj", st)?;
 
             // MLP
             k!(gpu_quant_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, scale(2), shift(2), a8.ptr(), asc.ptr(), m,
                 F as i32, 1, s(st)))?;
+            self.prof.mark("quant", st)?;
             k!(gpu_int8_gemm(a8.ptr(), wp("w_l1"), asc.ptr(), wp("s_l1"), null(), hid.ptr(), rows as i64, MLP as i64, fi, DT_BF16, s(st)))?;
+            self.prof.mark("gemm mlp1", st)?;
             if let (Some((a, mm)), Some((xn, lt, dl, _))) = (mat(Module::Mlp1), lb) {
                 normed(2, xn)?;
                 lora_delta(a, mm, xn, F, rows, lt, dl, MLP, st)?;
@@ -753,6 +772,7 @@ impl Dit {
                         MLP as i64, DT_BF16, s(st)))?;
                 }
             }
+            self.prof.mark("mlp2", st)?;
             self.blocks.release(b, st)?;
             if let Some(p) = probe.as_mut() {
                 p(&format!("block{b}"), x, rows * F * 2);

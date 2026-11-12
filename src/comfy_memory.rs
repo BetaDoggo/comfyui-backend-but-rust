@@ -9,6 +9,8 @@
 //!   for a node (`load_models_gpu`): it moves to the top of the priority list and its watermark goes back to the top.
 //! * Units at or above a model's watermark are not faulted: they go through one of the cast buffers (one per offload
 //!   stream, two by default), copied before each use. The watermark only falls until the model is prioritized again.
+//!   The watermark runs over the units in [`spread_order`], not in run order, so the streamed units lie between
+//!   resident ones and each copy overlaps the compute of the blocks before it.
 //! * Every device allocation first frees the budget deficit, and a failed one frees its own size and retries. Freeing
 //!   lowers watermarks from the top, the lowest-priority model first and the running model last, so activations take
 //!   VRAM from weights, and a model that ran earlier (a text encoder) gives up its weights before the running one.
@@ -16,7 +18,8 @@
 //!   `--reserve-vram`) against the card's capacity, and, polled every two seconds, the DXCore process budget less
 //!   512 MB and NVML's free memory less 512 MB, whichever is shortest.
 //!
-//! What differs from ComfyUI: residency moves by unit, not by 32 MB page; the small weights outside the units, the
+//! What differs from ComfyUI: residency moves by unit, not by 32 MB page; which units stream is spread through the
+//! model, where aimdo streams its tail; the small weights outside the units, the
 //! VAEs and encoded prompts are plain allocations (ComfyUI force-loads tensors under 16 KB and streams the rest of
 //! those models too); one copy stream carries both cast buffers' copies; and CFG's two halves still run one after the
 //! other, where ComfyUI batches them when they fit.
@@ -102,8 +105,11 @@ struct Unit {
 struct Vbar {
     id: u64,
     name: String,
+    /// In [`spread_order`]: the unit at position 0 is the last to leave VRAM.
     units: Vec<Unit>,
-    /// Units at or above this index are streamed until the model is prioritized again.
+    /// Each unit's position in `units`, by its index in run order.
+    pos: Vec<usize>,
+    /// Units at or above this position are streamed until the model is prioritized again.
     watermark: usize,
     /// Faulted or streamed since it was last prioritized, for the residency report.
     used: bool,
@@ -130,6 +136,18 @@ impl Vbar {
         }
         c
     }
+}
+
+/// The order a model's units give up VRAM in, last first: run-order indices sorted by their reversed bits. Whatever
+/// the watermark, the units above it are then spread through the model instead of being its tail. A streamed unit's
+/// copy takes about as long whatever the image size, so when a block computes faster than it copies (small images,
+/// or a model with large blocks) a run of streamed blocks waits for every copy, while streamed blocks between
+/// resident ones copy during those blocks' compute.
+fn spread_order(n: usize) -> Vec<usize> {
+    let bits = usize::BITS - n.saturating_sub(1).leading_zeros();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&u| if bits == 0 { 0 } else { u.reverse_bits() >> (usize::BITS - bits) });
+    order
 }
 
 /// A cast buffer: streamed units are copied into it before each use.
@@ -200,7 +218,7 @@ impl State {
         unit.buf = None;
         unit.valid = false;
         if self.debug {
-            eprintln!("comfy memory: [{}] unit {u} out of VRAM ({} MB)", v.name, unit.size / MB);
+            eprintln!("comfy memory: [{}] unit {} out of VRAM ({} MB)", v.name, v.pos.iter().position(|&p| p == u).unwrap_or(u), unit.size / MB);
         }
         unit.size
     }
@@ -253,7 +271,8 @@ impl State {
         Ok(())
     }
 
-    /// Bring `id`'s unit `u` into VRAM if the budget allows, pinned (aimdo's `vbar_fault`). None means stream it.
+    /// Bring `id`'s unit at position `u` into VRAM if the budget allows, pinned (aimdo's `vbar_fault`). None means
+    /// stream it.
     fn fault(&mut self, id: u64, u: usize) -> Result<Option<(*mut c_void, bool)>> {
         let d = self.deficit(0);
         self.free(d)?;
@@ -360,8 +379,11 @@ pub fn register(name: &str, sizes: Vec<usize>) -> Result<u64> {
     with(|st| {
         let id = st.next_id;
         st.next_id += 1;
-        let units: Vec<Unit> = sizes.into_iter().map(|size| Unit { size, buf: None, pins: 0, valid: false }).collect();
-        st.vbars.push(Vbar { id, name: name.to_string(), watermark: units.len(), units, used: false });
+        let order = spread_order(sizes.len());
+        let units: Vec<Unit> = order.iter().map(|&u| Unit { size: sizes[u], buf: None, pins: 0, valid: false }).collect();
+        let mut pos = vec![0; order.len()];
+        order.iter().enumerate().for_each(|(p, &u)| pos[u] = p);
+        st.vbars.push(Vbar { id, name: name.to_string(), watermark: units.len(), units, pos, used: false });
         Ok(id)
     })
 }
@@ -390,13 +412,17 @@ pub fn ensure_active(id: u64) -> Result<()> {
 
 /// Unit `u` of `id`, pinned in VRAM with whether it holds its data, or None to stream it.
 pub fn fault(id: u64, u: usize) -> Result<Option<(*mut c_void, bool)>> {
-    with(|st| st.fault(id, u))
+    with(|st| {
+        let p = st.vbars[st.index(id)?].pos[u];
+        st.fault(id, p)
+    })
 }
 
 /// The unit's buffer now holds its data (the copy is on its way, ahead of any use on the compute stream).
 pub fn mark_valid(id: u64, u: usize) -> Result<()> {
     with(|st| {
         let i = st.index(id)?;
+        let u = st.vbars[i].pos[u];
         st.vbars[i].units[u].valid = true;
         Ok(())
     })
@@ -406,6 +432,7 @@ pub fn mark_valid(id: u64, u: usize) -> Result<()> {
 pub fn unpin(id: u64, u: usize) -> Result<()> {
     with(|st| {
         let i = st.index(id)?;
+        let u = st.vbars[i].pos[u];
         let above = u >= st.vbars[i].watermark;
         let unit = &mut st.vbars[i].units[u];
         unit.pins = unit.pins.saturating_sub(1);
@@ -421,6 +448,7 @@ pub fn unpin(id: u64, u: usize) -> Result<()> {
 pub fn holds(id: u64, u: usize) -> bool {
     with(|st| {
         let v = &st.vbars[st.index(id)?];
+        let u = v.pos[u];
         Ok(u < v.watermark && v.units[u].buf.is_some() && v.units[u].valid)
     })
     .unwrap_or(false)
@@ -429,7 +457,8 @@ pub fn holds(id: u64, u: usize) -> bool {
 /// Copy `len` bytes of `src` over unit `u` at `off`, if it is in VRAM with its data. Issued on `s`.
 pub fn write(id: u64, u: usize, off: usize, src: &DevBuf, len: usize, s: &Stream) -> Result<()> {
     with(|st| {
-        let unit = &st.vbars[st.index(id)?].units[u];
+        let v = &st.vbars[st.index(id)?];
+        let unit = &v.units[v.pos[u]];
         if let (Some(b), true) = (&unit.buf, unit.valid) {
             cuda::memcpy_d2d(b.at(off), src.ptr(), len, s)?;
         }
@@ -518,5 +547,27 @@ pub fn release_all() -> Result<usize> {
 pub fn log_residency() {
     if let Some(st) = lock().as_ref() {
         st.vbars.iter().filter(|v| v.used).for_each(report);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spread_order;
+
+    #[test]
+    fn streamed_units_are_spread_at_every_watermark() {
+        for n in [1usize, 2, 5, 28, 35, 50] {
+            let order = spread_order(n);
+            let mut seen = order.clone();
+            seen.sort();
+            assert_eq!(seen, (0..n).collect::<Vec<_>>());
+            // with up to half the units streamed, no two of them are neighbours in run order
+            for streamed in 1..=n / 2 {
+                let mut s = order[n - streamed..].to_vec();
+                s.sort();
+                assert!(s.windows(2).all(|w| w[1] - w[0] >= 2), "{n} units, {streamed} streamed: {s:?}");
+            }
+        }
+        assert_eq!(spread_order(8), [0, 4, 2, 6, 1, 5, 3, 7]);
     }
 }

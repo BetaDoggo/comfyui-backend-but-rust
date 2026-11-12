@@ -315,6 +315,15 @@ const SPLAT_DINO: &str = "clip_vision/dino_v3_vit_h_bf16.safetensors";
 const SPLAT_DECODER: &str = "VAE/idol_decoder_fp16.safetensors";
 
 impl Args {
+    /// `--attention`: INT8 unless flash is asked for.
+    fn int8_attention(&self) -> Result<bool> {
+        match self.attention.as_deref().unwrap_or("int8") {
+            "flash" => Ok(false),
+            "int8" | "sage" => Ok(true),
+            a => bail!("unknown --attention {a} (flash | int8)"),
+        }
+    }
+
     fn sampling(&self, default: &str, ms: ModelSampling, seed: u64, latent: (usize, usize)) -> Result<pipeline::Sampling> {
         pipeline::Sampling::new(self.sampler.as_deref().unwrap_or(default), &self.scheduler, ms, self.steps, self.cfg, seed, latent)
     }
@@ -841,13 +850,14 @@ fn run_pixal3d(args: &Args, image: &Path) -> Result<()> {
     };
     let (rgba, w, h) = read_rgba(image)?;
     if let Some(r) = &args.pixal3d_check {
-        return diffusion::pixal3d::check(&paths, &rgba, w, h, r, args.threads);
+        return diffusion::pixal3d::check(&paths, &rgba, w, h, r, args.threads, args.int8_attention()?);
     }
     let mut p = diffusion::pixal3d::Params::example(args.seed);
     p.fov = args.fov;
     p.resolution = args.resolution;
     p.texture_enabled = !args.no_texture;
     p.max_faces = args.max_faces;
+    p.int8_attn = args.int8_attention()?;
     if let Some(seeds) = &args.pixal3d_seeds {
         let v = seeds.split(',').map(|s| s.trim().parse::<u64>()).collect::<Result<Vec<_>, _>>()?;
         let [a, b, c, d] = v[..] else { bail!("--pixal3d-seeds takes four seeds") };
@@ -943,11 +953,7 @@ fn main() -> Result<()> {
         diffusion::cuda::init(0)?;
         return diffusion::birefnet::check(&args.model(&args.birefnet, BIREFNET), args.birefnet_check.as_ref().unwrap());
     }
-    let int8_attn = match args.attention.as_deref().unwrap_or("int8") {
-        "flash" => false,
-        "int8" | "sage" => true,
-        a => bail!("unknown --attention {a} (flash | int8)"),
-    };
+    let int8_attn = args.int8_attention()?;
     let load = pipeline::LoadOptions {
         dit: args.model(&args.dit, KREA_DIT),
         te: args.model(&args.te, KREA_TE),

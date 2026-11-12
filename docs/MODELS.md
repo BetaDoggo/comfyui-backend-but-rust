@@ -486,11 +486,11 @@ Warm, on this machine's 12 GB card, which holds 23 of the 50 blocks and streams 
 
 | Size | Here | ComfyUI |
 |---|---|---|
-| 1024x1024, per step | 0.86 s | 0.68 s |
-| 2048x2048, per step | 1.22 s | 1.34 s |
-| 2048x2048, VAE decode | 2.8 s | 0.93 s |
+| 1024x1024, per step | 0.35 s | 0.68 s |
+| 2048x2048, per step | 1.07 s | 1.34 s |
+| 2048x2048, VAE decode | 0.55 s of tiles, 3.2 s with the first read of its weights | 0.93 s |
 
-At 1024 both are bound by the block uploads, and here 0.58 s of the step is that wait. Through `comfy-server` over HTTP, a
+Streamed blocks are held in pinned RAM after their first read, and lie between resident ones, so their copies overlap compute; at 1024 that took the step from 0.86 s to 0.35 s, with the same image byte for byte. The VAE decodes 32 tiles at a time with FlashAttention-2 (54.5 dB from the earlier one-tile decode). The first two evaluations still wait for the blocks' first read. Through `comfy-server` over HTTP, a
 warm 2048x2048 graph took 10.6 s in all and a 1024x1024 one 6.1 s.
 
 **Edits.** `MiniMaxH3ImageConditioning`'s pictures, and `--image` on the CLI, are shown to the text encoder as
@@ -543,7 +543,7 @@ Compared stage by stage with ComfyUI on its own inputs (`tools/pixal3d_ref.py` d
 | DINOv3 tokens (float32) | 1.6e-4 relative |
 | NAF maps (float16) | 3e-4 relative |
 | Projected features | 1.6e-3 relative |
-| First evaluation of each sub-model, cond and uncond | 0.6 to 1.0% relative, cosine 0.99995 or better |
+| First evaluation of each sub-model, cond and uncond | 0.6 to 1.2% relative with int8 attention, 0.6 to 1.0% with `--attention flash`; cosine 0.9999 or better |
 | Structure decode | the same voxels |
 | Shape decode | 99.99% of the final voxels shared; on those, vertices within 6e-6 and colours within 7e-4 relative |
 
@@ -554,7 +554,7 @@ voxel sets differ slightly. ComfyUI varies more than that between its own runs: 
 The full mesh at 1536 has about 16 million triangles. Vertex clustering simplifies it to `--max-faces` (700,000 by
 default, the number the example decimates to; 0 keeps everything). Like ComfyUI's GLB it has no normals and a
 double-sided material: the dual grid doesn't say which side of a face is inside, and windings are made consistent only
-where the mesh is manifold. Attention is bf16 FlashAttention-2, which dominates the refine stage. The engine refuses the
+where the mesh is manifold. Self-attention is int8 by default, as on the other families: an evaluation over 25,706 tokens took 1.20 s against 2.59 s with bf16 FlashAttention-2 (`--attention flash`). The cross-attention to the five image tokens stays bf16. The mesh timings above are from before this change, and weren't measured again (the DINOv3 file wasn't installed). The engine refuses the
 multi-view checkpoint, and uses only the first image of a batch.
 
 Not done: multi-view, the field-of-view estimate, UV unwrapping and texture baking, and the bf16 checkpoint.

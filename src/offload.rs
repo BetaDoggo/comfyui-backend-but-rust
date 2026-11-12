@@ -12,6 +12,7 @@
 //! ahead of compute. Clean file pages can be dropped without touching the pagefile, so a model larger
 //! than free RAM costs reads, not paging. Units rewritten by a LoRA keep a pinned host image and go
 //! straight to VRAM: a copy through staging would cross the memory bus twice, and it is the slow part.
+//! So do the units that turn out to be streamed, which are copied on every evaluation, while RAM allows.
 //!
 //! Under ComfyUI's memory management ([`comfy_memory`], the default) plans are ignored: each unit is faulted into
 //! VRAM on use while ComfyUI's budget allows, or copied into a shared cast buffer, and other allocations can take it
@@ -192,9 +193,9 @@ impl Layout {
                 Src::Bf16(names) => {
                     let mut o = 0;
                     for n in names {
-                        let b = st.bf16_bytes(n)?;
-                        d[o..o + b.len()].copy_from_slice(&b);
-                        o += b.len();
+                        let len = st.packed_len(n, Dt::BF16)?;
+                        st.bf16_into(n, &mut d[o..o + len])?;
+                        o += len;
                     }
                 }
                 Src::F32(n, add) => {
@@ -262,6 +263,32 @@ impl Store<'_> {
 
 /// Units staged per reader thread, ahead of compute.
 const STAGING: usize = 4;
+
+/// In place of a unit, tells a reader thread to stop.
+const STOP: usize = usize::MAX;
+
+/// RAM left available after a streamed unit of a lazy set is given a pinned image.
+const KEEP_RAM_FREE: u64 = 8 << 30;
+
+#[repr(C)]
+struct MemoryStatusEx {
+    length: u32,
+    load: u32,
+    total_phys: u64,
+    avail_phys: u64,
+    rest: [u64; 5],
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
+}
+
+/// Physical memory the system can hand out now, file cache included.
+fn available_ram() -> Option<u64> {
+    let mut m = MemoryStatusEx { length: std::mem::size_of::<MemoryStatusEx>() as u32, load: 0, total_phys: 0, avail_phys: 0, rest: [0; 5] };
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.avail_phys)
+}
 
 type Staged = (usize, u64, Result<PinnedBuf>);
 
@@ -340,6 +367,9 @@ struct Lazy {
     st: Arc<SafeTensors>,
     images: Arc<Vec<RwLock<Option<Image>>>>,
     keep: Arc<AtomicBool>,
+    /// Units that went through a cast buffer or a ring slot: they are copied on every evaluation, so the readers
+    /// give them a pinned image when they next read them.
+    streams: Arc<Vec<AtomicBool>>,
     want: mpsc::Sender<(usize, u64)>,
     done: mpsc::Receiver<Staged>,
     staging: Arc<Staging>,
@@ -348,11 +378,21 @@ struct Lazy {
     /// Resident units whose VRAM holds their data.
     filled: Vec<bool>,
     generation: u64,
+    readers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Lazy {
     fn drop(&mut self) {
+        // The readers share the images and the staging buffers, and would free the last of them as they stop. Page-locked
+        // memory and events released on another thread while the process exits hang or crash in the driver, so the
+        // readers are stopped first and everything is released here.
         self.staging.start(u64::MAX);
+        for _ in &self.readers {
+            let _ = self.want.send((STOP, 0));
+        }
+        for r in self.readers.drain(..) {
+            let _ = r.join();
+        }
     }
 }
 
@@ -555,10 +595,16 @@ impl WeightSet {
         let images: Arc<Vec<RwLock<Option<Image>>>> = Arc::new((0..n).map(|_| RwLock::new(None)).collect());
         let want_rx = Arc::new(Mutex::new(want_rx));
         let keep = Arc::new(AtomicBool::new(false));
+        let streams: Arc<Vec<AtomicBool>> = Arc::new((0..n).map(|_| AtomicBool::new(false)).collect());
+        let mut readers = Vec::new();
         for _ in 0..threads.clamp(1, 3) {
-            let (want_rx, staging, done_tx, st, layouts, images, keep) = (want_rx.clone(), staging.clone(), done_tx.clone(), st.clone(), layouts.clone(), images.clone(), keep.clone());
-            std::thread::spawn(move || loop {
+            let (want_rx, staging, done_tx, st, layouts, images, keep, streams) =
+                (want_rx.clone(), staging.clone(), done_tx.clone(), st.clone(), layouts.clone(), images.clone(), keep.clone(), streams.clone());
+            readers.push(std::thread::spawn(move || loop {
                 let Ok((unit, generation)) = want_rx.lock().unwrap().recv() else { break };
+                if unit == STOP {
+                    break;
+                }
                 let Some((buf, event)) = staging.take(generation) else { continue };
                 let r = (|| -> Result<PinnedBuf> {
                     if let Some(e) = event {
@@ -574,8 +620,15 @@ impl WeightSet {
                         Some(img) => buf.as_mut_slice()[..size].copy_from_slice(&img.bytes()[..size]),
                         None => {
                             layouts[unit].pack(&st, &mut buf.as_mut_slice()[..size])?;
-                            if keep.load(Ordering::Relaxed) {
-                                let mut img = Image::new(size);
+                            // a streamed unit is only worth holding pinned: from pageable memory it would pass through here again
+                            let img = if keep.load(Ordering::Relaxed) {
+                                Some(Image::new(size))
+                            } else if streams[unit].load(Ordering::Relaxed) && available_ram().is_some_and(|a| a >= size as u64 + KEEP_RAM_FREE) {
+                                PinnedBuf::alloc(size).ok().map(Image::Pinned)
+                            } else {
+                                None
+                            };
+                            if let Some(mut img) = img {
                                 img.bytes()[..size].copy_from_slice(&buf.as_mut_slice()[..size]);
                                 *held = Some(img);
                                 layouts[unit].evict(&st);
@@ -594,11 +647,11 @@ impl WeightSet {
                 if done_tx.send((unit, generation, r)).is_err() {
                     break;
                 }
-            });
+            }));
         }
         let total: usize = layouts.iter().map(|l| l.size).sum();
         eprintln!("[{name}] {n} units, {:.2} GB: {} resident, {} streamed via {} slots, read on use", total as f64 / 1e9, plan.resident, streamed.len(), slots.len());
-        let lazy = Lazy { st, images, keep, want, done, staging, staged: HashMap::new(), asked: HashSet::new(), filled: vec![false; n], generation: 0 };
+        let lazy = Lazy { st, images, keep, streams, want, done, staging, staged: HashMap::new(), asked: HashSet::new(), filled: vec![false; n], generation: 0, readers };
         Ok(WeightSet { name: name.to_string(), layouts, stores, rewritten: vec![false; n], streamed, slot_of: HashMap::new(), next_rank: 0, rr: 0, slots, copy: Stream::new()?, lazy: Some(lazy), comfy, copied_bytes: 0 })
     }
 
@@ -882,7 +935,8 @@ impl WeightSet {
         let unit = self.streamed[self.next_rank];
         // the slot's previous occupant must be finished on the compute stream
         self.copy.wait(&self.slots[si].free)?;
-        if self.lazy.is_some() {
+        if let Some(l) = &self.lazy {
+            l.streams[unit].store(true, Ordering::Relaxed);
             let dst = self.slots[si].buf.ptr();
             self.fill(unit, dst)?;
         } else {
@@ -1002,6 +1056,9 @@ impl WeightSet {
                 (ptr, None)
             }
             None => {
+                if let Some(l) = &self.lazy {
+                    l.streams[unit].store(true, Ordering::Relaxed);
+                }
                 let (idx, ptr) = comfy_memory::cast_take(self.layouts[unit].size, &self.copy)?;
                 let done = self.copy_unit(unit, ptr)?;
                 compute.wait(&done)?;

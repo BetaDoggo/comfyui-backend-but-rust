@@ -177,7 +177,9 @@ one of our streamed units (a block) in place of aimdo's 32 MB page:
 * Weights stay in VRAM between prompts, and the cast buffers are released after each sampler run, as ComfyUI does
   after each node. A latent batch is never split.
 
-What differs from ComfyUI: residency moves by block, not by 32 MB page, so a block is either in VRAM or streamed; the
+What differs from ComfyUI: residency moves by block, not by 32 MB page, so a block is either in VRAM or streamed;
+the watermark runs over the blocks in bit-reversed order, so the streamed ones lie between resident ones and each copy
+overlaps compute (Krea 2 at 512x512: 190 to 150 ms per evaluation, the same images); the
 small weights outside the blocks, the image VAEs and encoded prompts are plain allocations, where ComfyUI streams those
 models too; one copy stream carries both cast buffers; host copies are packed and pinned for every block at load,
 without ComfyUI's RAM-pressure pin eviction; and CFG's two halves still run one after the other, where ComfyUI batches
@@ -261,7 +263,9 @@ features, and the PLY, run on the CPU.
 
 Offloading is the lazy kind in [`src/offload.rs`](../src/offload.rs): nothing is read at load, and reader threads fill
 up to four pinned staging buffers ahead of compute, taken only when a unit needs one and returned when the set parks.
-Pages read once leave the process right after, which took a H3 run's peak working set from 52 GB to 32 GB.
+Pages read once leave the process right after, which took a H3 run's peak working set from 52 GB to 32 GB. A unit that
+turns out to be streamed is kept in pinned RAM after its next read, while 8 GB of RAM stays available, so it goes
+straight to VRAM afterwards.
 
 Weights stay in packed 6-bit form in VRAM and decode to int8 before each GEMM, which leaves room for 30 of the 50 blocks
 at 512x512. Streamed blocks are spread evenly among the resident ones, so each copy overlaps compute instead of queueing

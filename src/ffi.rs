@@ -40,6 +40,10 @@ extern "C" {
     pub fn gpu_flash_attn(q: P, k: P, v: P, o: PM, lse: PM, b: i32, sq: i32, sk: i32, h: i32, hk: i32, q_bs: i64,
         q_rs: i64, q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64, v_hs: i64, o_bs: i64, o_rs: i64,
         o_hs: i64, scale: f32, variant: i32, s: PM) -> i32;
+    /// `gpu_flash_attn` for heads `d` wide, 128 or 64.
+    pub fn gpu_flash_attn_d(q: P, k: P, v: P, o: PM, lse: PM, b: i32, sq: i32, sk: i32, h: i32, hk: i32, d: i32, q_bs: i64,
+        q_rs: i64, q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64, v_hs: i64, o_bs: i64, o_rs: i64,
+        o_hs: i64, scale: f32, variant: i32, s: PM) -> i32;
 
     // block-sparse attention (csrc/sparse_attn.cu over comfy-kitchen's Sol-Attn)
     pub fn gpu_sol_attn_workspace(t: i32, h: i32, n_tok: i32) -> i64;

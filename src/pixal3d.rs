@@ -61,6 +61,8 @@ pub struct Params {
     pub texture_enabled: bool,
     /// simplify the mesh to at most this many triangles (ComfyUI's example decimates to 700k); 0 keeps them all
     pub max_faces: usize,
+    /// INT8 self-attention in the flow models (the default everywhere); false is bf16 FlashAttention-2
+    pub int8_attn: bool,
 }
 
 impl Params {
@@ -78,6 +80,7 @@ impl Params {
             texture: st(seed.wrapping_add(1), 12, 1.0, "normal", 3.0, None, None),
             texture_enabled: true,
             max_faces: 700_000,
+            int8_attn: true,
         }
     }
 }
@@ -475,6 +478,7 @@ pub fn run(paths: &Paths, rgb: &[f32], mask: &[f32], w: usize, h: usize, p: &Par
     let ss_coords = grid_coords(SS_RES);
     let ss_proj = project(&cam, &dense_world(SS_RES), &StageMaps { lr: &t512, hr: None, image_res: 512 }, &st)?;
     let mut flow = Flow::load(&dit_st, Stage::Structure, budget(&st)?, threads, &st)?;
+    flow.int8_attn = p.int8_attn;
     let cond = flow.stage_cond(&g512, &ss_proj, ss_coords.len(), &st)?;
     drop(ss_proj);
     let rope = upload_rope(&ss_coords, &st)?;
@@ -493,6 +497,7 @@ pub fn run(paths: &Paths, rgb: &[f32], mask: &[f32], w: usize, h: usize, p: &Par
     let proj = project(&cam, &coords_world(&coords512, SHAPE512_RES), &StageMaps { lr: &t512, hr: Some((&hr512, 512)), image_res: 512 }, &st)?;
     drop(hr512);
     let mut flow = Flow::load(&dit_st, Stage::Shape512, budget(&st)?, threads, &st)?;
+    flow.int8_attn = p.int8_attn;
     let cond = flow.stage_cond(&g512, &proj, n512, &st)?;
     drop(proj);
     let rope = upload_rope(&xyz(&coords512), &st)?;
@@ -508,6 +513,7 @@ pub fn run(paths: &Paths, rgb: &[f32], mask: &[f32], w: usize, h: usize, p: &Par
     let proj = project(&cam, &coords_world(&coords, grid_res), &StageMaps { lr: &t1024, hr: Some((&hr1024, 512)), image_res: 1024 }, &st)?;
     drop(hr1024);
     let mut flow = Flow::load(&dit_st, Stage::Shape, budget(&st)?, threads, &st)?;
+    flow.int8_attn = p.int8_attn;
     let cond = flow.stage_cond(&g1024, &proj, n, &st)?;
     drop(proj);
     let rope = upload_rope(&xyz(&coords), &st)?;
@@ -529,6 +535,7 @@ pub fn run(paths: &Paths, rgb: &[f32], mask: &[f32], w: usize, h: usize, p: &Par
         drop(hr_tex);
         drop((t512, t1024, dino));
         let mut flow = Flow::load(&dit_st, Stage::Texture, budget(&st)?, threads, &st)?;
+        flow.int8_attn = p.int8_attn;
         let cond = flow.stage_cond(&g1024, &proj, n, &st)?;
         drop(proj);
         let rope = upload_rope(&xyz(&coords), &st)?;
@@ -936,7 +943,7 @@ fn upload_bf16(v: &[f32], st: &Stream) -> Result<DevBuf> {
 /// One evaluation of `stage` on the reference's first-call inputs, cond (batch row 0) and, if present, uncond.
 #[allow(clippy::too_many_arguments)]
 fn check_eval(r: &SafeTensors, dit: &SafeTensors, stage: Stage, mode: &str, coords: &[[i32; 3]], slat: Option<&[f32]>, threads: usize,
-    st: &Stream) -> Result<()> {
+    int8_attn: bool, st: &Stream) -> Result<()> {
     let x = ref_f32(r, &format!("{mode}_x"))?;
     let t = ref_f32(r, &format!("{mode}_t"))?;
     // the sparse passes after the first attend to the 1024 encode (`embeds`), the others to the context
@@ -955,6 +962,7 @@ fn check_eval(r: &SafeTensors, dit: &SafeTensors, stage: Stage, mode: &str, coor
     crate::cuda::trim_pool()?;
     let free = crate::cuda::device_free()?.saturating_sub(3 << 30);
     let mut flow = Flow::load(dit, stage, free, threads, st)?;
+    flow.int8_attn = int8_attn;
     let projd = upload_bf16(&proj[..n * stage.proj_ch()], st)?;
     let cond = flow.stage_cond(&ctx[..CTX_LEN * CTX], &projd, n, st)?;
     let rope = upload_rope(coords, st)?;
@@ -969,8 +977,11 @@ fn check_eval(r: &SafeTensors, dit: &SafeTensors, stage: Stage, mode: &str, coor
         }
         let td = upload_bf16(&tok, st)?;
         // t is sigma * 1000 before ComfyUI rounds it to bf16, which predict does again
+        st.sync()?;
+        let t0 = Instant::now();
         flow.predict(&td, &rope, t[b] / 1000.0, &cond, is_uncond[b], &vel, st, None)?;
         let v = download_half(&vel, n * out_ch, true, st)?;
+        eprintln!("{:24} {n} tokens in {:.0} ms", "", t0.elapsed().as_secs_f64() * 1e3);
         let ob = &out[b * per..(b + 1) * per];
         let theirs: Vec<f32> = (0..n).flat_map(|i| (0..out_ch).map(move |c| ob[c * n + i])).collect();
         report(&format!("{mode} {}", if is_uncond[b] { "uncond" } else { "cond" }), &v, &theirs);
@@ -979,7 +990,7 @@ fn check_eval(r: &SafeTensors, dit: &SafeTensors, stage: Stage, mode: &str, coor
 }
 
 /// Compares every stage with `ref_path`, a dump of `tools/pixal3d_ref.py` on the same image.
-pub fn check(paths: &Paths, rgba: &[u8], w: usize, h: usize, ref_path: &std::path::Path, threads: usize) -> Result<()> {
+pub fn check(paths: &Paths, rgba: &[u8], w: usize, h: usize, ref_path: &std::path::Path, threads: usize, int8_attn: bool) -> Result<()> {
     crate::cuda::init(0)?;
     crate::ffi::ok(unsafe { crate::ffi::gpu_blas_init(64 << 20) }, "cublasLt init")?;
     let st = Stream::new()?;
@@ -991,67 +1002,71 @@ pub fn check(paths: &Paths, rgba: &[u8], w: usize, h: usize, ref_path: &std::pat
     let differing = composite.iter().zip(&rc).filter(|(a, b)| a != b).count();
     eprintln!("{:24} {differing} of {} values differ", "", rc.len());
 
-    // conditioning, from the reference's composite
-    let dino_st = SafeTensors::open(&paths.dino)?;
-    let mut dino = Dino3::load(&dino_st, threads, &st)?;
-    let img512 = lanczos_f32(&rc, COMPOSITE, COMPOSITE, 3, 512, 512);
-    let img1024 = lanczos_f32(&rc, COMPOSITE, COMPOSITE, 3, 1024, 1024);
-    let mut probe = |name: &str, b: &DevBuf, nn: usize| {
-        let theirs = match name {
-            "embed" => "dino_embed",
-            "layer0" => "dino_layer0",
-            "layer23" => "dino_layer23",
-            n if n.starts_with("dbg") => {
-                if let Ok(v) = download_f32(b, nn, &st) {
-                    let bad = v.iter().position(|x| !x.is_finite());
-                    eprintln!("{name:24} first non-finite {bad:?}, max abs {:.3e}", v.iter().filter(|x| x.is_finite()).fold(0f32, |a, x| a.max(x.abs())));
-                }
-                return;
-            }
-            _ => return,
-        };
-        if let (Ok(v), Ok(t)) = (download_f32(b, nn, &st), ref_f32(&r, theirs)) {
-            report(&format!("dino {name}"), &v, &t);
-        }
-    };
-    let t512 = dino.encode_probe(&img512, 512, &st, Some(&mut probe))?;
-    let t1024 = dino.encode(&img1024, 1024, &st)?;
-    let all512 = download_f32(&t512.buf, (PREFIX + 32 * 32) * 1024, &st)?;
-    let all1024 = download_f32(&t1024.buf, (PREFIX + 64 * 64) * 1024, &st)?;
-    report("global_512", &all512[..PREFIX * 1024], &ref_f32(&r, "global_512")?);
-    report("global_1024", &all1024[..PREFIX * 1024], &ref_f32(&r, "global_1024")?);
-    report("patches_512", &all512[PREFIX * 1024..], &nhwc(&ref_f32(&r, "ss_lr")?, 1024, 32 * 32));
-    report("patches_1024", &all1024[PREFIX * 1024..], &nhwc(&ref_f32(&r, "shape_1024_lr")?, 1024, 64 * 64));
-    dino.free_vit();
-    for (name, img, size, tok, out) in [("shape_512", &img512, 512, &t512, 512), ("shape_1024", &img1024, 1024, &t1024, 512),
-        ("tex_1024", &img1024, 1024, &t1024, 1024)]
-    {
-        let hr = dino.naf(img, size, tok.patches(), tok.side, out, &st)?;
-        let v = download_half(&hr, out * out * 1024, false, &st)?;
-        let sub: Vec<f32> = (0..1024).flat_map(|c| (0..out / 8).flat_map(move |y| (0..out / 8).map(move |x| (c, y, x))))
-            .map(|(c, y, x)| v[((y * 8) * out + x * 8) * 1024 + c]).collect();
-        report(&format!("{name}_hr (1/8)"), &sub, &ref_f32(&r, &format!("{name}_hr_sub"))?);
-        let ch0: Vec<f32> = (0..4).flat_map(|c| (0..out * out).map(move |p| (c, p))).map(|(c, p)| v[p * 1024 + c]).collect();
-        report(&format!("{name}_hr (4 ch)"), &ch0, &ref_f32(&r, &format!("{name}_hr_ch0"))?);
-    }
-    let cam = Camera::new(49.13);
-    let ss_proj = project(&cam, &dense_world(SS_RES), &StageMaps { lr: &t512, hr: None, image_res: 512 }, &st)?;
-    report("ss_proj", &download_half(&ss_proj, 4096 * 1024, true, &st)?, &ref_f32(&r, "ss_proj")?);
     let c512 = ref_coords(&r, "shape512_coords")?;
-    let hr512 = dino.naf(&img512, 512, t512.patches(), t512.side, 512, &st)?;
-    let p512 = project(&cam, &coords_world(&c512, SHAPE512_RES), &StageMaps { lr: &t512, hr: Some((&hr512, 512)), image_res: 512 }, &st)?;
-    report("shape512_proj", &download_half(&p512, c512.len() * 2048, true, &st)?, &ref_f32(&r, "shape512_proj")?);
-    drop((hr512, p512, ss_proj));
-    drop((t512, t1024, dino));
+    // conditioning, from the reference's composite
+    if paths.dino.exists() {
+        let dino_st = SafeTensors::open(&paths.dino)?;
+        let mut dino = Dino3::load(&dino_st, threads, &st)?;
+        let img512 = lanczos_f32(&rc, COMPOSITE, COMPOSITE, 3, 512, 512);
+        let img1024 = lanczos_f32(&rc, COMPOSITE, COMPOSITE, 3, 1024, 1024);
+        let mut probe = |name: &str, b: &DevBuf, nn: usize| {
+            let theirs = match name {
+                "embed" => "dino_embed",
+                "layer0" => "dino_layer0",
+                "layer23" => "dino_layer23",
+                n if n.starts_with("dbg") => {
+                    if let Ok(v) = download_f32(b, nn, &st) {
+                        let bad = v.iter().position(|x| !x.is_finite());
+                        eprintln!("{name:24} first non-finite {bad:?}, max abs {:.3e}", v.iter().filter(|x| x.is_finite()).fold(0f32, |a, x| a.max(x.abs())));
+                    }
+                    return;
+                }
+                _ => return,
+            };
+            if let (Ok(v), Ok(t)) = (download_f32(b, nn, &st), ref_f32(&r, theirs)) {
+                report(&format!("dino {name}"), &v, &t);
+            }
+        };
+        let t512 = dino.encode_probe(&img512, 512, &st, Some(&mut probe))?;
+        let t1024 = dino.encode(&img1024, 1024, &st)?;
+        let all512 = download_f32(&t512.buf, (PREFIX + 32 * 32) * 1024, &st)?;
+        let all1024 = download_f32(&t1024.buf, (PREFIX + 64 * 64) * 1024, &st)?;
+        report("global_512", &all512[..PREFIX * 1024], &ref_f32(&r, "global_512")?);
+        report("global_1024", &all1024[..PREFIX * 1024], &ref_f32(&r, "global_1024")?);
+        report("patches_512", &all512[PREFIX * 1024..], &nhwc(&ref_f32(&r, "ss_lr")?, 1024, 32 * 32));
+        report("patches_1024", &all1024[PREFIX * 1024..], &nhwc(&ref_f32(&r, "shape_1024_lr")?, 1024, 64 * 64));
+        dino.free_vit();
+        for (name, img, size, tok, out) in [("shape_512", &img512, 512, &t512, 512), ("shape_1024", &img1024, 1024, &t1024, 512),
+            ("tex_1024", &img1024, 1024, &t1024, 1024)]
+        {
+            let hr = dino.naf(img, size, tok.patches(), tok.side, out, &st)?;
+            let v = download_half(&hr, out * out * 1024, false, &st)?;
+            let sub: Vec<f32> = (0..1024).flat_map(|c| (0..out / 8).flat_map(move |y| (0..out / 8).map(move |x| (c, y, x))))
+                .map(|(c, y, x)| v[((y * 8) * out + x * 8) * 1024 + c]).collect();
+            report(&format!("{name}_hr (1/8)"), &sub, &ref_f32(&r, &format!("{name}_hr_sub"))?);
+            let ch0: Vec<f32> = (0..4).flat_map(|c| (0..out * out).map(move |p| (c, p))).map(|(c, p)| v[p * 1024 + c]).collect();
+            report(&format!("{name}_hr (4 ch)"), &ch0, &ref_f32(&r, &format!("{name}_hr_ch0"))?);
+        }
+        let cam = Camera::new(49.13);
+        let ss_proj = project(&cam, &dense_world(SS_RES), &StageMaps { lr: &t512, hr: None, image_res: 512 }, &st)?;
+        report("ss_proj", &download_half(&ss_proj, 4096 * 1024, true, &st)?, &ref_f32(&r, "ss_proj")?);
+        let hr512 = dino.naf(&img512, 512, t512.patches(), t512.side, 512, &st)?;
+        let p512 = project(&cam, &coords_world(&c512, SHAPE512_RES), &StageMaps { lr: &t512, hr: Some((&hr512, 512)), image_res: 512 }, &st)?;
+        report("shape512_proj", &download_half(&p512, c512.len() * 2048, true, &st)?, &ref_f32(&r, "shape512_proj")?);
+        drop((hr512, p512, ss_proj));
+        drop((t512, t1024, dino));
+    } else {
+        eprintln!("{} not found: skipping the conditioning stages", paths.dino.display());
+    }
 
     // first evaluation of each sub-model
     let dit = SafeTensors::open(&paths.dit)?;
     let chr = ref_coords(&r, "hr_coords")?;
-    check_eval(&r, &dit, Stage::Structure, "structure_generation", &grid_coords(SS_RES), None, threads, &st)?;
-    check_eval(&r, &dit, Stage::Shape512, "shape_generation_512", &xyz(&c512), None, threads, &st)?;
-    check_eval(&r, &dit, Stage::Shape, "shape_generation", &xyz(&chr), None, threads, &st)?;
+    check_eval(&r, &dit, Stage::Structure, "structure_generation", &grid_coords(SS_RES), None, threads, int8_attn, &st)?;
+    check_eval(&r, &dit, Stage::Shape512, "shape_generation_512", &xyz(&c512), None, threads, int8_attn, &st)?;
+    check_eval(&r, &dit, Stage::Shape, "shape_generation", &xyz(&chr), None, threads, int8_attn, &st)?;
     let hr_latent = ref_f32(&r, "hr_latent")?;
-    check_eval(&r, &dit, Stage::Texture, "texture_generation", &xyz(&chr), Some(&tokens_major(&hr_latent, chr.len())), threads, &st)?;
+    check_eval(&r, &dit, Stage::Texture, "texture_generation", &xyz(&chr), Some(&tokens_major(&hr_latent, chr.len())), threads, int8_attn, &st)?;
 
     // decoders
     let shape_st = SafeTensors::open(&paths.shape_vae)?;

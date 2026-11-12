@@ -21,7 +21,7 @@ It really generates with these image, video and image-to-3D models, from specifi
 | Qwen Image 2.1 | Text to image with alpha, and edits with reference images | 0.36 s/step, 0.22 to 0.44 s/step with references | 0.46 s/step |
 | MiniMax H3 | Text to video with audio | 0.24 s/step, 5 frames at 512x512 | 1.59 s/step |
 | HyperFlow H3 Flash | Text to video with audio, 6 steps | 0.49 s/step, 22 frames at 512x512 | needs custom nodes, not timed |
-| MiniMax-H3-Image | Text to image, 6 steps | 0.86 s/step, 1.22 s/step at 2048x2048 | 0.68 s/step, 1.34 s/step at 2048x2048 |
+| MiniMax-H3-Image | Text to image, 6 steps | 0.35 s/step, 1.07 s/step at 2048x2048 | 0.68 s/step, 1.34 s/step at 2048x2048 |
 | Pixal3D | Image to a vertex-coloured 3D mesh (GLB), cutting the object out first with BiRefNet | 40 s per mesh at resolution 1024, 110 s at 1536 | not timed |
 | Idol (TripoSplat) | Image to a 3D gaussian splat (PLY), cutting the object out first with BiRefNet | 14.4 s per splat, 0.57 s/step at CFG 3 | 111 s/step headless here, not tuned |
 | SeedVR2 3B | Restores a picture, as SwarmUI's SeedVR stage | 0.79 s per 1024 restore, DiT 145 ms | DiT 235 ms |

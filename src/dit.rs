@@ -32,6 +32,7 @@ pub struct Dit {
     pub attn_variant: i32,
     /// Use INT8 (Sage-style) attention for the main blocks instead of FlashAttention-2 bf16.
     pub int8_attn: bool,
+    pub prof: crate::prof::Prof,
 }
 
 /// Reference images as DiT tokens, added after the image's.
@@ -145,7 +146,7 @@ impl Dit {
         let layouts = (0..nb).map(|i| block_layout(st, i)).collect::<Result<Vec<_>>>()?;
         let p = plan(&layouts, block_budget, slots);
         let blocks = WeightSet::load("dit blocks", st, layouts, p, threads)?;
-        Ok(Dit { globals, gl, txt, blocks, attn_variant: 0, int8_attn: false })
+        Ok(Dit { globals, gl, txt, blocks, attn_variant: 0, int8_attn: false, prof: crate::prof::Prof::new() })
     }
 
     fn g(&self, key: &str) -> PM {
@@ -340,6 +341,7 @@ impl Dit {
         let plane = CH * h * w * 4;
         let mut probe = probe;
 
+        self.prof.mark("start", st)?;
         let (t, tvec) = self.timestep(sigma, st)?;
         let tvec0 = match refs {
             Some(r) if r.timestep_zero => Some(self.timestep(0.0, st)?.1),
@@ -361,6 +363,7 @@ impl Dit {
             }
         }
 
+        self.prof.mark("embed", st)?;
         let a8 = DevBuf::alloc_async(rows * MLP, st)?;
         let asc = DevBuf::alloc_async(rows * 4, st)?;
         let qkvg = DevBuf::alloc_async(rows * QKVG * 2, st)?;
@@ -393,18 +396,22 @@ impl Dit {
             if let Some(t0) = &tvec0 {
                 k!(gpu_add_vec_bf16(modv0.ptr(), t0.ptr(), wp("mod"), 1, MOD as i32, s(st)))?;
             }
+            self.prof.mark("stream", st)?;
             // attention
             for &(r0, n, mv) in &groups {
                 k!(gpu_quant_rows(DT_BF16, PRO_RMS, off(xp, r0 * F * 2), fi, null(), 0, 0, wp("pre"), EPS, mo(mv, 0), mo(mv, 1), off(a8.ptr(), r0 * F),
                     off(asc.ptr(), r0 * 4), n as i32, F as i32, 1, s(st)))?;
             }
+            self.prof.mark("quant", st)?;
             k!(gpu_int8_gemm(a8.ptr(), wp("wqkvg"), asc.ptr(), wp("sqkvg"), null(), qkvg.ptr(), rows as i64,
                 QKVG as i64, fi, DT_BF16, s(st)))?;
+            self.prof.mark("gemm qkvg", st)?;
             // the RoPE table is one image's
             for i in 0..batch {
                 k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(qkvg.ptr(), i * l * QKVG * 2), QKVG as i64, 0, (HQ * HD) as i32, HQ as i32,
                     HK as i32, wp("qn"), wp("kn"), EPS, rope.ptr(), 1, l as i32, s(st)))?;
             }
+            self.prof.mark("rope", st)?;
             let q = qkvg.ptr();
             let (kp, vp) = (off(q, HQ * HD * 2), off(q, (HQ + HK) * HD * 2));
             if let Some(ws) = &int8_ws {
@@ -414,27 +421,34 @@ impl Dit {
             } else {
                 self.flash(q, kp, vp, attn.ptr(), lse.ptr(), batch, l, HQ, HK, QKVG, F, st)?;
             }
+            self.prof.mark("attn", st)?;
             k!(gpu_quant_rows(DT_BF16, PRO_GATE, attn.ptr(), fi, off(q, (HQ + 2 * HK) * HD * 2), QKVG as i64, 0,
                 null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m, F as i32, 1, s(st)))?;
+            self.prof.mark("quant gate", st)?;
             for &(r0, n, mv) in &groups {
                 let xr = off(xp, r0 * F * 2);
                 k!(gpu_int8_gemm_residual(off(a8.ptr(), r0 * F), wp("wo"), off(asc.ptr(), r0 * 4), wp("so"), null(), mo(mv, 2), xr, xr, n as i64, fi,
                     fi, DT_BF16, s(st)))?;
             }
+            self.prof.mark("gemm o", st)?;
             // MLP
             for &(r0, n, mv) in &groups {
                 k!(gpu_quant_rows(DT_BF16, PRO_RMS, off(xp, r0 * F * 2), fi, null(), 0, 0, wp("post"), EPS, mo(mv, 3), mo(mv, 4), off(a8.ptr(), r0 * F),
                     off(asc.ptr(), r0 * 4), n as i32, F as i32, 1, s(st)))?;
             }
+            self.prof.mark("quant", st)?;
             k!(gpu_int8_gemm(a8.ptr(), wp("wgu"), asc.ptr(), wp("sgu"), null(), gu.ptr(), rows as i64, (2 * MLP) as i64,
                 fi, DT_BF16, s(st)))?;
+            self.prof.mark("gemm gu", st)?;
             k!(gpu_quant_rows(DT_BF16, PRO_SWIGLU, gu.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0,
                 null(), null(), a8.ptr(), asc.ptr(), m, MLP as i32, 1, s(st)))?;
+            self.prof.mark("quant swiglu", st)?;
             for &(r0, n, mv) in &groups {
                 let xr = off(xp, r0 * F * 2);
                 k!(gpu_int8_gemm_residual(off(a8.ptr(), r0 * MLP), wp("wd"), off(asc.ptr(), r0 * 4), wp("sd"), null(), mo(mv, 5), xr, xr, n as i64, fi,
                     MLP as i64, DT_BF16, s(st)))?;
             }
+            self.prof.mark("gemm down", st)?;
             self.blocks.release(b, st)?;
             if let Some(p) = probe.as_mut() {
                 p(&format!("block{b}"), &x, rows * F * 2);
@@ -462,6 +476,8 @@ impl Dit {
                 PATCH as i32, sigma, sigma_next, den, s(st)))?;
         }
         let _ = PRO_PLAIN;
+        self.prof.mark("head", st)?;
+        self.prof.report("step", st)?;
         Ok(())
     }
 }

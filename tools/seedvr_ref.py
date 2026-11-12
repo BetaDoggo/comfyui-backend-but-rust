@@ -15,10 +15,10 @@ import os
 import sys
 import time
 
-SWARM = os.environ.get("SWARM_DIR", r"G:\StableSwarmUI")
+SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
 COMFY = os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI")
 sys.path.insert(0, COMFY)
-MODELS = os.environ.get("MODELS_ROOT", r"G:\stable-diffusion-webui-forge\models")
+MODELS = os.environ.get("MODELS_ROOT") or sys.exit("set MODELS_ROOT to the models folder")
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")

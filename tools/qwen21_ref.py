@@ -15,7 +15,7 @@ import os
 import sys
 import time
 
-SWARM = os.environ.get("SWARM_DIR", r"G:\StableSwarmUI")
+SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
 COMFY = os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI")
 sys.path.insert(0, COMFY)
 sys.path.insert(0, os.path.join(SWARM, "src", "BuiltinExtensions", "ComfyUIBackend", "ExtraNodes"))
@@ -61,7 +61,7 @@ import comfy.utils
 import node_helpers
 from SwarmComfyCommon.SwarmText import SwarmTextEncodeAdvanced
 
-MODELS = os.environ.get("MODELS_ROOT", r"G:\stable-diffusion-webui-forge\models")
+MODELS = os.environ.get("MODELS_ROOT") or sys.exit("set MODELS_ROOT to the models folder")
 DIT = os.path.join(MODELS, r"Stable-diffusion\rayQwen21_v1Int8Convrot.safetensors")
 TE = os.path.join(MODELS, r"clip\qwen3vl_8b_int8_convrot.safetensors")
 VAE = os.path.join(MODELS, r"VAE\QwenImage\qwen_image_2.1_vae_bf16.safetensors")

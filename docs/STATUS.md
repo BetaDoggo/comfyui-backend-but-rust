@@ -18,6 +18,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | Server | Runs beside a real ComfyUI backend | Live test: Krea 2 stayed here and Anima went to ComfyUI. First job isn't pinned without Exact Backend ID. |
 | P0 | Server | Model folder scanning | Uses Swarm's and ComfyUI's folder names, including Stable-diffusion, clip and VAE. |
 | P0 | Server | Start script | start-backend.bat builds, starts the server and prints the connection steps. |
+| P1 | Server | Self-starting SwarmUI backend | The comfy-rust backend extension lets SwarmUI start, stop and restart the native server, using SwarmUI's own model paths file. The maintainer has used it extensively inside SwarmUI. |
 | P0 | Engine core | Low-memory block streaming | Packed blocks in pinned RAM, streamed through VRAM slots on a copy stream. |
 | P0 | Engine core | Cancelling and Free VRAM | Interrupt stops at the next step. Free VRAM unloads models, and they reload on next use. `/free` with `free_memory` alone moves the weights to RAM and keeps the models loaded: tested on Krea 2 through a direct workflow, not through SwarmUI. |
 | P0 | Engine core | Sampler: er_sde | Anima and MOSS Image, generated through SwarmUI. Noise follows torch's CUDA Philox layout on this GPU. Other GPUs untested. |
@@ -89,7 +90,6 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | Server | Swarm prompt syntax parsing | <break>, <weight>, <alternate>, <fromto>, <embed> and LoRA hooks parse. See the rows for each family and the Todo rows for what is refused. |
 | P0 | Image workflows | Refiner and upscale | Latent upscale refiners work (see partial sampling). Model upscalers reach the engine API, which doesn't run them. |
 | P0 | LoRA and control | LoRAs on non-quantised models | Loader, patches and hooks reach the engine. No non-quantised model runs yet; int8 LoRAs work. The LoRA formats are done in src/lora.rs. |
-| P1 | Server | Self-starting SwarmUI backend | The comfy-rust backend extension compiles against SwarmUI's DLL. `selfstart.bat` started the native server, and it listed every model from SwarmUI's real model paths file. Not yet run inside SwarmUI, so starting, stopping and reloading from SwarmUI are untested. |
 | P1 | Server | Mask and image nodes | Crop, scale, blur, grow, threshold and composite run in the server. Not yet used with real generations. |
 | P1 | Server | Video and audio output | mp4, webm, mov, gif and audio encoding through ffmpeg. H3 mp4 with audio works through SwarmUI. The other formats have only had placeholder frames. |
 | P1 | Image workflows | Use Inpainting Encode | `VAEEncodeForInpaint` reaches the engine; noise masks and Differential Diffusion work (see partial sampling). Not run through SwarmUI. |

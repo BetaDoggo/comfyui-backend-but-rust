@@ -14,7 +14,7 @@ import os
 import sys
 import time
 
-SWARM = os.environ.get("SWARM_DIR", r"G:\StableSwarmUI")
+SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
 sys.path.insert(0, os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI"))
 
 ap = argparse.ArgumentParser()

@@ -99,8 +99,8 @@ this backend. The two share the GPU: the native engine re-plans DiT residency fr
 ## Let SwarmUI start it
 
 The comfy-rust backend extension in [`swarm-extension/`](swarm-extension) adds a **comfy-rust Self-Starting** backend type,
-meant to be started, stopped and restarted by SwarmUI like its own ComfyUI self-start. This hasn't been run inside SwarmUI
-yet. It passes the `comfy-auto-model.yaml` that SwarmUI writes for ComfyUI, so
+started, stopped and restarted by SwarmUI like its own ComfyUI self-start. It passes the `comfy-auto-model.yaml` that
+SwarmUI writes for ComfyUI, so
 every model root and folder setting in SwarmUI applies, and changing them reloads the backend. The stock ComfyUI
 Self-Starting type can't be used, because it always runs ComfyUI's Python and pip setup.
 

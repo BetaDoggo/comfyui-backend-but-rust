@@ -5,6 +5,7 @@ usage: python_embeded/python.exe qwen21_cmp.py <ref dump.safetensors> <ours.safe
 Run the reference with --no-cache so its block outputs cover the whole sequence; ours then splits them into the
 prefix's rows (prefix_blockN) and the image's (blockN). The latent is compared at 512x512.
 """
+import os
 import sys
 
 import torch
@@ -47,6 +48,6 @@ for b in (0, 1, 31):
 if "proj_out" in ours:
     stats("dit_out", ours["proj_out"].float().reshape(-1, 64), ref["dit_out"].float()[0].flatten(1).T)
 # ComfyUI's samples come out after process_latent_out; ours stay at the sampler's scale
-sys.path.insert(0, r"G:\StableSwarmUI\dlbackend\comfy\ComfyUI")
+sys.path.insert(0, os.path.join(os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder"), "dlbackend", "comfy", "ComfyUI"))
 from comfy.latent_formats import QwenImage21
 stats("samples", QwenImage21().process_out(ours["samples"].float().reshape(ref["samples"].shape)), ref["samples"])

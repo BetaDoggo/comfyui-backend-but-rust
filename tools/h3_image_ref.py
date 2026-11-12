@@ -58,7 +58,7 @@ if args.cmp:
         print(f"image psnr {(-10 * torch.log10(((a - b) ** 2).mean())).item():.2f} dB")
     sys.exit(0)
 
-COMFY = os.environ.get("COMFY_DIR", os.path.join(os.environ.get("SWARM_DIR", r"G:\StableSwarmUI"), "dlbackend", "comfy", "ComfyUI"))
+COMFY = os.environ.get("COMFY_DIR") or os.path.join(os.environ.get("SWARM_DIR") or sys.exit("set COMFY_DIR, or SWARM_DIR to the SwarmUI folder"), "dlbackend", "comfy", "ComfyUI")
 sys.path.insert(0, COMFY)
 sys.argv = [sys.argv[0]]
 

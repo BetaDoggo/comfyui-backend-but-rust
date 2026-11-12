@@ -1,7 +1,13 @@
 # Working on this repository
 
-Rules and context for people and coding agents. The [README](README.md) covers setup, and the
-[technical overview](docs/TECHNICAL_OVERVIEW.md) covers the design.
+Rules and context for people and coding agents. The [README](README.md) covers setup, the
+[technical overview](docs/TECHNICAL_OVERVIEW.md) covers the design, and [Testing](docs/TESTING.md) covers checking the
+engine against ComfyUI and SwarmUI.
+
+**Starting on a fresh machine?** If a task needs ComfyUI's reference output or a live SwarmUI and they aren't set up,
+follow [docs/TESTING.md](docs/TESTING.md): it lists what to install, where each piece goes, the environment variables
+the scripts read, and how to run a separate SwarmUI instance. Model files are the maintainer's to provide; ask for the
+models folder instead of downloading checkpoints.
 
 ## Rules
 
@@ -79,7 +85,8 @@ Anything that changes what a cached value depends on must invalidate it, or the 
 ## Comparing with ComfyUI
 
 The scripts in `tools/` run ComfyUI's real code and compare the results. Most need SwarmUI's copy of ComfyUI and its
-`python_embeded` Python, because `ref/ComfyUI` is too old for the newer models. Each script's docstring gives its usage.
+`python_embeded` Python, because `ref/ComfyUI` is too old for the newer models. Each script's docstring gives its usage,
+and [Testing](docs/TESTING.md#which-comfyui-each-script-uses) says which ComfyUI each one needs.
 
 * Images are close to ComfyUI's, not identical. Judge a change by tokens, hidden states and the first model evaluation
   before PSNR.
@@ -108,8 +115,10 @@ Only run live tests when asked. To avoid touching a real install's configuration
 SwarmUI folder:
 
 ```bash
-dotnet src/bin/live_release/SwarmUI.dll --data_dir <tmp> --settings_file <tmp> --backends_file <tmp> --port 7872 --launch_mode none
+dotnet src/bin/live_release/SwarmUI.dll --data_dir <tmp> --settings_file <tmp>/Settings.fds --backends_file <tmp>/Backends.fds --port 7872 --launch_mode none
 ```
+
+[Testing](docs/TESTING.md#testing-in-swarmui) shows what to put in those two files.
 
 * Start it after `comfy-server` is listening, or call `RestartBackends`.
 * While another SwarmUI is running, set `ModelMetadataPerFolder: false` in its `Settings.fds`, or models lose their class.
@@ -125,6 +134,7 @@ dotnet src/bin/live_release/SwarmUI.dll --data_dir <tmp> --settings_file <tmp> -
 | [docs/MODELS.md](docs/MODELS.md) | Timings, parity, limits per family | Anything is measured again |
 | [docs/STATUS.md](docs/STATUS.md) | What works, by priority | A feature lands |
 | [docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md) | Design and dependencies | The design changes |
+| [docs/TESTING.md](docs/TESTING.md) | Setting up ComfyUI and SwarmUI for checks | A reference script, its ComfyUI or the live-test setup changes |
 | [swarm backend/README.md](swarm%20backend/README.md) | Running the server | Flags or SwarmUI behaviour change |
 | [INPUT_MAPPING.md](swarm%20backend/docs/INPUT_MAPPING.md) | What SwarmUI sends | SwarmUI or the engine API changes |
 | [ADDING_MODELS.md](swarm%20backend/docs/ADDING_MODELS.md) | How to add a model family | The steps for adding one change |

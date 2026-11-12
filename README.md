@@ -102,7 +102,7 @@ Set `MODELS_ROOT`, run [`swarm backend/start-backend.bat`](swarm%20backend/start
 is refused or reaches a mock engine. See the [SwarmUI backend guide](swarm%20backend/README.md).
 
 To have SwarmUI start and stop the server itself, use the comfy-rust backend extension instead. It uses SwarmUI's own model
-folders, so `MODELS_ROOT` isn't needed. This hasn't been run inside SwarmUI yet.
+folders, so `MODELS_ROOT` isn't needed.
 
 1. Build the server from `swarm backend/`, with the CUDA toolkit's `bin` folder on `PATH`. SwarmUI doesn't build it, so
    repeat this after pulling changes:

@@ -10,7 +10,7 @@ import argparse
 import os
 import sys
 
-SWARM = os.environ.get("SWARM_DIR", r"G:\StableSwarmUI")
+SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
 COMFY = os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI")
 sys.path.insert(0, COMFY)
 

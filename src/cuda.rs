@@ -23,6 +23,8 @@ extern "C" {
         height: usize, kind: c_int, s: cudaStream_t) -> c_int;
     fn cudaHostAlloc(p: *mut *mut c_void, size: usize, flags: u32) -> c_int;
     fn cudaFreeHost(p: *mut c_void) -> c_int;
+    fn cudaHostRegister(p: *mut c_void, size: usize, flags: u32) -> c_int;
+    fn cudaHostUnregister(p: *mut c_void) -> c_int;
     fn cudaStreamCreateWithFlags(s: *mut cudaStream_t, flags: u32) -> c_int;
     fn cudaStreamDestroy(s: cudaStream_t) -> c_int;
     fn cudaStreamSynchronize(s: cudaStream_t) -> c_int;
@@ -331,6 +333,10 @@ pub fn memcpy_2d_d2d(dst: *mut c_void, dpitch: usize, src: *const c_void, spitch
     height: usize, s: &Stream) -> Result<()> {
     ck!(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, D2D, s.0))
 }
+/// Rows of device memory to page-locked host memory. Issued on `s`: the rows are there once it is synchronized.
+pub fn memcpy_2d_d2h(dst: *mut u8, dpitch: usize, src: *const c_void, spitch: usize, width: usize, height: usize, s: &Stream) -> Result<()> {
+    ck!(cudaMemcpy2DAsync(dst as *mut c_void, dpitch, src, spitch, width, height, D2H, s.0))
+}
 
 /// Page-locked host memory (DMA source for weight streaming).
 pub struct PinnedBuf {
@@ -359,4 +365,21 @@ impl Drop for PinnedBuf {
     fn drop(&mut self) {
         unsafe { cudaFreeHost(self.ptr as *mut c_void) };
     }
+}
+
+/// Page-lock `len` bytes at `ptr` where they are, so copies from them to the device need no staging. With `read_only`
+/// the device only reads them, which a read-only file mapping needs. Returns the CUDA error when the driver refuses.
+pub fn host_register(ptr: *const u8, len: usize, read_only: bool) -> std::result::Result<(), c_int> {
+    const READ_ONLY: u32 = 8;
+    let e = unsafe { cudaHostRegister(ptr as *mut c_void, len, if read_only { READ_ONLY } else { 0 }) };
+    if e != 0 {
+        unsafe { cudaGetLastError() };
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Undo [`host_register`]. Copies from the range must be finished.
+pub fn host_unregister(ptr: *const u8) {
+    unsafe { cudaHostUnregister(ptr as *mut c_void) };
 }

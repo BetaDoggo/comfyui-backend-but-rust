@@ -2,13 +2,44 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use half::{bf16, f16};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
+use std::sync::Mutex;
 
 #[link(name = "kernel32")]
 extern "system" {
     fn VirtualUnlock(addr: *const std::ffi::c_void, size: usize) -> i32;
+}
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtSetInformationThread(thread: isize, class: u32, info: *const std::ffi::c_void, len: u32) -> i32;
+    #[cfg(test)]
+    fn NtQueryInformationThread(thread: isize, class: u32, info: *mut std::ffi::c_void, len: u32, returned: *mut u32) -> i32;
+}
+
+/// The calling thread's reads from disk, page faults on a mapping included, wait for everyone else's from now on. A
+/// model is tens of gigabytes, and read at normal priority from the drive that holds the pagefile it freezes the
+/// desktop until it is in. With nothing else reading, it loads as fast.
+pub fn read_in_background() {
+    // ThreadIoPriority, IoPriorityVeryLow: what Windows gives its own background work
+    const THREAD_IO_PRIORITY: u32 = 22;
+    let very_low: u32 = 0;
+    // -2 is the calling thread
+    unsafe { NtSetInformationThread(-2, THREAD_IO_PRIORITY, (&very_low as *const u32).cast(), 4) };
+}
+
+/// A mapping is page-locked in pieces of this size ([`SafeTensors::pin`]).
+const PIN_CHUNK: usize = 64 << 20;
+
+/// Bring `len` mapped bytes at `ptr` into this process from the file, on the calling thread and at its I/O priority.
+pub fn read_in(ptr: *const u8, len: usize) {
+    let mut sum = 0u8;
+    for o in (0..len).step_by(4096) {
+        sum = sum.wrapping_add(unsafe { ptr.add(o).read_volatile() });
+    }
+    std::hint::black_box(sum);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +89,22 @@ pub struct SafeTensors {
     pub config: Option<serde_json::Value>,
     /// The `__metadata__` strings of the files, merged.
     pub metadata: HashMap<String, String>,
+    /// The pieces of each mapping page-locked for the device, as (file, piece).
+    pinned: Mutex<HashSet<(usize, usize)>>,
+}
+
+impl Drop for SafeTensors {
+    fn drop(&mut self) {
+        let held = self.pinned.get_mut().unwrap_or_else(|e| e.into_inner());
+        if held.is_empty() {
+            return;
+        }
+        // copies from the mapping must be over before its pages are let go
+        let _ = crate::cuda::device_sync();
+        for (file, piece) in held.drain() {
+            crate::cuda::host_unregister(unsafe { self.mmaps[file].as_ptr().add(piece * PIN_CHUNK) });
+        }
+    }
 }
 
 /// The index and config of a diffusers model stored in shards, if `path` is one of its shards.
@@ -76,7 +123,7 @@ impl SafeTensors {
     /// One safetensors file, or every shard of a diffusers model when `path` is one of them.
     pub fn open(path: &Path) -> Result<Self> {
         let Some((index, config)) = diffusers_shards(path) else {
-            let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), config: None, metadata: HashMap::new() };
+            let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), config: None, metadata: HashMap::new(), pinned: Default::default() };
             st.add_file(path)?;
             return Ok(st);
         };
@@ -86,7 +133,7 @@ impl SafeTensors {
         files.sort_unstable();
         files.dedup();
         let config = serde_json::from_slice(&std::fs::read(&config)?).with_context(|| format!("reading {}", config.display()))?;
-        let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), config: Some(config), metadata: HashMap::new() };
+        let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), config: Some(config), metadata: HashMap::new(), pinned: Default::default() };
         let dir = index.parent().unwrap();
         for f in files {
             st.add_file(&dir.join(f))?;
@@ -160,11 +207,49 @@ impl SafeTensors {
     /// a soft fault per page rather than a disk read: not for tensors read again on every step.
     pub fn evict(&self, name: &str) {
         if let Ok(i) = self.info(name) {
+            // page-locked pieces are held for the device
+            let held = self.pinned.lock().unwrap();
+            if i.len == 0 || (i.start / PIN_CHUNK..=(i.start + i.len - 1) / PIN_CHUNK).any(|c| held.contains(&(i.file, c))) {
+                return;
+            }
+            drop(held);
             let m = &self.mmaps[i.file];
             let (start, end) = (i.start & !4095, (i.start + i.len).next_multiple_of(4096).min(m.len()));
             // on pages that aren't locked this reports failure and does what we want, as documented
             unsafe { VirtualUnlock(m[start..end].as_ptr().cast(), end - start) };
         }
+    }
+
+    /// Page-lock a tensor's bytes where they are in the mapping, so that copies of them to the device need no page-locked
+    /// copy in RAM: the file cache's pages are the only ones. They stay locked until the file is dropped. Returns the
+    /// tensor as the runs of bytes to copy, each (address, bytes): a copy can't cross from one locked piece into the
+    /// next. None when the driver refuses, which leaves what was locked before as it was.
+    pub fn pin(&self, name: &str) -> Option<Vec<(usize, usize)>> {
+        let i = self.info(name).ok()?;
+        if i.len == 0 {
+            return Some(Vec::new());
+        }
+        let m = &self.mmaps[i.file];
+        // the last page is mapped whole
+        let end = m.len().next_multiple_of(4096);
+        let mut held = self.pinned.lock().unwrap();
+        for c in i.start / PIN_CHUNK..=(i.start + i.len - 1) / PIN_CHUNK {
+            if held.contains(&(i.file, c)) {
+                continue;
+            }
+            let (a, b) = (c * PIN_CHUNK, ((c + 1) * PIN_CHUNK).min(end));
+            if crate::cuda::host_register(unsafe { m.as_ptr().add(a) }, b - a, true).is_err() {
+                return None;
+            }
+            held.insert((i.file, c));
+        }
+        let (mut runs, mut at, end) = (Vec::new(), i.start, i.start + i.len);
+        while at < end {
+            let stop = ((at / PIN_CHUNK + 1) * PIN_CHUNK).min(end);
+            runs.push((m.as_ptr() as usize + at, stop - at));
+            at = stop;
+        }
+        Some(runs)
     }
 
     /// Tensor as f32 values, first rounded through bf16 when `via_bf16` (ComfyUI keeps the
@@ -243,4 +328,24 @@ pub fn f16_bytes(v: &[f32]) -> Vec<u8> {
         o.copy_from_slice(&f16::from_f32(*x).to_le_bytes());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_reader_thread_gets_very_low_io_priority() {
+        std::thread::spawn(|| {
+            let io_priority = || {
+                let (mut v, mut n) = (u32::MAX, 0u32);
+                let status = unsafe { super::NtQueryInformationThread(-2, 22, (&mut v as *mut u32).cast(), 4, &mut n) };
+                assert_eq!(status, 0);
+                v
+            };
+            assert_eq!(io_priority(), 2, "a new thread reads at normal priority");
+            super::read_in_background();
+            assert_eq!(io_priority(), 0);
+        })
+        .join()
+        .unwrap();
+    }
 }

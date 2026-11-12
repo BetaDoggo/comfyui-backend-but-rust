@@ -180,41 +180,79 @@ impl Layout {
 
     pub fn pack(&self, st: &SafeTensors, dst: &mut [u8]) -> Result<()> {
         for e in &self.entries {
-            let d = &mut dst[e.off..e.off + e.len];
+            Self::pack_entry(e, st, &mut dst[e.off..e.off + e.len])?;
+        }
+        Ok(())
+    }
+
+    /// This unit as it can go to VRAM from the file's mapping: its large raw tensors where they lie, page-locked, and
+    /// the rest packed in a small buffer. None when much of it isn't stored as the unit reads it, or the driver won't
+    /// lock the mapping.
+    fn map(&self, st: &SafeTensors) -> Result<Option<Image>> {
+        let lies = |e: &Entry| matches!(&e.src, Src::Raw(names) if names.iter().all(|n| st.info(n).is_ok_and(|i| i.len >= MAPPED_MIN)));
+        let rest_len: usize = self.entries.iter().filter(|e| !lies(e)).map(|e| e.len).sum();
+        if rest_len * 8 > self.size {
+            return Ok(None);
+        }
+        let mut rest = PinnedBuf::alloc(rest_len)?;
+        let mut parts = Vec::new();
+        let mut o = 0;
+        for e in &self.entries {
             match &e.src {
-                Src::Raw(names) => {
-                    let mut o = 0;
+                Src::Raw(names) if lies(e) => {
+                    let mut off = e.off;
                     for n in names {
-                        let b = st.bytes(n)?;
-                        d[o..o + b.len()].copy_from_slice(b);
-                        o += b.len();
-                    }
-                }
-                Src::Bf16(names) => {
-                    let mut o = 0;
-                    for n in names {
-                        let len = st.packed_len(n, Dt::BF16)?;
-                        st.bf16_into(n, &mut d[o..o + len])?;
-                        o += len;
-                    }
-                }
-                Src::F32(n, add) => {
-                    let v: Vec<f32> = st.f32_vec(n, true)?.into_iter().map(|x| x + add).collect();
-                    d.copy_from_slice(&f32_bytes(&v));
-                }
-                Src::Bytes(b) => d.copy_from_slice(b),
-                Src::Padded(parts) => {
-                    d.fill(0);
-                    let mut o = 0;
-                    for (n, rows, cols) in parts {
-                        let i = st.info(n)?;
-                        let (es, (r, c)) = (i.dtype.size(), (i.shape[0], i.shape[1]));
-                        let b = st.bytes(n)?;
-                        for y in 0..r {
-                            d[o + y * cols * es..][..c * es].copy_from_slice(&b[y * c * es..][..c * es]);
+                        let Some(runs) = st.pin(n) else { return Ok(None) };
+                        for (addr, len) in runs {
+                            parts.push((off, addr, len));
+                            off += len;
                         }
-                        o += rows * cols * es;
                     }
+                }
+                _ => {
+                    Self::pack_entry(e, st, &mut rest.as_mut_slice()[o..o + e.len])?;
+                    parts.push((e.off, rest.ptr() as usize + o, e.len));
+                    o += e.len;
+                }
+            }
+        }
+        Ok(Some(Image::Mapped { rest, parts }))
+    }
+
+    fn pack_entry(e: &Entry, st: &SafeTensors, d: &mut [u8]) -> Result<()> {
+        match &e.src {
+            Src::Raw(names) => {
+                let mut o = 0;
+                for n in names {
+                    let b = st.bytes(n)?;
+                    d[o..o + b.len()].copy_from_slice(b);
+                    o += b.len();
+                }
+            }
+            Src::Bf16(names) => {
+                let mut o = 0;
+                for n in names {
+                    let len = st.packed_len(n, Dt::BF16)?;
+                    st.bf16_into(n, &mut d[o..o + len])?;
+                    o += len;
+                }
+            }
+            Src::F32(n, add) => {
+                let v: Vec<f32> = st.f32_vec(n, true)?.into_iter().map(|x| x + add).collect();
+                d.copy_from_slice(&f32_bytes(&v));
+            }
+            Src::Bytes(b) => d.copy_from_slice(b),
+            Src::Padded(parts) => {
+                d.fill(0);
+                let mut o = 0;
+                for (n, rows, cols) in parts {
+                    let i = st.info(n)?;
+                    let (es, (r, c)) = (i.dtype.size(), (i.shape[0], i.shape[1]));
+                    let b = st.bytes(n)?;
+                    for y in 0..r {
+                        d[o + y * cols * es..][..c * es].copy_from_slice(&b[y * c * es..][..c * es]);
+                    }
+                    o += rows * cols * es;
                 }
             }
         }
@@ -290,7 +328,8 @@ fn available_ram() -> Option<u64> {
     (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.avail_phys)
 }
 
-type Staged = (usize, u64, Result<PinnedBuf>);
+/// A unit a reader is done with: in its staging buffer, or None when it goes to VRAM from its image.
+type Staged = (usize, u64, Result<Option<PinnedBuf>>);
 
 /// Leave to fill a staging buffer, with the buffer if one is free and what it must wait for.
 type Ticket = (Option<PinnedBuf>, Option<Event>);
@@ -343,10 +382,16 @@ impl Staging {
     }
 }
 
+/// Raw tensors smaller than this are copied next to a mapped unit's other small parts.
+const MAPPED_MIN: usize = 1 << 20;
+
 /// A unit held in RAM, pinned unless there is no room for that.
 enum Image {
     Pinned(PinnedBuf),
     Plain(Vec<u8>),
+    /// The file's own pages, page-locked in its mapping, and what the file doesn't hold as the unit reads it in `rest`.
+    /// `parts` are the unit's pieces, each (offset in the unit, address, bytes).
+    Mapped { rest: PinnedBuf, parts: Vec<(usize, usize, usize)> },
 }
 
 impl Image {
@@ -354,10 +399,20 @@ impl Image {
         PinnedBuf::alloc(size).map_or_else(|_| Image::Plain(vec![0; size]), Image::Pinned)
     }
 
-    fn bytes(&mut self) -> &mut [u8] {
+    /// The unit's bytes, unless they lie in the file's mapping.
+    fn bytes(&mut self) -> Option<&mut [u8]> {
         match self {
-            Image::Pinned(p) => p.as_mut_slice(),
-            Image::Plain(v) => v,
+            Image::Pinned(p) => Some(p.as_mut_slice()),
+            Image::Plain(v) => Some(v),
+            Image::Mapped { .. } => None,
+        }
+    }
+
+    /// Read a mapped unit's pages from the file, ahead of the copies that page-lock them.
+    fn read_in(&self) {
+        if let Image::Mapped { rest, parts } = self {
+            let own = rest.ptr() as usize..rest.ptr() as usize + rest.size();
+            parts.iter().filter(|(_, p, _)| !own.contains(p)).for_each(|&(_, p, len)| crate::st::read_in(p as *const u8, len));
         }
     }
 }
@@ -373,7 +428,7 @@ struct Lazy {
     want: mpsc::Sender<(usize, u64)>,
     done: mpsc::Receiver<Staged>,
     staging: Arc<Staging>,
-    staged: HashMap<usize, PinnedBuf>,
+    staged: HashMap<usize, Option<PinnedBuf>>,
     asked: HashSet<usize>,
     /// Resident units whose VRAM holds their data.
     filled: Vec<bool>,
@@ -509,6 +564,7 @@ impl WeightSet {
                 let (layouts, resident, next, free_rx, host_out, err) =
                     (&layouts, &resident, &next, &free_rx, &host_out, &err);
                 s.spawn(move || loop {
+                    crate::st::read_in_background();
                     let i = next.fetch_add(1, Ordering::SeqCst);
                     if i >= n {
                         break;
@@ -597,16 +653,50 @@ impl WeightSet {
         let keep = Arc::new(AtomicBool::new(false));
         let streams: Arc<Vec<AtomicBool>> = Arc::new((0..n).map(|_| AtomicBool::new(false)).collect());
         let mut readers = Vec::new();
-        for _ in 0..threads.clamp(1, 3) {
+        // one reader: more of them read no faster from a drive, and leave it less room for anyone else
+        let _ = threads;
+        for _ in 0..1 {
             let (want_rx, staging, done_tx, st, layouts, images, keep, streams) =
                 (want_rx.clone(), staging.clone(), done_tx.clone(), st.clone(), layouts.clone(), images.clone(), keep.clone(), streams.clone());
             readers.push(std::thread::spawn(move || loop {
+                crate::st::read_in_background();
                 let Ok((unit, generation)) = want_rx.lock().unwrap().recv() else { break };
                 if unit == STOP {
                     break;
                 }
+                // a streamed unit goes to VRAM from the file's mapping when it can: that takes no second copy of it in RAM
+                // and no staging buffer, and leaves the file cache holding it when the process ends
+                let mut mapped = matches!(&*images[unit].read().unwrap(), Some(Image::Mapped { .. }));
+                let size = layouts[unit].size;
+                if !mapped && images[unit].read().unwrap().is_none() && !keep.load(Ordering::Relaxed) && streams[unit].load(Ordering::Relaxed)
+                    && available_ram().is_some_and(|a| a >= size as u64 + KEEP_RAM_FREE)
+                {
+                    match layouts[unit].map(&st) {
+                        Ok(Some(img)) => {
+                            img.read_in();
+                            let mut held = images[unit].write().unwrap();
+                            if held.is_none() {
+                                *held = Some(img);
+                                mapped = true;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            if done_tx.send((unit, generation, Err(e))).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                if mapped {
+                    if staging.current(generation) && done_tx.send((unit, generation, Ok(None))).is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 let Some((buf, event)) = staging.take(generation) else { continue };
-                let r = (|| -> Result<PinnedBuf> {
+                let r = (|| -> Result<Option<PinnedBuf>> {
                     if let Some(e) = event {
                         e.sync()?;
                     }
@@ -614,10 +704,10 @@ impl WeightSet {
                         Some(b) => b,
                         None => PinnedBuf::alloc(max_size)?,
                     };
-                    let size = layouts[unit].size;
                     let mut held = images[unit].write().unwrap();
-                    match &mut *held {
-                        Some(img) => buf.as_mut_slice()[..size].copy_from_slice(&img.bytes()[..size]),
+                    match held.as_mut().map(|img| img.bytes()) {
+                        Some(Some(b)) => buf.as_mut_slice()[..size].copy_from_slice(&b[..size]),
+                        Some(None) => layouts[unit].pack(&st, &mut buf.as_mut_slice()[..size])?,
                         None => {
                             layouts[unit].pack(&st, &mut buf.as_mut_slice()[..size])?;
                             // a streamed unit is only worth holding pinned: from pageable memory it would pass through here again
@@ -629,13 +719,13 @@ impl WeightSet {
                                 None
                             };
                             if let Some(mut img) = img {
-                                img.bytes()[..size].copy_from_slice(&buf.as_mut_slice()[..size]);
+                                img.bytes().unwrap()[..size].copy_from_slice(&buf.as_mut_slice()[..size]);
                                 *held = Some(img);
                                 layouts[unit].evict(&st);
                             }
                         }
                     }
-                    Ok(buf)
+                    Ok(Some(buf))
                 })();
                 // nobody waits for a stale unit, and a parked set wants its memory back
                 if r.is_err() || !staging.current(generation) {
@@ -689,7 +779,7 @@ impl WeightSet {
         self.restart_ring()?;
         if let (true, Some(l)) = (self.stores.iter().all(|s| s.dev.is_none()) && self.slots.is_empty(), &self.lazy) {
             while let Ok((_, _, r)) = l.done.try_recv() {
-                if r.is_ok() {
+                if matches!(r, Ok(Some(_))) {
                     l.staging.put((None, None));
                 }
             }
@@ -719,12 +809,42 @@ impl WeightSet {
         }
     }
 
-    /// `unit`'s image, if it can go to VRAM as it is.
-    fn pinned(&self, unit: usize) -> Option<*mut u8> {
+    /// For a set that runs once per prompt. Its units are held in pinned RAM from their first read, while RAM allows:
+    /// the file cache doesn't reliably keep what was read through the mapping, and reading it again costs a trip to
+    /// the disk. Under ComfyUI's memory management it is streamed rather than faulted into VRAM while the models
+    /// don't fit there together ([`comfy_memory::set_transient`]).
+    pub fn once_per_prompt(&self) {
+        if let Some(l) = &self.lazy {
+            l.streams.iter().for_each(|s| s.store(true, Ordering::Relaxed));
+        }
+        if let Some(c) = &self.comfy {
+            comfy_memory::set_transient(c.id);
+        }
+    }
+
+    /// True when `unit`'s image can go to VRAM as it is.
+    fn has_direct(&self, unit: usize) -> bool {
+        self.lazy.as_ref().is_some_and(|l| matches!(&*l.images[unit].read().unwrap(), Some(Image::Pinned(_) | Image::Mapped { .. })))
+    }
+
+    /// `unit`'s image as the pieces that go to VRAM as they are, each (offset in the unit, address, bytes).
+    fn direct(&self, unit: usize) -> Option<Vec<(usize, usize, usize)>> {
         match &*self.lazy.as_ref()?.images[unit].read().unwrap() {
-            Some(Image::Pinned(p)) => Some(p.ptr()),
+            Some(Image::Pinned(p)) => Some(vec![(0, p.ptr() as usize, self.layouts[unit].size)]),
+            Some(Image::Mapped { parts, .. }) => Some(parts.clone()),
             _ => None,
         }
+    }
+
+    /// Copy `unit`'s pieces to `dst` on the copy stream.
+    fn copy_direct(&mut self, unit: usize, parts: &[(usize, usize, usize)], dst: *mut c_void) -> Result<Event> {
+        for &(off, src, len) in parts {
+            memcpy_h2d(unsafe { (dst as *mut u8).add(off) }.cast(), src as *const u8, len, &self.copy)?;
+        }
+        let done = Event::new()?;
+        done.record(&self.copy)?;
+        self.copied_bytes += self.layouts[unit].size;
+        Ok(done)
     }
 
     /// True when `unit`'s data will have to come from the host.
@@ -745,7 +865,7 @@ impl WeightSet {
             if ahead == STAGING - 1 {
                 break;
             }
-            if self.needs_data(v) && self.pinned(v).is_none() {
+            if self.needs_data(v) && !self.has_direct(v) {
                 ahead += 1;
                 let l = self.lazy.as_mut().unwrap();
                 if l.asked.insert(v) {
@@ -760,13 +880,9 @@ impl WeightSet {
     fn fill(&mut self, unit: usize, dst: *mut c_void) -> Result<Event> {
         let size = self.layouts[unit].size;
         // what the readers were asked for is on its way through staging, whatever became of its image
-        let direct = if self.lazy.as_ref().unwrap().asked.contains(&unit) { None } else { self.pinned(unit) };
-        if let Some(p) = direct {
-            memcpy_h2d(dst, p, size, &self.copy)?;
-            let done = Event::new()?;
-            done.record(&self.copy)?;
-            self.copied_bytes += size;
-            return Ok(done);
+        let direct = if self.lazy.as_ref().unwrap().asked.contains(&unit) { None } else { self.direct(unit) };
+        if let Some(parts) = direct {
+            return self.copy_direct(unit, &parts, dst);
         }
         let l = self.lazy.as_mut().unwrap();
         if l.asked.insert(unit) {
@@ -777,12 +893,16 @@ impl WeightSet {
             let buf = r?;
             if generation == l.generation {
                 l.staged.insert(u, buf);
-            } else {
-                l.staging.put((Some(buf), None));
+            } else if buf.is_some() {
+                l.staging.put((buf, None));
             }
         }
         let buf = l.staged.remove(&unit).unwrap();
         l.asked.remove(&unit);
+        let Some(buf) = buf else {
+            let parts = self.direct(unit).context("a unit left its mapping while it was read")?;
+            return self.copy_direct(unit, &parts, dst);
+        };
         memcpy_h2d(dst, buf.ptr(), size, &self.copy)?;
         let done = Event::new()?;
         done.record(&self.copy)?;
@@ -877,7 +997,9 @@ impl WeightSet {
             l.staging.start(l.generation);
             l.asked.clear();
             for (_, buf) in l.staged.drain() {
-                l.staging.put((Some(buf), None));
+                if buf.is_some() {
+                    l.staging.put((buf, None));
+                }
             }
         }
         self.slot_of.clear();
@@ -903,12 +1025,13 @@ impl WeightSet {
         }
         if let Some(l) = &self.lazy {
             let mut image = l.images[unit].write().unwrap();
-            if image.is_none() {
+            // a rewritten unit is no longer what the file holds
+            if !matches!(&*image, Some(Image::Pinned(_) | Image::Plain(_))) {
                 let mut b = Image::new(self.layouts[unit].size);
-                self.layouts[unit].pack(&l.st, &mut b.bytes()[..self.layouts[unit].size])?;
+                self.layouts[unit].pack(&l.st, &mut b.bytes().unwrap()[..self.layouts[unit].size])?;
                 *image = Some(b);
             }
-            src.download(0, &mut image.as_mut().unwrap().bytes()[off..off + len], st)?;
+            src.download(0, &mut image.as_mut().unwrap().bytes().unwrap()[off..off + len], st)?;
             if let (Some(d), true) = (&self.stores[unit].dev, l.filled[unit]) {
                 memcpy_d2d(d.at(off), src.ptr(), len, st)?;
             }

@@ -795,6 +795,7 @@ impl Dit {
         let mid_width = units.iter().map(Unit::mid_width).max().unwrap_or(0);
         let blocks = WeightSet::lazy("h3 blocks", st.clone(), layouts, Plan { resident: 0, slots: 0 }, threads)?;
         let refiner = WeightSet::lazy("h3 refiner", st.clone(), ref_layouts, Plan { resident: 0, slots: 0 }, threads)?;
+        refiner.once_per_prompt();
         Ok(Dit { globals, gl, blocks, units, refiner, table, inv_freq, tdim, hyper, mid_width, int8_attn: true, attn_variant: 0,
             sparse: None, sparse_logged: Vec::new(), block_ids, shifts: (SHIFT_VIDEO as f32, SHIFT_AUDIO as f32), pdd, dense_refiner, prof: crate::prof::Prof::new() })
     }

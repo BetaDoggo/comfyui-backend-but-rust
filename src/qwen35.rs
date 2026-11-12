@@ -93,6 +93,7 @@ impl TextEncoder {
         let layouts = layer_layouts(&st)?;
         let p = plan(&layouts, vram_budget, 2);
         let ws = WeightSet::load("text encoder", &st, layouts, p, threads)?;
+        ws.once_per_prompt();
         let v = plus_one(&st, &format!("{PRE}norm.weight"))?;
         let norm = DevBuf::alloc(v.len() * 4)?;
         norm.upload(0, &crate::st::f32_bytes(&v), s0)?;

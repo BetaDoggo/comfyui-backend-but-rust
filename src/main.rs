@@ -434,31 +434,34 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     gen.ensure_flux2_vae(&vae)?;
     apply_loras(&mut gen, args)?;
     let n = 128 * (args.height / 16) * (args.width / 16);
-    for group in args.batches() {
-        let r = pipeline::MossRequest {
-            positive: Prompt::text(args.prompt.trim()),
-            negative: Prompt::text(args.negative.trim()),
-            width: args.width,
-            height: args.height,
-            sampling: args.batch_sampling("euler", ModelSampling::Flow { shift }, group, (args.width / 16, args.height / 16))?,
-            noise: args.noise(group, n)?,
-        };
-        let mut dump = pipeline::Dump::new();
-        let t0 = Instant::now();
-        let (latents, _) = gen.sample_moss(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
-        for (j, latent) in latents.chunks_exact(n).enumerate() {
-            let i = group.0 + j;
-            let t1 = Instant::now();
-            let rgb = gen.decode_moss(latent, args.width, args.height)?;
-            eprintln!("VAE decode {:.0} ms", t1.elapsed().as_secs_f64() * 1e3);
-            let path = out_path(&args.out, i, args.count);
-            std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
-                .with_context(|| format!("writing {}", path.display()))?;
-            eprintln!("[{i}] saved {} (seed {})", path.display(), args.seed + i as u64);
-        }
-        eprintln!("{} image(s) done in {:.2}s", group.1, t0.elapsed().as_secs_f64());
-        if let Some(d) = &args.dump {
-            write_safetensors(d, &dump)?;
+    let prompts = args.prompts()?;
+    for (p, prompt) in prompts.iter().enumerate() {
+        for group in args.batches() {
+            let r = pipeline::MossRequest {
+                positive: Prompt::text(prompt.trim()),
+                negative: Prompt::text(args.negative.trim()),
+                width: args.width,
+                height: args.height,
+                sampling: args.batch_sampling("euler", ModelSampling::Flow { shift }, group, (args.width / 16, args.height / 16))?,
+                noise: args.noise(group, n)?,
+            };
+            let mut dump = pipeline::Dump::new();
+            let t0 = Instant::now();
+            let (latents, _) = gen.sample_moss(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
+            for (j, latent) in latents.chunks_exact(n).enumerate() {
+                let i = p * args.count + group.0 + j;
+                let t1 = Instant::now();
+                let rgb = gen.decode_moss(latent, args.width, args.height)?;
+                eprintln!("VAE decode {:.0} ms", t1.elapsed().as_secs_f64() * 1e3);
+                let path = out_path(&args.out, i, prompts.len() * args.count);
+                std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                eprintln!("[{i}] saved {} (seed {})", path.display(), args.seed + (group.0 + j) as u64);
+            }
+            eprintln!("{} image(s) done in {:.2}s", group.1, t0.elapsed().as_secs_f64());
+            if let Some(d) = &args.dump {
+                write_safetensors(d, &dump)?;
+            }
         }
     }
     Ok(())
@@ -558,42 +561,46 @@ fn run_h3_image(args: &Args, load: pipeline::LoadOptions, dit: PathBuf, te: Path
         vae: Some(args.model(&args.vae, H3_IMAGE_VAE)),
         keyframes: Vec::new(),
     };
-    let r = pipeline::H3Request {
-        prompt: Prompt::text(&args.prompt),
-        negative: Prompt::text(&args.negative),
-        shape,
-        sampling,
-        shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO),
-        noise,
-        sparse: None,
-        windows: None,
-        conds,
-        seed: args.seed,
-    };
-    let mut dump = pipeline::Dump::new();
-    let t0 = Instant::now();
-    let (latent, _) = gen.sample_h3(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
-    eprintln!("sampled in {:.2}s", t0.elapsed().as_secs_f64());
-    dump.insert("samples".into(), ("F32".into(), vec![latent.len()], st::f32_bytes(&latent).to_vec()));
-    let t1 = Instant::now();
-    let img = gen.decode_h3(&args.model(&args.vae, H3_IMAGE_VAE), &latent, shape, 1)?;
-    eprintln!("decoded in {:.2}s", t1.elapsed().as_secs_f64());
-    let (h, w) = (img.h, img.w);
-    let mut rgb = vec![0u8; h * w * 3];
-    let mut hwc = vec![0f32; h * w * 3];
-    for c in 0..3 {
-        for i in 0..h * w {
-            let v = img.data[c * h * w + i];
-            hwc[i * 3 + c] = v;
-            rgb[i * 3 + c] = (v * 255.0).round() as u8;
+    let prompts = args.prompts()?;
+    for (i, prompt) in prompts.iter().enumerate() {
+        let r = pipeline::H3Request {
+            prompt: Prompt::text(prompt),
+            negative: Prompt::text(&args.negative),
+            shape,
+            sampling: sampling.clone(),
+            shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO),
+            noise: noise.clone(),
+            sparse: None,
+            windows: None,
+            conds: conds.clone(),
+            seed: args.seed,
+        };
+        let mut dump = pipeline::Dump::new();
+        let t0 = Instant::now();
+        let (latent, _) = gen.sample_h3(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
+        eprintln!("sampled in {:.2}s", t0.elapsed().as_secs_f64());
+        dump.insert("samples".into(), ("F32".into(), vec![latent.len()], st::f32_bytes(&latent).to_vec()));
+        let t1 = Instant::now();
+        let img = gen.decode_h3(&args.model(&args.vae, H3_IMAGE_VAE), &latent, shape, 1)?;
+        eprintln!("decoded in {:.2}s", t1.elapsed().as_secs_f64());
+        let (h, w) = (img.h, img.w);
+        let mut rgb = vec![0u8; h * w * 3];
+        let mut hwc = vec![0f32; h * w * 3];
+        for c in 0..3 {
+            for i in 0..h * w {
+                let v = img.data[c * h * w + i];
+                hwc[i * 3 + c] = v;
+                rgb[i * 3 + c] = (v * 255.0).round() as u8;
+            }
         }
+        dump.insert("image".into(), ("F32".into(), vec![1, h, w, 3], st::f32_bytes(&hwc).to_vec()));
+        if let Some(d) = &args.dump {
+            write_safetensors(&out_path(d, i, prompts.len()), &dump)?;
+        }
+        let out = out_path(&args.out, i, prompts.len());
+        std::fs::write(&out, pipeline::encode_png(w, h, &rgb)?)?;
+        eprintln!("saved {} (seed {}), {:.1}s in all", out.display(), args.seed, t_all.elapsed().as_secs_f64());
     }
-    dump.insert("image".into(), ("F32".into(), vec![1, h, w, 3], st::f32_bytes(&hwc).to_vec()));
-    if let Some(d) = &args.dump {
-        write_safetensors(d, &dump)?;
-    }
-    std::fs::write(&args.out, pipeline::encode_png(w, h, &rgb)?)?;
-    eprintln!("saved {} (seed {}), {:.1}s in all", args.out.display(), args.seed, t_all.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -782,6 +789,21 @@ fn write_safetensors(path: &Path, tensors: &BTreeMap<String, (String, Vec<usize>
     }
     std::fs::write(path, out)?;
     Ok(())
+}
+
+impl Args {
+    /// The prompts to run: `--prompt-file`'s lines, else `--prompt`.
+    fn prompts(&self) -> Result<Vec<String>> {
+        Ok(match &self.prompt_file {
+            Some(p) => std::fs::read_to_string(p)
+                .with_context(|| format!("reading {}", p.display()))?
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            None => vec![self.prompt.clone()],
+        })
+    }
 }
 
 fn out_path(base: &Path, i: usize, count: usize) -> PathBuf {
@@ -989,15 +1011,7 @@ fn run_krea(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     let t_start = Instant::now();
     let mut gen = pipeline::Generator::load_krea(&load)?;
     apply_loras(&mut gen, args)?;
-    let prompts: Vec<String> = match &args.prompt_file {
-        Some(p) => std::fs::read_to_string(p)
-            .with_context(|| format!("reading {}", p.display()))?
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect(),
-        None => vec![args.prompt.clone()],
-    };
+    let prompts = args.prompts()?;
     let jobs: Vec<(usize, &String, (usize, usize))> = prompts.iter().enumerate().flat_map(|(p, prompt)| args.batches().into_iter().map(move |g| (p, prompt, g))).collect();
     let n_jobs = prompts.len() * args.count;
     let n = 16 * (args.height / 8) * (args.width / 8);

@@ -493,11 +493,25 @@ Warm, on this machine's 12 GB card, which holds 23 of the 50 blocks and streams 
 Streamed blocks are held in pinned RAM after their first read, and lie between resident ones, so their copies overlap compute; at 1024 that took the step from 0.86 s to 0.35 s, with the same image byte for byte. The VAE decodes 32 tiles at a time with FlashAttention-2 (54.5 dB from the earlier one-tile decode). The first two evaluations still wait for the blocks' first read. Through `comfy-server` over HTTP, a
 warm 2048x2048 graph took 10.6 s in all and a 1024x1024 one 6.1 s.
 
+**Text encoding.** The encoder's layers stay page-locked in the file's mapping after their first read and are streamed
+from there for each prompt, so the diffusion model keeps its VRAM
+([details](TECHNICAL_OVERVIEW.md#comfyui-memory-management)). From the CLI with `--prompt-file`, a prompt change took
+about 1.0 s to encode (0.8 s of it the layers' own work, for about 20 tokens), where it took 53 to 355 s when each
+prompt read the layers from the file again. The first prompt of a new process took 2.2 s with the file in Windows' cache,
+against 50 to 240 s, and 2.5 to 4 minutes from this machine's drive when it wasn't. The images were the same byte for byte. These
+were measured with three readers at normal I/O priority; the single low-priority reader used now wasn't timed.
+
 **Edits.** `MiniMaxH3ImageConditioning`'s pictures, and `--image` on the CLI, are shown to the text encoder as
 `Picture i: ` at a 1024 short edge and, with the VAE, packed as reference rows at a short edge between 1024 and 2048, as
 described under [reference pictures](#reference-pictures-and-keyframes). With pictures, the node's width and height of
 0 take the first picture's VAE size. Edits were tried through SwarmUI's graph (below) and found working, but not compared with
 ComfyUI. `tools/h3_image_ref.py --image` dumps ComfyUI's reference latents (`ref0`, ...) to compare with `--dump`.
+
+With one 1024x1024 picture the prompt is 1048 tokens and took 7.2 to 7.5 s to encode. The encoder is causal, so a
+prompt of 256 tokens or more leaves its keys, values and final states in RAM (about 410 KB a token, up to 1 GB), and the
+next prompt that starts with the same tokens and pictures, followed only by text, runs just its own tokens against
+them ([`h3te::Prefix`](../src/h3te.rs)). That path is written but untested: it has not run to completion, so its
+speed and its output are unknown.
 
 Refused with an error: LoRAs, init images, noise masks, `<break>`, context windows and sparse attention. The bf16 and
 w4a8 releases are refused too.

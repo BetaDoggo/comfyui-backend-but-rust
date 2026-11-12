@@ -176,6 +176,7 @@ impl TextEncoder {
         }
         let p = plan(&layouts, vram_budget, 2);
         let ws = WeightSet::load("text encoder", &st, layouts, p, threads)?;
+        ws.once_per_prompt();
         let _ = s0;
         Ok(TextEncoder { st, ws, tok: Tokenizer::new()?, lora: Default::default(), spec })
     }

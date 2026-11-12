@@ -18,7 +18,8 @@
 //!   `--reserve-vram`) against the card's capacity, and, polled every two seconds, the DXCore process budget less
 //!   512 MB and NVML's free memory less 512 MB, whichever is shortest.
 //!
-//! What differs from ComfyUI: residency moves by unit, not by 32 MB page; which units stream is spread through the
+//! What differs from ComfyUI: a model that runs once per prompt ([`set_transient`]) is only streamed unless the models'
+//! weights fit in three quarters of the card together, where ComfyUI faults it in over the diffusion model's weights; residency moves by unit, not by 32 MB page; which units stream is spread through the
 //! model, where aimdo streams its tail; the small weights outside the units, the
 //! VAEs and encoded prompts are plain allocations (ComfyUI force-loads tensors under 16 KB and streams the rest of
 //! those models too); one copy stream carries both cast buffers' copies; and CFG's two halves still run one after the
@@ -113,6 +114,8 @@ struct Vbar {
     watermark: usize,
     /// Faulted or streamed since it was last prioritized, for the residency report.
     used: bool,
+    /// Runs once per prompt ([`set_transient`]).
+    transient: bool,
 }
 
 impl Vbar {
@@ -350,7 +353,20 @@ impl State {
         if v.used {
             report(&v);
         }
-        v.watermark = v.units.len();
+        // a model that runs once per prompt would push out the weights of one that runs every step, only to be pushed
+        // out itself before it runs again: unless the models share VRAM with room left for activations and decoders,
+        // it goes through the cast buffers
+        let total: usize = self.vbars.iter().chain(std::iter::once(&v)).flat_map(|m| &m.units).map(|u| u.size).sum();
+        let crowded = v.transient && total > self.capacity / 4 * 3;
+        if crowded {
+            for u in &mut v.units {
+                if u.pins == 0 {
+                    u.buf = None;
+                    u.valid = false;
+                }
+            }
+        }
+        v.watermark = if crowded { 0 } else { v.units.len() };
         v.used = false;
         let staged: usize = v.units.iter().map(|u| u.size).sum();
         eprintln!("[{}] prepared for dynamic VRAM loading: {} MB staged, {} MB in VRAM", v.name, staged / MB, v.resident_bytes() / MB);
@@ -383,7 +399,7 @@ pub fn register(name: &str, sizes: Vec<usize>) -> Result<u64> {
         let units: Vec<Unit> = order.iter().map(|&u| Unit { size: sizes[u], buf: None, pins: 0, valid: false }).collect();
         let mut pos = vec![0; order.len()];
         order.iter().enumerate().for_each(|(p, &u)| pos[u] = p);
-        st.vbars.push(Vbar { id, name: name.to_string(), watermark: units.len(), units, pos, used: false });
+        st.vbars.push(Vbar { id, name: name.to_string(), watermark: units.len(), units, pos, used: false, transient: false });
         Ok(id)
     })
 }
@@ -397,6 +413,16 @@ pub fn unregister(id: u64) {
     if st.active == Some(id) {
         st.active = None;
     }
+}
+
+/// `id` runs once per prompt, such as a text encoder: unless every registered model's weights fit in three quarters of
+/// the card together, its units are streamed through the cast buffers and take no VRAM from the others.
+pub fn set_transient(id: u64) {
+    let _ = with(|st| {
+        let i = st.index(id)?;
+        st.vbars[i].transient = true;
+        Ok(())
+    });
 }
 
 /// The model is loaded for a node: it gets the top priority and may fault every unit in again.

@@ -257,7 +257,7 @@ impl H3 {
         let tags: Vec<u8> = expanded.iter().map(|t| u8::from(!vision_ids.contains(t))).collect();
         let len = expanded.len();
         let (_, te) = self.te.as_mut().context("no H3 text encoder")?;
-        let cond = te.encode(ids, &refs, st)?;
+        let cond = te.encode(ids, &embeds, st)?;
         scale_rows(&cond, h3te::D, &grown, st)?;
         if let Some(d) = dump {
             let mut b = vec![0u8; len * h3te::D * 4];

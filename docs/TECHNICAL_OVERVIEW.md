@@ -185,6 +185,24 @@ models too; one copy stream carries both cast buffers; host copies are packed an
 without ComfyUI's RAM-pressure pin eviction; and CFG's two halves still run one after the other, where ComfyUI batches
 them when they fit.
 
+Text encoders, and H3's token refiner, run once per prompt, and are treated apart
+([`WeightSet::once_per_prompt`](../src/offload.rs)):
+
+* Unless every loaded model's weights fit in three quarters of the card together, such a model is only streamed through
+  the cast buffers and takes no VRAM. Faulted in, it pushed the diffusion model's blocks out and was pushed out itself
+  before the next prompt. On MOSS Image at 1024x1024 a prompt change went from 0.36 to 0.65 s of text encoding and 3.9
+  to 10 s of sampling to 0.25 s and 2.2 s, and on Krea 2 from 200 to 166 ms of text encoding, with the same images byte
+  for byte.
+* A model read on use (H3's) keeps its streamed units in RAM from their first read, while that leaves 8 GB available.
+  The units aren't copied: the file's mapping is page-locked for the device in 64 MB pieces
+  (`cudaHostRegister`, read-only) and copies go from it at the speed of pinned memory, 28 GB/s here. Only what the file
+  doesn't hold as the unit reads it, such as norm weights, is packed into a small pinned buffer. A unit that is mostly
+  such data, or one a LoRA rewrote, keeps a pinned copy as before. With a second copy in RAM, Windows dropped the file
+  from its cache and every new process read it from the disk again.
+* The threads that read weights from disk ask for very low I/O priority, and a model read on use has one reader. Read at
+  normal priority from the drive that also held the pagefile, a model froze the desktop until it was in. How much
+  slower a load is with one low-priority reader wasn't measured.
+
 Measured on the RTX 5070 (12 GB), Krea 2 at 1024x1024, 8 steps, warm second image, pictures pixel-identical in both
 modes:
 

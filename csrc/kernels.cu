@@ -547,6 +547,8 @@ GPU_API int gpu_qk_norm_rope(int dtype, int head_dim, void* buf, int64_t row_str
 // ---------------------------------------------------------------------------------------------
 // Small exact attention, used for text encoders and the Anima LLM adapter (short sequences).
 // grid (lq, hq), one thread per head-dim element. q: [lq, hq*d], k and v: [lk, hk*d], out: [lq, hq*d].
+// causal: 0 for none, else query i reads the first i + causal keys: 1 when the queries are the keys' tokens, more
+// when keys of earlier tokens come before them.
 // ---------------------------------------------------------------------------------------------
 template <typename T>
 __global__ void attn_small_kernel(const T* q, int64_t q_stride, const T* kp, const T* vp, int64_t kv_stride, int hq,
@@ -560,7 +562,7 @@ __global__ void attn_small_kernel(const T* q, int64_t q_stride, const T* kp, con
     const int kh = h / (hq / hk);
     if (e0 < d) qs[e0] = ldf(q, (int64_t)i * q_stride + h * d + e0);
     __syncthreads();
-    const int n = causal ? i + 1 : lk;
+    const int n = causal ? min(lk, i + causal) : lk;
     float mx = -INFINITY;
     for (int j = threadIdx.x; j < n; j += blockDim.x) {
         const T* kr = kp + (int64_t)j * kv_stride + kh * d;

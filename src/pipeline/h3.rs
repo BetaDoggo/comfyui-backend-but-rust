@@ -325,9 +325,10 @@ impl Generator {
         f.clear_prompts();
         f.model = None;
         let t0 = Instant::now();
-        let mut file = st::SafeTensors::open(path)?;
-        h3::prepare(&mut file)?;
-        let dst = Arc::new(file);
+        if h3::is_hyperflow_diffusers(path) {
+            bail!("{}", h3::HYPERFLOW_DIFFUSERS);
+        }
+        let dst = Arc::new(st::SafeTensors::open(path)?);
         let mut dit = h3::Dit::load(&dst, env.threads, &env.st)?;
         dit.attn_variant = env.attn_variant;
         dit.int8_attn = env.int8_attn;

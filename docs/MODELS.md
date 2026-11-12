@@ -10,7 +10,7 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | MOSS Image | Images | `euler`, `simple` | int8 ConvRot with fused q/k/v only |
 | Qwen Image 2.1 | Images with alpha, and edits | `euler`, `simple` | int8 ConvRot only |
 | MiniMax H3 | Video with audio | `res_multistep`, `simple` | `w6a8` only |
-| HyperFlow H3 Flash | Video with audio, with reference pictures on `ref2va` | `euler` or `res_multistep`, `hyperflow`, 6 steps | int8 ConvRot: the `fl2va` diffusers folder, or ComfyUI's single file of either task |
+| HyperFlow H3 Flash | Video with audio, with reference pictures on `ref2va` | `euler` or `res_multistep`, `hyperflow`, 6 steps | int8 ConvRot, ComfyUI's single file of either task |
 | MiniMax-H3-Image | Images | `euler`, `simple`, 6 steps | int8 ConvRot (`minimax_h3_image_pruned_int8_convrot`) only |
 | Pixal3D | A 3D mesh from one image | the example workflow's four `euler` samplers | int8 ConvRot (`pixal3d_int8_convrot`) only |
 | Idol (TripoSplat) | A 3D gaussian splat from one image | `dpmpp_2m`, `simple`, 20 steps, CFG 3 | Comfy-Org's fp16 files |
@@ -419,77 +419,55 @@ lengths, step counts and fuse methods weren't tried, and the audio wasn't judged
 ### HyperFlow H3 Flash
 
 [HyperFlow H3 Flash](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash) is a community few-step H3, which
-ComfyUI doesn't run without its custom nodes. It loads as H3, picked by the `config.json` next to its shards: point
-`--dit` or SwarmUI at any shard of `fl2va_int8_convrot/`, and keep the folder's `config.json` and index beside it. Its
-text encoder and decoders are H3's own.
+ComfyUI doesn't run without its custom nodes. It runs from ComfyUI-HyperFlow-Flash's single files, put in
+`Stable-diffusion/`: `ref2va_int8_convrot_comfyui/` (reference to video) or `fl2va_int8_convrot_comfyui/` (text, first
+and last frames to video) in that repository. Each is picked by the `hyperflow` entry in its metadata, and loads as H3
+with H3's own text encoder and decoders. The diffusers folders (`fl2va_int8_convrot/`, `ref2va_int8_convrot/`) are
+refused. Reference pictures go through H3's own path ([Reference pictures and keyframes](#reference-pictures-and-keyframes)):
+`--image` on the CLI, `<Picture n>` in the prompt, or SwarmUI's references.
 
 ```bash
-target/release/diffusion.exe --h3 --dit "$MODELS_ROOT/Stable-diffusion/hyperflow_h3_flash_fl2va/diffusion_pytorch_model-00001-of-00003.safetensors" --width 512 --height 512 --frames 22 --steps 6 --scheduler hyperflow -p "a stone lighthouse on a sea cliff at dawn, waves crashing below, no people" -o clip.mp4
+target/release/diffusion.exe --h3 --dit "$MODELS_ROOT/Stable-diffusion/minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors" --width 512 --height 512 --frames 22 --steps 6 --scheduler hyperflow --image fox.png -p "<Picture 1> trots slowly through the snowy forest at sunset, no people" -o clip.mp4
 ```
 
-What differs from H3, all read from the files as they are:
+What differs from H3, all read from the file as it is:
 
-* Blocks 6, 21 and 22 are gone. Each linear of the other 47 is either int8 ConvRot (W8A8 behind the same 256-wide
-  Hadamard as ComfyUI's) or a low-rank bf16 pair run as two GEMMs, as diffusers runs it. q, k and v are joined at load.
-  The low-rank ranks are zero-padded to multiples of 8 as each block is staged, so the GEMM strides are aligned, and
-  q, k and v share one down GEMM. That changes no value, but cuBLASLt then picks other kernels, and this model is
-  sensitive to their rounding: padding to 8 or to 64, which are the same mathematics, gave first evaluations 1.8%
-  apart and frames 25.5 dB apart, with the same picture.
-  Diffusers stores each SwiGLU input as `[value; gate]`, so its halves are read in ComfyUI's order.
+* Some blocks are dropped (9 in `ref2va`; 6, 21 and 22 in `fl2va`) and the rest renumbered, so block indices, such as
+  sparse attention's `dense_blocks`, count as ComfyUI counts them.
+* Each linear is either ComfyUI's `int8_tensorwise` ConvRot (W8A8 behind the same 256-wide Hadamard, q, k and v
+  joined) or a low-rank bf16 pair run as two GEMMs, with q, k and v apart and already padded to multiples of 64. q, k
+  and v share one down GEMM. Every SwiGLU input is already in ComfyUI's `[gate; value]` order.
 * The token refiner and the video head are bf16 and float32, not int8.
-* Each AdaLN reads `temb(t, r) = emb_t(t) + 0.25 (emb_r(r) - emb_t(t))`, where `r` is where the step ends: the
-  schedule's next sigma, found as HyperFlow's ComfyUI node finds it. Audio's `r` follows its own shift, as its `t` does.
+* Each AdaLN reads `temb(t, r) = emb_t(t) + gate (emb_r(r) - emb_t(t))`, where `r` is where the step ends: the
+  schedule's next sigma, found as HyperFlow's ComfyUI node finds it. Audio's `r` follows its own shift, as its `t`
+  does. As in ComfyUI's model, `temb` is rounded to bf16 before the SiLU. The gate (0.25) and the 6-step schedule are
+  tensors (`hyperflow_gate`, `hyperflow_sigmas`); the stored schedule matches the `hyperflow` scheduler's within 1e-4.
+* Keyframe and reference rows run at `max(t, 0.999)`, as on H3, with `r = t`. HyperFlow's node looks the endpoint up
+  by time among the targets' and finds none for them.
 
 The `hyperflow` scheduler is its 4, 6 or 8-step grid, shifted by the model's video shift (12, or SwarmUI's Sigma Shift).
 The server lists it on `SwarmKSampler`, so SwarmUI offers it; other models refuse it. Other schedulers run too, with `r`
 taken from their own next sigma, as in the ComfyUI node; only the grid is what the model was distilled on. Samplers:
 `euler`, which it was distilled with, and `res_multistep` (SwarmUI's default) with its `cfg_pp` form. Each evaluates
 once per step at the schedule's sigma and lands on the next, so the endpoint `r` is where the step really ends.
-On the `ref2va` fox clip below, `res_multistep` kept the same fox, scene and motion as `euler`, but left bright white blown-out patches around the legs and tail that `euler` doesn't, so `euler` stays the better choice. Refused: other samplers, since ancestral, SDE and midpoint steps
-evaluate or land elsewhere, and LoRAs, since its layers no longer match H3's.
+On the `ref2va` fox clip timed below, `res_multistep` kept the same fox, scene and motion as `euler`, but left bright white
+blown-out patches around the legs and tail that `euler` doesn't, so `euler` stays the better choice. Refused: other
+samplers, since ancestral, SDE and midpoint steps evaluate or land elsewhere, and LoRAs, since its layers no longer
+match H3's.
 
-On this machine, 512x512, 22 frames, 6 steps, CFG 1, once the weights were in the file cache: 0.49 s per evaluation
-after the first (0.52 s before the padding), of which the int8 GEMMs took about 215 ms (about 200 TOPS), the low-rank
-pairs about 100 ms (4.8 TFLOP, about 48 TFLOPS in bf16) and attention about 90 ms. The first evaluation took 5.0 s, 4.5 s
-of it reading the blocks from the file mapping as it placed 32 of 47 in VRAM; blocks are read from the file again after
-the decoders park them. Video decode took 1.9 s and audio decode 0.2 s. Reading the files cold, the text encoder took
-195 s and sampling 30 s. The clip was clean and coherent across its frames.
-The maintainer reports it works through SwarmUI, but it's a bit janky there: SwarmUI expects one file per model, not a
-folder of diffusers shards. It hasn't been compared with HyperFlow's own pipeline or tried above 22 frames or 512x512,
-and its audio hasn't been listened to.
+The comfy-rust SwarmUI extension registers the files as MiniMax H3 models. SwarmUI's own check needs block 49 and
+misses them.
 
-#### Reference to video (`ref2va`), ComfyUI's single file
+`ref2va`, on this machine, 512x512, 22 frames, 6 steps, one 512x512 reference picture of a fox in a snowy forest: 0.53 s
+per evaluation warm, and 5.4 s for the first, which reads the blocks. The clip kept the fox and the scene, and the fox
+stood and walked. Reading the files cold, the vision tower took 29 s to pack and the text encoder 32 s. The maintainer
+reports it works through SwarmUI. Not compared with ComfyUI's HyperFlow node, nothing larger tried, audio not listened to.
+Reference videos and audio are refused, as on H3. Keyframes on HyperFlow are no longer refused, but weren't tried.
 
-The `ref2va` release runs from ComfyUI-HyperFlow-Flash's single file, `ref2va_int8_convrot_comfyui/` in the same
-repository, put in `Stable-diffusion/`. It is picked by the `hyperflow` entry in its metadata. Reference pictures go
-through H3's own path ([Reference pictures and keyframes](#reference-pictures-and-keyframes)): `--image` on the CLI,
-`<Picture n>` in the prompt, or SwarmUI's references.
-
-```bash
-target/release/diffusion.exe --h3 --dit "$MODELS_ROOT/Stable-diffusion/minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors" --width 512 --height 512 --frames 22 --steps 6 --scheduler hyperflow --image fox.png -p "<Picture 1> trots slowly through the snowy forest at sunset, no people" -o clip.mp4
-```
-
-How this file differs from the diffusers folder, all read from it as it is:
-
-* ComfyUI's tensor names. Block 9 is dropped and the other 49 are renumbered, so block indices, such as sparse
-  attention's `dense_blocks`, count as ComfyUI counts them. The int8 linears are ComfyUI's `int8_tensorwise` ConvRot
-  with q, k and v joined. The low-rank pairs keep q, k and v apart and are already padded to multiples of 64. Every
-  SwiGLU input is already in ComfyUI's `[gate; value]` order.
-* The gate and the 6-step schedule are tensors (`hyperflow_gate`, `hyperflow_sigmas`). The stored schedule matches the
-  `hyperflow` scheduler's within 1e-4, and the gate is 0.25.
-* As in ComfyUI's model, `temb` is rounded to bf16 before the AdaLN's SiLU.
-* Keyframe and reference rows run at `max(t, 0.999)`, as on H3, with `r = t`. HyperFlow's node looks the endpoint up
-  by time among the targets' and finds none for them.
-
-The comfy-rust SwarmUI extension registers the file as a MiniMax H3 model. SwarmUI's own check needs block 49 and
-misses it.
-
-On this machine, 512x512, 22 frames, 6 steps, one 512x512 reference picture of a fox in a snowy forest: 0.53 s per
-evaluation warm, and 5.4 s for the first, which reads the blocks. The clip kept the fox and the scene, and the fox
-stood and walked. Reading the files cold, the vision tower took 29 s to pack and the text encoder 32 s. Not compared
-with ComfyUI's HyperFlow node, not run through SwarmUI or `comfy-server`, nothing larger tried, audio not listened to.
-Reference videos and audio are refused, as on H3. The single-file `fl2va` release should load the same way but wasn't
-tried. Keyframes on HyperFlow are no longer refused, but they were not tried either.
+`fl2va`'s single file has the same tensor names and format as `ref2va`'s, and differs only in its dropped blocks and
+per-block ranks, but it hasn't been run. Its diffusers folder used to run here, before the single files: at 512x512,
+22 frames, 6 steps, a clean, coherent clip at 0.49 s per evaluation warm, with the int8 GEMMs about 215 ms, the
+low-rank pairs about 100 ms and attention about 90 ms.
 
 ## MiniMax-H3-Image
 

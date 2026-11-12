@@ -85,8 +85,6 @@ impl TensorInfo {
 pub struct SafeTensors {
     mmaps: Vec<memmap2::Mmap>,
     pub tensors: HashMap<String, TensorInfo>,
-    /// The diffusers `config.json` next to a sharded model.
-    pub config: Option<serde_json::Value>,
     /// The `__metadata__` strings of the files, merged.
     pub metadata: HashMap<String, String>,
     /// The pieces of each mapping page-locked for the device, as (file, piece).
@@ -107,37 +105,11 @@ impl Drop for SafeTensors {
     }
 }
 
-/// The index and config of a diffusers model stored in shards, if `path` is one of its shards.
-pub fn diffusers_shards(path: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    let name = path.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".safetensors")?;
-    // <base>-00001-of-00003
-    let base = stem.rsplit_once("-of-").and_then(|(a, _)| a.rsplit_once('-')).map(|(a, _)| a)?;
-    let dir = path.parent()?;
-    let index = dir.join(format!("{base}.safetensors.index.json"));
-    let config = dir.join("config.json");
-    (index.is_file() && config.is_file()).then_some((index, config))
-}
-
 impl SafeTensors {
-    /// One safetensors file, or every shard of a diffusers model when `path` is one of them.
+    /// One safetensors file.
     pub fn open(path: &Path) -> Result<Self> {
-        let Some((index, config)) = diffusers_shards(path) else {
-            let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), config: None, metadata: HashMap::new(), pinned: Default::default() };
-            st.add_file(path)?;
-            return Ok(st);
-        };
-        let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(&index)?).with_context(|| format!("reading {}", index.display()))?;
-        let mut files: Vec<&str> = idx["weight_map"].as_object().ok_or_else(|| anyhow!("{}: no weight_map", index.display()))?
-            .values().filter_map(|v| v.as_str()).collect();
-        files.sort_unstable();
-        files.dedup();
-        let config = serde_json::from_slice(&std::fs::read(&config)?).with_context(|| format!("reading {}", config.display()))?;
-        let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), config: Some(config), metadata: HashMap::new(), pinned: Default::default() };
-        let dir = index.parent().unwrap();
-        for f in files {
-            st.add_file(&dir.join(f))?;
-        }
+        let mut st = SafeTensors { mmaps: Vec::new(), tensors: HashMap::new(), metadata: HashMap::new(), pinned: Default::default() };
+        st.add_file(path)?;
         Ok(st)
     }
 

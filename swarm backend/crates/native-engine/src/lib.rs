@@ -177,7 +177,9 @@ fn read_header(path: &Path) -> anyhow::Result<Arc<serde_json::Value>> {
 
 /// The file's architecture. Refuses other models and formats before any weights are touched.
 fn check_dit(file: &ModelFile) -> EngineResult<Family> {
-    // HyperFlow H3 Flash is a diffusers folder: any of its shards stands for the model
+    if h3::is_hyperflow_diffusers(&file.path) {
+        return Err(unsupported(format!("{}: {}", file.name, h3::HYPERFLOW_DIFFUSERS)));
+    }
     if let Some(c) = h3::hyperflow_config(&file.path) {
         if c["quantization"]["method"] != "int8_convrot" {
             return Err(unsupported(format!("{}: this backend only runs the int8 ConvRot HyperFlow H3 Flash release", file.name)));

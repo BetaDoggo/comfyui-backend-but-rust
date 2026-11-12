@@ -1,0 +1,5 @@
+# Commits for git blame to skip. GitHub reads this file; locally run once:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Normalize line endings: store text as LF, check out CRLF
+990af5668686c10bd8bd3c22333866e515515684

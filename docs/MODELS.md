@@ -8,8 +8,10 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | Krea 2 Turbo | Images | `euler`, `simple` | W8A8 int8 only |
 | Anima | Images | `er_sde`, `simple` | int8 ConvRot only |
 | MOSS Image | Images | `euler`, `simple` | int8 ConvRot with fused q/k/v only |
+| Qwen Image 2.1 | Images with alpha, and edits | `euler`, `simple` | int8 ConvRot only |
 | MiniMax H3 | Video with audio | `res_multistep`, `simple` | `w6a8` only |
 | HyperFlow H3 Flash | Video with audio | `euler`, `hyperflow`, 6 steps | the int8 ConvRot diffusers folder only |
+| MiniMax-H3-Image | Images | `euler`, `simple`, 6 steps | int8 ConvRot (`minimax_h3_image_pruned_int8_convrot`) only |
 | Pixal3D | A 3D mesh from one image | the example workflow's four `euler` samplers | int8 ConvRot (`pixal3d_int8_convrot`) only |
 | Idol (TripoSplat) | A 3D gaussian splat from one image | `dpmpp_2m`, `simple`, 20 steps, CFG 3 | Comfy-Org's fp16 files |
 | SeedVR2 3B | A restored copy of a picture (SwarmUI's SeedVR stage) | `euler`, `simple`, 1 step, CFG 1 | int8 ConvRot (`seedvr2_3b_int8_convrot`) only |
@@ -25,7 +27,7 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | Makes | Images | Images | Images | Images with alpha | Video with audio | A mesh from one image |
 | Checkpoint | W8A8 int8 | int8 ConvRot | int8 ConvRot, fused q/k/v | int8 ConvRot | `w6a8` | int8 ConvRot |
 | Other file formats (bf16, fp8, ...) | Refused | Refused | Refused | Refused | Refused | Refused |
-| Run through SwarmUI itself | Yes | Yes | Yes | Yes | Yes | Yes |
+| Run through SwarmUI itself | Yes | Yes | Yes | Yes | Yes | Not yet (CLI and `comfy-server` only) |
 | Every sampler and scheduler | Yes | Yes | Yes | Yes | Yes | Fixed to the example's four `euler` |
 | CFG and negative prompts | Yes | Yes | Yes | Yes | Yes | - |
 | Rescale, Renorm, Zero Star, TCFG | Yes | Yes | Yes | Not tested | Refused | - |
@@ -35,7 +37,7 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | Live previews | Yes | Yes | Yes | Not tested | First frame only | - |
 | LoRAs | Yes | Yes | Yes | Yes | Yes (the turbo LoRA's ComfyUI file) | - |
 | Text encoder LoRAs | Yes | Yes | Yes | Not tested (the code is shared with Krea 2) | Not tested | - |
-| Prompt Images and reference images | Yes | Refused | Refused | Yes (one and two tested) | Not tested (pictures and keyframes) | The input itself |
+| Prompt Images and reference images | Yes | Refused | Refused | Yes (one and two tested) | Yes (pictures and keyframes, not compared with ComfyUI) | The input itself |
 | Prompt weights | Refused | Yes | Yes | Refused | Yes | - |
 | `<break>` | Yes | Refused | Yes | Refused | Refused | - |
 | `<alternate>`, `<fromto>` | Refused | Refused | Refused | Refused | Refused | - |
@@ -43,7 +45,8 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | VAE tiling, Seamless Tileable | Refused | Refused | Refused | Refused | Only the 256 / 64 tile | - |
 | Background removal | - | - | - | - | - | Yes (BiRefNet) |
 
-ControlNet, regions, IP-Adapter, style models, GLIGEN, LoRA hooks and embeddings are refused on every family. Anima
+HyperFlow H3 Flash, MiniMax-H3-Image, Idol and SeedVR2 aren't in this matrix; their own sections below say what they
+take. ControlNet, regions, IP-Adapter, style models, GLIGEN, LoRA hooks and embeddings are refused on every family. Anima
 takes both `(word:1.2)` and `<weight>`; Qwen Image 2.1's encoder reads `(word:1.2)` as plain text.
 
 ### Batches

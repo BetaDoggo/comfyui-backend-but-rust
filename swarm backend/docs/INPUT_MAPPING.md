@@ -1,4 +1,4 @@
-# Engine input mapping: Krea 2, Anima, MiniMax H3, MOSS Image, Qwen Image 2.1
+# Engine input mapping
 
 What SwarmUI actually sends for each model, and what the Rust engine has to accept as a result. This is the contract, not
 a status report: the native engine does only part of it, and [STATUS](../../docs/STATUS.md) says which part.
@@ -6,7 +6,8 @@ a status report: the native engine does only part of it, and [STATUS](../../docs
 Everything here was traced from SwarmUI's `WorkflowGenerator*.cs` / `WGNodeData.cs` and the Swarm
 Python nodes (`ExtraNodes/SwarmComfyCommon`), cloned 2026-10-29 (SwarmUI `e7f38c3`, ComfyUI `fd7639f`).
 The fixtures in `crates/comfy-server/tests/fixtures/` are concrete examples of each graph.
-To add another model, see [ADDING_MODELS.md](ADDING_MODELS.md).
+To add another model, see [ADDING_MODELS.md](ADDING_MODELS.md). HyperFlow H3 Flash, MiniMax-H3-Image, SnapRef and
+Idol don't have sections here yet; their fixtures, and the [Models](../../docs/MODELS.md) sections, show what they take.
 
 **Verified against a live SwarmUI** (built from the clone above, "ComfyUI API By URL" → this server,
 mock engine, fake model files tagged via `modelspec.architecture`): backend loads with all Swarm-node
@@ -63,7 +64,7 @@ someone uses that feature:
 | `vae_encode` | init image / ref images | init image | keyframes | init image | ref images, init image, RGBA re-encode |
 | `warmup` | "load model" button | same | same | same | same |
 
-**LoRAs** work the same way for every model. Verified live for all five, both from the LoRA parameter and
+**LoRAs** work the same way for every model. Verified live for each model in this table, both from the LoRA parameter and
 from `<lora:name:weight>` in the prompt:
 
 | Model | `LorasTargetTextEnc` | Node SwarmUI sends | Engine sees |
@@ -378,7 +379,7 @@ when `progress.interrupted()` turns true (SwarmUI's cancel button → `POST /int
 
 | Call | When | Implemented |
 |---|---|---|
-| `GET /object_info` | backend init (model lists, samplers, feature detection) | ✔ 163 native nodes, plus the generic-route nodes the engine claims (255 in all with the mock); model lists rescanned per call |
+| `GET /object_info` | backend init (model lists, samplers, feature detection) | ✔ the native nodes, plus the generic-route nodes the engine claims (all of them with the mock); model lists rescanned per call |
 | `GET /features` | idle health check | ✔ |
 | `GET /ws?clientId=` + `feature_flags` | per generation (socket reused) | ✔ |
 | `POST /prompt` `{prompt, client_id}` | generate | ✔ Comfy-shaped validation errors (HTTP 400) |
@@ -392,7 +393,7 @@ when `progress.interrupted()` turns true (SwarmUI's cancel button → `POST /int
 
 * No node-editor web UI at `/`. SwarmUI's "Comfy Workflow" tab won't render, but generation works.
 * [COMPATIBILITY.md](COMPATIBILITY.md) lists every SwarmUI parameter and prompt-syntax feature, probed live
-  against all five models. Every node class SwarmUI can emit is native or on the generic route. An engine that
+  against Krea 2, Anima, MiniMax H3, MOSS Image and Qwen Image 2.1. Every node class SwarmUI can emit is native or on the generic route. An engine that
   doesn't claim a generic-route class gets a `missing_node_type` validation error for it, naming the node and
   the SwarmUI parameters behind it.
 * The third-party schemas in `tools/third_party_schemas.py` were written from the packs' public node

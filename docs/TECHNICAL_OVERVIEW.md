@@ -224,7 +224,8 @@ How each stage maps to ComfyUI:
   RMSNorm + AdaLN modulation / sigmoid gate / SwiGLU prologue, rounding to bf16 at the same points
   where ComfyUI materializes bf16 tensors. GEMMs use comfy-kitchen's CUTLASS int8 kernel with the
   dequant (and gated residual) fused in the epilogue. q|k|v|gate and gate|up are fused into single
-  GEMMs. Attention is FlashAttention-2 (bf16) reading q/k/v in place from the fused projection.
+  GEMMs. Attention is comfy-kitchen's INT8 attention by default, or FlashAttention-2 (bf16) with `--attention flash`,
+  reading q/k/v in place from the fused projection.
   The text-fusion adapter is timestep-independent, so it runs once per prompt instead of every step.
 * **VAE** (`src/vae.rs`, shared with Anima): for one frame every causal 3D conv equals a 2D conv with the kernel's last
   temporal slice, so the decoder runs as NHWC CUTLASS implicit-GEMM 2D convolutions.
@@ -258,22 +259,33 @@ features, and the PLY, run on the CPU.
 
 ### MiniMax H3
 
-Offloading is the lazy kind in [`src/offload.rs`](../src/offload.rs): nothing is read at load, reader threads fill up to four pinned staging buffers ahead of compute, taken only when a unit needs one and returned when the set parks. Pages read once leave the process right after, which took a H3 run's peak working set from 52 GB to 32 GB.
-Weights stay in packed 6-bit form in VRAM and decode to int8 before each GEMM, which leaves room for 30 of the 50 blocks at 512x512. Streamed blocks are spread evenly among the resident ones, so each copy overlaps compute instead of queueing behind the last; at 5 frames that took a step from 0.33 s to 0.24 s, and copies no longer hold it up.
-Splitting weights to keep them in L2 gained 2 to 3%, so it isn't used: the int8 GEMM already runs close to what this GPU can do.
-LoRA-baked blocks keep a pinned host copy, about 15 GB, and go straight to VRAM: this machine copies 18 GB/s in RAM but 28 GB/s from pinned memory to VRAM, so a pass through staging cost about 200 ms a step.
-If pinning fails they fall back to pageable memory and staging. The blocks leave VRAM before the video decode and come back for the next clip, re-planned for its size.
-The text encoder and refiner only hold VRAM while they run. The video decoder holds 2.4 GB of pinned RAM between clips, and takes no VRAM while sampling.
+Offloading is the lazy kind in [`src/offload.rs`](../src/offload.rs): nothing is read at load, and reader threads fill
+up to four pinned staging buffers ahead of compute, taken only when a unit needs one and returned when the set parks.
+Pages read once leave the process right after, which took a H3 run's peak working set from 52 GB to 32 GB.
+
+Weights stay in packed 6-bit form in VRAM and decode to int8 before each GEMM, which leaves room for 30 of the 50 blocks
+at 512x512. Streamed blocks are spread evenly among the resident ones, so each copy overlaps compute instead of queueing
+behind the last; at 5 frames that took a step from 0.33 s to 0.24 s, and copies no longer hold it up. Splitting weights
+to keep them in L2 gained 2 to 3%, so it isn't used: the int8 GEMM already runs close to what this GPU can do.
+
+LoRA-baked blocks keep a pinned host copy, about 15 GB, and go straight to VRAM: this machine copies 18 GB/s in RAM but
+28 GB/s from pinned memory to VRAM, so a pass through staging cost about 200 ms a step. If pinning fails they fall back
+to pageable memory and staging. The blocks leave VRAM before the video decode and come back for the next clip,
+re-planned for its size. The text encoder and refiner only hold VRAM while they run. The video decoder holds 2.4 GB of
+pinned RAM between clips, and takes no VRAM while sampling.
 
 ## Source layout
 
 ```
 build.rs            nvcc build of csrc/ (works around vcvars by passing a clean MSVC env)
+csrc/common.cuh     shared device helpers
 csrc/kernels.cu     fused prologue+ConvRot+int8-quantize, QK-norm+RoPE, small attention, VAE ops
 csrc/gemm.cu        cuBLASLt bf16/fp32 GEMM, CUTLASS conv2d, int8 GEMM wrappers
-csrc/attn.cu        FlashAttention-2 forward wrapper (only the needed variants instantiated)
-csrc/attn_int8.cu   optional INT8 attention wrapper
+csrc/attn.cu        FlashAttention-2 forward wrapper (only the needed variants instantiated), for --attention flash
+csrc/attn_int8.cu   INT8 attention wrapper, the default
 csrc/h3.cu          MiniMax H3 kernels
+csrc/qwen21.cu      Qwen Image 2.1: VAE shortcuts, prefix attention for text and reference tokens
+csrc/seedvr.cu      SeedVR2: patch embedding input, window attention reordering, VAE pixel shuffle
 csrc/trellis.cu     Pixal3D: per-head QK norm, voxel hashing and sparse-conv gathers, NAF attention, feature sampling
 csrc/triposplat.cu  TripoSplat: fp16 gated adds, RePo rotary + q/k RMS norm, SiLU gating
 csrc/birefnet.cu    BiRefNet: im2col, deformable-conv columns, Swin window gather and attention, bilinear resize

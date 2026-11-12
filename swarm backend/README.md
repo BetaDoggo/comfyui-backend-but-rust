@@ -1,22 +1,25 @@
 # swarm backend (Rust)
 
 A ComfyUI-API-compatible server that SwarmUI can use as a normal **"ComfyUI API By URL"** backend,
-fronting a native Rust generation engine. It ships with two engines: **native**, which really generates Krea 2
-Turbo, Anima, MOSS Image and Qwen Image 2.1 images, MiniMax H3 video, Pixal3D meshes and Idol gaussian splats with the Rust + CUDA pipelines
-in the parent repository, and the
-**mock engine**, which returns placeholder images/video/audio of the correct shapes for every other model family.
+fronting a native Rust generation engine. It ships with two engines: **native**, which really generates with the
+model families listed in the [main README](../README.md) through the Rust + CUDA pipelines in the parent repository,
+and the **mock engine**, which returns placeholder images/video/audio of the correct shapes for every other model family.
 
 ```
 crates/
   engine-api/     the contract: Engine trait + typed request structs (no web deps)
   comfy-server/   HTTP + websocket server that speaks ComfyUI's protocol, validates and runs graphs
-  native-engine/   the real engine (optional, `--features native`)
-swarm-extension/  comfy-rust backend: SwarmUI extension that starts the server
+  native-engine/    the real engine (optional, `--features native`)
+swarm-extension/    comfy-rust backend: SwarmUI extension that starts the server
+pixal3d-extension/  the Pixal3D tab: SwarmUI extension and its ComfyUI node
 docs/
-  INPUT_MAPPING.md   what SwarmUI sends for Krea 2 / Anima / MiniMax H3 / MOSS Image / Qwen Image 2.1, and what the engine receives
+  INPUT_MAPPING.md   what SwarmUI sends for each native family, and what the engine receives
   COMPATIBILITY.md   every Swarm parameter probed live, and the node classes served through the generic custom_node route
-tools/            scripts that (re)generate the node catalog, third-party schemas and COMPATIBILITY.md from live SwarmUI / ComfyUI
-reference/        (gitignored, local) SwarmUI + ComfyUI clones used as the protocol reference
+  ADDING_MODELS.md   how to add a model family
+tools/              scripts that (re)generate the node catalog, third-party schemas and COMPATIBILITY.md from live SwarmUI / ComfyUI
+start-backend.bat   build and start the server by hand
+selfstart.bat       the start script the comfy-rust backend extension runs
+reference/          (gitignored, local) SwarmUI + ComfyUI clones used as the protocol reference
 ```
 
 ## Run
@@ -38,7 +41,7 @@ and video inputs. PNG/JPEG/GIF/WAV are handled natively.
 ## Run the native engine
 
 The native engine needs the parent repository's build requirements (CUDA 13, MSVC Build Tools, CUTLASS and
-flash-attention checkouts). The first build takes about 10 minutes, so it's behind a feature and the default
+flash-attention checkouts). The first build takes several minutes, so it's behind a feature and the default
 build stays mock-only.
 
 ```bash
@@ -48,7 +51,7 @@ cargo run --release -p comfy-server --features native -- --engine native --model
 On Windows, [`start-backend.bat`](start-backend.bat) does this for the folder in `MODELS_ROOT`, and prints what to enter
 in SwarmUI. Extra arguments go to the server, so `--models-root` can add a second folder.
 
-Extra flags: `--reserve-vram 512` (MB left for the desktop and other apps), `--max-side 2048`, `--live-previews` (off by default)
+Extra flags: `--reserve-vram MB` (left for the desktop and other apps), `--max-side 2048`, `--live-previews` (off by default)
 and `--extra-model-paths-config <file>` (a ComfyUI `extra_model_paths` YAML, repeatable, searched before `--models-root`).
 VRAM is managed as ComfyUI's DynamicVRAM does (see
 [ComfyUI memory management](../docs/TECHNICAL_OVERVIEW.md#comfyui-memory-management)), and `--reserve-vram` defaults to
@@ -71,6 +74,9 @@ about 3 s to MOSS Image with the files cached.
 | `<break>` | Yes, not with Prompt Images | Refused | Yes | Refused |
 | Rescale CFG, Renorm CFG, CFG Zero Star, TCFG | Yes | Yes | Yes | Refused |
 | Prompt Images | Yes, with `index` and `index_timestep_zero` reference latents | Not supported | Refused | Refused |
+
+The table covers the most-used families. [Models](../docs/MODELS.md#support-matrix) has the full support matrix, and a
+section for each family.
 
 These work on every family: all samplers and schedulers except `ltxv-image`, any CFG with a negative prompt, Sampler Sigma
 Min, Sigma Max and Rho, LoRAs, live previews with `--live-previews`, Conditioning Multiplier, Negative Conditioning Multiplier and Zero Negative. See [Usage](../docs/USAGE.md) and [Models](../docs/MODELS.md).
@@ -117,7 +123,7 @@ Server → Backends → **ComfyUI API By URL** → Address `http://127.0.0.1:818
 SwarmUI reads `/object_info`, sees the Swarm core nodes (`SwarmKSampler`, `SwarmSaveImageWS`, …), and from then
 on generates exactly as it would against ComfyUI with Swarm's custom nodes installed.
 
-Nodes beyond the five target models (other model families' stock nodes, third-party packs such as IP-Adapter,
+Nodes the native engine doesn't run (other model families' stock nodes, third-party packs such as IP-Adapter,
 SAM2 and RIFE) are served through the engine's generic `custom_node` hook, and only for classes the engine
 claims. The mock claims all of them, so SwarmUI enables every feature. `--mock-native-only` turns that off.
 `--advertise-todo-nodes` lists unclaimed classes in `/object_info` anyway, for inspecting their workflows;
@@ -126,7 +132,7 @@ running them fails validation. See [COMPATIBILITY.md](docs/COMPATIBILITY.md).
 ## Plugging in the real engine
 
 [`crates/native-engine`](crates/native-engine/src/lib.rs) is a worked example. Implement
-[`swarm_engine_api::Engine`](crates/engine-api/src/engine.rs). It has 11 required methods. The
+[`swarm_engine_api::Engine`](crates/engine-api/src/engine.rs). Its
 optional feature operations (audio, latent ops, segmentation, upscaling, CLIP Vision, custom sampling, the generic
 `custom_node` hook, warmup, free-memory) default to "unsupported" or a no-op. Then add it to `make_engine` in
 [`main.rs`](crates/comfy-server/src/main.rs). Engines receive:
@@ -191,4 +197,4 @@ cargo test
 
 `crates/comfy-server/tests/swarm_compat.rs` drives the server the way SwarmUI's `ComfyUIAPIAbstractBackend`
 does (websocket handshake, `/prompt`, frame classification, `/history`), using workflows shaped like
-SwarmUI's generator output for Krea 2, Anima, MiniMax H3, MOSS Image, and Qwen Image 2.1 (`tests/fixtures/`).
+SwarmUI's generator output for the native families (`tests/fixtures/`).

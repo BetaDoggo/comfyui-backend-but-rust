@@ -30,11 +30,12 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P0 | LoRA and control | LoRA formats | Every ComfyUI format on Krea 2, Anima and MOSS Image (and Qwen Image 2.1, per the maintainer's SwarmUI test): LoCon, DoRA, LoHa, LoKr, GLoRA, OFT, BOFT, diff, set, MOSS control adapters. Compared with ComfyUI on real modules, identical or within 2e-4 where ComfyUI can compute them. |
 | P0 | LoRA and control | Text encoder LoRAs | Baked in float32 at the clip strength. Weights match ComfyUI on Krea 2 and MOSS Image. Run through the server on Anima, not through SwarmUI. |
 | P0 | MOSS Image | MOSS Image LoRAs | Baked like ComfyUI, including fused q/k/v slices. All 168 weights identical. Tested through SwarmUI with the DMD LoRA; the edit LoRA applies but has no image input yet. |
-| P0 | Engine core | Sampler: euler for all flow models | Every flow model now samples on the host, Krea 2 included. Real images on all three. |
+| P0 | Engine core | Sampler: euler for all flow models | Every flow model samples on the host, Krea 2 included, with real images. |
 | P0 | Engine core | Sampler: res_multistep | Ported with the other samplers. Tested on Anima against ComfyUI; 25 dB with flash attention. |
-| P0 | Engine core | CFG and negative prompts | All three models, tested through SwarmUI. |
+| P0 | Engine core | CFG and negative prompts | Tested through SwarmUI on Krea 2, Anima and MOSS Image. [Models](MODELS.md#support-matrix) covers the other families. |
 | P0 | Krea 2 | CFG above 1 and negative prompts | Tested through SwarmUI at CFG 2 with prompt images and references. Compared with ComfyUI only with a reference latent, at 24.9 dB. |
 | P0 | Image workflows | VAE encoder | Qwen Image VAE encoder, 0.6% from ComfyUI, about 50 ms at 768. Used by Krea 2 reference latents and init images. Flux 2 VAE encoder for MOSS Image: cosine 0.99984 against ComfyUI's on a 768x512 picture, and the two latents decode 55.5 dB apart, 44.0 dB from the picture against ComfyUI's 43.9; 116 ms (`tools/flux2_vae_ref.py`, `--flux2-vae-check`). |
+| P0 | Engine core | Partial sampling | Init images with Creativity, refiners and inpainting: init latents, start and end steps, `denoise`, add noise off, leftover noise, `SetLatentNoiseMask` and `DifferentialDiffusion`. Tested through SwarmUI at 768x512 against standalone ComfyUI running the same workflows. Krea 2: Creativity 0.3 and 0.6 at 42.3 and 38.1 dB, inpainting with Differential Diffusion at 40.0 and 39.1 dB (the kept half identical), a latent bislerp x1.5 refiner at 33.7 dB, against 34.2 dB for text to image. Anima: img2img 28.2, inpainting 32.0, against 26.1 for text to image. Qwen Image 2.1: 47.6 and 51.7, against 31.0. MOSS Image: Creativity 0.6 at 33.2 dB, inpainting at 38.4 dB (the kept half identical, the repainted half 35.3), the refiner at 26.6, against 27.2 for text to image. KSampler's step ranges match ComfyUI's code in all 840 recorded cases, and 132 runs of 11 samplers match `KSamplerX0Inpaint` on a mock model to within 5.8e-7 (`tools/partial_ref.py`). Refused on MiniMax H3. A batch of different masks is refused except on MOSS Image, because ComfyUI resizes it across the batch on 5D latents. |
 | P1 | Krea 2 | Variation Seed | Direct workflow test; output changes as expected. Not compared with ComfyUI. |
 | P1 | Krea 2 | Sigma Shift | ModelSamplingFlux. Direct workflow test. |
 | P1 | MiniMax H3 | H3 text to video with audio | Through real SwarmUI and the CLI: w6a8 DiT, nvfp4 text encoder, turbo LoRA, video and audio decoders, mp4 through ffmpeg. 512x512, 5 and 22 frames, 0.24 to 0.53 s/step against 1.59 in ComfyUI; a warm repeat takes 2.6 to 3.8 s. Same picture at 21 dB; both are 1.2% from an exact refiner run. Audio not judged by ear. |
@@ -49,12 +50,10 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Anima | Anima prompt weights | (word:1.2) and <weight> scale the T5 tokens, as ComfyUI does. Token ids match ComfyUI. |
 | P1 | Anima | Anima Batch Size, Sigma Shift and CFG | Generated through real SwarmUI. Output not compared with ComfyUI at CFG above 1. |
 | P1 | MOSS Image | MOSS Image Batch Size, Sigma Shift and CFG | Generated through real SwarmUI at 1024x1024 and 832x1216. Euler at CFG 4 compared with ComfyUI; er_sde and CFG 1 not compared. |
-| P1 | Engine core | Samplers: dpmpp_2m, dpmpp_2m_sde, uni_pc, ddim | All 45 ComfyUI samplers: within 8e-6 of ComfyUI's own code on a mock model. Real images on all three models, through the server API and CLI, not the SwarmUI page. dpm_adaptive picks steps per batch, as ComfyUI does, unless the batch is split to fit in VRAM. |
-| P1 | Engine core | Schedulers: normal, karras, sgm_uniform, beta | All 9 ComfyUI schedulers plus turbo, align_your_steps, flux2 and ideogram4. Within 2e-6 of ComfyUI on 1105 schedules. ltxv-image is refused. |
-| P2 | Engine core | Sigma overrides | Sigma Min, Sigma Max and Rho for karras and exponential, as SwarmKSampler does. Run once through the server API. |
-| P2 | Krea 2 | Prompt Images | Vision tower and DeepStack, up to several images, on both prompts. Tokens match SwarmUI's text node, 40.8 dB from ComfyUI, tested through SwarmUI. A 1024 image costs 3.9 s against 130 ms at 384. |
-| P1 | Engine core | Live previews | Off unless the server gets `--live-previews`. All four families, through the ComfyUI latent-to-RGB factors, honouring Swarm's preview modes. Direct workflow test: previews arrive and the final image is pixel-identical without them. Not looked at in SwarmUI's page. H3 shows the first frame only, where ComfyUI can animate. |
-| P1 | Engine core | Conditioning Multiplier, Negative Conditioning Multiplier, Zero Negative | All four families in the engine. Direct workflow tests on Krea 2, MOSS Image and Anima; H3 not run. Krea 2 and MOSS Image match ComfyUI's picture at 23 to 26 dB, as their plain images do. Zero Negative's mottled texture at CFG above 1 is in ComfyUI too. |
+| P1 | Engine core | Samplers: dpmpp_2m, dpmpp_2m_sde, uni_pc, ddim | Every ComfyUI sampler: within 8e-6 of ComfyUI's own code on a mock model. Real images on Krea 2, Anima and MOSS Image, through the server API and CLI, not the SwarmUI page. dpm_adaptive picks steps per batch, as ComfyUI does, unless the batch is split to fit in VRAM. |
+| P1 | Engine core | Schedulers: normal, karras, sgm_uniform, beta | Every ComfyUI scheduler plus turbo, align_your_steps, flux2 and ideogram4. Within 2e-6 of ComfyUI on 1105 schedules. ltxv-image is refused. |
+| P1 | Engine core | Live previews | Off unless the server gets `--live-previews`. Krea 2, Anima, MOSS Image and H3, through the ComfyUI latent-to-RGB factors, honouring Swarm's preview modes. Direct workflow test: previews arrive and the final image is pixel-identical without them. Not looked at in SwarmUI's page. H3 shows the first frame only, where ComfyUI can animate. |
+| P1 | Engine core | Conditioning Multiplier, Negative Conditioning Multiplier, Zero Negative | Krea 2, Anima, MOSS Image and H3 in the engine. Direct workflow tests on Krea 2, MOSS Image and Anima; H3 not run. Krea 2 and MOSS Image match ComfyUI's picture at 23 to 26 dB, as their plain images do. Zero Negative's mottled texture at CFG above 1 is in ComfyUI too. |
 | P1 | Krea 2 | <break> | Chunks encoded apart and joined. 27.9 dB from ComfyUI at 768, direct workflow test. Refused with Prompt Images. |
 | P1 | MOSS Image | MOSS Image <weight> and <break> | Tokens and weights match SwarmTextEncodeAdvanced's own code. 25.9 and 31.6 dB from ComfyUI at 768, direct workflow test. Prompts now use the model's template, as SwarmUI does without images. |
 | P1 | MiniMax H3 | H3 Video Context Window | `MiniMaxH3ContextWindows`, ComfyUI's static windows with FreeNoise and all four fuse methods. Through real SwarmUI at 384x384, 260 frames, 4 turbo steps: three windows, a clip with audio. First evaluation within 4.6% of ComfyUI on video and 11.3% on audio, frames at 16.6 dB with the same composition; both engines' later windows break up the same way. Other settings not tried, audio not judged by ear. |
@@ -62,17 +61,18 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | MiniMax H3 | H3 <weight> | Tokens and weights match SwarmTextEncodeAdvanced's own code. Direct workflow test, output changes as expected. Not compared with ComfyUI on a real run. |
 | P1 | MiniMax H3 | H3 Variation Seed | Noise matches swarm_fixed_noise on a small latent. Direct workflow test. Not compared with ComfyUI on a real run. |
 | P1 | Engine core | ComfyUI memory management | The default on the CLI and `comfy-server`, with the older planner kept as `--legacy-offload`: comfy-aimdo's fault, watermark and budget policy at block granularity. Through the CLI on Krea 2 and Anima, pixel-identical to the legacy planner. Tested by the maintainer through SwarmUI, where it cuts PCIe transfers in most cases. With 9000 MB reserved, Krea 2 keeps 631 ms/evaluation where our planner falls to its one-slot 994 ms. MOSS Image, Qwen Image 2.1, H3, Pixal3D and LoRAs not tested in this mode here. |
-| P2 | Guidance and speed | CFG tweaks | Rescale, Renorm, CFG Zero Star and TCFG on Krea 2, Anima and MOSS Image, against ComfyUI's own code on random tensors, within 2e-5. Sample of real output by direct workflow test, not compared with ComfyUI. Refused on H3. |
-| P0 | Engine core | Partial sampling | Init images with Creativity, refiners and inpainting: init latents, start and end steps, `denoise`, add noise off, leftover noise, `SetLatentNoiseMask` and `DifferentialDiffusion`. Tested through SwarmUI at 768x512 against standalone ComfyUI running the same workflows. Krea 2: Creativity 0.3 and 0.6 at 42.3 and 38.1 dB, inpainting with Differential Diffusion at 40.0 and 39.1 dB (the kept half identical), a latent bislerp x1.5 refiner at 33.7 dB, against 34.2 dB for text to image. Anima: img2img 28.2, inpainting 32.0, against 26.1 for text to image. Qwen Image 2.1: 47.6 and 51.7, against 31.0. MOSS Image: Creativity 0.6 at 33.2 dB, inpainting at 38.4 dB (the kept half identical, the repainted half 35.3), the refiner at 26.6, against 27.2 for text to image. KSampler's step ranges match ComfyUI's code in all 840 recorded cases, and 132 runs of 11 samplers match `KSamplerX0Inpaint` on a mock model to within 5.8e-7 (`tools/partial_ref.py`). Refused on MiniMax H3. A batch of different masks is refused except on MOSS Image, because ComfyUI resizes it across the batch on 5D latents. |
 | P1 | Anima | SnapRef (SwarmUI-SnapRef extension) | The `SnapRef` node runs natively: reference stream with its LoRA and mode embedding, cached keys, target LoRA, strength and Fidelity. Real output through the CLI and through `comfy-server` over HTTP; reference keys within 0.2% to 1.3% of ComfyUI's node, first target block 1.2%. Not run through SwarmUI itself. `ref_guidance_on` refused. Stitch, `use_batch` and per-picture weights only run on the mock. |
-| P2 | Krea 2 | Reference latents | index and index_timestep_zero, tested through SwarmUI. 1% from ComfyUI on the first evaluation; images 25 dB, about what int8 and flash differ by here (27 and 19 dB). No Krea 2 edit LoRA installed, so base model only. |
 | P1 | SeedVR2 | SeedVR2 restoration (SwarmUI's SeedVR stage) | The 3B int8 ConvRot model and its VAE, with `SeedVR2Preprocess`, `SeedVR2Conditioning` and `SeedVR2PostProcessing` in the server. Tested through SwarmUI by the maintainer; here through `comfy-server` over HTTP with SwarmUI's node chain: 0.79 s for a 1024 restore warm. DiT 145 ms and VAE decode 234 ms at 1024 against ComfyUI's 235 and 276; 568 and 1119 ms at 2048 against 855 and 2631. Final picture 44.3 dB from ComfyUI's, at the int8-versus-flash noise floor. The VAE tiles itself when a picture doesn't fit, like ComfyUI's: 4096x4096 in 15.7 s and 3328x4864 in 17.8 s on 12 GB (`--max-side` doesn't apply to SeedVR2); tiled decode 62.6 dB from ComfyUI's at 2048. Missing pieces are in the Todo rows below. |
+| P2 | Engine core | Sigma overrides | Sigma Min, Sigma Max and Rho for karras and exponential, as SwarmKSampler does. Run once through the server API. |
+| P2 | Krea 2 | Prompt Images | Vision tower and DeepStack, up to several images, on both prompts. Tokens match SwarmUI's text node, 40.8 dB from ComfyUI, tested through SwarmUI. A 1024 image costs 3.9 s against 130 ms at 384. |
+| P2 | Guidance and speed | CFG tweaks | Rescale, Renorm, CFG Zero Star and TCFG on Krea 2, Anima and MOSS Image, against ComfyUI's own code on random tensors, within 2e-5. Sample of real output by direct workflow test, not compared with ComfyUI. Refused on H3. |
+| P2 | Krea 2 | Reference latents | index and index_timestep_zero, tested through SwarmUI. 1% from ComfyUI on the first evaluation; images 25 dB, about what int8 and flash differ by here (27 and 19 dB). No Krea 2 edit LoRA installed, so base model only. |
 
 ## Doing
 
 | Priority | Area | Item | Notes |
 |---|---|---|---|
-| P0 | Engine core | Route each model to its engine | One backend now serves Krea 2, Anima, MOSS Image, Qwen Image 2.1 and MiniMax H3, picked from the checkpoint's keys. Still inside native-engine; other families need a real router. |
+| P0 | Engine core | Route each model to its engine | One backend serves every native family, picked from the checkpoint's keys. Still inside native-engine; other families need a real router. |
 | P0 | Engine core | Dynamic VRAM offloading | Live residency works and adapted to ComfyUI's memory. Open: 16 to 11 drop at 1024, one 867 ms/step run after ComfyUI. |
 | P0 | Engine core | Latent operations | `LatentAdd`, `LatentMultiply`, `SwarmLatentBlendMasked`, `RepeatLatentBatch`, `LatentFromBatch`, `LatentBatch` and `LatentUpscaleBy` with all five methods, on image latents. Each matches ComfyUI's own node code on recorded random latents to within 1e-6 (`tools/latent_ops_ref.py`). Tested through SwarmUI on Krea 2 at 768x512: Init Image Reset To Norm with Creativity 0 (batch 2, and with a mask) decodes at 47.7 and 49.0 dB from ComfyUI, and each upscale method at 41.8 to 44.8 dB, against 46.1 dB for the plain VAE round trip. `LatentFromBatch` and `LatentBatch` after sampling, as raw workflows, give exactly the images of the plain runs. Real ComfyUI fails on the Reset To Norm workflows with Krea 2, because its Qwen Image VAE latents are 5D and the empty latent is 4D, so it was compared with that axis dropped. Sampling from these latents is in the partial sampling row. Video and audio latents, `TrimVideoLatent`, `SwarmReferenceOnly` and the Kandinsky 5 frame ops are refused. Anima, MOSS Image and Qwen Image 2.1 latents not tested. |
 | P1 | Krea 2 | Model Attention Backend | int8 and flash, per request. flash not yet run through the server. |
@@ -85,11 +85,11 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 
 | Priority | Area | Item | Notes |
 |---|---|---|---|
-| P0 | Server | Graph validation and execution | 163 native nodes with stock schemas. Exercised with real workflows only for Krea 2 text-to-image. |
-| P1 | Server | Self-starting SwarmUI backend | The comfy-rust backend extension compiles against SwarmUI's DLL. `selfstart.bat` started the native server, and it listed every model from SwarmUI's real model paths file. Not yet run inside SwarmUI, so starting, stopping and reloading from SwarmUI are untested. |
+| P0 | Server | Graph validation and execution | Native nodes with stock schemas. Exercised with real workflows only for Krea 2 text-to-image. |
 | P0 | Server | Swarm prompt syntax parsing | <break>, <weight>, <alternate>, <fromto>, <embed> and LoRA hooks parse. See the rows for each family and the Todo rows for what is refused. |
 | P0 | Image workflows | Refiner and upscale | Latent upscale refiners work (see partial sampling). Model upscalers reach the engine API, which doesn't run them. |
 | P0 | LoRA and control | LoRAs on non-quantised models | Loader, patches and hooks reach the engine. No non-quantised model runs yet; int8 LoRAs work. The LoRA formats are done in src/lora.rs. |
+| P1 | Server | Self-starting SwarmUI backend | The comfy-rust backend extension compiles against SwarmUI's DLL. `selfstart.bat` started the native server, and it listed every model from SwarmUI's real model paths file. Not yet run inside SwarmUI, so starting, stopping and reloading from SwarmUI are untested. |
 | P1 | Server | Mask and image nodes | Crop, scale, blur, grow, threshold and composite run in the server. Not yet used with real generations. |
 | P1 | Server | Video and audio output | mp4, webm, mov, gif and audio encoding through ffmpeg. H3 mp4 with audio works through SwarmUI. The other formats have only had placeholder frames. |
 | P1 | Image workflows | Use Inpainting Encode | `VAEEncodeForInpaint` reaches the engine; noise masks and Differential Diffusion work (see partial sampling). Not run through SwarmUI. |
@@ -99,7 +99,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | Masks and detection | <segment:text> with CLIPSeg | Face and object refining. Needs a CLIPSeg model. |
 | P1 | Masks and detection | <segment:yolo-...> | Needs YOLOv8 inference. |
 | P1 | Guidance and speed | EasyCache | Often speeds up long runs. Needs step-output reuse in the sampler. |
-| P2 | Server | Generic custom_node route | 92 extra node classes can be routed to an engine that claims them. Only the mock does. |
+| P2 | Server | Generic custom_node route | Extra node classes can be routed to an engine that claims them. Only the mock does. |
 | P2 | Image workflows | Regions: <region> and <object> | Mask maths is done. The sampler has to apply per-region conditioning. |
 | P2 | Image workflows | Unsampler Prompt | Sampling in reverse. |
 | P2 | Image workflows | Seamless Tileable | Circular padding in the model and VAE. |
@@ -107,7 +107,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P2 | LoRA and control | Use Reference Only | Self-attention key and value extension. |
 | P2 | LoRA and control | GLIGEN | Boxes reach the engine. |
 | P2 | LoRA and control | IP-Adapter | Generic route only. |
-| P2 | Masks and detection | Remove Background | Needs a background removal model. |
+| P2 | Masks and detection | Remove Background | SwarmUI's Remove Background parameter (`SwarmRemBg`) uses rembg, which the engine doesn't run. BiRefNet runs for Pixal3D and Idol (see Doing). |
 | P2 | Guidance and speed | Attention guidance | SAG, PAG and NAG. |
 | P2 | Guidance and speed | FreeU | UNet models only. |
 | P2 | Video and audio | Video generation workflow | Frames, swap, extend, boomerang, trim and end image, on the mock. |
@@ -122,10 +122,6 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | Priority | Area | Item | Notes |
 |---|---|---|---|
 | P1 | SeedVR2 | Batches and video | ComfyUI restores a batch (or a video) as one clip of 4n + 1 frames through the causal temporal VAE and the DiT's frame windows; refused until that path exists, so SeedVR needs Batch Size 1. Split Latent (`SeedVR2TemporalChunk`, `SeedVR2TemporalMerge`) goes with it. |
-| P2 | SeedVR2 | 7B models and other formats | Only the 3B int8 ConvRot file runs; the 7B (and 7B sharp) and the 3B's fp16, fp8, mxfp8 and nvfp4 files are refused. |
-| P2 | SeedVR2 | Upscale methods `model-*` and `pidmodel-*` | SeedVR Upscale Method with an upscale model (`ImageUpscaleWithModel`) or a pixel decoder is refused: the engine runs no upscale models yet. `pixel-*` works; `latent-*` isn't tested. |
-| P2 | SeedVR2 | VAE Tile Size | An explicit `VAEDecodeTiled` / `VAEEncodeTiled` on SeedVR2 is refused; its VAE tiles by itself instead. |
-| P2 | SeedVR2 | Untested settings | SeedVR2 as the refiner model, CFG above 1, the wavelet, AdaIN and none colour methods against ComfyUI, and pictures above 4096x4096. |
 | P1 | Engine core | Hardware beyond this card | Everything targets sm_120 on Windows. Other GPUs and Linux are untested. |
 | P1 | Krea 2 | Prompt weights | <weight> through SwarmAttnTokenWeights, inside attention. |
 | P1 | Krea 2 | <alternate> and <fromto> | Per-step conditioning. |
@@ -140,10 +136,14 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P1 | MiniMax H3 | H3 long clips | Sampling timed on the CLI up to 768x512 and 124 frames, with int8 attention now the default: faster per step than ComfyUI (5.0 s against 6.2 s at 124 frames). The clips weren't watched, nothing larger was tried, and sparse attention's speedup above its 12,288-token threshold is unmeasured. |
 | P1 | MOSS Image | MOSS Image reference images | Prompt Images and edit LoRAs need Qwen3.5's vision encoder, the VAE encoder and reference tokens. |
 | P1 | MOSS Image | Other MOSS Image checkpoint formats | bf16 and unfused q/k/v files are refused. Only fused int8 ConvRot runs. |
+| P2 | SeedVR2 | 7B models and other formats | Only the 3B int8 ConvRot file runs; the 7B (and 7B sharp) and the 3B's fp16, fp8, mxfp8 and nvfp4 files are refused. |
+| P2 | SeedVR2 | Upscale methods `model-*` and `pidmodel-*` | SeedVR Upscale Method with an upscale model (`ImageUpscaleWithModel`) or a pixel decoder is refused: the engine runs no upscale models yet. `pixel-*` works; `latent-*` isn't tested. |
+| P2 | SeedVR2 | VAE Tile Size | An explicit `VAEDecodeTiled` / `VAEEncodeTiled` on SeedVR2 is refused; its VAE tiles by itself instead. |
+| P2 | SeedVR2 | Untested settings | SeedVR2 as the refiner model, CFG above 1, the wavelet, AdaIN and none colour methods against ComfyUI, and pictures above 4096x4096. |
 | P2 | Server | ComfyUI node editor page | SwarmUI's Comfy Workflow tab won't render. Generation doesn't need it. |
 | P2 | Engine core | Tiled sampling | Swarm's Tile Sample and refiner tiling. |
 | P2 | Other models | Flux and Flux 2 | Very common in Swarm. T5 and CLIP encoders, GGUF and NF4 formats. |
 | P2 | Anima | Anima LLLite ControlNet | Needs the patch hooks inside the blocks. |
 | P2 | MOSS Image | Close the MOSS Image output gap | torch's bf16 GEMM isn't exact at text-embedder sizes, so that stage differs by 0.5%. Same picture at about 34 dB PSNR. |
-| P3 | Other models | Wan, LTX-V, Hunyuan and other video | 63 stock nodes across model families. |
+| P3 | Other models | Wan, LTX-V, Hunyuan and other video | Their stock nodes only reach the mock. |
 | P3 | Video and audio | Text-to-audio models | ACE-Step, YuE and MiniMax Music. |

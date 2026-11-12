@@ -111,7 +111,7 @@ Differences to know about:
 
 ## Samplers
 
-All 45 ComfyUI samplers and all 9 ComfyUI schedulers run on every model, plus SwarmUI's `turbo`, `align_your_steps`,
+Every ComfyUI sampler and scheduler runs on the image and video models, plus SwarmUI's `turbo`, `align_your_steps`,
 `flux2`, `ideogram4`, `ideogram4turbo` and `ltxv` (`ltxv-image` is refused), its Sigma Min, Sigma Max and Rho overrides,
 and any CFG with a negative prompt, now including Krea 2. One more scheduler, `hyperflow`, is HyperFlow H3 Flash's
 4, 6 or 8-step grid and runs on that model only, with `euler` ([details](MODELS.md#hyperflow-h3-flash)):

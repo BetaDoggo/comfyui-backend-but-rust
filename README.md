@@ -11,7 +11,7 @@
 A Rust and CUDA backend that speaks ComfyUI's API and replaces the ComfyUI features SwarmUI uses most, so SwarmUI can
 generate without Python or ComfyUI. The goal is speed first.
 
-It really generates with five image and video model families and two image-to-3D models, from specific checkpoints only:
+It really generates with these image, video and image-to-3D models, from specific checkpoints only:
 
 | Family | Generates | 1024x1024 sampling here | ComfyUI |
 |---|---|---|---|
@@ -24,11 +24,13 @@ It really generates with five image and video model families and two image-to-3D
 | MiniMax-H3-Image | Text to image, 6 steps | 0.86 s/step, 1.22 s/step at 2048x2048 | 0.68 s/step, 1.34 s/step at 2048x2048 |
 | Pixal3D | Image to a vertex-coloured 3D mesh (GLB), cutting the object out first with BiRefNet | 40 s per mesh at resolution 1024, 110 s at 1536 | not timed |
 | Idol (TripoSplat) | Image to a 3D gaussian splat (PLY), cutting the object out first with BiRefNet | 14.4 s per splat, 0.57 s/step at CFG 3 | 111 s/step headless here, not tuned |
+| SeedVR2 3B | Restores a picture, as SwarmUI's SeedVR stage | 0.79 s per 1024 restore, DiT 145 ms | DiT 235 ms |
 
-All of them take every ComfyUI sampler and scheduler, and all of them take LoRAs. Init images, inpainting and refiners work on the image
-models. ControlNet and every other model family don't work yet. The server accepts far more of SwarmUI's features than that, but they only reach a
-mock engine, so run this beside a normal ComfyUI backend. [Status](docs/STATUS.md) lists what works and what's left, in
-priority order.
+The image and video models take every ComfyUI sampler and scheduler and LoRAs, with exceptions listed in
+[Models](docs/MODELS.md): HyperFlow H3 Flash samples with `euler` only, and it and MiniMax-H3-Image refuse LoRAs. Init
+images, inpainting and refiners work on the image models. ControlNet and every other model family don't work yet. The
+server accepts far more of SwarmUI's features than that, but they only reach a mock engine, so run this beside a normal
+ComfyUI backend. [Status](docs/STATUS.md) lists what works and what's left, in priority order.
 
 ## Quick start
 
@@ -41,7 +43,7 @@ The build takes CUTLASS and FlashAttention-2 from a comfy-kitchen checkout. Run 
 git clone --recursive https://github.com/Comfy-Org/comfy-kitchen ref/comfy-kitchen
 ```
 
-Then build, which takes about 6 minutes the first time:
+Then build, which takes several minutes the first time:
 
 ```bash
 cargo build --release

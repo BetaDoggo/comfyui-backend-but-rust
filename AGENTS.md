@@ -23,14 +23,18 @@ Rules and context for people and coding agents. The [README](README.md) covers s
 | Path | What it is |
 |---|---|
 | `src/`, `csrc/`, `build.rs` | The `diffusion` library and CLI, and the CUDA kernels |
+| `tests/` | Sampler, latent and prompt checks against ComfyUI's recorded output, with their golden files |
+| `assets/` | Tokenizer files copied from ComfyUI, under their upstream licenses |
+| `docs/` | User and design documentation, see [Keeping the docs true](#keeping-the-docs-true) |
+| `tools/` | Comparisons with real ComfyUI |
 | `swarm backend/crates/engine-api` | The `Engine` trait and typed requests |
 | `swarm backend/crates/comfy-server` | ComfyUI protocol, node graph, mock engine |
 | `swarm backend/crates/native-engine` | `Engine` on top of the `diffusion` library |
 | `swarm backend/swarm-extension` | comfy-rust backend: SwarmUI extension that starts the server |
 | `swarm backend/pixal3d-extension` | Pixal3D tab: SwarmUI extension, meant to become its own repository |
-| `tools/` | Comparisons with real ComfyUI |
+| `swarm backend/docs/` | Server documentation: input mapping, compatibility, adding models |
 | `swarm backend/tools/` | Node catalog and COMPATIBILITY.md generators |
-| `ref/`, `swarm backend/reference/`, `swarm backend/scratch/` | Local and gitignored; may not exist |
+| `ref/`, `refout/`, `prof/`, `data/`, `swarm backend/reference/`, `swarm backend/scratch/`, `swarm backend/data/` | Local and gitignored; may not exist |
 
 `swarm backend/` is a separate Cargo workspace, so run its commands from that folder.
 
@@ -122,9 +126,13 @@ dotnet src/bin/live_release/SwarmUI.dll --data_dir <tmp> --settings_file <tmp> -
 | [docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md) | Design and dependencies | The design changes |
 | [swarm backend/README.md](swarm%20backend/README.md) | Running the server | Flags or SwarmUI behaviour change |
 | [INPUT_MAPPING.md](swarm%20backend/docs/INPUT_MAPPING.md) | What SwarmUI sends | SwarmUI or the engine API changes |
-| [COMPATIBILITY.md](swarm%20backend/docs/COMPATIBILITY.md) | Generated, don't edit | Edit `tools/gen_compat_doc.py` and run it |
+| [ADDING_MODELS.md](swarm%20backend/docs/ADDING_MODELS.md) | How to add a model family | The steps for adding one change |
+| [COMPATIBILITY.md](swarm%20backend/docs/COMPATIBILITY.md) | Generated, don't edit | Edit `swarm backend/tools/gen_compat_doc.py` and run it |
+| [Pixal3D extension](swarm%20backend/pixal3d-extension/README.md) | The Pixal3D tab | The tab or its node changes |
+| [assets/README.md](assets/README.md) | Tokenizer provenance and licenses | A tokenizer is added |
 
 * In STATUS, **Working** needs real output, tested end to end. Server plus mock is **Plumbing**.
 * In COMPATIBILITY, **Works** only means the server and mock handle it. Don't quote it as a feature claim.
 * Write only numbers you measured, and say what wasn't tested.
+* Don't write counts that go stale, such as how many families, nodes or samplers there are. Name them, or say "every".
 * Keep maintainers' machine paths out of the repository.

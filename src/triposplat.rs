@@ -15,7 +15,7 @@ use crate::offload::{plan, Layout, WeightSet};
 use crate::pixal3d::{pil_lanczos, Progress};
 use crate::samplers::{self, CfgTweaks, Eval, ModelSampling, Uncond};
 use crate::sampling::{torch_randn_streams, Mt19937};
-use crate::st::{f32_bytes, SafeTensors};
+use crate::st::{f16_bytes, f32_bytes, SafeTensors};
 use anyhow::{bail, Result};
 use half::f16;
 use std::path::PathBuf;
@@ -116,10 +116,6 @@ pub fn is_decoder(has: impl Fn(&str) -> bool) -> bool {
 
 fn r16(x: f32) -> f32 {
     f16::from_f32(x).to_f32()
-}
-
-fn f16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| f16::from_f32(*x).to_le_bytes()).collect()
 }
 
 fn f16_values(b: &[u8]) -> Vec<f32> {

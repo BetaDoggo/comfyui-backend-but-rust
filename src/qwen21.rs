@@ -10,7 +10,7 @@ use crate::cuda::{memcpy_2d_d2d, memcpy_d2d, DevBuf, Stream};
 use crate::dit::Dit as KreaDit;
 use crate::ffi::{k, null, off, s, DT_BF16, PM, PRO_LN_MOD, PRO_PLAIN, PRO_RMS, PRO_SILU, PRO_SWIGLU};
 use crate::offload::{plan, Layout, Store, WeightSet};
-use crate::st::SafeTensors;
+use crate::st::{bf16_bytes, SafeTensors};
 use anyhow::{bail, Result};
 use half::bf16;
 
@@ -226,10 +226,6 @@ pub fn n_blocks(st: &SafeTensors, pre: &str) -> usize {
 /// Rough activation footprint of one denoising step (bytes) for `l` image rows against `keys` keys.
 pub fn step_activation_bytes(l: usize, keys: usize) -> usize {
     l * (F * 2 /*x*/ + QKV * 2 + F * 2 /*attn*/ + 2 * MLP * 2 /*gate|up*/ + MLP /*int8*/ + 16 + CH * 2) + 2 * keys * F * 2 /*k, v*/ + H * l * 4 + (128 << 20)
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| bf16::from_f32(*x).to_le_bytes()).collect()
 }
 
 impl Dit {

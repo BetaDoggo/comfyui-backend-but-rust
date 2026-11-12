@@ -796,7 +796,7 @@ pub fn tetrahedron_glb(color: [f32; 3]) -> Vec<u8> {
     out.extend_from_slice(b"JSON");
     out.extend(jb);
     out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"BIN ");
+    out.extend_from_slice(b"BIN\0");
     out.extend(bin);
     out
 }

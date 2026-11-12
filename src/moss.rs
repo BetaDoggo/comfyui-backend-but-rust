@@ -5,9 +5,8 @@ use crate::cuda::{DevBuf, Stream};
 use crate::dit::Dit as KreaDit;
 use crate::ffi::{k, null, off, s, DT_BF16, PM, PRO_ADALN, PRO_PLAIN, PRO_RMS, PRO_SITU};
 use crate::offload::{plan, Layout, Store, WeightSet};
-use crate::st::SafeTensors;
+use crate::st::{bf16_bytes, SafeTensors};
 use anyhow::Result;
-use half::bf16;
 use std::collections::HashMap;
 
 const F: usize = 3072;
@@ -102,10 +101,6 @@ pub fn n_blocks(st: &SafeTensors) -> usize {
 /// Rough activation footprint of one denoising step (bytes) for `l` tokens.
 pub fn step_activation_bytes(l: usize) -> usize {
     l * (F * 2 /*x*/ + QKV * 2 + F * 2 /*attn*/ + 2 * MLP * 2 + MLP /*int8*/ + 8) + 2 * l * 2 * F * 2 /*int8 attn*/ + (128 << 20)
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| bf16::from_f32(*x).to_le_bytes()).collect()
 }
 
 /// RoPE table [rows][64][(cos, sin)] for an h x w image, then `len` text tokens. The image sits after

@@ -3,9 +3,8 @@
 use crate::cuda::{DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_BF16, PRO_GATE, PRO_PLAIN, PRO_RMS, PRO_SWIGLU, PM};
 use crate::offload::{plan, Layout, Store, WeightSet};
-use crate::st::SafeTensors;
+use crate::st::{bf16_bytes, SafeTensors};
 use anyhow::{bail, Result};
-use half::bf16;
 
 pub const F: usize = 6144; // features
 const HQ: usize = 48;
@@ -56,10 +55,6 @@ fn pad_circular(latent: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) 
         }
     }
     (out, ph, pw)
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| bf16::from_f32(*x).to_le_bytes()).collect()
 }
 
 /// Per-block VRAM image size (bytes) without loading, for planning.

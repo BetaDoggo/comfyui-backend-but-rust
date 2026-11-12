@@ -9,7 +9,7 @@
 use crate::cuda::{DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_BF16, P, PM, PRO_ADALN, PRO_PLAIN, PRO_RMS, PRO_SILU, PRO_SWIGLU};
 use crate::offload::{plan, Layout, Store, WeightSet};
-use crate::st::{f32_bytes, SafeTensors};
+use crate::st::{bf16_bytes, f32_bytes, SafeTensors};
 use anyhow::{bail, Result};
 use half::bf16;
 use std::collections::HashMap;
@@ -155,10 +155,6 @@ pub fn windows(t: usize, h: usize, w: usize, shifted: bool) -> Vec<[(usize, usiz
 /// bf16 rounding of an f32.
 fn bf(x: f32) -> f32 {
     bf16::from_f32(x).to_f32()
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| bf16::from_f32(*x).to_le_bytes()).collect()
 }
 
 fn i32_bytes(v: &[i32]) -> Vec<u8> {

@@ -200,3 +200,13 @@ impl SafeTensors {
 pub fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
+
+/// `v` rounded to bf16, as little-endian bytes for an upload.
+pub fn bf16_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| bf16::from_f32(*x).to_le_bytes()).collect()
+}
+
+/// `v` rounded to f16, as little-endian bytes for an upload.
+pub fn f16_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| f16::from_f32(*x).to_le_bytes()).collect()
+}

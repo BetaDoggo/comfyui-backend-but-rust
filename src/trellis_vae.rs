@@ -8,7 +8,7 @@
 use crate::cuda::{DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_F16, PM, PRO_LAYERNORM, PRO_LN_AFFINE, PRO_LN_AFFINE_SILU, PRO_SILU};
 use crate::offload::Layout;
-use crate::st::{f32_bytes, SafeTensors};
+use crate::st::{f16_bytes, f32_bytes, SafeTensors};
 use anyhow::{bail, Result};
 use half::f16;
 
@@ -98,10 +98,6 @@ impl Subdivision {
         }
         Subdivision { flat, coords }
     }
-}
-
-fn f16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| f16::from_f32(*x).to_le_bytes()).collect()
 }
 
 /// A tensor converted to f16 (ComfyUI casts the bf16 weights to the f16 compute dtype), zero-padded to `rows` rows.

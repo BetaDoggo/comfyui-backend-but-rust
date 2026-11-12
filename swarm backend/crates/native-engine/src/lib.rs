@@ -149,14 +149,30 @@ fn internal(e: anyhow::Error) -> EngineError {
     }
 }
 
-/// The safetensors header, as JSON.
-fn read_header(path: &Path) -> anyhow::Result<serde_json::Value> {
+/// The safetensors header, as JSON. Family checks ask for the same files' headers on every request, so parsed headers
+/// are kept, each until its file's size or modification time changes.
+fn read_header(path: &Path) -> anyhow::Result<Arc<serde_json::Value>> {
+    type Key = (PathBuf, u64, Option<std::time::SystemTime>);
+    static CACHE: Mutex<Vec<(Key, Arc<serde_json::Value>)>> = Mutex::new(Vec::new());
+    const KEEP: usize = 32;
     let mut f = std::fs::File::open(path)?;
+    let meta = f.metadata()?;
+    let key: Key = (path.to_path_buf(), meta.len(), meta.modified().ok());
+    if let Some((_, h)) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
+        return Ok(h.clone());
+    }
     let mut n = [0u8; 8];
     f.read_exact(&mut n)?;
     let mut h = vec![0u8; u64::from_le_bytes(n) as usize];
     f.read_exact(&mut h)?;
-    Ok(serde_json::from_slice(&h)?)
+    let h = Arc::new(serde_json::from_slice(&h)?);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|(k, _)| k.0 != key.0);
+    if cache.len() >= KEEP {
+        cache.remove(0);
+    }
+    cache.push((key, Arc::clone(&h)));
+    Ok(h)
 }
 
 /// The file's architecture. Refuses other models and formats before any weights are touched.

@@ -171,6 +171,7 @@ extern "C" {
     // SeedVR2 (csrc/seedvr.cu)
     pub fn gpu_seedvr_patch_in(x: P, cond: P, tok: PM, h: i32, w: i32, ld: i32, s: PM) -> i32;
     pub fn gpu_seedvr_unwindow(x: P, c: i32, src: P, offs: P, rows: i32, out: PM, s: PM) -> i32;
+    pub fn gpu_seedvr_stack3(a: P, b: P, c: P, out: PM, px: i64, ch: i32, s: PM) -> i32;
     pub fn gpu_pixel_shuffle2_bf16(x: P, out: PM, h: i32, w: i32, c: i32, s: PM) -> i32;
 }
 

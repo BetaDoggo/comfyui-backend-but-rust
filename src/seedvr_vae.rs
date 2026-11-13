@@ -1,17 +1,25 @@
-//! SeedVR2's causal video VAE for single images, NHWC bf16.
+//! SeedVR2's causal video VAE, NHWC bf16.
 //!
 //! On one frame every causal conv sees its input repeated in front of it (ComfyUI pads the time axis with copies of the
 //! first frame), so it is a 2D conv with the kernel's temporal taps summed; the temporal up and down samplers keep one
 //! frame. The decoder's upsampler is a 1x1 expansion to four phases, shuffled into pixels, then a 3x3 conv.
+//!
+//! A clip runs a frame at a time. Each causal conv keeps its last two input frames and sees them in front of the new
+//! one, the three taps stacked along channels for one 2D conv: the same sums as ComfyUI's whole-clip pass, with only a
+//! frame's activations live. The encoder's two temporal downsamplers keep every other frame (the first, third, ...),
+//! and the decoder's two temporal upsamplers make two frames of each but the first, so 4n + 1 frames make n + 1 latents
+//! and back.
 
 use crate::cuda::{DevBuf, Stream};
-use crate::ffi::{k, null, s, DT_BF16, PM};
+use crate::ffi::{k, null, off, s, DT_BF16, PM};
 use crate::offload::Layout;
 use crate::st::{f32_bytes, SafeTensors};
 use crate::vae::{single_head_attention, RGB_PAD};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use half::bf16;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 const OUT_PAD: usize = 8;
 const GROUPS: usize = 32;
@@ -32,6 +40,46 @@ pub struct Vae {
     up: Vec<(usize, usize, usize)>,
     e_in: usize,
     d_in: usize,
+    /// Which encoder downsamplers halve time too.
+    down_t: Vec<bool>,
+    /// Frames each decoder upsampler makes of one (2 doubles time).
+    up_tr: Vec<usize>,
+    path: PathBuf,
+    /// The causal convs' full temporal kernels, for clips: loaded on the first clip.
+    temporal: Option<(DevBuf, Layout)>,
+}
+
+/// A clip's way through the VAE: each causal conv's input frames so far and its last two, and the frames each decoder
+/// upsampler has taken.
+#[derive(Default)]
+struct Clip {
+    hist: HashMap<String, (usize, [Option<Rc<DevBuf>>; 2])>,
+    up_seen: [usize; LEVELS],
+}
+
+/// Conv weight [Cout, Cin, 3, R, R] -> KRSC bf16 over the three temporal taps side by side along C (tap, then Cin
+/// zero-padded to `cin_pad`), Cout zero-padded to `cout_pad`.
+fn conv_stacked(st: &SafeTensors, name: &str, cout_pad: usize, cin_pad: usize) -> Result<Vec<u8>> {
+    let info = st.info(name)?.clone();
+    let &[co, ci, t, r, r2] = info.shape.as_slice() else { bail!("{name}: unexpected conv shape {:?}", info.shape) };
+    if t != 3 || r != r2 {
+        bail!("{name}: expected 3 temporal taps, got {:?}", info.shape);
+    }
+    let v = st.f32_vec(name, false)?;
+    let (cop, cip) = (cout_pad.max(co), cin_pad.max(ci));
+    let mut out = vec![bf16::ZERO; cop * r * r * t * cip];
+    for o in 0..co {
+        for c in 0..ci {
+            for tt in 0..t {
+                for y in 0..r {
+                    for x in 0..r {
+                        out[((o * r + y) * r + x) * t * cip + tt * cip + c] = bf16::from_f32(v[(((o * ci + c) * t + tt) * r + y) * r + x]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out.iter().flat_map(|b| b.to_le_bytes()).collect())
 }
 
 /// Conv weight [Cout, Cin, T, R, R] -> KRSC bf16 with the temporal taps summed, Cout zero-padded to `cout_pad` and Cin
@@ -106,6 +154,7 @@ impl Vae {
         conv(&mut lay, "e.in", "encoder.conv_in", 0, RGB_PAD)?;
         let e_in = st.info("encoder.conv_in.weight")?.shape[0];
         let mut down = Vec::with_capacity(LEVELS);
+        let mut down_t = Vec::with_capacity(LEVELS);
         for i in 0..LEVELS {
             let p = format!("encoder.down_blocks.{i}");
             let n = count(&p);
@@ -122,6 +171,7 @@ impl Vae {
             }
             if i + 1 < LEVELS {
                 conv(&mut lay, &format!("e{i}.down"), &format!("{p}.downsamplers.0.conv"), 0, 0)?;
+                down_t.push(st.info(&format!("{p}.downsamplers.0.conv.weight"))?.shape.get(2) == Some(&3));
             }
         }
         res(&mut lay, "em0", "encoder.mid_block.resnets.0")?;
@@ -140,6 +190,7 @@ impl Vae {
         attn(&mut lay, "dattn", "decoder.mid_block.attentions.0")?;
         res(&mut lay, "dm1", "decoder.mid_block.resnets.1")?;
         let mut up = Vec::with_capacity(LEVELS);
+        let mut up_tr = Vec::with_capacity(LEVELS);
         for i in 0..LEVELS {
             let p = format!("decoder.up_blocks.{i}");
             let n = count(&p);
@@ -162,6 +213,7 @@ impl Vae {
                     bail!("{u}.upscale_conv: {rows} outputs for {c} channels");
                 }
                 let tr = rows / (4 * c);
+                up_tr.push(tr);
                 let (mut ew, mut eb) = (Vec::with_capacity(4 * c * c), Vec::with_capacity(4 * c));
                 for ph in 0..4 {
                     for ch in 0..c {
@@ -186,7 +238,7 @@ impl Vae {
         let buf = DevBuf::alloc(lay.size)?;
         buf.upload(0, &host, s0)?;
         s0.sync()?;
-        Ok(Vae { buf, lay, down, up, e_in, d_in })
+        Ok(Vae { buf, lay, down, up, e_in, d_in, down_t, up_tr, path: path.to_path_buf(), temporal: None })
     }
 
     fn w(&self, key: &str) -> PM {
@@ -249,14 +301,19 @@ impl Vae {
 
     fn mid(&self, pre: &str, x: DevBuf, h: usize, w: usize, c: usize, stats: PM, st: &Stream) -> Result<DevBuf> {
         let x = self.res(&format!("{pre}m0"), x, h, w, c, c, stats, st)?;
+        self.frame_attn(pre, &x, h, w, c, stats, st)?;
+        self.res(&format!("{pre}m1"), x, h, w, c, c, stats, st)
+    }
+
+    /// The mid block's single-head attention within one frame, residual included, in place.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_attn(&self, pre: &str, x: &DevBuf, h: usize, w: usize, c: usize, stats: PM, st: &Stream) -> Result<()> {
         let p = h * w;
         let n = DevBuf::alloc_async(p * c * 2, st)?;
         let a = format!("{pre}attn");
         self.norm(&format!("{a}.n"), x.ptr(), n.ptr(), stats, p, c, false, st)?;
-        single_head_attention(&x, &n, p, c, [self.w(&format!("{a}.qkv.w")), self.w(&format!("{a}.qkv.b")), self.w(&format!("{a}.proj.w")),
-            self.w(&format!("{a}.proj.b"))], st)?;
-        drop(n);
-        self.res(&format!("{pre}m1"), x, h, w, c, c, stats, st)
+        single_head_attention(x, &n, p, c, [self.w(&format!("{a}.qkv.w")), self.w(&format!("{a}.qkv.b")), self.w(&format!("{a}.proj.w")),
+            self.w(&format!("{a}.proj.b"))], st)
     }
 
     /// Peak activation memory (bytes) of encoding or decoding an `h` x `w` picture (`h`, `w` in pixels).
@@ -443,6 +500,422 @@ impl Vae {
             }
         }
         Ok(out)
+    }
+}
+
+/// Most elements of a causal conv's stacked input (three frames side by side) in one band of rows.
+const STACK_ELEMENTS: usize = 1 << 27;
+
+impl Vae {
+    /// Load the causal convs' full temporal kernels, once.
+    fn ensure_temporal(&mut self, s0: &Stream) -> Result<()> {
+        if self.temporal.is_some() {
+            return Ok(());
+        }
+        let st = SafeTensors::open(&self.path)?;
+        // (layout key, checkpoint name, Cout padding, Cin padding)
+        let mut names: Vec<(String, String, usize, usize)> = vec![("e.in".into(), "encoder.conv_in".into(), 0, RGB_PAD)];
+        let res = |names: &mut Vec<(String, String, usize, usize)>, key: String, name: String| {
+            for c in ["1", "2"] {
+                names.push((format!("{key}.c{c}"), format!("{name}.conv{c}"), 0, 0));
+            }
+        };
+        for (i, &(_, _, n)) in self.down.iter().enumerate() {
+            for b in 0..n {
+                res(&mut names, format!("e{i}.{b}"), format!("encoder.down_blocks.{i}.resnets.{b}"));
+            }
+            if self.down_t.get(i) == Some(&true) {
+                names.push((format!("e{i}.down"), format!("encoder.down_blocks.{i}.downsamplers.0.conv"), 0, 0));
+            }
+        }
+        for (pre, side) in [("e", "encoder"), ("d", "decoder")] {
+            for m in 0..2 {
+                res(&mut names, format!("{pre}m{m}"), format!("{side}.mid_block.resnets.{m}"));
+            }
+        }
+        names.push(("eout".into(), "encoder.conv_out".into(), 0, 0));
+        names.push(("d.in".into(), "decoder.conv_in".into(), 0, 0));
+        for (i, &(_, _, n)) in self.up.iter().enumerate() {
+            for b in 0..n {
+                res(&mut names, format!("u{i}.{b}"), format!("decoder.up_blocks.{i}.resnets.{b}"));
+            }
+            if i + 1 < LEVELS {
+                names.push((format!("u{i}.up"), format!("decoder.up_blocks.{i}.upsamplers.0.conv"), 0, 0));
+            }
+        }
+        names.push(("dout".into(), "decoder.conv_out".into(), OUT_PAD, 0));
+        let mut lay = Layout::new();
+        for (key, name, co, ci) in &names {
+            lay.bytes(&format!("{key}.w3"), conv_stacked(&st, &format!("{name}.weight"), *co, *ci)?);
+        }
+        // the second temporal phase of the time-doubling expansions: (i, j, t = 1, c) of their outputs
+        let to_bf16 = |v: &[f32]| v.iter().flat_map(|x| bf16::from_f32(*x).to_le_bytes()).collect::<Vec<u8>>();
+        for (i, &(c, _, _)) in self.up.iter().enumerate() {
+            if i + 1 < LEVELS && self.up_tr[i] == 2 {
+                let u = format!("decoder.up_blocks.{i}.upsamplers.0.upscale_conv");
+                let (w, b) = (st.f32_vec(&format!("{u}.weight"), false)?, st.f32_vec(&format!("{u}.bias"), false)?);
+                let (mut ew, mut eb) = (Vec::with_capacity(4 * c * c), Vec::with_capacity(4 * c));
+                for ph in 0..4 {
+                    for ch in 0..c {
+                        let k = (ph * 2 + 1) * c + ch;
+                        ew.extend_from_slice(&w[k * c..(k + 1) * c]);
+                        eb.push(b[k]);
+                    }
+                }
+                lay.bytes(&format!("u{i}.exp1.w"), to_bf16(&ew));
+                lay.bytes(&format!("u{i}.exp1.b"), to_bf16(&eb));
+            }
+        }
+        let mut host = vec![0u8; lay.size];
+        lay.pack(&st, &mut host)?;
+        let buf = DevBuf::alloc(lay.size)?;
+        buf.upload(0, &host, s0)?;
+        s0.sync()?;
+        self.temporal = Some((buf, lay));
+        Ok(())
+    }
+
+    fn tw(&self, key: &str) -> PM {
+        let (buf, lay) = self.temporal.as_ref().expect("SeedVR2 VAE temporal kernels not loaded");
+        buf.at(lay.off(key))
+    }
+
+    /// The causal conv `key` (3x3 in space, three temporal taps) over input frames `taps`, oldest first: the taps side by
+    /// side along channels, in bands of rows with a row of halo.
+    #[allow(clippy::too_many_arguments)]
+    fn conv3(&self, key: &str, taps: [PM; 3], out: PM, h: usize, w: usize, cin: usize, cout: usize, st: &Stream) -> Result<()> {
+        let (wk, bk) = (self.tw(&format!("{key}.w3")), self.w(&format!("{key}.b")));
+        let c3 = 3 * cin;
+        let band = (STACK_ELEMENTS / (w * c3.max(cout))).saturating_sub(2).max(1);
+        let rows_max = (band + 2).min(h);
+        let stacked = DevBuf::alloc_async(rows_max * w * c3 * 2, st)?;
+        let tmp = if band < h { Some(DevBuf::alloc_async(rows_max * w * cout * 2, st)?) } else { None };
+        for y0 in (0..h).step_by(band) {
+            let y1 = (y0 + band).min(h);
+            let (a, b) = (y0.saturating_sub(1), (y1 + 1).min(h));
+            let at = |p: PM| off(p, a * w * cin * 2);
+            k!(gpu_seedvr_stack3(at(taps[0]), at(taps[1]), at(taps[2]), stacked.ptr(), ((b - a) * w) as i64, cin as i32, s(st)))?;
+            match &tmp {
+                None => k!(gpu_conv2d(stacked.ptr(), wk, bk, out, 1, h as i32, w as i32, c3 as i32, cout as i32, 3, s(st)))?,
+                Some(t) => {
+                    k!(gpu_conv2d(stacked.ptr(), wk, bk, t.ptr(), 1, (b - a) as i32, w as i32, c3 as i32, cout as i32, 3, s(st)))?;
+                    crate::cuda::memcpy_d2d(off(out, y0 * w * cout * 2), off(t.ptr(), (y0 - a) * w * cout * 2), (y1 - y0) * w * cout * 2, st)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The next frame `x` of a clip into the causal conv `key`: its output frame, or `None` where a time-halving conv
+    /// (`stride2`) keeps none. The conv sees the two frames before `x`, copies of the first at the start.
+    #[allow(clippy::too_many_arguments)]
+    fn causal(&self, clip: &mut Clip, key: &str, x: Rc<DevBuf>, h: usize, w: usize, cin: usize, cout: usize, stride2: bool, st: &Stream)
+        -> Result<Option<DevBuf>> {
+        let e = clip.hist.entry(key.to_string()).or_insert((0, [None, None]));
+        let idx = e.0;
+        e.0 += 1;
+        let (p0, p1) = match std::mem::replace(&mut e.1, [None, None]) {
+            [Some(a), Some(b)] if idx > 0 => (a, b),
+            _ => (x.clone(), x.clone()),
+        };
+        e.1 = [Some(p1.clone()), Some(x.clone())];
+        if stride2 && idx % 2 == 1 {
+            return Ok(None);
+        }
+        let out = DevBuf::alloc_async(h * w * cout * 2, st)?;
+        self.conv3(key, [p0.ptr(), p1.ptr(), x.ptr()], out.ptr(), h, w, cin, cout, st)?;
+        Ok(Some(out))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn res3(&self, clip: &mut Clip, key: &str, x: DevBuf, h: usize, w: usize, cin: usize, cout: usize, stats: PM, st: &Stream) -> Result<DevBuf> {
+        let p = h * w;
+        let t = DevBuf::alloc_async(p * cin * 2, st)?;
+        self.norm(&format!("{key}.n1"), x.ptr(), t.ptr(), stats, p, cin, true, st)?;
+        let u = self.causal(clip, &format!("{key}.c1"), Rc::new(t), h, w, cin, cout, false, st)?.context("causal conv")?;
+        let t2 = DevBuf::alloc_async(p * cout * 2, st)?;
+        self.norm(&format!("{key}.n2"), u.ptr(), t2.ptr(), stats, p, cout, true, st)?;
+        drop(u);
+        let v = self.causal(clip, &format!("{key}.c2"), Rc::new(t2), h, w, cout, cout, false, st)?.context("causal conv")?;
+        let residual = if cin != cout {
+            let sc = DevBuf::alloc_async(p * cout * 2, st)?;
+            self.conv(&format!("{key}.sc"), x.ptr(), sc.ptr(), h, w, cin, cout, 1, st)?;
+            sc
+        } else {
+            x
+        };
+        k!(gpu_add_gated_bf16(v.ptr(), cout as i64, residual.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
+        Ok(v)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mid3(&self, clip: &mut Clip, pre: &str, x: DevBuf, h: usize, w: usize, c: usize, stats: PM, st: &Stream) -> Result<DevBuf> {
+        let x = self.res3(clip, &format!("{pre}m0"), x, h, w, c, c, stats, st)?;
+        self.frame_attn(pre, &x, h, w, c, stats, st)?;
+        self.res3(clip, &format!("{pre}m1"), x, h, w, c, c, stats, st)
+    }
+
+    /// The next input frame of a clip (bf16 [h, w, RGB_PAD] in -1..1) through the encoder: its latent frame as f32 rows
+    /// [h/8 * w/8][16] (the mean times [`SCALE`]), or `None` where the temporal downsamplers keep none.
+    fn encode_frame(&self, clip: &mut Clip, input: DevBuf, h: usize, w: usize, sp: PM, st: &Stream) -> Result<Option<Vec<f32>>> {
+        let alloc = |c: usize, a: usize, b: usize| DevBuf::alloc_async(a * b * c * 2, st);
+        let mut c = self.e_in;
+        let mut x = self.causal(clip, "e.in", Rc::new(input), h, w, RGB_PAD, c, false, st)?.context("causal conv")?;
+        let (mut hh, mut ww) = (h, w);
+        for (i, &(cout, cin, blocks)) in self.down.iter().enumerate() {
+            for b in 0..blocks {
+                let from = if b == 0 { cin } else { cout };
+                x = self.res3(clip, &format!("e{i}.{b}"), x, hh, ww, from, cout, sp, st)?;
+                c = cout;
+            }
+            if i + 1 < LEVELS {
+                let key = format!("e{i}.down");
+                // as on an image: the odd positions of a stride 1 conv are the stride 2 conv over a right and bottom
+                // zero border
+                let full = if self.down_t[i] {
+                    match self.causal(clip, &key, Rc::new(x), hh, ww, c, c, true, st)? {
+                        Some(f) => f,
+                        None => return Ok(None),
+                    }
+                } else {
+                    let full = alloc(c, hh, ww)?;
+                    self.conv(&key, x.ptr(), full.ptr(), hh, ww, c, c, 3, st)?;
+                    full
+                };
+                let y = alloc(c, hh / 2, ww / 2)?;
+                k!(gpu_take_odd(full.ptr(), y.ptr(), hh as i32, ww as i32, c as i32, s(st)))?;
+                x = y;
+                hh /= 2;
+                ww /= 2;
+            }
+        }
+        x = self.mid3(clip, "e", x, hh, ww, c, sp, st)?;
+        let p = hh * ww;
+        let t = alloc(c, hh, ww)?;
+        self.norm("eout.n", x.ptr(), t.ptr(), sp, p, c, true, st)?;
+        drop(x);
+        let moments = self.causal(clip, "eout", Rc::new(t), hh, ww, c, 2 * Z, false, st)?.context("causal conv")?;
+        let mut bytes = vec![0u8; p * 2 * Z * 2];
+        moments.download(0, &mut bytes, st)?;
+        let mut rows = Vec::with_capacity(p * Z);
+        for px in bytes.chunks_exact(2 * Z * 2) {
+            rows.extend((0..Z).map(|ch| bf16::from_le_bytes([px[ch * 2], px[ch * 2 + 1]]).to_f32() * SCALE));
+        }
+        Ok(Some(rows))
+    }
+
+    /// RGB f32 [frames][h][w][3] in 0..1 -> the encoder's latent frames, f32 rows [h/8 * w/8][16] each.
+    fn encode_frames(&self, rgb: &[f32], frames: usize, h: usize, w: usize, st: &Stream) -> Result<Vec<Vec<f32>>> {
+        let mut clip = Clip::default();
+        let stats = DevBuf::alloc_async(GROUPS * 8, st)?;
+        let mut out = Vec::new();
+        for f in 0..frames {
+            let mut px = vec![bf16::ZERO; h * w * RGB_PAD];
+            for (o, v) in px.chunks_exact_mut(RGB_PAD).zip(rgb[f * h * w * 3..(f + 1) * h * w * 3].chunks_exact(3)) {
+                for c in 0..3 {
+                    o[c] = bf16::from_f32(v[c] * 2.0 - 1.0);
+                }
+            }
+            let input = DevBuf::alloc_async(h * w * RGB_PAD * 2, st)?;
+            input.upload(0, &px.iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>(), st)?;
+            if let Some(rows) = self.encode_frame(&mut clip, input, h, w, stats.ptr(), st)? {
+                out.push(rows);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Decoder level `i` and those after it on one frame `x` of `hh` x `ww`, pushing finished frames (f32 [h][w][3],
+    /// before `process_output`) to `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_level(&self, clip: &mut Clip, i: usize, mut x: DevBuf, hh: usize, ww: usize, sp: PM, st: &Stream, out: &mut Vec<Vec<f32>>)
+        -> Result<()> {
+        let alloc = |c: usize, a: usize, b: usize| DevBuf::alloc_async(a * b * c * 2, st);
+        let (c, cin, blocks) = self.up[i];
+        for b in 0..blocks {
+            let from = if b == 0 { cin } else { c };
+            x = self.res3(clip, &format!("u{i}.{b}"), x, hh, ww, from, c, sp, st)?;
+        }
+        let p = hh * ww;
+        if i + 1 == LEVELS {
+            let t = alloc(c, hh, ww)?;
+            self.norm("dout.n", x.ptr(), t.ptr(), sp, p, c, true, st)?;
+            drop(x);
+            let o = self.causal(clip, "dout", Rc::new(t), hh, ww, c, OUT_PAD, false, st)?.context("causal conv")?;
+            let mut bytes = vec![0u8; p * OUT_PAD * 2];
+            o.download(0, &mut bytes, st)?;
+            let mut rgb = Vec::with_capacity(p * 3);
+            for px in bytes.chunks_exact(OUT_PAD * 2) {
+                rgb.extend((0..3).map(|ch| bf16::from_le_bytes([px[ch * 2], px[ch * 2 + 1]]).to_f32()));
+            }
+            out.push(rgb);
+            return Ok(());
+        }
+        // a time-doubling upsampler makes one frame of the clip's first and two of every other
+        let seen = clip.up_seen[i];
+        clip.up_seen[i] += 1;
+        let phases = if self.up_tr[i] == 2 && seen > 0 { 2 } else { 1 };
+        for t in 0..phases {
+            let (ew, eb) = if t == 0 {
+                (self.w(&format!("u{i}.exp.w")), self.w(&format!("u{i}.exp.b")))
+            } else {
+                (self.tw(&format!("u{i}.exp1.w")), self.tw(&format!("u{i}.exp1.b")))
+            };
+            let e = alloc(4 * c, hh, ww)?;
+            k!(gpu_gemm(x.ptr(), c as i64, ew, c as i64, e.ptr(), (4 * c) as i64, eb, p as i64, (4 * c) as i64, c as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0,
+                s(st)))?;
+            let shuffled = alloc(c, 2 * hh, 2 * ww)?;
+            k!(gpu_pixel_shuffle2_bf16(e.ptr(), shuffled.ptr(), hh as i32, ww as i32, c as i32, s(st)))?;
+            drop(e);
+            let y = self.causal(clip, &format!("u{i}.up"), Rc::new(shuffled), 2 * hh, 2 * ww, c, c, false, st)?.context("causal conv")?;
+            self.decode_level(clip, i + 1, y, 2 * hh, 2 * ww, sp, st, out)?;
+        }
+        Ok(())
+    }
+
+    /// The sampler's latent f32 [16][frames][lh][lw] -> the decoder's frames, f32 [8lh][8lw][3] each before
+    /// `process_output`.
+    fn decode_frames(&self, latent: &[f32], frames: usize, lh: usize, lw: usize, st: &Stream) -> Result<Vec<Vec<f32>>> {
+        let mut clip = Clip::default();
+        let stats = DevBuf::alloc_async(GROUPS * 8, st)?;
+        let p = lh * lw;
+        let mut out = Vec::new();
+        for f in 0..frames {
+            let mut sub = Vec::with_capacity(Z * p);
+            for c in 0..Z {
+                sub.extend_from_slice(&latent[(c * frames + f) * p..][..p]);
+            }
+            let d = DevBuf::alloc_async(sub.len() * 4, st)?;
+            d.upload(0, &f32_bytes(&sub), st)?;
+            let z = DevBuf::alloc_async(p * Z * 2, st)?;
+            k!(gpu_vae_latent_in(d.ptr(), self.w("lat.mean"), self.w("lat.std"), z.ptr(), Z as i32, p as i32, s(st)))?;
+            let x = self.causal(&mut clip, "d.in", Rc::new(z), lh, lw, Z, self.d_in, false, st)?.context("causal conv")?;
+            let x = self.mid3(&mut clip, "d", x, lh, lw, self.d_in, stats.ptr(), st)?;
+            self.decode_level(&mut clip, 0, x, lh, lw, stats.ptr(), st, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Bytes of the frames the causal convs keep over a clip of `h` x `w` pixels: two input frames each.
+    fn cache_bytes(&self, h: usize, w: usize, decode: bool) -> usize {
+        let res = |cin: usize, cout: usize, n: usize| (cin + cout + 2 * (n - 1) * cout) as f64;
+        // channels at each level, weighted by its share of the picture's pixels
+        let mut ch = 0f64;
+        if decode {
+            let mut area = 1.0 / 64.0;
+            ch += (Z + 4 * self.d_in) as f64 * area;
+            for (i, &(cout, cin, n)) in self.up.iter().enumerate() {
+                ch += res(cin, cout, n) * area;
+                if i + 1 < LEVELS {
+                    area *= 4.0;
+                    ch += cout as f64 * area;
+                }
+            }
+            ch += self.up[LEVELS - 1].0 as f64 * area;
+        } else {
+            let mut area = 1.0;
+            ch += RGB_PAD as f64;
+            for (i, &(cout, cin, n)) in self.down.iter().enumerate() {
+                ch += res(cin, cout, n) * area;
+                if i + 1 < LEVELS {
+                    if self.down_t[i] {
+                        ch += cout as f64 * area;
+                    }
+                    area /= 4.0;
+                }
+            }
+            ch += 5.0 * self.down[LEVELS - 1].0 as f64 * area;
+        }
+        (ch * (h * w) as f64 * 2.0 * 2.0) as usize
+    }
+
+    /// Peak device memory of a clip of `h` x `w` pixel frames through the encoder or the decoder, besides the temporal
+    /// kernels ([`Vae::temporal_bytes`]).
+    pub fn clip_bytes(&self, h: usize, w: usize, decode: bool) -> usize {
+        Self::activation_bytes(h, w) + self.cache_bytes(h, w, decode) + 2 * STACK_ELEMENTS * 2
+    }
+
+    /// Bytes the temporal kernels take when a clip first loads them (about three times the summed ones).
+    pub fn temporal_bytes(&self) -> usize {
+        if self.temporal.is_some() { 0 } else { self.lay.size * 3 }
+    }
+
+    /// RGB f32 [frames][h][w][3] in 0..1 (sides multiples of 8) -> the sampler's latent f32 [16][latent frames][h/8][w/8]
+    /// and its latent frames, as ComfyUI's `VAEEncode` of a clip. With `tile`, in square tiles of that many pixels
+    /// overlapping by the second (multiples of 8), as [`Vae::encode_tiled`].
+    pub fn encode_clip(&mut self, rgb: &[f32], frames: usize, h: usize, w: usize, tile: Option<(usize, usize)>, st: &Stream)
+        -> Result<(Vec<f32>, usize)> {
+        if h % 8 != 0 || w % 8 != 0 || h == 0 || w == 0 || frames == 0 || rgb.len() != frames * h * w * 3 {
+            bail!("can't encode {frames} frames of {w}x{h} from {} values", rgb.len());
+        }
+        self.ensure_temporal(st)?;
+        let (tile, ov) = match tile {
+            Some((t, o)) if t % 8 == 0 && o % 8 == 0 && t > 0 => (t, o.min(t - 8)),
+            Some((t, o)) => bail!("can't encode in tiles of {t} overlapping by {o}"),
+            None => (h.max(w), 0),
+        };
+        let (lh, lw) = (h / 8, w / 8);
+        let mut blends: Vec<Blend> = Vec::new();
+        for (y0, y1, x0, x1) in tile_ranges(h, w, tile, ov) {
+            let tw = x1 - x0;
+            let mut sub = Vec::with_capacity(frames * (y1 - y0) * tw * 3);
+            for f in 0..frames {
+                for y in y0..y1 {
+                    sub.extend_from_slice(&rgb[((f * h + y) * w + x0) * 3..][..tw * 3]);
+                }
+            }
+            let lat = self.encode_frames(&sub, frames, y1 - y0, tw, st)?;
+            if blends.is_empty() {
+                blends = (0..lat.len()).map(|_| Blend::new(lh, lw)).collect();
+            }
+            for (b, rows) in blends.iter_mut().zip(&lat) {
+                b.add(rows, Z, (y0 / 8, y1 / 8, x0 / 8, x1 / 8), (y0 > 0, y1 < h, x0 > 0, x1 < w), ov / 8);
+            }
+        }
+        let (lt, p) = (blends.len(), lh * lw);
+        let mut out = vec![0f32; Z * lt * p];
+        for (f, b) in blends.into_iter().enumerate() {
+            let px = b.finish();
+            for i in 0..p {
+                for c in 0..Z {
+                    out[(c * lt + f) * p + i] = px[i * Z + c];
+                }
+            }
+        }
+        Ok((out, lt))
+    }
+
+    /// The sampler's latent f32 [16][frames][lh][lw] -> RGB f32 [out frames][8lh][8lw][3] in 0..1 and its frames
+    /// (4 (frames - 1) + 1). With `tile`, in square tiles of that many latent pixels as [`Vae::decode_tiled`].
+    pub fn decode_clip(&mut self, latent: &[f32], frames: usize, lh: usize, lw: usize, tile: Option<usize>, st: &Stream)
+        -> Result<(Vec<f32>, usize)> {
+        if latent.len() != Z * frames * lh * lw || frames == 0 {
+            bail!("latent has {} values, expected {}", latent.len(), Z * frames * lh * lw);
+        }
+        self.ensure_temporal(st)?;
+        let (tile, ov) = match tile {
+            Some(t) => (t.max(2), (t.max(2) / 4).min(t.max(2) - 1)),
+            None => (lh.max(lw), 0),
+        };
+        let mut blends: Vec<Blend> = Vec::new();
+        for (y0, y1, x0, x1) in tile_ranges(lh, lw, tile, ov) {
+            let (th, tw) = (y1 - y0, x1 - x0);
+            let mut sub = Vec::with_capacity(Z * frames * th * tw);
+            for cf in 0..Z * frames {
+                for y in y0..y1 {
+                    sub.extend_from_slice(&latent[(cf * lh + y) * lw + x0..][..tw]);
+                }
+            }
+            let px = self.decode_frames(&sub, frames, th, tw, st)?;
+            if blends.is_empty() {
+                blends = (0..px.len()).map(|_| Blend::new(lh * 8, lw * 8)).collect();
+            }
+            for (b, f) in blends.iter_mut().zip(&px) {
+                b.add(f, 3, (y0 * 8, y1 * 8, x0 * 8, x1 * 8), (y0 > 0, y1 < lh, x0 > 0, x1 < lw), ov * 8);
+            }
+        }
+        let n = blends.len();
+        Ok((blends.into_iter().flat_map(|b| b.finish()).map(to_unit).collect(), n))
     }
 }
 

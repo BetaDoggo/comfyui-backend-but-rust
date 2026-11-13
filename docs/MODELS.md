@@ -660,7 +660,8 @@ multiples of 16), `VAEEncode` with SeedVR2's VAE, `SeedVR2Conditioning`, one `eu
 `SeedVR2PostProcessing` (colour matched to the picture, CIELAB by default). The DiT is [`src/seedvr.rs`](../src/seedvr.rs):
 32 MM-DiT blocks with a fixed text prompt stored in the checkpoint, attending in windows of about 400 tokens that
 alternate with half-shifted ones. On one frame the causal video VAE is a 2D VAE with each conv's temporal taps summed
-([`src/seedvr_vae.rs`](../src/seedvr_vae.rs)). The pre- and post-processing nodes run in the server. SeedVR2 is held
+([`src/seedvr_vae.rs`](../src/seedvr_vae.rs)); a clip runs through it a frame at a time, see [Clips](#clips). The pre-
+and post-processing nodes run in the server. SeedVR2 is held
 beside the loaded family, so the model that made the picture stays loaded (its weights only move to RAM for room).
 
 Files: `diffusion_models/SeedVR2/seedvr2_3b_int8_convrot.safetensors` and `VAE/SeedVR2/seedvr2_ema_vae_fp16.safetensors`
@@ -708,14 +709,48 @@ restore, untiled, took 3.0 s. ComfyUI wasn't timed at these sizes. Above 2900 sq
 
 The maintainer has run it through SwarmUI, up to 3328x4864.
 
+### Clips
+
+A batch of frames is one clip, as in ComfyUI: `SeedVR2Preprocess` pads it to 4n + 1 frames, the VAE makes n + 1 latent
+frames (`[1, 16, n + 1, H/8, W/8]`), the DiT samples them together with windows over time as well as space, and the
+decoder makes the 4n + 1 frames back. `SeedVR2PostProcessing` drops the padding frames. The VAE runs a frame at a time:
+each causal conv keeps its last two input frames and sees them in front of the new one, which gives the same sums as
+ComfyUI's pass over the whole clip. Those kept frames cost about 8 KB per output pixel in the decoder and 4 KB in the
+encoder, so a clip tiles at a smaller size than a picture; tiles are square, the largest that fit.
+
+Against ComfyUI on its own inputs (`tools/seedvr_ref.py --frames N`, then `--seedvr-check`), a scenery pan, warm:
+
+| Clip | VAE encode | DiT (one evaluation) | VAE decode | ComfyUI sampling | Decoded frames from ComfyUI's |
+|---|---|---|---|---|---|
+| 9 frames, 384x256 | 186 ms | 47 ms | 452 ms | not warm | 48.3 to 53.1 dB |
+| 17 frames, 768x432 | 1227 ms | 252 ms | 2850 ms | 372 ms | 50.8 to 52.1 dB |
+
+At 17 frames the VAE latent is at cosine 0.99996 and ComfyUI's latent through this decoder 60.5 dB from ComfyUI's
+decode; the denoised latent is at cosine 0.9994, and flash attention lands as far from ComfyUI as int8. ComfyUI's decode
+of the 17 frames took 18.8 s in the script's single run, which wasn't a warm comparison. The 9-frame clip through
+`comfy-server` over HTTP with SwarmUI's node chain (frames joined by `ImageBatch`, CIELAB colour correction) came out
+45.7 to 49.7 dB from ComfyUI's final frames. Tiled clip decodes of ComfyUI's latent: 50.97 dB from its untiled decode in
+256 pixel tiles, 38.7 dB in 128 pixel ones. Clips weren't run through SwarmUI itself, nor longer than 17 frames or larger
+than 768x432.
+
+SeedVR Split Latent samples a clip in chunks of latent frames, as ComfyUI's `SeedVR2TemporalChunk` and
+`SeedVR2TemporalMerge` do: the chunks overlap by Temporal Video Overlap, each is conditioned and sampled with the same
+seed, and the overlaps are crossfaded back with a Hann window over their middle third. The server runs the conditioning
+and sampler once per chunk, as ComfyUI does for list outputs. SwarmUI always sends `auto`, which ComfyUI sizes with a
+law fitted to its own memory use (8.5 GB held back, so on 12 GB it picks one latent frame a chunk); here `auto` takes the
+most latent frames one evaluation fits by this engine's estimate, so the chunks, and the frames, can differ from
+ComfyUI's on the same card. `manual` chunks are ComfyUI's. The 17-frame clip at 768x432 in `manual` chunks of 13 frames
+overlapping by 3 latent frames (two chunks of 4) came out 46.1 to 49.8 dB from ComfyUI's chunked run through
+`comfy-server` over HTTP. `auto` was only run where the whole clip fits, which it then samples in one chunk; the estimate
+wasn't tested at the edge of VRAM.
+
 ### What SeedVR2 is missing here
 
 Each of these is refused with an error SwarmUI shows, unless marked untested:
 
 | SwarmUI setting | Through ComfyUI | Here |
 |---|---|---|
-| Batch Size above 1, video input (Video SeedVR) | restored as one clip of 4n + 1 frames | **Refused**: the temporal VAE and the DiT's frame windows aren't implemented. Use Batch Size 1 |
-| SeedVR Split Latent, Temporal Video Overlap | `SeedVR2TemporalChunk` / `SeedVR2TemporalMerge` | **Refused** (not registered); they only matter for video |
+| Variation Seed, or a noise mask, on a clip | apply | **Refused** on clips; pictures take them as before |
 | SeedVR Model: 7B, 7B sharp, the 3B's fp16, fp8, mxfp8 and nvfp4 files | all run | **Refused**: only the 3B int8 ConvRot file runs |
 | SeedVR Upscale Method `model-*` (ESRGAN and the like) | `ImageUpscaleWithModel` | **Refused**: the engine runs no upscale models yet, for any family |
 | SeedVR Upscale Method `pidmodel-*` | a pixel decoder | **Refused** |

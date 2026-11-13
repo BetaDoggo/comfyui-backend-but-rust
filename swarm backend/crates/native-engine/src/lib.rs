@@ -85,8 +85,8 @@ impl Family {
     }
 }
 
-/// Why a SeedVR2 batch is refused.
-const SEEDVR_BATCH: &str = "SeedVR2 on more than one picture: ComfyUI restores a batch (or a video) as one clip, which this backend doesn't do yet; use Batch Size 1";
+/// Why a SeedVR2 latent batch is refused.
+const SEEDVR_BATCH: &str = "SeedVR2 on a batch of more than one clip latent (a batch of pictures is one clip after SeedVR2Preprocess)";
 
 /// The VRAM ComfyUI keeps free without `--reserve-vram`.
 pub const COMFY_HEADROOM_MB: usize = diffusion::comfy_memory::DEFAULT_HEADROOM_MB;
@@ -821,8 +821,8 @@ impl NativeEngine {
         Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads })
     }
 
-    /// SeedVR2's restore of the picture `SeedVR2Conditioning` carries. ComfyUI restores a batch as one video, which
-    /// this backend doesn't run, so one picture at a time.
+    /// SeedVR2's restore of the picture or clip `SeedVR2Conditioning` carries: a clip (`[1, 16, T, H/8, W/8]`) is one
+    /// sample over all its frames, as in ComfyUI.
     fn sample_seedvr(&self, req: &SampleRequest, settings: &ModelSettings, progress: &mut dyn ProgressSink) -> EngineResult<Latent> {
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         if !settings.loras.is_empty() {
@@ -831,8 +831,10 @@ impl NativeEngine {
         let LatentSamples::Single(tensor) = &req.latent.samples else {
             return Err(unsupported("SeedVR2 on an audio/video latent"));
         };
-        let &[batch, 16, lh, lw] = tensor.shape.as_slice() else {
-            return Err(unsupported(format!("SeedVR2 on a latent of shape {:?}", tensor.shape)));
+        let (batch, frames, lh, lw) = match *tensor.shape.as_slice() {
+            [b, 16, lh, lw] => (b, 1, lh, lw),
+            [b, 16, t, lh, lw] if t > 0 => (b, t, lh, lw),
+            _ => return Err(unsupported(format!("SeedVR2 on a latent of shape {:?}", tensor.shape))),
         };
         if batch != 1 {
             return Err(unsupported(SEEDVR_BATCH));
@@ -840,56 +842,73 @@ impl NativeEngine {
         if tensor.format != LatentFormat::SeedVr2 {
             return Err(unsupported("SeedVR2 on a latent its VAE didn't encode"));
         }
-        let condition = seedvr_condition(&req.positive, (lh, lw))?.to_vec();
+        if frames > 1 && req.latent.noise_mask.is_some() {
+            return Err(unsupported("a noise mask on a SeedVR2 clip"));
+        }
+        if frames > 1 && req.variation.is_some() {
+            return Err(unsupported("Variation Seed on a SeedVR2 clip"));
+        }
+        let condition = seedvr_condition(&req.positive, &tensor.shape)?.to_vec();
         let finish = |data| {
             let t = LatentTensor { format: LatentFormat::SeedVr2, shape: tensor.shape.clone(), data: Opaque::new(HostLatent { data }) };
             Ok(req.latent.with_samples(LatentSamples::Single(t)))
         };
+        // [16, frames, lh, lw] in the order of a [16, frames * lh, lw] picture, which is how the sampler sees it
+        let flat = LatentTensor { format: tensor.format, shape: vec![1, 16, frames * lh, lw], data: tensor.data.clone() };
         let Some(sigmas) = schedule(req, settings, (lh, lw))? else {
-            let plan = Plan::new(Vec::new(), &req.latent, tensor, settings)?;
-            return finish(plan.latent.unwrap_or_else(|| vec![0.0; 16 * lh * lw]));
+            let plan = Plan::new(Vec::new(), &req.latent, &flat, settings)?;
+            return finish(plan.latent.unwrap_or_else(|| vec![0.0; 16 * frames * lh * lw]));
         };
-        let plan = Plan::new(sigmas, &req.latent, tensor, settings)?;
+        let plan = Plan::new(sigmas, &req.latent, &flat, settings)?;
         let sampling = sampling(req, settings, &plan, 1)?;
-        if sampling.uses_negative() && seedvr_condition(&req.negative, (lh, lw))? != condition.as_slice() {
+        if sampling.uses_negative() && seedvr_condition(&req.negative, &tensor.shape)? != condition.as_slice() {
             return Err(unsupported("different pictures on SeedVR2's positive and negative conditioning"));
         }
-        let r = SeedVrRequest { width: lw * 8, height: lh * 8, noise: plan.noise(req, 1, (16, lh, lw)), sampling, condition };
+        let noise = plan.noise(req, 1, (16, frames * lh, lw));
+        let r = SeedVrRequest { width: lw * 8, height: lh * 8, frames, noise, sampling, condition };
         let mut gen = self.gen();
         gen.ensure_seedvr(&file.path).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
         // SeedVR2's latents have no preview colours in ComfyUI
         let (latent, stats) = gen.sample_seedvr(&r, |step| report(PreviewMode::None, progress, 1, step, |_| (Vec::new(), 0, 0))).map_err(internal)?;
-        tracing::info!("seedvr2: {}x{}: sampling {:.0} ms", r.width, r.height, stats.sample_ms);
+        tracing::info!("seedvr2: {} latent frames of {}x{}: sampling {:.0} ms", r.frames, r.width, r.height, stats.sample_ms);
         finish(latent)
     }
 
+    /// SeedVR2's VAE on a picture, or on a batch of frames as one clip (`[1, 16, T, H/8, W/8]`), as ComfyUI's.
     fn encode_seedvr(&self, file: &ModelFile, pixels: &ImageBatch) -> EngineResult<Latent> {
-        if pixels.count != 1 {
-            return Err(unsupported(SEEDVR_BATCH));
-        }
         let (w, h) = (pixels.width as usize, pixels.height as usize);
         if w % 16 != 0 || h % 16 != 0 {
             return Err(unsupported(format!("SeedVR2 VAE encode of a {w}x{h} picture (SeedVR2Preprocess pads to multiples of 16)")));
         }
+        let frames = pixels.count as usize;
         let mut gen = self.gen();
         gen.ensure_seedvr_vae(&file.path).map_err(internal)?;
-        let data = gen.encode_seedvr(&rgb_f32(pixels), w, h).map_err(internal)?;
-        let tensor = LatentTensor { format: LatentFormat::SeedVr2, shape: vec![1, 16, h / 8, w / 8], data: Opaque::new(HostLatent { data }) };
-        Ok(Latent::single(tensor, PixelInfo::image(w as u32, h as u32, 1)))
+        let c = pixels.channels as usize;
+        let rgb: Vec<f32> = (0..pixels.count)
+            .flat_map(|f| pixels.frame_f32(f).chunks_exact(c).flat_map(|px| [px[0], px[1.min(c - 1)], px[2.min(c - 1)]]).collect::<Vec<_>>())
+            .collect();
+        let (data, lt) = gen.encode_seedvr(&rgb, frames, w, h).map_err(internal)?;
+        let shape = if frames == 1 { vec![1, 16, h / 8, w / 8] } else { vec![1, 16, lt, h / 8, w / 8] };
+        let tensor = LatentTensor { format: LatentFormat::SeedVr2, shape, data: Opaque::new(HostLatent { data }) };
+        let mut info = PixelInfo::image(w as u32, h as u32, 1);
+        info.frames = pixels.count;
+        Ok(Latent::single(tensor, info))
     }
 
     fn decode_seedvr(&self, vae: &VaeHandle, t: &LatentTensor, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
-        let &[1, 16, lh, lw] = t.shape.as_slice() else {
-            return Err(unsupported(format!("SeedVR2 decode of a latent of shape {:?}", t.shape)));
+        let (frames, lh, lw) = match *t.shape.as_slice() {
+            [1, 16, lh, lw] => (1, lh, lw),
+            [1, 16, f, lh, lw] if f > 0 => (f, lh, lw),
+            _ => return Err(unsupported(format!("SeedVR2 decode of a latent of shape {:?}", t.shape))),
         };
         let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("decoding a latent this engine didn't sample"))?;
         let file = vae.source.as_ref().ok_or_else(|| unsupported("the pixel-space VAE"))?;
         let mut gen = self.gen();
         gen.ensure_seedvr_vae(&file.path).map_err(internal)?;
-        let rgb = gen.decode_seedvr(&latent.data, lw * 8, lh * 8).map_err(internal)?;
+        let (rgb, n) = gen.decode_seedvr(&latent.data, frames, lw * 8, lh * 8).map_err(internal)?;
         progress.progress(1, 1);
-        Ok(ImageBatch::from_f32(1, (lh * 8) as u32, (lw * 8) as u32, 3, rgb))
+        Ok(ImageBatch::from_f32(n as u32, (lh * 8) as u32, (lw * 8) as u32, 3, rgb))
     }
 
     /// SwarmUI always asks for previews, so the server's option decides.
@@ -1413,8 +1432,8 @@ fn is_seedvr2_vae(file: &ModelFile) -> bool {
     read_header(&file.path).is_ok_and(|h| diffusion::seedvr::is_seedvr2_vae(|k| h.get(k).is_some()))
 }
 
-/// The `SeedVR2Conditioning` an entry list carries: its picture's latent, one image of [16, lh, lw].
-fn seedvr_condition(c: &Conditioning, (lh, lw): (usize, usize)) -> EngineResult<&[f32]> {
+/// The `SeedVR2Conditioning` an entry list carries: its picture's or clip's latent, of the sampled latent's `shape`.
+fn seedvr_condition<'a>(c: &'a Conditioning, shape: &[usize]) -> EngineResult<&'a [f32]> {
     let [entry] = c.entries.as_slice() else {
         return Err(unsupported("SeedVR2 with other conditioning than one SeedVR2Conditioning"));
     };
@@ -1429,8 +1448,8 @@ fn seedvr_condition(c: &Conditioning, (lh, lw): (usize, usize)) -> EngineResult<
     let LatentSamples::Single(t) = &cond.latent.samples else {
         return Err(unsupported("SeedVR2Conditioning of an audio/video latent"));
     };
-    if t.shape != [1, 16, lh, lw] {
-        return Err(unsupported(format!("a SeedVR2 condition of shape {:?} for a latent of {lw}x{lh}", t.shape)));
+    if t.shape != shape {
+        return Err(unsupported(format!("a SeedVR2 condition of shape {:?} for a latent of shape {shape:?}", t.shape)));
     }
     let h = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("a SeedVR2 condition this engine didn't encode"))?;
     Ok(&h.data)
@@ -1734,6 +1753,20 @@ impl Engine for NativeEngine {
 
     fn latent_op(&self, op: &LatentOp) -> EngineResult<Latent> {
         latent::latent_op(op)
+    }
+
+    /// SeedVR2 clips: the most latent frames one evaluation fits, from this engine's own estimate.
+    fn sample_frames_that_fit(&self, latent: &Latent) -> EngineResult<Option<usize>> {
+        let LatentSamples::Single(t) = &latent.samples else { return Ok(None) };
+        if t.format != LatentFormat::SeedVr2 {
+            return Ok(None);
+        }
+        let (frames, lh, lw) = match *t.shape.as_slice() {
+            [_, _, f, lh, lw] => (f, lh, lw),
+            [_, _, lh, lw] => (1, lh, lw),
+            _ => return Ok(None),
+        };
+        Ok(Some(self.gen().seedvr_frames_that_fit(lw * 8, lh * 8, frames).map_err(internal)?))
     }
 
     fn vae_decode_audio(&self, req: &VaeDecodeAudioRequest) -> EngineResult<AudioData> {

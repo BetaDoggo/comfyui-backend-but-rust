@@ -87,6 +87,11 @@ pub enum LatentOp {
     /// of the first `start_frame_count` latent frames against the next
     /// `min(reference_frame_count, frames - 1)`. No-op for single-frame latents.
     NormalizeStart { latent: Latent, start_frame_count: u32, reference_frame_count: u32 },
+    /// `SeedVR2TemporalChunk`: latent frames `start..end` of a video latent `[B, C, T, H, W]`, kept 5D.
+    SliceFrames { latent: Latent, start: u32, end: u32 },
+    /// `SeedVR2TemporalMerge`: video latent chunks in order, each starting `overlap` frames before the previous one
+    /// ends (only the last may be shorter), the overlaps crossfaded with a Hann window over their middle third.
+    MergeChunks { chunks: Vec<Latent>, overlap: u32 },
 }
 
 /// Segmentation models that turn an image into a mask (SwarmUI's `<segment:...>` and `<clear:...>`).

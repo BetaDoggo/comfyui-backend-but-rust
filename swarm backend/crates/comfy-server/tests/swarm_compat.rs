@@ -62,6 +62,8 @@ const MODEL_FILES: &[&str] = &[
     "diffusion_models/idol_fp16.safetensors",
     "clip_vision/dino_v3_vit_h_bf16.safetensors",
     "VAE/idol_decoder_fp16.safetensors",
+    "diffusion_models/SeedVR2/seedvr2_3b_int8_convrot.safetensors",
+    "VAE/SeedVR2/seedvr2_ema_vae_fp16.safetensors",
 ];
 
 struct TestServer {
@@ -489,6 +491,8 @@ struct Recorded {
     custom_nodes: Vec<(String, Vec<(String, String)>)>,
     /// Every `latent_op` (variant name) and `unsample` call, in order.
     latent_ops: Vec<String>,
+    /// The latent shape of every `sample`, in order.
+    sample_shapes: Vec<Vec<usize>>,
 }
 
 struct RecordingEngine {
@@ -531,6 +535,9 @@ impl Engine for RecordingEngine {
         self.inner.empty_latent(r)
     }
     fn sample(&self, r: &SampleRequest, progress: &mut dyn ProgressSink) -> EngineResult<Latent> {
+        if let LatentSamples::Single(t) = &r.latent.samples {
+            self.seen.lock().unwrap().sample_shapes.push(t.shape.clone());
+        }
         self.seen.lock().unwrap().sample_masks.push((r.latent.noise_mask.clone(), r.latent.audio_noise_mask.clone()));
         self.seen.lock().unwrap().positive = r.positive.entries.iter().map(|e| e.meta.clone()).collect();
         self.seen.lock().unwrap().negative = r.negative.entries.iter().map(|e| e.meta.clone()).collect();
@@ -1406,6 +1413,64 @@ async fn upload_load_save_view_roundtrip() {
     assert_eq!(png_dims(&bytes), (60, 40));
     let traversal = s.http.get(s.url("view?filename=../../Cargo.toml&type=output")).send().await.unwrap();
     assert_ne!(traversal.status(), 200);
+}
+
+/// SwarmUI's SeedVR stage on a 9-frame clip with SeedVR Split Latent: `SeedVR2TemporalChunk` makes a list, the
+/// conditioning and the sampler run once per chunk, and `SeedVR2TemporalMerge` takes the whole list back.
+fn seedvr_split_workflow(chunking_mode: Value) -> Value {
+    let img = ImageBatch::from_u8(1, 64, 96, 3, (0..64 * 96 * 3).map(|i| (i % 233) as u8).collect());
+    let b64 = base64::engine::general_purpose::STANDARD.encode(encode::png8(&img, 0).unwrap());
+    let mut wf = json!({
+        "1": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": b64 } },
+        "20": { "class_type": "SeedVR2Preprocess", "inputs": { "resized_images": ["17", 0] } },
+        "21": { "class_type": "UNETLoader", "inputs": { "unet_name": "SeedVR2/seedvr2_3b_int8_convrot.safetensors", "weight_dtype": "default" } },
+        "22": { "class_type": "VAELoader", "inputs": { "vae_name": "SeedVR2/seedvr2_ema_vae_fp16.safetensors" } },
+        "23": { "class_type": "VAEEncode", "inputs": { "pixels": ["20", 0], "vae": ["22", 0] } },
+        "24": { "class_type": "SeedVR2TemporalChunk", "inputs": { "latent": ["23", 0], "temporal_overlap": 1, "chunking_mode": chunking_mode } },
+        "25": { "class_type": "SeedVR2Conditioning", "inputs": { "model": ["21", 0], "vae_conditioning": ["24", 0] } },
+        "26": { "class_type": "SwarmKSampler", "inputs": { "model": ["21", 0], "noise_seed": 51, "steps": 1, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple",
+            "positive": ["25", 0], "negative": ["25", 1], "latent_image": ["24", 0], "start_at_step": 0, "end_at_step": 10000, "return_with_leftover_noise": "disable",
+            "add_noise": "enable", "control_after_generate": "fixed", "var_seed": 0, "var_seed_strength": 0.0, "sigma_min": -1.0, "sigma_max": -1.0, "rho": 7.0,
+            "previews": "none", "tile_sample": false, "tile_size": 1024, "model_negative": null } },
+        "27": { "class_type": "SeedVR2TemporalMerge", "inputs": { "latents": ["26", 0], "temporal_overlap": ["24", 1] } },
+        "28": { "class_type": "VAEDecode", "inputs": { "samples": ["27", 0], "vae": ["22", 0] } },
+        "29": { "class_type": "SeedVR2PostProcessing", "inputs": { "images": ["28", 0], "original_resized_images": ["17", 0], "color_correction_method": "none" } },
+        "30": { "class_type": "SaveImage", "inputs": { "images": ["29", 0], "filename_prefix": "tests/seedvr_split" } }
+    });
+    // nine frames joined into one batch, as a video's frames reach the stage
+    let mut prev = json!(["1", 0]);
+    for i in 0..8 {
+        let id = format!("{}", 10 + i);
+        wf[&id] = json!({ "class_type": "ImageBatch", "inputs": { "image1": prev, "image2": ["1", 0] } });
+        prev = json!([id, 0]);
+    }
+    wf
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn seedvr_split_latent_samples_each_chunk_and_merges() {
+    let engine = RecordingEngine::new();
+    let s = TestServer::start_engine(engine.clone(), 0, false).await;
+    // 3 latent frames in chunks of 2 (5 pixel frames) overlapping by 1: (0, 2) and (1, 3)
+    let mut wf = seedvr_split_workflow(json!("manual"));
+    wf["24"]["inputs"]["chunking_mode.frames_per_chunk"] = json!(5);
+    let r = run_like_swarm(&s, wf, |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    {
+        let seen = engine.seen.lock().unwrap();
+        assert_eq!(seen.sample_shapes, [vec![1, 16, 2, 8, 12], vec![1, 16, 2, 8, 12]]);
+        assert_eq!(seen.latent_ops, ["SliceFrames", "SliceFrames", "MergeChunks"]);
+    }
+    assert_eq!(r.history_entry()["outputs"]["30"]["images"].as_array().unwrap().len(), 9, "{:#}", r.history);
+
+    // auto, with an engine that knows no limit: one chunk, sampled whole
+    engine.seen.lock().unwrap().sample_shapes.clear();
+    engine.seen.lock().unwrap().latent_ops.clear();
+    let r = run_like_swarm(&s, seedvr_split_workflow(json!("auto")), |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    let seen = engine.seen.lock().unwrap();
+    assert_eq!(seen.sample_shapes, [vec![1, 16, 3, 8, 12]]);
+    assert_eq!(seen.latent_ops, ["MergeChunks"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

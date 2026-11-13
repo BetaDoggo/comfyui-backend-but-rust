@@ -66,7 +66,7 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
             let (target, subfolder, stem, counter) = output_slot(&ctx.env.output_dir, i.string("filename_prefix")?)?;
             let filename = format!("{stem}_{counter:05}_.glb");
             std::fs::write(target.join(&filename), glb).map_err(anyhow::Error::from)?;
-            Ok(NodeOutput { values: Vec::new(), ui: Some(json!({ "3d": [{ "filename": filename, "subfolder": subfolder, "type": "output" }] })) })
+            Ok(NodeOutput { lists: Default::default(), values: Vec::new(), ui: Some(json!({ "3d": [{ "filename": filename, "subfolder": subfolder, "type": "output" }] })) })
         },
     );
     r.add(
@@ -110,7 +110,7 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
             let (target, subfolder, stem, counter) = output_slot(&ctx.env.output_dir, i.string("filename_prefix")?)?;
             let filename = format!("{stem}_{counter:05}_.ply");
             std::fs::write(target.join(&filename), ply).map_err(anyhow::Error::from)?;
-            Ok(NodeOutput { values: Vec::new(), ui: Some(json!({ "3d": [{ "filename": filename, "subfolder": subfolder, "type": "output" }] })) })
+            Ok(NodeOutput { lists: Default::default(), values: Vec::new(), ui: Some(json!({ "3d": [{ "filename": filename, "subfolder": subfolder, "type": "output" }] })) })
         },
     );
 }

@@ -87,6 +87,76 @@ fn mask_frames(mask: &Mask, frames: impl Iterator<Item = usize>) -> Mask {
     Mask { count: (data.len() / plane.max(1)) as u32, height: mask.height, width: mask.width, data: Arc::new(data) }
 }
 
+/// A SeedVR2 latent's values and shape `[B, C, T, H, W]` (a 4D one is one frame). Its engine and ComfyUI scales agree.
+fn video(l: &Latent) -> EngineResult<(&[f32], [usize; 5])> {
+    let LatentSamples::Single(t) = &l.samples else {
+        return Err(unsupported("frame operations on audio/video latents"));
+    };
+    if t.format != LatentFormat::SeedVr2 {
+        return Err(unsupported(format!("frame operations on {:?} latents", t.format)));
+    }
+    let shape = match *t.shape.as_slice() {
+        [b, c, f, h, w] => [b, c, f, h, w],
+        [b, c, h, w] => [b, c, 1, h, w],
+        _ => return Err(unsupported(format!("frame operations on latents of shape {:?}", t.shape))),
+    };
+    let h = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("a latent this engine didn't make"))?;
+    if h.data.len() != shape.iter().product::<usize>() {
+        return Err(EngineError::InvalidInput(format!("a latent of {} values for shape {:?}", h.data.len(), t.shape)));
+    }
+    Ok((&h.data, shape))
+}
+
+/// `base` with a 5D SeedVR2 latent of `shape`, its pixel frames 4 (T - 1) + 1.
+fn video_output(base: &Latent, data: Vec<f32>, shape: [usize; 5]) -> Latent {
+    let t = LatentTensor { format: LatentFormat::SeedVr2, shape: shape.to_vec(), data: Opaque::new(HostLatent { data }) };
+    let mut out = base.with_samples(LatentSamples::Single(t));
+    out.empty = false;
+    out.pixel.frames = (4 * (shape[2] - 1) + 1) as u32;
+    out
+}
+
+/// `_seedvr2_chunk_crossfade_weights`: the previous chunk's weights over `n` overlapping frames, flat at 1 over the
+/// first third, a Hann fall over the middle one, flat at 0 over the last.
+pub fn crossfade_weights(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let t = if n > 1 { i as f32 / (n - 1) as f32 } else { 0.0 };
+            let r = ((t - 1.0 / 3.0) / (1.0 / 3.0)).clamp(0.0, 1.0);
+            0.5 + 0.5 * (std::f32::consts::PI * r).cos()
+        })
+        .collect()
+}
+
+/// `SeedVR2TemporalMerge` on chunks of `[planes][frames][hw]` values: each chunk starts `overlap` frames before the
+/// previous one's end and fades in over the frames already filled. The merged values and their frames.
+fn merge_chunks(chunks: &[(&[f32], usize)], planes: usize, hw: usize, overlap: usize) -> (Vec<f32>, usize) {
+    let chunk_t = chunks[0].1;
+    let step = chunk_t - overlap.min(chunk_t - 1);
+    let total = step * (chunks.len() - 1) + chunks.last().map_or(0, |c| c.1);
+    let mut out = vec![0f32; planes * total * hw];
+    let mut filled = 0usize;
+    for (i, &(x, t)) in chunks.iter().enumerate() {
+        let start = i * step;
+        let fade = filled.saturating_sub(start).min(t);
+        let wts = crossfade_weights(fade);
+        for p in 0..planes {
+            for f in 0..t {
+                let src = &x[(p * t + f) * hw..][..hw];
+                let dst = &mut out[(p * total + start + f) * hw..][..hw];
+                if f < fade {
+                    let wp = wts[f];
+                    dst.iter_mut().zip(src).for_each(|(d, s)| *d = *d * wp + *s * (1.0 - wp));
+                } else {
+                    dst.copy_from_slice(src);
+                }
+            }
+        }
+        filled = start + t;
+    }
+    (out, total)
+}
+
 fn checked(e: anyhow::Error) -> EngineError {
     unsupported(format!("{e:#}"))
 }
@@ -157,6 +227,38 @@ pub fn latent_op(op: &LatentOp) -> EngineResult<Latent> {
             out.pixel.height = (latent.pixel.height as usize * shape[2] / s[2]) as u32;
             Ok(out)
         }
+        LatentOp::SliceFrames { latent, start, end } => {
+            let (x, [b, c, t, h, w]) = video(latent)?;
+            let (start, end) = (*start as usize, (*end as usize).min(t));
+            if start >= end {
+                return Err(EngineError::InvalidInput(format!("latent frames {start}..{end} of {t}")));
+            }
+            let (hw, n) = (h * w, end - start);
+            let data: Vec<f32> = (0..b * c).flat_map(|bc| x[(bc * t + start) * hw..(bc * t + end) * hw].iter().copied()).collect();
+            Ok(video_output(latent, data, [b, c, n, h, w]))
+        }
+        LatentOp::MergeChunks { chunks, overlap } => {
+            let first = chunks.first().ok_or_else(|| EngineError::InvalidInput("no latents to merge".into()))?;
+            let parts = chunks.iter().map(video).collect::<EngineResult<Vec<_>>>()?;
+            let [b, c, chunk_t, h, w] = parts[0].1;
+            for (i, (_, s)) in parts.iter().enumerate().skip(1) {
+                if s[..2] != [b, c] || s[3..] != [h, w] {
+                    return Err(EngineError::InvalidInput(format!("chunk {i} of shape {s:?} doesn't match chunk 0's {:?} outside the frames", parts[0].1)));
+                }
+                if i + 1 < parts.len() && s[2] != chunk_t {
+                    return Err(EngineError::InvalidInput(format!("chunk {i} has {} latent frames but chunk 0 has {chunk_t}; only the last may be shorter", s[2])));
+                }
+            }
+            if parts.len() == 1 {
+                let mut out = first.clone();
+                out.noise_mask = None;
+                return Ok(out);
+            }
+            let (data, total) = merge_chunks(&parts.iter().map(|(x, s)| (*x, s[2])).collect::<Vec<_>>(), b * c, h * w, *overlap as usize);
+            let mut merged = video_output(first, data, [b, c, total, h, w]);
+            merged.noise_mask = None;
+            Ok(merged)
+        }
         other => {
             let name = format!("{other:?}");
             Err(unsupported(format!("latent operation {}", name.split([' ', '{', '(']).next().unwrap_or("?"))))
@@ -189,6 +291,34 @@ mod tests {
         l.samples = LatentSamples::Single(LatentTensor { format, shape: shape.to_vec(), data: Opaque::none() });
         l.empty = true;
         l
+    }
+
+    fn clip(data: Vec<f32>, shape: [usize; 5]) -> Latent {
+        let t = LatentTensor { format: LatentFormat::SeedVr2, shape: shape.to_vec(), data: Opaque::new(HostLatent { data }) };
+        Latent::single(t, PixelInfo::image(shape[4] as u32 * 8, shape[3] as u32 * 8, 1))
+    }
+
+    #[test]
+    fn seedvr2_chunks_slice_and_merge_like_comfy() {
+        // two planes of 5 frames of one value each: plane * 100 + frame
+        let x: Vec<f32> = (0..2).flat_map(|p| (0..5).map(move |f| (p * 100 + f) as f32)).collect();
+        let whole = clip(x.clone(), [1, 2, 5, 1, 1]);
+        let a = latent_op(&LatentOp::SliceFrames { latent: whole.clone(), start: 0, end: 4 }).unwrap();
+        let b = latent_op(&LatentOp::SliceFrames { latent: whole, start: 2, end: 5 }).unwrap();
+        assert_eq!(data(&b), [2.0, 3.0, 4.0, 102.0, 103.0, 104.0]);
+        assert_eq!(a.pixel.frames, 13);
+        // slices of one clip merge back to it whatever the fade
+        let m = latent_op(&LatentOp::MergeChunks { chunks: vec![a.clone(), b], overlap: 2 }).unwrap();
+        assert_eq!(data(&m), x);
+        // ComfyUI's weights: a linspace over the fade, ramped on its middle third
+        assert_eq!(crossfade_weights(1), [1.0]);
+        assert_eq!(crossfade_weights(2), [1.0, 0.0]);
+        let w = crossfade_weights(7);
+        assert!((w[0] - 1.0).abs() < 1e-6 && (w[2] - 1.0).abs() < 1e-6 && (w[3] - 0.5).abs() < 1e-6 && w[4].abs() < 1e-6, "{w:?}");
+        // a different chunk is blended in by those weights: two overlapping frames, [1, 0]
+        let b2 = clip(vec![9.0; 6], [1, 2, 3, 1, 1]);
+        let m = latent_op(&LatentOp::MergeChunks { chunks: vec![a, b2], overlap: 2 }).unwrap();
+        assert_eq!(data(&m), [0.0, 1.0, 2.0, 9.0, 9.0, 100.0, 101.0, 102.0, 9.0, 9.0]);
     }
 
     #[test]

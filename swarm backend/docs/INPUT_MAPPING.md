@@ -435,20 +435,22 @@ fetches it through `/view` and saves it in the SwarmUI user's output folder.
 
 ## 11. SeedVR2 (SeedVR Model)
 
-SwarmUI's SeedVR stage (and a SeedVR2 refiner model) restores the current picture. Its `CreateSeedVR2Restore` sends:
+SwarmUI's SeedVR stage (and a SeedVR2 refiner model) restores the current picture or video. Its `CreateSeedVR2Restore`
+sends:
 
 | Node | Inputs | Engine |
 |---|---|---|
 | `ImageScale` | only with SeedVR Upscale / Pre-Downscale, `pixel-*` methods | server |
 | `SeedVR2Preprocess` | `resized_images` | server: RGB, clamped, zero-padded right and bottom to multiples of 16; a batch is one clip padded to 4n + 1 frames |
 | `UNETLoader` / `CheckpointLoaderSimple`, `VAELoader` | the SeedVR model by folder; `SeedVR2/seedvr2_ema_vae_fp16.safetensors` | `ensure_seedvr`, `ensure_seedvr_vae` |
-| `VAEEncode` | the padded picture, SeedVR2's VAE | a `LatentFormat::SeedVr2` latent `[1, 16, H/8, W/8]` |
+| `VAEEncode` | the padded picture or clip, SeedVR2's VAE | a `LatentFormat::SeedVr2` latent `[1, 16, H/8, W/8]`, or `[1, 16, n + 1, H/8, W/8]` for a clip of 4n + 1 frames |
+| `SeedVR2TemporalChunk` | only with SeedVR Split Latent: `latent`, `temporal_overlap` (Temporal Video Overlap), `chunking_mode` `auto` | server: a list of latent chunks (`LatentOp::SliceFrames`), `auto` sized by `Engine::sample_frames_that_fit`; the nodes after it run once per chunk |
 | `SeedVR2Conditioning` | `model`, `vae_conditioning` | server: positive and negative entries with `CondMeta::seedvr2` (the latent, and which stored prompt) and no embedding |
 | `SwarmKSampler` | steps 1, CFG 1, `euler`, `simple` unless the SeedVR section sets them; seed = Seed + 9 | `Engine::sample`: the model's own stored prompts, the latent as `condition` |
-| `VAEDecode` | SeedVR2's VAE | f32 RGB |
+| `SeedVR2TemporalMerge` | only with SeedVR Split Latent: the sampled chunks, the chunk node's overlap | server: one latent, overlaps crossfaded (`LatentOp::MergeChunks`) |
+| `VAEDecode` | SeedVR2's VAE | f32 RGB, 4n + 1 frames for a clip |
 | `SeedVR2PostProcessing` | `images`, `original_resized_images`, `color_correction_method` (`lab` default, `wavelet`, `adain`, `none`) | server: cropped to the picture, colour matched, alpha put back, sides cut to even |
 
-The engine tiles SeedVR2's VAE by itself when a picture doesn't fit, as ComfyUI does. It refuses more than one picture
-(ComfyUI's `SeedVR2Preprocess` makes a batch one video), `VAEDecodeTiled` / `VAEEncodeTiled` (VAE Tile Size), LoRAs,
-and other formats of the model. SeedVR Split Latent's `SeedVR2TemporalChunk` and `SeedVR2TemporalMerge` aren't
-registered.
+A batch of pictures or a video's frames is one clip, as in ComfyUI. The engine tiles SeedVR2's VAE by itself when a
+picture or clip doesn't fit, as ComfyUI does. It refuses `VAEDecodeTiled` / `VAEEncodeTiled` (VAE Tile Size), LoRAs,
+other formats of the model, and Variation Seed or a noise mask on a clip.

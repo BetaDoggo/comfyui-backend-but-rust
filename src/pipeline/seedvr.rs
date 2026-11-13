@@ -11,16 +11,19 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// One picture to restore.
+/// One picture or clip to restore.
 pub struct SeedVrRequest {
     /// Pixels, multiples of 16.
     pub width: usize,
     pub height: usize,
+    /// Latent frames: 1 for a picture, n + 1 for a clip of 4n + 1 frames.
+    pub frames: usize,
     /// One image.
     pub sampling: Sampling,
+    /// f32 [16, frames, height / 8, width / 8], as the condition.
     pub noise: Vec<f32>,
-    /// The picture's latent from [`Generator::encode_seedvr`], f32 [16, height / 8, width / 8]: the model's
-    /// `condition` (`SeedVR2Conditioning`).
+    /// The latent from [`Generator::encode_seedvr`], f32 [16, frames, height / 8, width / 8]: the model's `condition`
+    /// (`SeedVR2Conditioning`).
     pub condition: Vec<f32>,
 }
 
@@ -40,9 +43,9 @@ fn check_sides(width: usize, height: usize) -> Result<()> {
 }
 
 /// Activation memory of one evaluation.
-fn step_need(width: usize, height: usize, lt: usize) -> usize {
+fn step_need(frames: usize, width: usize, height: usize, lt: usize) -> usize {
     let (lh, lw) = (height / 8, width / 8);
-    seedvr::step_activation_bytes((lh / 2) * (lw / 2), lt, seedvr::window_count(lh, lw))
+    seedvr::step_activation_bytes(frames * (lh / 2) * (lw / 2), lt, seedvr::window_count(frames, lh, lw))
 }
 
 impl Generator {
@@ -78,18 +81,19 @@ impl Generator {
         Ok(())
     }
 
-    /// The restored latent, sampled as ComfyUI's KSampler does (SwarmUI sends one euler step at CFG 1).
+    /// The restored latent, sampled as ComfyUI's KSampler does (SwarmUI sends one euler step at CFG 1). A clip is one
+    /// sample over all its frames, as ComfyUI's.
     pub fn sample_seedvr(&mut self, r: &SeedVrRequest, mut progress: impl FnMut(Step) -> bool) -> Result<(Vec<f32>, Stats)> {
         check_sides(r.width, r.height)?;
         let (lh, lw) = (r.height / 8, r.width / 8);
-        let n = seedvr::CH * lh * lw;
+        let n = seedvr::CH * r.frames * lh * lw;
         if r.sampling.images != 1 {
-            bail!("SeedVR2 restores one picture at a time");
+            bail!("SeedVR2 restores one picture or clip at a time");
         }
-        if r.noise.len() != n || r.condition.len() != n {
+        if r.frames == 0 || r.noise.len() != n || r.condition.len() != n {
             bail!("noise and condition have {} and {} values, expected {n}", r.noise.len(), r.condition.len());
         }
-        let need = step_need(r.width, r.height, 64);
+        let need = step_need(r.frames, r.width, r.height, 64);
         // the loaded family's blocks give way first (legacy planner; ComfyUI's memory management does it as it goes)
         self.make_room(need)?;
         let env = &self.env;
@@ -102,7 +106,7 @@ impl Generator {
         let latent = {
             let dit = &mut m.dit;
             let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, _eval: usize| -> Result<()> {
-                dit.predict(x, &cond, lh, lw, sigma, negative, out, st, None)
+                dit.predict(x, &cond, r.frames, lh, lw, sigma, negative, out, st, None)
             };
             run_sampler(&r.sampling, &r.noise, st, &mut stats, &mut model, &mut progress)
         };
@@ -115,9 +119,21 @@ impl Generator {
         Ok((latent?, stats))
     }
 
-    /// RGB f32 [height, width, 3] in 0..1 (sides multiples of 16) -> SeedVR2's latent f32 [16, height / 8, width / 8].
-    pub fn encode_seedvr(&mut self, rgb: &[f32], width: usize, height: usize) -> Result<Vec<f32>> {
+    /// RGB f32 [frames, height, width, 3] in 0..1 (sides multiples of 16) -> SeedVR2's latent f32 [16, latent frames,
+    /// height / 8, width / 8] and its latent frames. One frame goes through the image path, more as one clip.
+    pub fn encode_seedvr(&mut self, rgb: &[f32], frames: usize, width: usize, height: usize) -> Result<(Vec<f32>, usize)> {
         check_sides(width, height)?;
+        if frames > 1 {
+            let tile = self.clip_tile(width, height, false)?;
+            let st = &self.env.st;
+            let vae = &mut self.seedvr_vae.as_mut().context("no SeedVR2 VAE loaded")?.1;
+            let t0 = Instant::now();
+            // in pixels, overlapping by a quarter as the decode does
+            let (z, lt) = vae.encode_clip(rgb, frames, height, width, tile.map(|t| (t * 8, t * 2)), st)?;
+            eprintln!("SeedVR2 VAE encode of {frames} frames {:.0} ms{}", t0.elapsed().as_secs_f64() * 1e3,
+                tile.map_or(String::new(), |t| format!(" in tiles of {}", t * 8)));
+            return Ok((z, lt));
+        }
         self.make_room(seedvr_vae::Vae::activation_bytes(height, width))?;
         let tile = self.vae_tile(width, height)?;
         let st = &self.env.st;
@@ -129,7 +145,38 @@ impl Generator {
             None => vae.encode(rgb, height, width, st)?,
         };
         eprintln!("SeedVR2 VAE encode {:.0} ms{}", t0.elapsed().as_secs_f64() * 1e3, tile.map_or(String::new(), |t| format!(" in tiles of {}", t * 8)));
-        Ok(z)
+        Ok((z, 1))
+    }
+
+    /// The most latent frames of a `width` x `height` clip that one SeedVR2 evaluation fits in the VRAM it may take (at
+    /// least 1), for `SeedVR2TemporalChunk`'s `auto` mode. The blocks stream, so only their slots and the activations
+    /// need room.
+    pub fn seedvr_frames_that_fit(&self, width: usize, height: usize, frames: usize) -> Result<usize> {
+        check_sides(width, height)?;
+        // the DiT's globals, two streamed blocks, the modulations and the window geometry
+        const BESIDE: usize = 1 << 30;
+        let room = self.vae_room()?.saturating_sub(BESIDE);
+        Ok((1..=frames).rev().find(|&f| step_need(f, width, height, 64) <= room).unwrap_or(1))
+    }
+
+    /// [`Generator::vae_tile`] for a clip: the causal convs keep two frames each, so it tiles sooner, with the largest
+    /// tile whose clip fits.
+    fn clip_tile(&mut self, width: usize, height: usize, decode: bool) -> Result<Option<usize>> {
+        let vae = &self.seedvr_vae.as_ref().context("no SeedVR2 VAE loaded")?.1;
+        let need = vae.clip_bytes(height, width, decode) + vae.temporal_bytes();
+        self.make_room(need)?;
+        if let Ok(v) = std::env::var("SEEDVR_VAE_TILE") {
+            let n: usize = v.trim().parse().context("SEEDVR_VAE_TILE")?;
+            return Ok((n > 0).then_some(n));
+        }
+        let room = self.vae_room()?;
+        let vae = &self.seedvr_vae.as_ref().context("no SeedVR2 VAE loaded")?.1;
+        let room = room.saturating_sub(vae.temporal_bytes());
+        if vae.clip_bytes(height, width, decode) <= room {
+            return Ok(None);
+        }
+        let side = (height.max(width) / 8).next_multiple_of(8);
+        Ok(Some((2..side / 8).rev().map(|t| t * 8).find(|t| vae.clip_bytes(t * 8, t * 8, decode) <= room).unwrap_or(16)))
     }
 
     /// The VRAM the VAE may take: what is free, plus under ComfyUI's memory management the weights it would move to RAM.
@@ -158,18 +205,29 @@ impl Generator {
         Ok(Some(seedvr_vae::preferred_tile(room)))
     }
 
-    /// SeedVR2's latent f32 [16, height / 8, width / 8] -> RGB f32 [height, width, 3] in 0..1.
-    pub fn decode_seedvr(&mut self, latent: &[f32], width: usize, height: usize) -> Result<Vec<f32>> {
+    /// SeedVR2's latent f32 [16, frames, height / 8, width / 8] -> RGB f32 [out frames, height, width, 3] in 0..1 and its
+    /// frames: one for a picture, 4 (frames - 1) + 1 for a clip.
+    pub fn decode_seedvr(&mut self, latent: &[f32], frames: usize, width: usize, height: usize) -> Result<(Vec<f32>, usize)> {
         let (lh, lw) = (height / 8, width / 8);
-        if latent.len() != seedvr::CH * lh * lw {
-            bail!("latent has {} values, expected {}", latent.len(), seedvr::CH * lh * lw);
+        if latent.len() != seedvr::CH * frames * lh * lw || frames == 0 {
+            bail!("latent has {} values, expected {}", latent.len(), seedvr::CH * frames * lh * lw);
         }
-        self.make_room(seedvr_vae::Vae::activation_bytes(height, width))?;
         if !self.env.comfy {
             if let Some(m) = &mut self.seedvr {
                 m.dit.blocks.set_resident(0, 1, &m.st)?;
             }
         }
+        if frames > 1 {
+            let tile = self.clip_tile(width, height, true)?;
+            let st = &self.env.st;
+            let vae = &mut self.seedvr_vae.as_mut().context("no SeedVR2 VAE loaded")?.1;
+            let t0 = Instant::now();
+            let (rgb, n) = vae.decode_clip(latent, frames, lh, lw, tile, st)?;
+            eprintln!("SeedVR2 VAE decode of {n} frames {:.0} ms{}", t0.elapsed().as_secs_f64() * 1e3,
+                tile.map_or(String::new(), |t| format!(" in tiles of {}", t * 8)));
+            return Ok((rgb, n));
+        }
+        self.make_room(seedvr_vae::Vae::activation_bytes(height, width))?;
         let tile = self.vae_tile(width, height)?;
         let st = &self.env.st;
         let vae = &self.seedvr_vae.as_ref().context("no SeedVR2 VAE loaded")?.1;
@@ -179,7 +237,7 @@ impl Generator {
             None => vae.decode(&upload(latent, st)?, lh, lw, st)?,
         };
         eprintln!("SeedVR2 VAE decode {:.0} ms{}", t0.elapsed().as_secs_f64() * 1e3, tile.map_or(String::new(), |t| format!(" in tiles of {}", t * 8)));
-        Ok(rgb)
+        Ok((rgb, 1))
     }
 
     pub(super) fn seedvr_int8_attention(&mut self, on: bool) {

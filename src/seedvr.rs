@@ -1,10 +1,11 @@
-//! SeedVR2 3B: ByteDance's one-step restoration NaDiT, int8 ConvRot blocks, for single images. bf16 activations like
-//! ComfyUI's `comfy.ldm.seedvr.model`.
+//! SeedVR2 3B: ByteDance's one-step restoration NaDiT, int8 ConvRot blocks, for pictures and clips. bf16 activations
+//! like ComfyUI's `comfy.ldm.seedvr.model`.
 //!
 //! The image tokens and a fixed text prompt (stored in the checkpoint) run through 32 MM-DiT blocks; the first ten
-//! keep separate image and text weights, the rest share them. Attention is windowed: the token grid is cut into
-//! windows of about 400 tokens each (fewer, larger ones on small images), every window attends to itself and to the
-//! whole text, alternating with half-shifted windows. A text token's output is the mean of its windows'.
+//! keep separate image and text weights, the rest share them. Attention is windowed: the token grid (frames, rows,
+//! columns) is cut into windows of about 400 tokens a frame (fewer, larger ones on small images) and up to a quarter of
+//! the clip's frames, every window attends to itself and to the whole text, alternating with half-shifted windows. A
+//! text token's output is the mean of its windows'.
 
 use crate::cuda::{DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_BF16, P, PM, PRO_ADALN, PRO_PLAIN, PRO_RMS, PRO_SILU, PRO_SWIGLU};
@@ -37,7 +38,7 @@ const MOD_CACHE: usize = 16;
 /// Rows through the MLP at a time: hidden states for 32768 rows are 0.9 GB. ComfyUI's `SEEDVR2_MLP_CHUNK` is 8192, which
 /// measured 7% slower here at 2048x2048.
 const MLP_CHUNK: usize = 32768;
-/// Window geometries kept, one per (latent size, text length).
+/// Window geometries kept, one per (latent frames and size, text length).
 const GEO_CACHE: usize = 4;
 
 /// The 3B checkpoint, as ComfyUI's `model_detection` recognizes it.
@@ -75,7 +76,7 @@ pub struct Dit {
     pub int8_attn: bool,
     /// bf16 modulation vectors by sigma bits, see [`Dit::modulation`].
     mods: HashMap<u32, DevBuf>,
-    geos: Vec<((usize, usize, usize), Geometry)>,
+    geos: Vec<((usize, usize, usize, usize), Geometry)>,
 }
 
 /// One partition of the token grid into windows, and its way back.
@@ -228,7 +229,8 @@ pub fn n_blocks(st: &SafeTensors) -> usize {
     (0..).take_while(|i| st.has(&format!("blocks.{i}.attn.proj_out.all.weight")) || st.has(&format!("blocks.{i}.attn.proj_out.vid.weight"))).count()
 }
 
-/// Activation memory of one evaluation over `l` image tokens and `lt` text tokens in `windows` windows (bytes).
+/// Activation memory of one evaluation over `l` image tokens (every frame's) and `lt` text tokens in `windows` windows
+/// (bytes).
 pub fn step_activation_bytes(l: usize, lt: usize, windows: usize) -> usize {
     let rows = l + lt;
     let gathered = l + windows * lt;
@@ -237,10 +239,10 @@ pub fn step_activation_bytes(l: usize, lt: usize, windows: usize) -> usize {
         + gathered * (QKV * 2 + D * 2 + 3 * HD * 2 /*int8 attn*/) + l * (TOK_IN + TOK_OUT) * 2 + (64 << 20)
 }
 
-/// Windows an image of `lh` x `lw` latent pixels is attended in, at most.
-pub fn window_count(lh: usize, lw: usize) -> usize {
+/// Windows `frames` latent frames of `lh` x `lw` are attended in, at most.
+pub fn window_count(frames: usize, lh: usize, lw: usize) -> usize {
     let (h, w) = (lh / 2, lw / 2);
-    windows(1, h, w, false).len().max(windows(1, h, w, true).len())
+    windows(frames, h, w, false).len().max(windows(frames, h, w, true).len())
 }
 
 /// `get_timestep_embedding(t, 256, flip_sin_to_cos=False, downscale_freq_shift=0)`, rounded to bf16.
@@ -373,19 +375,19 @@ impl Dit {
         Ok(())
     }
 
-    /// The windows of an `lh` x `lw` latent with `lt` text tokens, built once.
-    fn geometry(&mut self, lh: usize, lw: usize, lt: usize, st: &Stream) -> Result<usize> {
-        let key = (lh, lw, lt);
+    /// The windows of `frames` latent frames of `lh` x `lw` with `lt` text tokens, built once.
+    fn geometry(&mut self, frames: usize, lh: usize, lw: usize, lt: usize, st: &Stream) -> Result<usize> {
+        let key = (frames, lh, lw, lt);
         if let Some(i) = self.geos.iter().position(|(k, _)| *k == key) {
             return Ok(i);
         }
         let (h, w) = (lh / 2, lw / 2);
-        let l = h * w;
+        let l = frames * h * w;
         let pair = |a: f32| [a.cos(), a.sin()];
         let mut ws_bytes = 0usize;
         let mut plans = Vec::with_capacity(2);
         for shifted in [false, true] {
-            let mut wins: Vec<Vec<usize>> = windows(1, h, w, shifted)
+            let mut wins: Vec<Vec<usize>> = windows(frames, h, w, shifted)
                 .into_iter()
                 .map(|[(t0, t1), (h0, h1), (w0, w1)]| {
                     let mut v = Vec::with_capacity((t1 - t0) * (h1 - h0) * (w1 - w0));
@@ -401,7 +403,7 @@ impl Dit {
                 .collect();
             // each token's place in its window
             let mut rope = vec![0f32; l * 128];
-            for [(t0, t1), (h0, h1), (w0, w1)] in windows(1, h, w, shifted) {
+            for [(t0, t1), (h0, h1), (w0, w1)] in windows(frames, h, w, shifted) {
                 for t in t0..t1 {
                     for y in h0..h1 {
                         for x in w0..w1 {
@@ -436,7 +438,7 @@ impl Dit {
                 }
             }
             if sources[..l].iter().any(|s| s.len() != 1) {
-                bail!("SeedVR2 windows don't cover the {h}x{w} grid once");
+                bail!("SeedVR2 windows don't cover the {frames}x{h}x{w} grid once");
             }
             let mut offs = vec![0i32];
             let mut src = Vec::with_capacity(gather.len());
@@ -475,25 +477,27 @@ impl Dit {
         Ok(self.geos.len() - 1)
     }
 
-    /// One model evaluation of a latent (f32 [16, lh, lw]) restoring `cond` (the VAE's latent of the picture, f32 [16,
-    /// lh, lw]): writes the denoised latent to `den`.
+    /// One model evaluation of a latent (f32 [16, frames, lh, lw]) restoring `cond` (the VAE's latent of the picture
+    /// or clip, the same shape): writes the denoised latent to `den`.
     #[allow(clippy::too_many_arguments)]
-    pub fn predict(&mut self, latent: &DevBuf, cond: &DevBuf, lh: usize, lw: usize, sigma: f32, negative: bool, den: &DevBuf, st: &Stream,
-        mut probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<()> {
-        if lh % 2 != 0 || lw % 2 != 0 {
-            bail!("SeedVR2 latents need an even size, got {lw}x{lh}");
+    pub fn predict(&mut self, latent: &DevBuf, cond: &DevBuf, frames: usize, lh: usize, lw: usize, sigma: f32, negative: bool, den: &DevBuf,
+        st: &Stream, mut probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<()> {
+        if lh % 2 != 0 || lw % 2 != 0 || frames == 0 {
+            bail!("SeedVR2 latents need an even size, got {frames} frames of {lw}x{lh}");
         }
         self.modulation(sigma, st)?;
         let lt = self.text_len(negative);
-        let gi = self.geometry(lh, lw, lt, st)?;
-        let l = (lh / 2) * (lw / 2);
+        let gi = self.geometry(frames, lh, lw, lt, st)?;
+        let l = frames * (lh / 2) * (lw / 2);
+        // the frames' rows one after another: patching works on [16, frames * lh, lw] as on a tall picture
+        let rows_h = frames * lh;
         let rows = l + lt;
         let di = D as i64;
 
         let x = DevBuf::alloc_async(rows * D * 2, st)?;
         {
             let tok = DevBuf::alloc_async(l * TOK_IN * 2, st)?;
-            k!(gpu_seedvr_patch_in(latent.ptr(), cond.ptr(), tok.ptr(), lh as i32, lw as i32, TOK_IN as i32, s(st)))?;
+            k!(gpu_seedvr_patch_in(latent.ptr(), cond.ptr(), tok.ptr(), rows_h as i32, lw as i32, TOK_IN as i32, s(st)))?;
             k!(gpu_gemm(tok.ptr(), TOK_IN as i64, self.g("in.w"), TOK_IN as i64, x.ptr(), di, self.g("in.b"), l as i64, di, TOK_IN as i64, 1,
                 DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
         }
@@ -635,7 +639,7 @@ impl Dit {
         let tok = DevBuf::alloc_async(l * TOK_OUT * 2, st)?;
         k!(gpu_gemm(normed.ptr(), di, self.g("out.w"), di, tok.ptr(), TOK_OUT as i64, self.g("out.b"), l as i64, TOK_OUT as i64, di, 1, DT_BF16,
             DT_BF16, 1.0, 0.0, s(st)))?;
-        k!(gpu_unpatch_denoised(tok.ptr(), TOK_OUT as i64, latent.ptr(), den.ptr(), CH as i32, lh as i32, lw as i32, 2,
+        k!(gpu_unpatch_denoised(tok.ptr(), TOK_OUT as i64, latent.ptr(), den.ptr(), CH as i32, rows_h as i32, lw as i32, 2,
             sigma, s(st)))
     }
 }
@@ -647,9 +651,10 @@ pub fn check(dit: &std::path::Path, vae: &std::path::Path, reference: &std::path
     crate::ffi::ok(unsafe { crate::ffi::gpu_blas_init(64 << 20) }, "cublasLt init")?;
     let r = SafeTensors::open(reference)?;
     let st = Stream::new()?;
-    let v = crate::seedvr_vae::Vae::load(vae, &st)?;
+    let mut v = crate::seedvr_vae::Vae::load(vae, &st)?;
+    // [1, frames, h, w, 3]
     let shape = r.info("pre")?.shape.clone();
-    let (h, w) = (shape[2], shape[3]);
+    let (pixel_frames, h, w) = (shape[1], shape[2], shape[3]);
     let (lh, lw) = (h / 8, w / 8);
     let pre = r.f32_vec("pre", false)?;
     let psnr = |a: &[f32], b: &[f32]| 10.0 * (a.len() as f64 / a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum::<f64>()).log10();
@@ -658,17 +663,24 @@ pub fn check(dit: &std::path::Path, vae: &std::path::Path, reference: &std::path
         d.upload(0, &f32_bytes(v), &st)?;
         Ok(d)
     };
+    let theirs = r.f32_vec("latent", false)?;
+    let frames = theirs.len() / (CH * lh * lw);
+    // a picture through the image path, a clip through the causal one
+    let clip = pixel_frames > 1;
+    eprintln!("{pixel_frames} frames of {w}x{h}, {frames} latent frames");
+    let decode = |v: &mut crate::seedvr_vae::Vae, lat: &[f32]| -> Result<Vec<f32>> {
+        if clip { Ok(v.decode_clip(lat, frames, lh, lw, None, &st)?.0) } else { v.decode(&up(lat)?, lh, lw, &st) }
+    };
     for run in 0..2 {
         let t0 = std::time::Instant::now();
-        let z = v.encode(&pre, h, w, &st)?;
+        let z = if clip { v.encode_clip(&pre, pixel_frames, h, w, None, &st)?.0 } else { v.encode(&pre, h, w, &st)? };
         st.sync()?;
         if run == 1 {
             eprintln!("VAE encode {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
-            report("latent", &z, &r.f32_vec("latent", false)?);
+            report("latent", &z, &theirs);
         }
     }
-    let theirs = r.f32_vec("latent", false)?;
-    let back = v.decode(&up(&theirs)?, lh, lw, &st)?;
+    let back = decode(&mut v, &theirs)?;
     eprintln!("roundtrip of ComfyUI's latent: {:.2} dB from ComfyUI's, {:.2} dB from the picture", psnr(&back, &r.f32_vec("roundtrip", false)?),
         psnr(&back, &pre));
 
@@ -677,7 +689,7 @@ pub fn check(dit: &std::path::Path, vae: &std::path::Path, reference: &std::path
     let mut d = Dit::load(&file, free.saturating_sub(3 << 30), 2, 6, &st)?;
     d.int8_attn = std::env::var_os("SEEDVR_FLASH").is_none();
     let (x, cond) = (up(&r.f32_vec("noise", false)?)?, up(&theirs)?);
-    let den = DevBuf::alloc(CH * lh * lw * 4)?;
+    let den = DevBuf::alloc(CH * frames * lh * lw * 4)?;
     let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
     for run in 0..3 {
         let t0 = std::time::Instant::now();
@@ -687,7 +699,7 @@ pub fn check(dit: &std::path::Path, vae: &std::path::Path, reference: &std::path
             probes.push((name.to_string(), v));
         };
         let p: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if run == 0 { Some(&mut probe) } else { None };
-        d.predict(&x, &cond, lh, lw, 1.0, false, &den, &st, p)?;
+        d.predict(&x, &cond, frames, lh, lw, 1.0, false, &den, &st, p)?;
         st.sync()?;
         eprintln!("evaluation {run}: {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
     }
@@ -706,17 +718,33 @@ pub fn check(dit: &std::path::Path, vae: &std::path::Path, reference: &std::path
     report("denoised", &ours, &samples);
     for run in 0..2 {
         let t0 = std::time::Instant::now();
-        let px = v.decode(&den, lh, lw, &st)?;
+        let px = decode(&mut v, &ours)?;
         if run == 1 {
             eprintln!("VAE decode {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
-            let theirs = v.decode(&up(&samples)?, lh, lw, &st)?;
+            let theirs = decode(&mut v, &samples)?;
             let decoded = r.f32_vec("decoded", false)?;
             eprintln!("decoded: ours {:.2} dB from ComfyUI's; ComfyUI's latent through our decoder {:.2} dB from ComfyUI's", psnr(&px, &decoded),
                 psnr(&theirs, &decoded));
-            write_png(&std::env::temp_dir().join("seedvr_check.png"), &px, w, h)?;
+            if clip {
+                let n = h * w * 3;
+                let decoded = r.f32_vec("decoded", false)?;
+                for f in 0..px.len() / n {
+                    eprintln!("  frame {f}: {:.2} dB", psnr(&px[f * n..][..n], &decoded[f * n..][..n]));
+                }
+            }
+            write_png(&std::env::temp_dir().join("seedvr_check.png"), &px[..h * w * 3], w, h)?;
         }
     }
     if let Some(t) = std::env::var("SEEDVR_VAE_TILE").ok().and_then(|v| v.parse::<usize>().ok()).filter(|t| *t > 0) {
+        if clip {
+            let t0 = std::time::Instant::now();
+            let tiled = v.decode_clip(&samples, frames, lh, lw, Some(t), &st)?.0;
+            eprintln!("tiled clip decode ({t} latents) {:.0} ms: ComfyUI's latent {:.2} dB from ComfyUI's decode", t0.elapsed().as_secs_f64() * 1e3,
+                psnr(&tiled, &r.f32_vec("decoded", false)?));
+            let z = v.encode_clip(&pre, pixel_frames, h, w, Some((t * 8, t * 2)), &st)?.0;
+            report("latent (tiled)", &z, &theirs);
+            return Ok(());
+        }
         let t0 = std::time::Instant::now();
         let tiled = v.decode_tiled(&samples, lh, lw, t, &st)?;
         eprintln!("tiled decode ({t} latents) {:.0} ms: ComfyUI's latent {:.2} dB from ComfyUI's decode", t0.elapsed().as_secs_f64() * 1e3,
@@ -746,16 +774,20 @@ mod tests {
     #[test]
     fn windows_tile_the_grid_once() {
         for &(h, w) in &[(64usize, 64usize), (32, 48), (128, 96), (7, 5), (1, 1), (45, 80), (100, 37)] {
-            for shifted in [false, true] {
-                let mut seen = vec![0u8; h * w];
-                for [_, (h0, h1), (w0, w1)] in windows(1, h, w, shifted) {
-                    for y in h0..h1 {
-                        for x in w0..w1 {
-                            seen[y * w + x] += 1;
+            for t in [1usize, 2, 3, 5, 9, 41] {
+                for shifted in [false, true] {
+                    let mut seen = vec![0u8; t * h * w];
+                    for [(t0, t1), (h0, h1), (w0, w1)] in windows(t, h, w, shifted) {
+                        for f in t0..t1 {
+                            for y in h0..h1 {
+                                for x in w0..w1 {
+                                    seen[(f * h + y) * w + x] += 1;
+                                }
+                            }
                         }
                     }
+                    assert!(seen.iter().all(|&c| c == 1), "{t}x{h}x{w} shifted {shifted}");
                 }
-                assert!(seen.iter().all(|&c| c == 1), "{h}x{w} shifted {shifted}");
             }
         }
     }

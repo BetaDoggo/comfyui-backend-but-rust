@@ -336,6 +336,8 @@ pub fn input_from_v1(name: &str, spec: &Json, optional: bool) -> InputSpec {
 pub struct OutputSpec {
     pub ty: String,
     pub name: String,
+    /// `output_is_list`: the node returns a list in this slot, and nodes downstream run once per item.
+    pub is_list: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -346,6 +348,8 @@ pub struct NodeSchema {
     pub description: String,
     pub python_module: String,
     pub output_node: bool,
+    /// `INPUT_IS_LIST`: the node takes whole lists ([`crate::nodes::NodeInputs::list`]) and runs once.
+    pub is_input_list: bool,
     pub inputs: Vec<InputSpec>,
     pub outputs: Vec<OutputSpec>,
 }
@@ -360,6 +364,7 @@ impl NodeSchema {
             description: String::new(),
             python_module: python_module.to_string(),
             output_node: false,
+            is_input_list: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
         }
@@ -385,10 +390,12 @@ impl NodeSchema {
             }
         }
         let names = info["output_name"].as_array().cloned().unwrap_or_default();
+        let lists = info["output_is_list"].as_array().cloned().unwrap_or_default();
         for (i, ty) in info["output"].as_array().cloned().unwrap_or_default().iter().enumerate() {
             let ty = ty.as_str().map(str::to_string).unwrap_or_else(|| "COMBO".to_string());
             let name = names.get(i).and_then(Json::as_str).unwrap_or(&ty).to_string();
-            s.outputs.push(OutputSpec { ty, name });
+            let is_list = lists.get(i).and_then(Json::as_bool).unwrap_or(false);
+            s.outputs.push(OutputSpec { ty, name, is_list });
         }
         s
     }
@@ -404,7 +411,19 @@ impl NodeSchema {
     }
 
     pub fn output(mut self, ty: &str, name: &str) -> Self {
-        self.outputs.push(OutputSpec { ty: ty.to_string(), name: name.to_string() });
+        self.outputs.push(OutputSpec { ty: ty.to_string(), name: name.to_string(), is_list: false });
+        self
+    }
+
+    /// An `output_is_list` output.
+    pub fn output_list(mut self, ty: &str, name: &str) -> Self {
+        self.outputs.push(OutputSpec { ty: ty.to_string(), name: name.to_string(), is_list: true });
+        self
+    }
+
+    /// `INPUT_IS_LIST`: every input arrives as a whole list.
+    pub fn input_list(mut self) -> Self {
+        self.is_input_list = true;
         self
     }
 
@@ -466,7 +485,8 @@ impl NodeSchema {
             "input": input,
             "input_order": order,
             "output": self.outputs.iter().map(|o| o.ty.clone()).collect::<Vec<_>>(),
-            "output_is_list": self.outputs.iter().map(|_| false).collect::<Vec<_>>(),
+            "output_is_list": self.outputs.iter().map(|o| o.is_list).collect::<Vec<_>>(),
+            "is_input_list": self.is_input_list,
             "output_name": self.outputs.iter().map(|o| o.name.clone()).collect::<Vec<_>>(),
             "name": self.class,
             "display_name": self.display_name,

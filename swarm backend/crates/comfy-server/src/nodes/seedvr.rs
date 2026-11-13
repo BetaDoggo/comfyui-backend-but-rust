@@ -1,9 +1,10 @@
 //! SeedVR2's nodes (`comfy_extras/nodes_seedvr.py`) as SwarmUI's SeedVR stage sends them: the padding before the VAE,
-//! the conditioning, and the colour correction after it. Pixel work runs here; the model and its VAE are the engine's.
+//! the conditioning, the colour correction after it, and Split Latent's temporal chunks. Pixel work runs here; the
+//! model, its VAE and the latents are the engine's.
 
-use swarm_engine_api::{CondMeta, Conditioning, ImageBatch, LatentFormat, LatentSamples, Opaque, SeedVr2Condition};
+use swarm_engine_api::{CondMeta, Conditioning, ImageBatch, Latent, LatentFormat, LatentOp, LatentSamples, Opaque, SeedVr2Condition};
 
-use super::{input_err, NodeError, NodeOutput, NodeRegistry};
+use super::{input_err, ExecContext, NodeError, NodeInputs, NodeOutput, NodeRegistry, NodeResult};
 use crate::env::ServerEnv;
 use crate::schema::*;
 use crate::value::Value;
@@ -274,7 +275,127 @@ pub fn postprocess(decoded: &ImageBatch, original: &ImageBatch, method: &str) ->
     Ok(ImageBatch::from_f32(t as u32, h2 as u32, w2 as u32, oc as u32, out))
 }
 
+/// `SeedVR2TemporalChunk`'s chunks of `t_latent` latent frames for `frames_per_chunk` pixel frames (4n + 1) and the
+/// requested overlap: the latent frame ranges, and the overlap used. One whole chunk (overlap 0) when the clip fits.
+pub fn chunk_ranges(t_latent: usize, frames_per_chunk: usize, overlap: usize) -> (Vec<(usize, usize)>, usize) {
+    let t_pixel = 4 * (t_latent - 1) + 1;
+    if t_pixel <= frames_per_chunk {
+        return (vec![(0, t_latent)], 0);
+    }
+    let chunk = (frames_per_chunk - 1) / 4 + 1;
+    let overlap = overlap.min(chunk - 1);
+    let step = chunk - overlap;
+    let mut out = Vec::new();
+    for start in (0..t_latent).step_by(step) {
+        let end = (start + chunk).min(t_latent);
+        out.push((start, end));
+        if end >= t_latent {
+            break;
+        }
+    }
+    (out, overlap)
+}
+
+/// `SeedVR2TemporalChunk`. `auto` sizes the chunks by this engine's own memory estimate, not ComfyUI's law, which is
+/// fitted to ComfyUI's memory use.
+fn temporal_chunk(i: &NodeInputs, ctx: &mut ExecContext) -> NodeResult {
+    let latent = i.latent("latent")?;
+    let LatentSamples::Single(t) = &latent.samples else {
+        return Err(input_err("SeedVR2TemporalChunk: expected a SeedVR2 video latent, not an audio/video one"));
+    };
+    let &[_, c, t_latent, _, _] = t.shape.as_slice() else {
+        return Err(input_err(format!("SeedVR2TemporalChunk: expected a 5-D video latent (B, C, T, H, W); got shape {:?}.", t.shape)));
+    };
+    if c != 16 {
+        return Err(input_err(format!("SeedVR2TemporalChunk: expected 16 latent channels; got shape {:?}.", t.shape)));
+    }
+    let overlap = i.int("temporal_overlap")?;
+    if overlap < 0 {
+        return Err(input_err(format!("SeedVR2TemporalChunk: temporal_overlap must be >= 0; got {overlap}.")));
+    }
+    let t_pixel = 4 * (t_latent - 1) + 1;
+    let frames_per_chunk = match i.string("chunking_mode")? {
+        "auto" => {
+            let fit = ctx.engine.sample_frames_that_fit(latent)?.unwrap_or(t_latent).max(1);
+            let f = (4 * (fit - 1) + 1).min(t_pixel);
+            tracing::info!("SeedVR2TemporalChunk auto: {fit} latent frames fit -> frames_per_chunk={f} (t_pixel={t_pixel})");
+            f
+        }
+        "manual" => {
+            let f = i.int("chunking_mode.frames_per_chunk")?;
+            if f < 1 || (f - 1) % 4 != 0 {
+                return Err(input_err(format!(
+                    "SeedVR2TemporalChunk: frames_per_chunk must be a 4n+1 pixel-frame count (1, 5, 9, 13, 17, 21, ...); got {f}."
+                )));
+            }
+            f as usize
+        }
+        m => return Err(input_err(format!("SeedVR2TemporalChunk: chunking_mode must be 'auto' or 'manual'; got '{m}'."))),
+    };
+    let (ranges, overlap) = chunk_ranges(t_latent, frames_per_chunk, overlap as usize);
+    let chunks = if ranges.len() == 1 {
+        vec![Value::Latent(latent.clone())]
+    } else {
+        ranges
+            .iter()
+            .map(|&(start, end)| ctx.engine.latent_op(&LatentOp::SliceFrames { latent: latent.clone(), start: start as u32, end: end as u32 }).map(Value::Latent))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(NodeOutput::values(vec![chunks[0].clone(), Value::Int(overlap as i64)]).with_list(0, chunks))
+}
+
+/// `SeedVR2TemporalMerge`, an `INPUT_IS_LIST` node: the sampled chunks back into one latent.
+fn temporal_merge(i: &NodeInputs, ctx: &mut ExecContext) -> NodeResult {
+    let overlap = match i.list("temporal_overlap")?.first() {
+        Some(Value::Int(v)) => *v,
+        other => return Err(input_err(format!("SeedVR2TemporalMerge: temporal_overlap expected INT, got {:?}", other.map(Value::type_name)))),
+    };
+    if overlap < 0 {
+        return Err(input_err(format!("SeedVR2TemporalMerge: temporal_overlap must be >= 0; got {overlap}.")));
+    }
+    let chunks = i
+        .list("latents")?
+        .into_iter()
+        .map(|v| match v {
+            Value::Latent(l) => Ok(l),
+            other => Err(input_err(format!("SeedVR2TemporalMerge: latents expected LATENT, got {}", other.type_name()))),
+        })
+        .collect::<Result<Vec<Latent>, _>>()?;
+    let merged = ctx.engine.latent_op(&LatentOp::MergeChunks { chunks, overlap: overlap as u32 })?;
+    Ok(NodeOutput::one(Value::Latent(merged)))
+}
+
 pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
+    r.add(
+        env,
+        |_| {
+            NodeSchema::new("SeedVR2TemporalChunk", "Split SeedVR2 Latent", "model/latent/seedvr")
+                .describe("Split a SeedVR2 video latent into overlapping temporal chunks small enough to sample one at a time within VRAM, wiring latents outputs to both Apply SeedVR2 Conditioning and the sampler latent input before recombining with Merge SeedVR2 Latents.")
+                .input(link("latent", "LATENT").tooltip("The VAE-encoded SeedVR2 latent to split."))
+                .input(int("temporal_overlap", 0, 0, 16384).tooltip("Latent frames shared between adjacent chunks and crossfaded at merge; 0 = no overlap."))
+                .input(
+                    dynamic_combo("chunking_mode", vec![("auto", vec![]), ("manual", vec![int_step("frames_per_chunk", 21, 1, 16384, 4)])])
+                        .tooltip("manual = use frames_per_chunk exactly; auto = predict the largest chunk that fits free VRAM."),
+                )
+                .output_list("LATENT", "latents")
+                .output("INT", "temporal_overlap")
+        },
+        temporal_chunk,
+    );
+
+    r.add(
+        env,
+        |_| {
+            NodeSchema::new("SeedVR2TemporalMerge", "Merge SeedVR2 Latents", "model/latent/seedvr")
+                .describe("Recombine sampled SeedVR2 latent temporal chunks into one latent, crossfading each overlap with a Hann window sized by the temporal_overlap wired from Split SeedVR2 Latent.")
+                .input_list()
+                .input(link("latents", "LATENT").tooltip("The sampled temporal chunks in sequence order."))
+                .input(int("temporal_overlap", 0, 0, 16384).force_input().tooltip("The temporal_overlap output of Split SeedVR2 Latent. 0 = plain concatenation."))
+                .output("LATENT", "latent")
+        },
+        temporal_merge,
+    );
+
     r.add(
         env,
         |_| {
@@ -361,6 +482,19 @@ mod tests {
         let rgb = image(1, 64, 64, 3);
         let none = postprocess(&rgb, &rgb, "none").unwrap();
         assert_eq!(none.frame_f32(0), rgb.frame_f32(0));
+    }
+
+    #[test]
+    fn chunks_step_like_comfy() {
+        // 5 latent frames (17 pixel frames) in chunks of 13 pixel frames (4 latents) overlapping by 2
+        assert_eq!(chunk_ranges(5, 13, 2), (vec![(0, 4), (2, 5)], 2));
+        // the overlap is capped at a chunk less one; no overlap concatenates
+        assert_eq!(chunk_ranges(5, 9, 7), (vec![(0, 3), (1, 4), (2, 5)], 2));
+        assert_eq!(chunk_ranges(5, 9, 0), (vec![(0, 3), (3, 5)], 0));
+        assert_eq!(chunk_ranges(6, 1, 0).0.len(), 6);
+        // a clip that fits is one chunk with no overlap
+        assert_eq!(chunk_ranges(5, 17, 3), (vec![(0, 5)], 0));
+        assert_eq!(chunk_ranges(5, 21, 3), (vec![(0, 5)], 0));
     }
 
     #[test]

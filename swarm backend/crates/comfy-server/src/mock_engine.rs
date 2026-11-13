@@ -397,7 +397,10 @@ impl Engine for MockEngine {
         tracing::info!("[mock] vae_encode {:?} vae_patches={:?}", req.pixels, req.vae.patches);
         let p = &req.pixels;
         let data = Opaque::new(MockLatent { seed: hash_of(&p.frame_u8(0)[..p.frame_len().min(3000)]), cond: 0 });
-        let tensor = LatentTensor { format: LatentFormat::EngineDefined, shape: vec![1, 16, p.height as usize / 8, p.width as usize / 8], data };
+        // a batch of frames is one clip of a video VAE's 4x fewer latent frames, as ComfyUI's 3D VAEs encode it
+        let (h, w) = (p.height as usize / 8, p.width as usize / 8);
+        let shape = if p.count > 1 { vec![1, 16, (p.count as usize + 3) / 4, h, w] } else { vec![1, 16, h, w] };
+        let tensor = LatentTensor { format: LatentFormat::EngineDefined, shape, data };
         Ok(Latent::single(tensor, PixelInfo { width: p.width, height: p.height, frames: p.count, batch_size: 1, fps: None, audio_seconds: None }))
     }
 
@@ -685,6 +688,27 @@ impl Engine for MockEngine {
                 l
             }
             LatentOp::TrimVideo { latent, trim_amount } => with_shape(latent, |s| if s.len() == 5 { s[2] = s[2].saturating_sub(*trim_amount as usize).max(1) }, latent_key(latent)),
+            LatentOp::SliceFrames { latent, start, end } => {
+                let n = end.saturating_sub(*start).max(1);
+                let mut l = with_shape(latent, |s| if s.len() == 5 { s[2] = n as usize }, hash_of((latent_key(latent), *start, *end)));
+                l.pixel.frames = 4 * (n - 1) + 1;
+                l
+            }
+            LatentOp::MergeChunks { chunks, overlap } => {
+                let first = chunks.first().ok_or_else(|| EngineError::InvalidInput("no latents to merge".into()))?;
+                let frames = |l: &Latent| match &l.samples {
+                    LatentSamples::Single(t) if t.shape.len() == 5 => t.shape[2],
+                    _ => 1,
+                };
+                let ct = frames(first);
+                let step = ct - (*overlap as usize).min(ct.saturating_sub(1));
+                let total = step * (chunks.len() - 1) + chunks.last().map_or(0, frames);
+                let key = hash_of(chunks.iter().map(latent_key).collect::<Vec<_>>());
+                let mut l = with_shape(first, |s| if s.len() == 5 { s[2] = total }, key);
+                l.pixel.frames = (4 * (total - 1) + 1) as u32;
+                l.noise_mask = None;
+                l
+            }
         };
         tracing::info!("[mock] latent_op {} -> {:?}", format!("{op:?}").split([' ', '{', '(']).next().unwrap_or("?"), latent_shape(&out));
         Ok(out)

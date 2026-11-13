@@ -24,7 +24,7 @@ It really generates with these image, video and image-to-3D models, from specifi
 | MiniMax-H3-Image | Text to image, 6 steps | 0.35 s/step, 1.07 s/step at 2048x2048 | 0.68 s/step, 1.34 s/step at 2048x2048 |
 | Pixal3D | Image to a vertex-coloured 3D mesh (GLB), cutting the object out first with BiRefNet | 40 s per mesh at resolution 1024, 110 s at 1536 | not timed |
 | Idol (TripoSplat) | Image to a 3D gaussian splat (PLY), cutting the object out first with BiRefNet | 14.4 s per splat, 0.57 s/step at CFG 3 | 111 s/step headless here, not tuned |
-| SeedVR2 3B | Restores a picture, as SwarmUI's SeedVR stage | 0.79 s per 1024 restore, DiT 145 ms | DiT 235 ms |
+| SeedVR2 3B | Restores a picture or clip, as SwarmUI's SeedVR stage | 0.79 s per 1024 restore, DiT 145 ms | DiT 235 ms |
 
 The image and video models take every ComfyUI sampler and scheduler and LoRAs, with exceptions listed in
 [Models](docs/MODELS.md): HyperFlow H3 Flash samples with `euler` and `res_multistep` only, and it and MiniMax-H3-Image refuse LoRAs. Init

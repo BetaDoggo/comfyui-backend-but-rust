@@ -1,14 +1,20 @@
-"""ComfyUI's SeedVR2 on one picture, as SwarmUI's graph runs it, with every stage dumped.
+"""ComfyUI's SeedVR2 on one picture or a short clip, as SwarmUI's graph runs it, with every stage dumped.
 
 SeedVR2Preprocess, VAEEncode, SeedVR2Conditioning, a 1-step euler/simple KSampler at CFG 1, VAEDecode and
 SeedVR2PostProcessing. Run with SwarmUI's ComfyUI and its python_embeded (ref/ComfyUI predates SeedVR2):
 
-usage: python_embeded/python.exe seedvr_ref.py <out_dir> --image a.png [--size W H] [--seed N] [--steps N] [--cfg X]
-           [--color lab|wavelet|adain|none] [--dit path] [--vae path] [--repeat N]
+usage: python_embeded/python.exe seedvr_ref.py <out_dir> --image a.png [--size W H] [--frames N] [--pan PX] [--seed N]
+           [--steps N] [--cfg X] [--color lab|wavelet|adain|none] [--dit path] [--vae path] [--repeat N]
+           [--chunk FRAMES --overlap N]
 
 --size resizes the picture first with PIL's Lanczos (SwarmUI's SeedVR Upscale does it with ImageScale lanczos); the
-resized picture is saved as input.png, so the engine can start from the same pixels. Check the dump with
-`diffusion --seedvr-check <out_dir>/dump.safetensors`.
+resized picture is saved as input.png, so the engine can start from the same pixels. --frames N makes a clip of N
+frames panning across the picture by --pan pixels a frame (SeedVR2Preprocess pads it to 4n + 1 frames). Check the dump
+with `diffusion --seedvr-check <out_dir>/dump.safetensors`.
+
+--chunk samples the clip as SeedVR Split Latent does: SeedVR2TemporalChunk in manual mode with that many pixel frames a
+chunk and --overlap latent frames of overlap, each chunk conditioned and sampled with the same seed, then
+SeedVR2TemporalMerge. Its dump's DiT stages are the first chunk's, so compare its final frames (`post`) instead.
 """
 import argparse
 import os
@@ -24,6 +30,10 @@ ap = argparse.ArgumentParser()
 ap.add_argument("out")
 ap.add_argument("--image", required=True)
 ap.add_argument("--size", type=int, nargs=2, default=None)
+ap.add_argument("--frames", type=int, default=1)
+ap.add_argument("--pan", type=int, default=4)
+ap.add_argument("--chunk", type=int, default=0)
+ap.add_argument("--overlap", type=int, default=0)
 ap.add_argument("--seed", type=int, default=42)
 ap.add_argument("--steps", type=int, default=1)
 ap.add_argument("--cfg", type=float, default=1.0)
@@ -67,10 +77,15 @@ def save_image(t, path):
 
 
 im = Image.open(args.image).convert("RGB")
-if args.size:
-    im = im.resize(tuple(args.size), Image.LANCZOS)
-im.save(os.path.join(args.out, "input.png"))
-image = torch.from_numpy(np.asarray(im).astype(np.float32) / 255.0)[None]
+w, h = args.size or im.size
+if args.frames > 1:
+    # a pan: the picture a little wider, a window sliding across it
+    wide = im.resize((w + args.pan * (args.frames - 1), h), Image.LANCZOS)
+    frames = [wide.crop((f * args.pan, 0, f * args.pan + w, h)) for f in range(args.frames)]
+else:
+    frames = [im.resize((w, h), Image.LANCZOS) if args.size else im]
+frames[0].save(os.path.join(args.out, "input.png"))
+image = torch.from_numpy(np.stack([np.asarray(f).astype(np.float32) / 255.0 for f in frames]))
 put("image", image)
 
 t0 = time.perf_counter()
@@ -148,9 +163,29 @@ dm.blocks[0].attn.proj_qkv.register_forward_hook(out2("block0_qkv"))
 samples_in = {"samples": latent}
 noise = comfy.sample.prepare_noise(latent, args.seed)
 put("noise", noise)
+
+
+
+def sample_chunked():
+    from comfy_extras.nodes_seedvr import SeedVR2TemporalChunk, SeedVR2TemporalMerge
+    mode = {"chunking_mode": "manual", "frames_per_chunk": args.chunk}
+    chunks, overlap = SeedVR2TemporalChunk.execute({"samples": latent}, args.overlap, mode).result
+    print(f"{len(chunks)} chunks of {[c['samples'].shape[2] for c in chunks]} latent frames, overlap {overlap}")
+    out = []
+    for c in chunks:
+        pos, neg = SeedVR2Conditioning.execute(model, c).result
+        nz = comfy.sample.prepare_noise(c["samples"], args.seed)
+        s = comfy.sample.sample(model, nz, args.steps, args.cfg, "euler", "simple", pos, neg, c["samples"], seed=args.seed)
+        out.append({"samples": s})
+    return SeedVR2TemporalMerge.execute(out, [overlap]).result[0]["samples"]
+
+
 for run in range(args.repeat):
     t1 = time.perf_counter()
-    samples = comfy.sample.sample(model, noise, args.steps, args.cfg, "euler", "simple", positive, negative, latent, seed=args.seed)
+    if args.chunk:
+        samples = sample_chunked()
+    else:
+        samples = comfy.sample.sample(model, noise, args.steps, args.cfg, "euler", "simple", positive, negative, latent, seed=args.seed)
     torch.cuda.synchronize()
     print(f"run {run}: sampling {time.perf_counter() - t1:.3f}s")
 put("samples", samples)

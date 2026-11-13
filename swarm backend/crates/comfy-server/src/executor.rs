@@ -6,6 +6,11 @@
 //!
 //! SwarmUI keys off `executing` with a null node to stop listening and fetch `/history`,
 //! where it looks for `execution_error` in `status.messages`.
+//!
+//! Every output slot holds a list of values, one item unless a node made more, with ComfyUI's
+//! list semantics: an `output_is_list` slot holds the items the node returned, a node fed lists runs
+//! once per item of its longest input list (shorter lists repeat their last item) and its outputs
+//! collect one item per run, and an `INPUT_IS_LIST` node runs once with every input's whole list.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -30,6 +35,24 @@ fn panic_message(p: &Box<dyn std::any::Any + Send>) -> String {
 fn idle_after() -> Option<Duration> {
     let secs = std::env::var("IDLE_RELEASE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     (secs > 0).then_some(Duration::from_secs(secs))
+}
+
+/// The `ui` of a node that ran once per item: its lists joined, as ComfyUI merges them.
+fn merge_ui(prev: Json, next: Json) -> Json {
+    match (prev, next) {
+        (Json::Object(mut a), Json::Object(b)) => {
+            for (k, v) in b {
+                match (a.get_mut(&k), v) {
+                    (Some(Json::Array(x)), Json::Array(y)) => x.extend(y),
+                    (_, v) => {
+                        a.insert(k, v);
+                    }
+                }
+            }
+            Json::Object(a)
+        }
+        (_, next) => next,
+    }
 }
 
 fn now_ms() -> u64 {
@@ -113,25 +136,60 @@ impl Executor {
         Some(format!("{}|{}", node.class_type, Json::Object(node.inputs.clone())))
     }
 
+    /// How many times a node runs: once for an `INPUT_IS_LIST` node, else once per item of its
+    /// longest linked list (0 when one is empty, as ComfyUI skips the node then).
+    fn runs(node: &graph::GraphNode, schema: &NodeSchema, results: &HashMap<String, Vec<Vec<Value>>>) -> usize {
+        if schema.is_input_list {
+            return 1;
+        }
+        let lens: Vec<usize> = node
+            .inputs
+            .values()
+            .filter_map(|raw| match classify(raw) {
+                Some(InputRef::Link { node: src, slot }) => results.get(&src).and_then(|o| o.get(slot)).map(Vec::len),
+                _ => None,
+            })
+            .collect();
+        if lens.contains(&0) {
+            0
+        } else {
+            lens.into_iter().max().unwrap_or(1).max(1)
+        }
+    }
+
+    /// The node's inputs for run `run`: item `run` of each linked list (or its last), or whole lists
+    /// for an `INPUT_IS_LIST` node.
     fn resolve_inputs(
         &self,
         id: &str,
         node: &graph::GraphNode,
         schema: &NodeSchema,
-        results: &HashMap<String, Vec<Value>>,
+        results: &HashMap<String, Vec<Vec<Value>>>,
+        run: usize,
     ) -> Result<NodeInputs, NodeError> {
         let mut values = HashMap::new();
+        let mut lists = HashMap::new();
         for (name, raw) in &node.inputs {
             let Some(spec) = schema.resolve_input(name) else { continue };
             match classify(raw) {
                 None => {}
                 Some(InputRef::Literal(v)) => {
                     let val = graph::convert_literal(&spec, v).map_err(|e| NodeError::Input(e["details"].as_str().unwrap_or("bad input").to_string()))?;
+                    if schema.is_input_list {
+                        lists.insert(name.clone(), vec![val.clone()]);
+                    }
                     values.insert(name.clone(), val);
                 }
                 Some(InputRef::Link { node: src, slot }) => {
-                    let out = results.get(&src).and_then(|o| o.get(slot)).ok_or_else(|| NodeError::Input(format!("input '{name}' links to {src}[{slot}] which produced no value")))?;
-                    values.insert(name.clone(), out.clone());
+                    let list = results
+                        .get(&src)
+                        .and_then(|o| o.get(slot))
+                        .filter(|l| !l.is_empty())
+                        .ok_or_else(|| NodeError::Input(format!("input '{name}' links to {src}[{slot}] which produced no value")))?;
+                    values.insert(name.clone(), list[run.min(list.len() - 1)].clone());
+                    if schema.is_input_list {
+                        lists.insert(name.clone(), list.clone());
+                    }
                 }
             }
         }
@@ -155,7 +213,7 @@ impl Executor {
                 }
             }
         }
-        Ok(NodeInputs { node_id: id.to_string(), class_type: node.class_type.clone(), values })
+        Ok(NodeInputs { node_id: id.to_string(), class_type: node.class_type.clone(), values, lists })
     }
 
     /// Executes one prompt and returns its history entry. The caller stores it and then
@@ -191,7 +249,7 @@ impl Executor {
         let order = graph::execution_order(&graph, &item.outputs);
 
         // Loader nodes with unchanged literal inputs are reused, and reported as cached.
-        let mut results: HashMap<String, Vec<Value>> = HashMap::new();
+        let mut results: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
         let mut cached_ids = Vec::new();
         {
             let cache = self.cache.lock().unwrap();
@@ -200,7 +258,7 @@ impl Executor {
                 let cacheable = self.registry.get(&node.class_type).is_some_and(|d| d.cacheable);
                 if let (true, Some(key)) = (cacheable, Self::cache_key(node)) {
                     if let Some(v) = cache.get(&key) {
-                        results.insert(id.clone(), v.clone());
+                        results.insert(id.clone(), v.iter().map(|x| vec![x.clone()]).collect());
                         cached_ids.push(id.clone());
                     }
                 }
@@ -228,27 +286,55 @@ impl Executor {
             self.hub.send_json("executing", json!({ "node": id, "display_node": id, "prompt_id": pid }), sid.as_deref());
             meta.insert(id.clone(), json!({ "node_id": id, "display_node": id, "parent_node": null, "real_node_id": id }));
 
-            let result = self.resolve_inputs(id, node, schema, &results).and_then(|inputs| {
-                let mut ctx = ExecContext { engine: self.engine.as_ref(), env: &self.env, prompt_id: &pid, node_id: id.clone(), events: &mut events };
-                tracing::debug!("executing {id} ({})", node.class_type);
-                // A panicking node (or engine) fails this prompt like any other error; letting it
-                // unwind would kill the worker thread and leave every later prompt queued forever.
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (def.exec)(&inputs, &mut ctx)))
-                    .unwrap_or_else(|p| Err(NodeError::Other(anyhow::anyhow!("internal error in {}: {}", node.class_type, panic_message(&p)))))
-            });
+            let runs = Self::runs(node, schema, &results);
+            let mut result: Result<(Vec<Vec<Value>>, Option<Json>), NodeError> = Ok((Vec::new(), None));
+            for run in 0..runs {
+                let out = self.resolve_inputs(id, node, schema, &results, run).and_then(|inputs| {
+                    let mut ctx = ExecContext { engine: self.engine.as_ref(), env: &self.env, prompt_id: &pid, node_id: id.clone(), events: &mut events };
+                    tracing::debug!("executing {id} ({}){}", node.class_type, if runs > 1 { format!(", item {} of {runs}", run + 1) } else { String::new() });
+                    // A panicking node (or engine) fails this prompt like any other error; letting it
+                    // unwind would kill the worker thread and leave every later prompt queued forever.
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (def.exec)(&inputs, &mut ctx)))
+                        .unwrap_or_else(|p| Err(NodeError::Other(anyhow::anyhow!("internal error in {}: {}", node.class_type, panic_message(&p)))))
+                });
+                let (slots, ui) = match (&mut result, out) {
+                    (Ok(acc), Ok(out)) => (acc, out),
+                    (_, Err(e)) => {
+                        result = Err(e);
+                        break;
+                    }
+                    (Err(_), _) => break,
+                };
+                let mut out = ui;
+                if runs == 1 && def.cacheable && out.lists.is_empty() {
+                    if let Some(key) = Self::cache_key(node) {
+                        self.cache.lock().unwrap().insert(key, out.values.clone());
+                    }
+                }
+                if slots.0.len() < out.values.len() {
+                    slots.0.resize(out.values.len(), Vec::new());
+                }
+                for (i, v) in out.values.into_iter().enumerate() {
+                    match out.lists.remove(&i) {
+                        Some(items) => slots.0[i].extend(items),
+                        None => slots.0[i].push(v),
+                    }
+                }
+                if let Some(ui) = out.ui {
+                    slots.1 = Some(match slots.1.take() {
+                        Some(prev) => merge_ui(prev, ui),
+                        None => ui,
+                    });
+                }
+            }
 
             match result {
-                Ok(out) => {
-                    if def.cacheable {
-                        if let Some(key) = Self::cache_key(node) {
-                            self.cache.lock().unwrap().insert(key, out.values.clone());
-                        }
-                    }
-                    if let Some(ui) = out.ui {
+                Ok((slots, ui)) => {
+                    if let Some(ui) = ui {
                         self.hub.send_json("executed", json!({ "node": id, "display_node": id, "output": ui, "prompt_id": pid }), sid.as_deref());
                         outputs_ui.insert(id.clone(), ui);
                     }
-                    results.insert(id.clone(), out.values);
+                    results.insert(id.clone(), slots);
                     executed.push(id.clone());
                 }
                 Err(e) if e.is_interrupt() => {

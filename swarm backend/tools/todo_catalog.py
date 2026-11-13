@@ -82,8 +82,6 @@ NODES = {
     'SenseNovaSamplingOptions': ('other_arch', 'arch', 'SenseNova'),
     'TextEncodeQwenImageEdit': ('other_arch', 'arch', 'Qwen Image Edit (2509 and earlier)'),
     'TextEncodeQwenImageEditPlus': ('other_arch', 'arch', 'Qwen Image Edit Plus'),
-    'SeedVR2TemporalChunk': ('other_arch', 'arch', 'SeedVR2 restoration (SeedVR Model param)'),
-    'SeedVR2TemporalMerge': ('other_arch', 'arch', 'SeedVR2 restoration (SeedVR Model param)'),
     # ---------------------------------------------------------------- third-party (not in core ComfyUI)
     'IPAdapter': ('third_party', 'engine', 'Use IP-Adapter (ComfyUI_IPAdapter_plus).'),
     'IPAdapterAdvanced': ('third_party', 'engine', 'Use IP-Adapter (ComfyUI_IPAdapter_plus).'),

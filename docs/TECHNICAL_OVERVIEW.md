@@ -89,7 +89,7 @@ the baked weights match ComfyUI's bit for bit. Sampling then runs the normal int
 | Qwen Image 2.1 | `src/qwen21.rs`, int8 ConvRot | Qwen3-VL 8B, `src/te.rs` and `src/vision.rs` | RGBA Wan 2.2 layout, `src/vae21.rs` |
 | MiniMax H3 | `src/h3.rs`, w6a8 | Qwen3-VL 32B, `src/h3te.rs` | Video and audio, `src/h3vae.rs` |
 | Pixal3D | `src/trellis.rs`, int8 ConvRot | DINOv3 ViT-L and NAF, `src/dino3.rs` | Sparse convolution shape and texture decoders, `src/trellis_vae.rs` |
-| SeedVR2 3B | `src/seedvr.rs`, int8 ConvRot | none: a fixed prompt stored in the checkpoint | Causal video VAE on one frame, `src/seedvr_vae.rs` |
+| SeedVR2 3B | `src/seedvr.rs`, int8 ConvRot | none: a fixed prompt stored in the checkpoint | Causal video VAE, a frame at a time, `src/seedvr_vae.rs` |
 | TripoSplat / Idol | `src/triposplat.rs`, fp16 | DINOv3 ViT-H, `src/dino3.rs`, and the Flux 2 VAE's encoder | Octree gaussian decoder, `src/triposplat.rs` |
 
 Each model is written directly against its checkpoint, with no general layer or graph abstraction. That is what allows
@@ -307,7 +307,7 @@ csrc/attn.cu        FlashAttention-2 forward wrapper (only the needed variants i
 csrc/attn_int8.cu   INT8 attention wrapper, the default
 csrc/h3.cu          MiniMax H3 kernels
 csrc/qwen21.cu      Qwen Image 2.1: VAE shortcuts, prefix attention for text and reference tokens
-csrc/seedvr.cu      SeedVR2: patch embedding input, window attention reordering, VAE pixel shuffle
+csrc/seedvr.cu      SeedVR2: patch embedding input, window attention reordering, VAE pixel shuffle and temporal taps
 csrc/trellis.cu     Pixal3D: per-head QK norm, voxel hashing and sparse-conv gathers, NAF attention, feature sampling
 csrc/triposplat.cu  TripoSplat: fp16 gated adds, RePo rotary + q/k RMS norm, SiLU gating
 csrc/birefnet.cu    BiRefNet: im2col, deformable-conv columns, Swin window gather and attention, bilinear resize

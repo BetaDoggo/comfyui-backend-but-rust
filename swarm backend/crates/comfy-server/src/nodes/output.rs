@@ -48,7 +48,7 @@ fn save_pngs(dir: &std::path::Path, type_name: &str, prefix: &str, images: &swar
         results.push(json!({ "filename": filename, "subfolder": subfolder, "type": type_name }));
         counter += 1;
     }
-    Ok(NodeOutput { values: vec![Value::Image(images.clone())], ui: Some(json!({ "images": results })) })
+    Ok(NodeOutput { lists: Default::default(), values: vec![Value::Image(images.clone())], ui: Some(json!({ "images": results })) })
 }
 
 pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
@@ -183,7 +183,7 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
             let filename = format!("{stem}_{counter:05}_.{ext}");
             std::fs::write(target.join(&filename), bytes).map_err(anyhow::Error::from)?;
             let ui = json!({ "audio": [{ "filename": filename, "subfolder": subfolder, "type": "output" }] });
-            Ok(NodeOutput { values: vec![Value::Audio(audio.clone())], ui: Some(ui) })
+            Ok(NodeOutput { lists: Default::default(), values: vec![Value::Audio(audio.clone())], ui: Some(ui) })
         },
     );
 

@@ -77,15 +77,29 @@ pub struct NodeOutput {
     /// The `ui` dict ComfyUI reports in the `executed` message and `/history` outputs
     /// (e.g. `{"images": [{"filename": ..., "subfolder": ..., "type": "output"}]}`).
     pub ui: Option<Json>,
+    /// The items of `output_is_list` slots, by slot; `values` holds the first item there.
+    pub lists: HashMap<usize, Vec<Value>>,
 }
 
 impl NodeOutput {
     pub fn values(values: Vec<Value>) -> Self {
-        Self { values, ui: None }
+        Self { values, ..Self::default() }
     }
 
     pub fn one(value: Value) -> Self {
-        Self { values: vec![value], ui: None }
+        Self { values: vec![value], ..Self::default() }
+    }
+
+    /// Slot `slot` as a list of `items` (an `output_is_list` output).
+    pub fn with_list(mut self, slot: usize, items: Vec<Value>) -> Self {
+        if let Some(first) = items.first() {
+            if self.values.len() <= slot {
+                self.values.resize(slot + 1, first.clone());
+            }
+            self.values[slot] = first.clone();
+        }
+        self.lists.insert(slot, items);
+        self
     }
 
     pub fn empty() -> Self {
@@ -202,6 +216,8 @@ pub struct NodeInputs {
     pub node_id: String,
     pub class_type: String,
     pub values: HashMap<String, Value>,
+    /// For an `INPUT_IS_LIST` node, every input's whole list; `values` holds the first items.
+    pub lists: HashMap<String, Vec<Value>>,
 }
 
 macro_rules! typed_getters {
@@ -224,6 +240,15 @@ macro_rules! typed_getters {
 }
 
 impl NodeInputs {
+    /// An input's whole list, on an `INPUT_IS_LIST` node (one item elsewhere).
+    pub fn list(&self, name: &str) -> Result<Vec<Value>, NodeError> {
+        match (self.lists.get(name), self.values.get(name)) {
+            (Some(l), _) => Ok(l.clone()),
+            (None, Some(v)) => Ok(vec![v.clone()]),
+            (None, None) => Err(input_err(format!("required input '{name}' is missing"))),
+        }
+    }
+
     typed_getters!(model, opt_model, Model, ModelHandle);
     typed_getters!(clip, opt_clip, Clip, TextEncoderHandle);
     typed_getters!(vae, opt_vae, Vae, VaeHandle);

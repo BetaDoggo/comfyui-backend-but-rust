@@ -82,3 +82,25 @@ GPU_API int gpu_pixel_shuffle2_bf16(const void* in, void* out, int H, int W, int
     KCHECK();
     return 0;
 }
+
+// out[p] = (a[p], b[p], c[p]) along channels: bf16 [px, 3C] from three [px, C] frames, the causal VAE's three temporal
+// taps of a conv side by side so one 2D conv over 3C channels sums them.
+__global__ void stack3_kernel(const bf16* a, const bf16* b, const bf16* c, bf16* out, int64_t px, int C) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int C8 = C / 8;
+    if (i >= px * 3 * C8) return;
+    const int c8 = (int)(i % C8);
+    const int64_t r = i / C8;
+    const int k = (int)(r % 3);
+    const int64_t p = r / 3;
+    const bf16* src = k == 0 ? a : (k == 1 ? b : c);
+    *reinterpret_cast<uint4*>(out + (p * 3 + k) * C + c8 * 8) = *reinterpret_cast<const uint4*>(src + p * C + c8 * 8);
+}
+
+GPU_API int gpu_seedvr_stack3(const void* a, const void* b, const void* c, void* out, int64_t px, int C, void* stream) {
+    if (C % 8) return -1;
+    const int64_t n = px * 3 * (C / 8);
+    if (n > 0) stack3_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const bf16*)a, (const bf16*)b, (const bf16*)c, (bf16*)out, px, C);
+    KCHECK();
+    return 0;
+}

@@ -183,6 +183,12 @@ pub trait Engine: Send + Sync + 'static {
         false
     }
 
+    /// The most latent frames of `latent`, a video latent, that one sampling fits in memory, for
+    /// `SeedVR2TemporalChunk`'s `auto` mode. Default: `None`, no limit known (one chunk).
+    fn sample_frames_that_fit(&self, _latent: &Latent) -> EngineResult<Option<usize>> {
+        Ok(None)
+    }
+
     /// See [`LatentOp`]. Default: unsupported.
     fn latent_op(&self, op: &LatentOp) -> EngineResult<Latent> {
         let name = format!("{op:?}");

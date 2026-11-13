@@ -21,6 +21,8 @@ models folder instead of downloading checkpoints.
 * **Refuse, don't ignore.** A feature the engine can't honour returns `EngineError::Unsupported`, which SwarmUI shows to
   the user. Never drop a parameter silently.
 * **Don't call something working until real output has been tested.** See [Keeping the docs true](#keeping-the-docs-true).
+  The maintainer tests in SwarmUI, so "it works" from them means it works in SwarmUI itself: record it that way in the
+  docs.
 * New code is GPL-3.0. Files in `csrc/vendor/` stay Apache-2.0.
 * Match the surrounding code. Model code is written directly against each checkpoint, with no general layer abstraction,
   because that is what allows fused kernels and caching.

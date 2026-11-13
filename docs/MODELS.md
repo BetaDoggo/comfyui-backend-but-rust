@@ -730,8 +730,8 @@ decode; the denoised latent is at cosine 0.9994, and flash attention lands as fa
 of the 17 frames took 18.8 s in the script's single run, which wasn't a warm comparison. The 9-frame clip through
 `comfy-server` over HTTP with SwarmUI's node chain (frames joined by `ImageBatch`, CIELAB colour correction) came out
 45.7 to 49.7 dB from ComfyUI's final frames. Tiled clip decodes of ComfyUI's latent: 50.97 dB from its untiled decode in
-256 pixel tiles, 38.7 dB in 128 pixel ones. Clips weren't run through SwarmUI itself, nor longer than 17 frames or larger
-than 768x432.
+256 pixel tiles, 38.7 dB in 128 pixel ones. Clips work in SwarmUI itself. The numbers here weren't measured beyond 17
+frames or 768x432.
 
 SeedVR Split Latent samples a clip in chunks of latent frames, as ComfyUI's `SeedVR2TemporalChunk` and
 `SeedVR2TemporalMerge` do: the chunks overlap by Temporal Video Overlap, each is conditioned and sampled with the same
@@ -741,8 +741,8 @@ law fitted to its own memory use (8.5 GB held back, so on 12 GB it picks one lat
 most latent frames one evaluation fits by this engine's estimate, so the chunks, and the frames, can differ from
 ComfyUI's on the same card. `manual` chunks are ComfyUI's. The 17-frame clip at 768x432 in `manual` chunks of 13 frames
 overlapping by 3 latent frames (two chunks of 4) came out 46.1 to 49.8 dB from ComfyUI's chunked run through
-`comfy-server` over HTTP. `auto` was only run where the whole clip fits, which it then samples in one chunk; the estimate
-wasn't tested at the edge of VRAM.
+`comfy-server` over HTTP. Split Latent works in SwarmUI itself, which sends `auto`; the estimate wasn't measured at the
+edge of VRAM.
 
 ### What SeedVR2 is missing here
 

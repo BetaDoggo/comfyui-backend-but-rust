@@ -38,6 +38,8 @@ pub enum Arch {
     Moss,
     H3,
     Qwen21,
+    /// Only for [`matched_modules`]: the engine can't patch SeedVR2.
+    SeedVr2,
     /// `comfy` names the encoder inside ComfyUI's text encoder model, as in `qwen3vl_4b`.
     TextEncoder { comfy: &'static str },
 }
@@ -632,6 +634,25 @@ impl Model<'_> {
     }
 }
 
+/// The model's weight tensors under `prefix`, each with its row count, and ComfyUI's LoRA key names for them.
+fn model_keys(arch: Arch, st: &SafeTensors, prefix: &str) -> (HashMap<String, usize>, HashMap<String, Target>) {
+    let tensors: HashMap<String, usize> = st.tensors.iter()
+        .filter_map(|(k, i)| Some((k.strip_prefix(prefix)?.to_string(), i.shape.first().copied().unwrap_or(1))))
+        .filter(|(k, _)| !k.ends_with(".weight_scale") && !k.ends_with(".weight_s_rel") && !k.ends_with(".weight_s_channel") && !k.ends_with(".comfy_quant"))
+        .collect();
+    let keys: Vec<(String, usize)> = tensors.iter().map(|(k, r)| (k.clone(), *r)).collect();
+    let map = key_map(arch, &keys);
+    (tensors, map)
+}
+
+/// How many modules of `lora` name a tensor of `model` by ComfyUI's keys for it. ComfyUI skips a module
+/// that names none, logging `lora key not loaded`, so a LoRA that matches nothing changes nothing there.
+pub fn matched_modules(arch: Arch, model: &SafeTensors, prefix: &str, lora: &Path) -> Result<usize> {
+    let (tensors, map) = model_keys(arch, model, prefix);
+    let file = SafeTensors::open(lora)?;
+    Ok(module_names(&file).into_iter().filter(|x| map.get(*x).is_some_and(|t| tensors.contains_key(&t.tensor))).count())
+}
+
 /// Make the model's weights hold `loras`, in order. Only tensors whose patches changed are touched.
 /// Returns true if any weight changed, so whatever was derived from the weights must be dropped.
 pub fn apply(arch: Arch, st: &SafeTensors, prefix: &str, mut stores: Vec<Store>, state: &mut State, loras: &[Lora], s0: &Stream) -> Result<bool> {
@@ -639,12 +660,7 @@ pub fn apply(arch: Arch, st: &SafeTensors, prefix: &str, mut stores: Vec<Store>,
         return Ok(false);
     }
     let t0 = Instant::now();
-    let tensors: HashMap<String, usize> = st.tensors.iter()
-        .filter_map(|(k, i)| Some((k.strip_prefix(prefix)?.to_string(), i.shape.first().copied().unwrap_or(1))))
-        .filter(|(k, _)| !k.ends_with(".weight_scale") && !k.ends_with(".weight_s_rel") && !k.ends_with(".weight_s_channel") && !k.ends_with(".comfy_quant"))
-        .collect();
-    let keys: Vec<(String, usize)> = tensors.iter().map(|(k, r)| (k.clone(), *r)).collect();
-    let map = key_map(arch, &keys);
+    let (tensors, map) = model_keys(arch, st, prefix);
 
     let files = loras.iter().map(|l| SafeTensors::open(&l.path)).collect::<Result<Vec<_>>>()?;
     let mut want: BTreeMap<String, Vec<Patch>> = BTreeMap::new();
@@ -724,6 +740,35 @@ fn file_label(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A safetensors file of one-element bf16 tensors with these names.
+    fn tiny_safetensors(name: &str, tensors: &[&str]) -> PathBuf {
+        let header: Vec<String> = tensors.iter().enumerate()
+            .map(|(i, t)| format!("\"{t}\":{{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[{},{}]}}", i * 2, i * 2 + 2))
+            .collect();
+        let json = format!("{{{}}}", header.join(","));
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(json.as_bytes());
+        bytes.resize(bytes.len() + tensors.len() * 2, 0);
+        let path = std::env::temp_dir().join(format!("diffusion-lora-test-{}-{name}.safetensors", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn matched_modules_skips_another_models_lora() {
+        let model = tiny_safetensors("seedvr", &["blocks.0.attn.proj_qkv.vid.weight", "vid_in.proj.weight"]);
+        let other = tiny_safetensors("moss", &["diffusion_model.layers.0.proj.q.lora_A.weight", "diffusion_model.layers.0.proj.q.lora_B.weight"]);
+        let own = tiny_safetensors("own", &["lora_unet_blocks_0_attn_proj_qkv_vid.lora_down.weight", "lora_unet_blocks_0_attn_proj_qkv_vid.lora_up.weight",
+            "diffusion_model.vid_in.proj.lora_A.weight", "diffusion_model.vid_in.proj.lora_B.weight"]);
+        let st = SafeTensors::open(&model).unwrap();
+        assert_eq!(matched_modules(Arch::SeedVr2, &st, "", &other).unwrap(), 0);
+        assert_eq!(matched_modules(Arch::SeedVr2, &st, "", &own).unwrap(), 2);
+        drop(st);
+        for p in [model, other, own] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 
     #[test]
     fn seed_is_comfys_crc() {

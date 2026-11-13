@@ -452,5 +452,7 @@ sends:
 | `SeedVR2PostProcessing` | `images`, `original_resized_images`, `color_correction_method` (`lab` default, `wavelet`, `adain`, `none`) | server: cropped to the picture, colour matched, alpha put back, sides cut to even |
 
 A batch of pictures or a video's frames is one clip, as in ComfyUI. The engine tiles SeedVR2's VAE by itself when a
-picture or clip doesn't fit, as ComfyUI does. It refuses `VAEDecodeTiled` / `VAEEncodeTiled` (VAE Tile Size), LoRAs,
-other formats of the model, and Variation Seed or a noise mask on a clip.
+picture or clip doesn't fit, as ComfyUI does. It refuses `VAEDecodeTiled` / `VAEEncodeTiled` (VAE Tile Size), LoRAs
+that patch SeedVR2, other formats of the model, and Variation Seed or a noise mask on a clip. SwarmUI puts every LoRA
+not confined to a section on the SeedVR model's loader too; ComfyUI skips keys that name nothing in the model, so a
+LoRA that patches none of SeedVR2's modules is skipped here, with a warning in the server log.

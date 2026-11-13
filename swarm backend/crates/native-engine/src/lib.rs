@@ -496,6 +496,25 @@ fn check_text_encoder_loras(positive: &DeferredCond, negative: &DeferredCond) ->
     Ok(())
 }
 
+/// SwarmUI puts LoRAs that aren't confined to a section on every model it loads, SeedVR2's too, and ComfyUI skips the
+/// keys that name nothing in it. So a LoRA for another model is skipped here too, and one that would patch SeedVR2 is
+/// refused.
+fn check_seedvr_loras(model: &Path, loras: &[Lora]) -> EngineResult<()> {
+    if loras.is_empty() {
+        return Ok(());
+    }
+    let st = diffusion::st::SafeTensors::open(model).map_err(internal)?;
+    for l in loras {
+        let name = l.path.file_name().unwrap_or(l.path.as_os_str()).to_string_lossy();
+        let matched = lora::matched_modules(lora::Arch::SeedVr2, &st, "", &l.path).map_err(internal)?;
+        if matched > 0 {
+            return Err(unsupported(format!("LoRAs on SeedVR2 ({name} patches {matched} of its modules)")));
+        }
+        tracing::warn!("SeedVR2: skipping {name}, which patches none of its modules");
+    }
+    Ok(())
+}
+
 /// `ModelSamplingFlux`: `max_shift` applies at 2560 latent patches, `base_shift` at 256.
 fn flux_shift(max_shift: f64, base_shift: f64, width: u32, height: u32) -> f64 {
     let mm = (max_shift - base_shift) / (2560.0 - 256.0);
@@ -825,9 +844,7 @@ impl NativeEngine {
     /// sample over all its frames, as in ComfyUI.
     fn sample_seedvr(&self, req: &SampleRequest, settings: &ModelSettings, progress: &mut dyn ProgressSink) -> EngineResult<Latent> {
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
-        if !settings.loras.is_empty() {
-            return Err(unsupported("LoRAs on SeedVR2"));
-        }
+        check_seedvr_loras(&file.path, &settings.loras)?;
         let LatentSamples::Single(tensor) = &req.latent.samples else {
             return Err(unsupported("SeedVR2 on an audio/video latent"));
         };

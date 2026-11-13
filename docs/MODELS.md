@@ -756,7 +756,8 @@ Each of these is refused with an error SwarmUI shows, unless marked untested:
 | SeedVR Upscale Method `pidmodel-*` | a pixel decoder | **Refused** |
 | SeedVR Upscale Method `latent-*` | `LatentUpscaleBy` | Should work (latent upscale works on the image models); **untested** with SeedVR |
 | VAE Tile Size (`VAEDecodeTiled`, `VAEEncodeTiled`) | tiles at that size | **Refused**; the VAE tiles by itself instead |
-| LoRAs on the SeedVR model | apply | **Refused** |
+| LoRAs that patch the SeedVR model | apply | **Refused** |
+| LoRAs for another model (SwarmUI puts unconfined LoRAs on the SeedVR loader too) | keys skipped, no effect | Skipped with a log warning; works in SwarmUI with a MOSS Image LoRA on the base stage |
 | SeedVR2 as the Refiner Model | runs the same stage | **Untested** (same code path) |
 | SeedVR CFG above 1 | the model's stored negative prompt | **Untested** |
 | Colour correction wavelet, AdaIN, none | GPU | Implemented on the CPU; only CIELAB compared with ComfyUI, the others have unit tests |

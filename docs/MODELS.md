@@ -7,7 +7,7 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 |---|---|---|---|
 | Krea 2 Turbo | Images | `euler`, `simple` | W8A8 int8 only |
 | Anima | Images | `er_sde`, `simple` | int8 ConvRot only |
-| MOSS Image | Images | `euler`, `simple` | int8 ConvRot with fused q/k/v only |
+| MOSS Image | Images | `euler`, `simple` | int8 ConvRot or bf16, with fused q/k/v |
 | Qwen Image 2.1 | Images with alpha, and edits | `euler`, `simple` | int8 ConvRot only |
 | MiniMax H3 | Video with audio | `res_multistep`, `simple` | `w6a8` only |
 | HyperFlow H3 Flash | Video with audio, with reference pictures on `ref2va` | `euler` or `res_multistep`, `hyperflow`, 6 steps | int8 ConvRot, ComfyUI's single file of either task |
@@ -211,6 +211,23 @@ was tested through `comfy-server` over HTTP and through the CLI.
 Runs int8 ConvRot MOSS Image checkpoints with fused q/k/v, the Qwen3.5 9B text encoder and the Flux 2 VAE. Both
 published key layouts of that VAE load, with its encoder, whose latents have a cosine similarity of 0.99984 with ComfyUI's on a 768x512 picture. Every sampler and scheduler works, at any CFG (see [Samplers](USAGE.md#samplers)); SwarmUI's default is `euler`.
 Prompts are literal: like ComfyUI, this encoder has no `(word:1.2)` emphasis.
+
+bf16 checkpoints with fused q/k/v (such as MossYume) load too. By default their blocks are quantized to int8 ConvRot as
+they load, in RAM; the file is only read. The arithmetic is convert_to_quant's `--int8 --scaling_mode row --convrot
+--simple`, which most published int8 ConvRot files use: float32, rotated in groups of 256, row absmax scales, rounded to
+nearest. Against a torch reproduction of it on layer 0's q/k/v, 1 of 28.3 million values differs, by one. The
+stochastic rounding ComfyUI uses after a LoRA had 1.4 times the weight error and gave a different composition. `--no-quant` on the CLI or the
+server, or No Quant in the SwarmUI backend's settings, runs them in bf16 instead. Measured on MossYume v0.1 at
+1024x1024, 20 steps, CFG 4:
+
+| | Load | Sampling | First evaluation against ComfyUI on the same bf16 file | Image after 4 steps against ComfyUI's |
+|---|---|---|---|---|
+| int8 (default) | 6.6 s to quantize, 4.5 GB of blocks | 574 ms/evaluation, every block in VRAM | 0.98% | 27.6 dB |
+| `--no-quant` | 9.1 GB of blocks | 1439 to 1529 ms/evaluation, 7 of 42 blocks streamed | 0.7% | 27.3 dB |
+
+At 20 steps the int8 picture is 29.5 dB from the bf16 one, the same composition. LoRAs bake on both: in
+bf16 like ComfyUI, and on the quantized weights as on an int8 file. An fp8 weight dtype from `UNETLoader` is refused on a
+bf16 file. The maintainer reports MossYume works in SwarmUI; the measurements, `--no-quant` and LoRAs were run through the CLI.
 
 ```bash
 target/release/diffusion.exe --moss -p "a stone lighthouse on a sea cliff at dawn, no people" --steps 20 --cfg 4 --negative "blurry" -o lighthouse.png

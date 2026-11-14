@@ -185,7 +185,16 @@ impl Generator {
         f.clear_prompts();
         f.model = None;
         let t0 = Instant::now();
-        let dst = st::SafeTensors::open(path)?;
+        let mut dst = st::SafeTensors::open(path)?;
+        if !moss::is_int8(&dst) {
+            if !moss::is_bf16(&dst) {
+                return Err(lora::Unsupported(format!("{}: MOSS Image blocks that are neither int8 ConvRot nor bf16 with fused q/k/v",
+                    path.display())).into());
+            }
+            if env.int8_weights {
+                moss::quantize_blocks(&mut dst, &env.st)?;
+            }
+        }
         let globals = moss::globals_layout(&dst)?.size;
         let free = cuda::device_free()?;
         let budget = free.saturating_sub(env.reserve + globals + moss_need(env.max_width, env.max_height, 1));

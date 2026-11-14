@@ -102,11 +102,13 @@ pub struct NativeOptions {
     pub threads: usize,
     /// Send latent previews while sampling.
     pub live_previews: bool,
+    /// Quantize bf16 MOSS Image blocks to int8 ConvRot as they load (the default); false runs them in bf16.
+    pub int8_weights: bool,
 }
 
 impl Default for NativeOptions {
     fn default() -> Self {
-        Self { reserve_vram_mb: 512, comfy_memory: Some(COMFY_HEADROOM_MB), max_side: 2048, threads: 6, live_previews: false }
+        Self { reserve_vram_mb: 512, comfy_memory: Some(COMFY_HEADROOM_MB), max_side: 2048, threads: 6, live_previews: false, int8_weights: true }
     }
 }
 
@@ -175,6 +177,11 @@ fn read_header(path: &Path) -> anyhow::Result<Arc<serde_json::Value>> {
     Ok(h)
 }
 
+/// True for a MOSS Image file whose blocks are int8 ConvRot.
+fn is_int8_moss(file: &ModelFile) -> EngineResult<bool> {
+    Ok(read_header(&file.path).map_err(internal)?.get("layers.0.proj.qkv.weight_scale").is_some())
+}
+
 /// The file's architecture. Refuses other models and formats before any weights are touched.
 fn check_dit(file: &ModelFile) -> EngineResult<Family> {
     if h3::is_hyperflow_diffusers(&file.path) {
@@ -209,8 +216,9 @@ fn check_dit(file: &ModelFile) -> EngineResult<Family> {
         return Ok(Family::Anima);
     }
     if diffusion::moss::is_moss(|k| h.get(k).is_some()) {
-        if h.get("layers.0.proj.qkv.weight_scale").is_none() {
-            return Err(unsupported(format!("{}: this backend only runs int8 ConvRot MOSS Image checkpoints with fused q/k/v", file.name)));
+        let bf16 = h.get("layers.0.proj.qkv.weight").and_then(|t| t.get("dtype")).is_some_and(|d| d == "BF16");
+        if h.get("layers.0.proj.qkv.weight_scale").is_none() && !bf16 {
+            return Err(unsupported(format!("{}: this backend only runs int8 ConvRot or bf16 MOSS Image checkpoints with fused q/k/v", file.name)));
         }
         return Ok(Family::Moss);
     }
@@ -835,6 +843,7 @@ impl NativeEngine {
             threads: o.threads,
             attn_variant: 0,
             int8_attn: true,
+            int8_weights: o.int8_weights,
             comfy_memory: o.comfy_memory,
         };
         Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads })
@@ -939,7 +948,7 @@ impl NativeEngine {
     }
 
     fn load_model(&self, file: &ModelFile) -> EngineResult<ModelHandle> {
-        // `weight_dtype` doesn't apply: the file's int8 weights are used as stored.
+        // int8 weights are used as stored; `load_diffusion_model` refuses an fp8 cast of bf16 ones.
         let (family, name) = match check_dit(file)? {
             Family::Krea2 => (self.gen().ensure_krea(&file.path), "krea-2"),
             Family::Anima => (self.gen().ensure_anima(&file.path), "anima"),
@@ -1502,6 +1511,10 @@ impl Engine for NativeEngine {
     }
 
     fn load_diffusion_model(&self, req: &LoadDiffusionModel) -> EngineResult<ModelHandle> {
+        // int8 files run as stored, but casting a bf16 file to fp8 isn't done here
+        if req.weight_dtype != WeightDtype::Default && check_dit(&req.file)? == Family::Moss && !is_int8_moss(&req.file)? {
+            return Err(unsupported(format!("{}: weight dtype {:?} on a bf16 MOSS Image file (choose default, which quantizes it to int8 unless the server has --no-quant)", req.file.name, req.weight_dtype)));
+        }
         self.load_model(&req.file)
     }
 

@@ -1,9 +1,11 @@
-//! MOSS Image: single-stream DiT (int8 ConvRot blocks) over [image tokens ; text tokens] with one
-//! modulation shared by all blocks, 128-channel latents at /16. bf16 activations like ComfyUI.
+//! MOSS Image: single-stream DiT over [image tokens ; text tokens] with one modulation shared by all blocks,
+//! 128-channel latents at /16. bf16 activations like ComfyUI. The blocks run int8 ConvRot weights, from the file or
+//! quantized at load ([`quantize_blocks`]), or bf16 weights as stored.
 
 use crate::cuda::{DevBuf, Stream};
 use crate::dit::Dit as KreaDit;
-use crate::ffi::{k, null, off, s, DT_BF16, PM, PRO_ADALN, PRO_PLAIN, PRO_RMS, PRO_SITU};
+use crate::ffi::{k, null, off, s, DT_BF16, DT_F32, PM, PRO_ADALN, PRO_PLAIN, PRO_RMS, PRO_SITU};
+use crate::st::Dt;
 use crate::offload::{plan, Layout, Store, WeightSet};
 use crate::st::{bf16_bytes, SafeTensors};
 use anyhow::Result;
@@ -30,10 +32,79 @@ pub fn is_moss(has: impl Fn(&str) -> bool) -> bool {
     has("shared_block_modulation.weight") && has("layers.0.proj.ffn_up_gate.weight")
 }
 
+/// The block projections, as the file names them after `layers.{i}.proj.`.
+const PROJ: [(&str, &str); 4] = [("qkv", "qkv"), ("o", "o"), ("ug", "ffn_up_gate"), ("d", "ffn_down")];
+
+/// True if the blocks hold int8 ConvRot weights with their row scales.
+pub fn is_int8(st: &SafeTensors) -> bool {
+    st.has("layers.0.proj.qkv.weight_scale")
+}
+
+/// True if the blocks hold bf16 weights with fused q/k/v, which run as stored or quantize at load.
+pub fn is_bf16(st: &SafeTensors) -> bool {
+    st.info("layers.0.proj.qkv.weight").is_ok_and(|i| i.dtype == Dt::BF16) && !is_int8(st)
+}
+
+/// Quantize the block projections of a bf16 file to int8 ConvRot in RAM, as an int8 file holds them, with f32 row
+/// scales beside them. The arithmetic is convert_to_quant's `--int8 --scaling_mode row --convrot --simple`, which most
+/// published int8 ConvRot files use: rotated in groups of 256 in float32, scaled by each row's absmax / 127, rounded to
+/// nearest. The file itself is only read.
+pub fn quantize_blocks(st: &mut SafeTensors, s0: &Stream) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    let mut names = Vec::new();
+    for i in 0..n_blocks(st) {
+        for (_, name) in PROJ {
+            names.push(format!("layers.{i}.proj.{name}"));
+        }
+    }
+    let shapes = names.iter().map(|n| {
+        let i = st.info(&format!("{n}.weight"))?;
+        match i.shape[..] {
+            [rows, cols] if i.dtype == Dt::BF16 && cols % 256 == 0 => Ok((rows, cols)),
+            _ => anyhow::bail!("{n}.weight: {:?} {:?}, not a bf16 matrix ConvRot can rotate", i.dtype, i.shape),
+        }
+    }).collect::<Result<Vec<_>>>()?;
+    let mut tensors = Vec::new();
+    for (stem, &(rows, cols)) in names.iter().zip(&shapes) {
+        tensors.push((format!("{stem}.weight"), Dt::I8, vec![rows, cols]));
+        tensors.push((format!("{stem}.weight_scale"), Dt::F32, vec![rows]));
+    }
+    let largest = shapes.iter().map(|(r, c)| r * c).max().unwrap_or(0);
+    let max_rows = shapes.iter().map(|s| s.0).max().unwrap_or(0);
+    let w = DevBuf::alloc(largest * 2)?;
+    let wf = DevBuf::alloc(largest * 4)?;
+    let q = DevBuf::alloc(largest)?;
+    let sc = DevBuf::alloc(max_rows * 4)?;
+    // each weight comes before its scales
+    let mut scales = Vec::new();
+    st.add_memory(tensors, |st, name, dst| {
+        if name.ends_with("_scale") {
+            dst.copy_from_slice(&scales);
+            return Ok(());
+        }
+        // still the file's bf16 weight: the new tensors replace it once all are filled
+        let (src, i) = (st.bytes(name)?, st.info(name)?);
+        let (n, kk) = (i.shape[0], i.shape[1]);
+        w.upload(0, src, s0)?;
+        k!(gpu_bf16_to_f32(w.ptr(), wf.ptr(), (n * kk) as i64, s(s0)))?;
+        // seed 0: round to nearest
+        k!(gpu_convrot_requant(DT_F32, wf.ptr(), q.ptr(), sc.ptr(), n as i64, kk as i32, 0, s(s0)))?;
+        q.download(0, dst, s0)?;
+        scales.resize(n * 4, 0);
+        sc.download(0, &mut scales, s0)?;
+        st.evict(name);
+        Ok(())
+    })?;
+    eprintln!("[moss] {} block weights quantized to int8 ConvRot in {:.1}s", names.len(), t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
 pub struct Dit {
     globals: DevBuf,
     gl: Layout,
     pub blocks: WeightSet,
+    /// int8 ConvRot block weights; bf16 otherwise.
+    int8: bool,
     pub attn_variant: i32,
     pub int8_attn: bool,
     mods: HashMap<u32, Mods>,
@@ -59,9 +130,14 @@ pub struct Context {
 pub fn block_layout(st: &SafeTensors, i: usize) -> Result<Layout> {
     let n = |x: &str| format!("layers.{i}.{x}");
     let mut l = Layout::new();
-    for (key, name) in [("qkv", "qkv"), ("o", "o"), ("ug", "ffn_up_gate"), ("d", "ffn_down")] {
-        l.raw(st, &format!("w_{key}"), &[n(&format!("proj.{name}.weight"))])?;
-        l.raw(st, &format!("s_{key}"), &[n(&format!("proj.{name}.weight_scale"))])?;
+    let int8 = is_int8(st);
+    for (key, name) in PROJ {
+        if int8 {
+            l.raw(st, &format!("w_{key}"), &[n(&format!("proj.{name}.weight"))])?;
+            l.raw(st, &format!("s_{key}"), &[n(&format!("proj.{name}.weight_scale"))])?;
+        } else {
+            l.bf16(st, &format!("w_{key}"), &[n(&format!("proj.{name}.weight"))])?;
+        }
     }
     l.bf16(st, "n1", &[n("norm1.weight")])?;
     l.bf16(st, "n2", &[n("norm2.weight")])?;
@@ -98,9 +174,10 @@ pub fn n_blocks(st: &SafeTensors) -> usize {
     (0..).take_while(|i| st.has(&format!("layers.{i}.proj.qkv.weight"))).count()
 }
 
-/// Rough activation footprint of one denoising step (bytes) for `l` tokens.
+/// Rough activation footprint of one denoising step (bytes) for `l` tokens, with int8 or bf16 blocks (the larger).
 pub fn step_activation_bytes(l: usize) -> usize {
-    l * (F * 2 /*x*/ + QKV * 2 + F * 2 /*attn*/ + 2 * MLP * 2 + MLP /*int8*/ + 8) + 2 * l * 2 * F * 2 /*int8 attn*/ + (128 << 20)
+    l * (F * 2 /*x*/ + QKV * 2 + F * 2 /*attn*/ + 2 * MLP * 2 + MLP * 2 /*bf16 or int8 MLP input*/ + F * 2 /*bf16 projection*/ + 8)
+        + 2 * l * 2 * F * 2 /*int8 attn*/ + (128 << 20)
 }
 
 /// RoPE table [rows][64][(cos, sin)] for an h x w image, then `len` text tokens. The image sits after
@@ -139,7 +216,7 @@ impl Dit {
         let layouts = (0..n_blocks(st)).map(|i| block_layout(st, i)).collect::<Result<Vec<_>>>()?;
         let p = plan(&layouts, block_budget, slots);
         let blocks = WeightSet::load("moss blocks", st, layouts, p, threads)?;
-        Ok(Dit { globals, gl, blocks, attn_variant: 0, int8_attn: true, mods: HashMap::new() })
+        Ok(Dit { globals, gl, blocks, int8: is_int8(st), attn_variant: 0, int8_attn: true, mods: HashMap::new() })
     }
 
     fn g(&self, key: &str) -> PM {
@@ -295,8 +372,10 @@ impl Dit {
             p("video_embedder_out", &x, li * F * 2);
         }
 
-        let a8 = DevBuf::alloc_async(rows * MLP, st)?;
+        // int8 blocks quantize each projection's input to a8; bf16 ones write it to a8 in bf16 and project into y
+        let a8 = DevBuf::alloc_async(rows * MLP * if self.int8 { 1 } else { 2 }, st)?;
         let asc = DevBuf::alloc_async(rows * 4, st)?;
+        let y = DevBuf::alloc_async(if self.int8 { 0 } else { rows * F * 2 }, st)?;
         let qkv = DevBuf::alloc_async(rows * QKV * 2, st)?;
         let attn = DevBuf::alloc_async(rows * F * 2, st)?;
         let hid = DevBuf::alloc_async(rows * 2 * MLP * 2, st)?;
@@ -313,26 +392,46 @@ impl Dit {
                 k!(gpu_adaln_weight(wp("n1"), shared(1), scale(0), F as i32, s(st)))?;
                 k!(gpu_adaln_weight(wp("n2"), shared(4), scale(1), F as i32, s(st)))?;
             }
-            k!(gpu_quant_rows(DT_BF16, PRO_ADALN, xp, fi, null(), 0, 0, null(), EPS, scale(0), shared(0), a8.ptr(), asc.ptr(), m, F as i32, 1,
-                s(st)))?;
-            k!(gpu_int8_gemm(a8.ptr(), wp("w_qkv"), asc.ptr(), wp("s_qkv"), null(), q, rows as i64, QKV as i64, fi, DT_BF16, s(st)))?;
+            if self.int8 {
+                k!(gpu_quant_rows(DT_BF16, PRO_ADALN, xp, fi, null(), 0, 0, null(), EPS, scale(0), shared(0), a8.ptr(), asc.ptr(), m, F as i32,
+                    1, s(st)))?;
+                k!(gpu_int8_gemm(a8.ptr(), wp("w_qkv"), asc.ptr(), wp("s_qkv"), null(), q, rows as i64, QKV as i64, fi, DT_BF16, s(st)))?;
+            } else {
+                k!(gpu_prologue_rows(DT_BF16, PRO_ADALN, xp, fi, null(), 0, 0, null(), EPS, scale(0), shared(0), a8.ptr(), fi, m, F as i32,
+                    s(st)))?;
+                self.gemm(a8.ptr(), wp("w_qkv"), nil, q, rows, QKV, F, QKV, st)?;
+            }
             // the RoPE table is one image's
             for i in 0..batch {
                 k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(q, i * l * QKV * 2), QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn"), wp("kn"),
                     EPS, rope.ptr(), 2, l as i32, s(st)))?;
             }
             self.attention(q, off(q, F * 2), off(q, 2 * F * 2), attn.ptr(), ws.ptr(), batch, l, st)?;
-            k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m, F as i32, 1,
-                s(st)))?;
-            k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_o"), asc.ptr(), wp("s_o"), null(), shared(2), xp, xp, rows as i64, fi, fi, DT_BF16, s(st)))?;
-
-            k!(gpu_quant_rows(DT_BF16, PRO_ADALN, xp, fi, null(), 0, 0, null(), EPS, scale(1), shared(3), a8.ptr(), asc.ptr(), m, F as i32, 1,
-                s(st)))?;
-            k!(gpu_int8_gemm(a8.ptr(), wp("w_ug"), asc.ptr(), wp("s_ug"), null(), hid.ptr(), rows as i64, (2 * MLP) as i64, fi, DT_BF16, s(st)))?;
-            k!(gpu_quant_rows(DT_BF16, PRO_SITU, hid.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0, null(), null(), a8.ptr(),
-                asc.ptr(), m, MLP as i32, 1, s(st)))?;
-            k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_d"), asc.ptr(), wp("s_d"), null(), shared(5), xp, xp, rows as i64, fi, MLP as i64, DT_BF16,
-                s(st)))?;
+            if self.int8 {
+                k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m, F as i32,
+                    1, s(st)))?;
+                k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_o"), asc.ptr(), wp("s_o"), null(), shared(2), xp, xp, rows as i64, fi, fi, DT_BF16,
+                    s(st)))?;
+                k!(gpu_quant_rows(DT_BF16, PRO_ADALN, xp, fi, null(), 0, 0, null(), EPS, scale(1), shared(3), a8.ptr(), asc.ptr(), m, F as i32,
+                    1, s(st)))?;
+                k!(gpu_int8_gemm(a8.ptr(), wp("w_ug"), asc.ptr(), wp("s_ug"), null(), hid.ptr(), rows as i64, (2 * MLP) as i64, fi, DT_BF16,
+                    s(st)))?;
+                k!(gpu_quant_rows(DT_BF16, PRO_SITU, hid.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0, null(), null(), a8.ptr(),
+                    asc.ptr(), m, MLP as i32, 1, s(st)))?;
+                k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_d"), asc.ptr(), wp("s_d"), null(), shared(5), xp, xp, rows as i64, fi, MLP as i64,
+                    DT_BF16, s(st)))?;
+            } else {
+                // x + gate * (input @ W^T), each rounded to bf16 as torch does
+                self.gemm(attn.ptr(), wp("w_o"), nil, y.ptr(), rows, F, F, F, st)?;
+                k!(gpu_add_gated_bf16(xp, fi, y.ptr(), fi, shared(2), m, F as i32, s(st)))?;
+                k!(gpu_prologue_rows(DT_BF16, PRO_ADALN, xp, fi, null(), 0, 0, null(), EPS, scale(1), shared(3), a8.ptr(), fi, m, F as i32,
+                    s(st)))?;
+                self.gemm(a8.ptr(), wp("w_ug"), nil, hid.ptr(), rows, 2 * MLP, F, 2 * MLP, st)?;
+                k!(gpu_prologue_rows(DT_BF16, PRO_SITU, hid.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0, null(), null(), a8.ptr(),
+                    MLP as i64, m, MLP as i32, s(st)))?;
+                self.gemm(a8.ptr(), wp("w_d"), nil, y.ptr(), rows, F, MLP, F, st)?;
+                k!(gpu_add_gated_bf16(xp, fi, y.ptr(), fi, shared(5), m, F as i32, s(st)))?;
+            }
             self.blocks.release(b, st)?;
             if let Some(p) = probe.as_mut() {
                 p(&format!("block{b}"), &x, l * F * 2);

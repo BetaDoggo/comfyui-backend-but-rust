@@ -1,8 +1,9 @@
 """Run ComfyUI's MOSS Image pipeline headlessly and dump intermediate tensors for parity tests.
 
 usage: python moss_ref.py <out_dir> [prompt] [--seed N] [--size W H] [--steps N] [--cfg X] [--shift X]
-                          [--negative TEXT] [--repeat N]
+                          [--negative TEXT] [--repeat N] [--dit FILE]
 
+--dit picks another diffusion model, such as a bf16 one (default: the int8 ConvRot release).
 --repeat runs the sampler that many times; the timings of the later runs are the warm baseline.
 """
 import argparse
@@ -23,6 +24,7 @@ ap.add_argument("--cfg", type=float, default=4.0)
 ap.add_argument("--shift", type=float, default=5.0)
 ap.add_argument("--negative", default="blurry, low quality")
 ap.add_argument("--repeat", type=int, default=1)
+ap.add_argument("--dit")
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
 
@@ -37,7 +39,7 @@ import comfy.utils
 import comfy.sample
 import comfy.samplers
 
-DIT = os.path.join(os.environ["MODELS_ROOT"], r"Stable-diffusion\moss_image_sft_int8_convrot_attn.safetensors")
+DIT = args.dit or os.path.join(os.environ["MODELS_ROOT"], r"Stable-diffusion\moss_image_sft_int8_convrot_attn.safetensors")
 TE = os.path.join(os.environ["MODELS_ROOT"], r"clip\qwen3.5_9b_int8_convrot.safetensors")
 VAE = os.path.join(os.environ["MODELS_ROOT"], r"VAE\flux2-vae.safetensors")
 

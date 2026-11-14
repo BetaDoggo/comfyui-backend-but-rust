@@ -59,6 +59,9 @@ public class ComfyRustSelfStartBackend : ComfyUIAPIAbstractBackend
         [ConfigComment("Whether to send latent previews while sampling.")]
         public bool EnablePreviews = false;
 
+        [ConfigComment("Whether to run bf16 checkpoints (MOSS Image) in their original precision.\nBy default they are quantized to int8 as they load: about 2.5 times as fast and half the VRAM, at a small cost in quality. Int8 checkpoints run as stored either way. Restart the backend after changing it.")]
+        public bool NoQuant = false;
+
         [ConfigComment("Which GPU to use, if multiple are available.\nShould be a single number, like '0'.")]
         public string GPU_ID = "0";
 
@@ -100,6 +103,10 @@ public class ComfyRustSelfStartBackend : ComfyUIAPIAbstractBackend
         if (Settings.EnablePreviews)
         {
             args += " --live-previews";
+        }
+        if (Settings.NoQuant)
+        {
+            args += " --no-quant";
         }
         AddLoadStatus("Starting self-start comfy-rust process...");
         await NetworkBackendUtils.DoSelfStart(Settings.StartScript, this, $"ComfyRust-{BackendData.ID}", $"backend-{BackendData.ID}", Settings.GPU_ID, args, InitInternal, (p, r) => { Port = p; RunningProcess = r; }, Settings.AutoRestart);

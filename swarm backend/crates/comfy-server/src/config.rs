@@ -62,6 +62,11 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub live_previews: bool,
 
+    /// native engine: run bf16 MOSS Image checkpoints in bf16. By default they are quantized to int8 ConvRot as they
+    /// load, for speed. Int8 checkpoints run as stored either way.
+    #[arg(long, default_value_t = false)]
+    pub no_quant: bool,
+
     /// Mock engine only: artificial delay per sampling step, so progress/previews are visible.
     #[arg(long, default_value_t = 40)]
     pub mock_step_ms: u64,
@@ -100,6 +105,7 @@ impl Config {
             comfy_memory_mode: false,
             max_side: 2048,
             live_previews: false,
+            no_quant: false,
             mock_step_ms: 0,
             mock_native_only: false,
             max_history: 100,

@@ -93,6 +93,10 @@ struct Args {
     /// Run MOSS Image instead of Krea 2 (--dit, --te and --vae then default to the MOSS files, --shift to 5)
     #[arg(long)]
     moss: bool,
+    /// Run a bf16 MOSS Image checkpoint in bf16. By default its blocks are quantized to int8 ConvRot as it loads, for
+    /// speed (in RAM; the file is only read)
+    #[arg(long)]
+    no_quant: bool,
     /// Run MiniMax H3 (text to video with audio); --dit and --te then default to its files
     #[arg(long)]
     h3: bool,
@@ -990,6 +994,7 @@ fn main() -> Result<()> {
         threads: args.threads,
         attn_variant: args.attn_variant,
         int8_attn,
+        int8_weights: !args.no_quant,
         comfy_memory: (!args.legacy_offload).then(|| args.reserve_vram.unwrap_or(diffusion::comfy_memory::DEFAULT_HEADROOM_MB)),
     };
     if args.h3 || args.h3_image {

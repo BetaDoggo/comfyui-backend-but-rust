@@ -26,6 +26,7 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--image a.png` | Qwen Image 2.1 edits: each image goes to the text encoder and into the sequence as a reference latent (repeatable); the prompt then says what to change, as in `put the boat from picture 2 on the sea in picture 1`. Output is RGBA |
 | `--image a.png`, `--first-frame a.png`, `--last-frame b.png` | MiniMax H3: reference pictures, `<Picture n>` in the prompt (repeatable), and keyframes stretched to the clip. MiniMax-H3-Image: pictures to edit or refer to. See [reference pictures](MODELS.md#reference-pictures-and-keyframes) |
 | `--qwen21-vae-check ref.safetensors` | Qwen Image 2.1: compare the VAE with `tools/qwen21_ref.py --vae-only` |
+| `--no-quant` | MOSS Image: run a bf16 checkpoint in bf16, rather than quantizing its blocks to int8 as it loads |
 | `--flux2-vae-check ref.safetensors` | MOSS Image: compare the Flux 2 VAE encoder with `tools/flux2_vae_ref.py` |
 | `--frames N` | H3 video length, snapped up to the 17k + 5 grid (default 5) |
 | `--sparse sol` or `--sparse sla` | H3 block-sparse attention, as ComfyUI's Model Sparse Attention node: Sol-Attn's adaptive threshold (`--sparse-tau`, default 1.3) or SLA-style top-k (`--sparse-keep` percent, default 10). `--sparse-start` (default 0.2), `--sparse-min-tokens` (default 12288) and `--sparse-extra-tokens` (default 256) are the node's start_percent, min_tokens and extra_tokens; see [sparse attention](MODELS.md#sparse-attention) |

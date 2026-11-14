@@ -162,6 +162,27 @@ impl SafeTensors {
         Ok(())
     }
 
+    /// Add tensors held in RAM rather than in a file, each `(name, dtype, shape)`, replacing any of the same name once
+    /// all are filled. `fill` writes each one's bytes in order and still sees the tensors it replaces.
+    pub fn add_memory(&mut self, tensors: Vec<(String, Dt, Vec<usize>)>, mut fill: impl FnMut(&Self, &str, &mut [u8]) -> Result<()>)
+        -> Result<()> {
+        let mut infos = Vec::with_capacity(tensors.len());
+        let mut end = 0usize;
+        for (name, dtype, shape) in tensors {
+            let start = end.next_multiple_of(256);
+            let len = shape.iter().product::<usize>() * dtype.size();
+            end = start + len;
+            infos.push((name, TensorInfo { dtype, shape, file: self.mmaps.len(), start, len }));
+        }
+        let mut m = memmap2::MmapMut::map_anon(end.max(1))?;
+        for (name, i) in &infos {
+            fill(self, name, &mut m[i.start..i.start + i.len])?;
+        }
+        self.mmaps.push(m.make_read_only()?);
+        self.tensors.extend(infos);
+        Ok(())
+    }
+
     pub fn info(&self, name: &str) -> Result<&TensorInfo> {
         self.tensors.get(name).ok_or_else(|| anyhow!("missing tensor {name}"))
     }

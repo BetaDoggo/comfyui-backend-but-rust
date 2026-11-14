@@ -120,6 +120,8 @@ ref/venv/Scripts/python.exe tools/moss_ref.py refout/moss "a stone lighthouse on
 target/release/diffusion.exe --moss -p "a stone lighthouse on a sea cliff at dawn, no people" --seed 42 --steps 20 --cfg 4 --dump refout/moss/ours.safetensors
 ```
 
+For a bf16 checkpoint, pass it as `--dit` to both, and add `--no-quant` to the engine's run to compare the bf16 path.
+
 ```bash
 python tools/moss_cmp.py refout/moss/ref.safetensors refout/moss/ours.safetensors
 ```

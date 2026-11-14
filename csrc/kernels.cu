@@ -1230,6 +1230,11 @@ __global__ void convrot_requant_kernel(const T* x, int8_t* q, float* scales, int
     const float scale_t = rnd<T>(scale);
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
         const float scaled = rnd<T>(rnd<T>(row[k]) / scale_t);
+        if (seed == 0) {
+            // torch.round: to nearest, ties to even
+            q[m * K + k] = (int8_t)fminf(127.f, fmaxf(-128.f, rintf(scaled)));
+            continue;
+        }
         const uint64_t key = (uint64_t)(m * K + k) + seed;
         const uint32_t folded = (uint32_t)key ^ (uint32_t)(key >> 32);
         const float v = floorf(noisy_sum(scaled, (float)(pcg_hash(folded) >> 8) * 0x1.0p-24f, (T*)nullptr));
@@ -1253,7 +1258,8 @@ GPU_API int gpu_convrot_dequant(int dtype, const void* q, const void* s, void* o
     return 0;
 }
 
-// x [N, K] in its original basis -> rotated q [N, K] and row scales s [N]
+// x [N, K] in its original basis -> rotated q [N, K] and row scales s [N]. Seed 0 rounds to nearest, as comfy-kitchen and
+// convert_to_quant do without a seed; any other seed rounds stochastically, as ComfyUI does after a LoRA.
 GPU_API int gpu_convrot_requant(int dtype, const void* x, void* q, void* s, int64_t N, int K, uint64_t seed, void* stream) {
     const int smem = (K + 33) * sizeof(float);
     cudaFuncSetAttribute(convrot_requant_kernel<float>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);

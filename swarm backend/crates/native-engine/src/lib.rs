@@ -1,5 +1,5 @@
 //! [`Engine`] implementation on the diffusion library: text-to-image for int8 ConvRot checkpoints of
-//! Krea 2, Anima, MOSS Image and Qwen Image 2.1 and text-to-video with audio for MiniMax H3, with every ComfyUI
+//! Krea 2, Anima, MOSS Image and Qwen Image 2.1, fp16 SD 1.x and SDXL checkpoints, and text-to-video with audio for MiniMax H3, with every ComfyUI
 //! sampler and scheduler, any CFG and LoRAs, plus the prompt images and reference
 //! latents of Krea 2 and of Qwen Image 2.1's edits, and MiniMax H3's reference pictures and keyframes. The image models also sample partially, from
 //! a latent and with a noise mask: init images, refiners and inpainting. Each
@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use diffusion::h3;
 use diffusion::h3window;
 use diffusion::pipeline::{
-    AnimaRequest, Cancelled, Generator, H3Conds, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, SeedVrRequest, SnapRefRequest,
-    Step,
+    AnimaRequest, Cancelled, Generator, H3Conds, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, SdRequest, SeedVrRequest,
+    SizeCond, SnapRefRequest, Step,
 };
 use diffusion::pixal3d;
 use diffusion::triposplat;
@@ -50,6 +50,10 @@ const MOSS_ENCODER: &str = "moss_image";
 /// Image 1 shares.
 const QWEN21_ENCODER: &str = "qwen_image_2.1";
 const MINIMAX_ENCODER: &str = "minimax";
+/// [`TextEncoderHandle::encoder_type`] of an SD 1.x or SDXL checkpoint's own CLIP text encoders, which only
+/// `CheckpointLoaderSimple` hands out.
+const SD1_ENCODER: &str = "sd1";
+const SDXL_ENCODER: &str = "sdxl";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
@@ -62,6 +66,8 @@ enum Family {
     Qwen21,
     /// SeedVR2 3B, the restoration model SwarmUI's SeedVR stage runs
     SeedVr2,
+    /// SD 1.x and SDXL base checkpoints, with their own CLIP and VAE
+    Sd,
 }
 
 impl Family {
@@ -70,6 +76,7 @@ impl Family {
         match self {
             Family::Moss => (diffusion::moss::CH, 16),
             Family::Qwen21 => (diffusion::qwen21::CH, diffusion::vae21::SCALE),
+            Family::Sd => (diffusion::unet::CH, 8),
             _ => (16, 8),
         }
     }
@@ -130,6 +137,10 @@ struct DeferredCond {
     loras: Vec<Lora>,
     /// MiniMax H3: reference pictures, sized and encoded when the model they're for samples.
     minimax: Option<MiniMaxReferences>,
+    /// SD 1.x and SDXL: `CLIPSetLastLayer`'s layer.
+    clip_layer: Option<i32>,
+    /// SDXL: the size conditioning `CLIPTextEncodeSDXL` or `SwarmTextEncodeAdvanced` set; `None` takes the latent's.
+    sdxl_size: Option<SdxlSize>,
 }
 
 /// Sampled latents, `[B, 16, H/8, W/8]`, or `[B, 128, H/16, W/16]` for MOSS Image.
@@ -222,6 +233,10 @@ fn check_dit(file: &ModelFile) -> EngineResult<Family> {
         }
         return Ok(Family::Moss);
     }
+    if diffusion::pipeline::is_sd(|k| h.get(k).is_some()) {
+        sd_is_xl(file, &h)?;
+        return Ok(Family::Sd);
+    }
     if h3::is_h3_image(|k| h.get(k).is_some()) {
         if h["blocks.0.attn.qkv_proj.weight"]["dtype"] != "I8" || h.get("blocks.0.attn.qkv_proj.weight_scale").is_none() {
             return Err(unsupported(format!("{}: this backend only runs the int8 ConvRot MiniMax-H3-Image release", file.name)));
@@ -236,12 +251,46 @@ fn check_dit(file: &ModelFile) -> EngineResult<Family> {
     }
     // The keys SwarmUI's `isKrea2` tests.
     if ["txtfusion.projector.weight", "blocks.0.attn.gate.weight", "blocks.0.mod.lin"].iter().any(|k| h.get(k).is_none()) {
-        return Err(unsupported(format!("{}: this backend only runs Krea 2, Anima, MOSS Image, Qwen Image 2.1, MiniMax H3 and MiniMax-H3-Image models", file.name)));
+        return Err(unsupported(format!("{}: this backend only runs Krea 2, Anima, MOSS Image, Qwen Image 2.1, SD 1.x, SDXL, MiniMax H3 and MiniMax-H3-Image models", file.name)));
     }
     if h.get("blocks.0.attn.gate.weight_scale").is_none() {
         return Err(unsupported(format!("{}: this backend only runs W8A8 (ConvRot int8) Krea 2 checkpoints", file.name)));
     }
     Ok(Family::Krea2)
+}
+
+/// Whether an SD checkpoint is SDXL (else SD 1.x), from its header: fp16, bf16 or fp32 weights, quantized to int8 here
+/// unless the server runs with `--no-quant`. SD 2.x, the SDXL refiner, inpainting UNets and quantized files are refused.
+fn sd_is_xl(file: &ModelFile, h: &serde_json::Value) -> EngineResult<bool> {
+    let p = diffusion::unet::key_prefix(|k| h.get(k).is_some()).ok_or_else(|| unsupported(format!("{}: no SD UNet", file.name)))?;
+    let conv_in = &h[format!("{p}input_blocks.0.0.weight")];
+    let dtype = conv_in["dtype"].as_str().unwrap_or("?");
+    if !matches!(dtype, "F16" | "BF16" | "F32") {
+        return Err(unsupported(format!("{}: {dtype} SD weights (this backend runs fp16, bf16 or fp32 SD 1.x and SDXL checkpoints, and quantizes them to int8 itself)", file.name)));
+    }
+    if conv_in["shape"][1] != 4 {
+        return Err(unsupported(format!("{}: a UNet that takes {} input channels (inpainting and instruct models)", file.name, conv_in["shape"][1])));
+    }
+    let keys = h.as_object().map(|o| o.iter()).into_iter().flatten();
+    let context = keys.filter(|(k, _)| k.starts_with(p) && k.ends_with("attn2.to_k.weight")).find_map(|(_, t)| t["shape"][1].as_u64());
+    let adm = h.get(format!("{p}label_emb.0.0.weight")).and_then(|t| t["shape"][1].as_u64());
+    match (context, adm) {
+        (Some(768), None) => Ok(false),
+        (Some(2048), Some(2816)) => Ok(true),
+        _ => Err(unsupported(format!("{}: this UNet (this backend runs SD 1.x and SDXL base models, not SD 2.x, the SDXL refiner or others)", file.name))),
+    }
+}
+
+/// [`sd_is_xl`] of a file.
+fn sd_file_is_xl(file: &ModelFile) -> EngineResult<bool> {
+    sd_is_xl(file, &*read_header(&file.path).map_err(internal)?)
+}
+
+/// An SD 1.x or SDXL VAE, alone or in a checkpoint: the 4-channel latent's decoder.
+fn is_sd_vae(file: &ModelFile) -> bool {
+    read_header(&file.path).is_ok_and(|h| {
+        diffusion::sdvae::key_prefix(|k| h.get(k).is_some()).is_some_and(|p| h[format!("{p}decoder.conv_in.weight")]["shape"][1] == 4)
+    })
 }
 
 /// Qwen Image 2.1's `CLIPLoader` type is Qwen Image 1's `qwen_image`; this tells the Qwen3-VL 8B by its shape and its
@@ -287,6 +336,9 @@ fn chunk_segments(leaves: &[PromptLeaf], family: Family) -> Result<Vec<(String, 
         match &leaf.kind {
             PromptLeafKind::Text(t) if family == Family::Anima => segments.extend(token_weights(t, leaf.weight as f32)),
             PromptLeafKind::Text(t) if family.one_piece() => text.push_str(t),
+            // SwarmTextEncodeAdvanced tokenizes each piece with weights disabled: parentheses are literal, escaped ones lose
+            // their backslash
+            PromptLeafKind::Text(t) if family == Family::Sd => segments.push((t.replace("\\)", ")").replace("\\(", "("), leaf.weight as f32)),
             PromptLeafKind::Text(t) => segments.push((t.clone(), leaf.weight as f32)),
             PromptLeafKind::Embed(_) => return Err("embeddings in prompts".into()),
             PromptLeafKind::LoraHook(_) => return Err("LoRA hooks in prompts".into()),
@@ -304,6 +356,7 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<Vec<(St
         match p {
             TextEncoderPatch::Lora { .. } => {}
             TextEncoderPatch::Hooks { .. } => return Err("LoRA hooks".into()),
+            TextEncoderPatch::StopAtLayer { .. } if family == Family::Sd => {}
             TextEncoderPatch::StopAtLayer { .. } => return Err("CLIP Stop At Layer".into()),
         }
     }
@@ -312,6 +365,15 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<Vec<(St
         TextEncodeMode::Plain { text } if family == Family::Anima => Ok(vec![token_weights(text, 1.0)]),
         // MOSSImageTokenizer trims a plain prompt; SwarmTextEncodeAdvanced's leaves skip that.
         TextEncodeMode::Plain { text } if family == Family::Moss => Ok(vec![vec![(text.trim().to_string(), 1.0)]]),
+        // CLIPTextEncode parses ComfyUI's (word:1.2) emphasis
+        TextEncodeMode::Plain { text } if family == Family::Sd => Ok(vec![token_weights(text, 1.0)]),
+        TextEncodeMode::Sdxl { text_g, text_l, .. } if family == Family::Sd => {
+            if text_g != text_l {
+                return Err("different text_g and text_l prompts".into());
+            }
+            Ok(vec![token_weights(text_g, 1.0)])
+        }
+        TextEncodeMode::Sdxl { .. } => Err("CLIPTextEncodeSDXL on a model other than SDXL".into()),
         TextEncodeMode::Plain { text } => Ok(vec![vec![(text.clone(), 1.0)]]),
         TextEncodeMode::MiniMax { text, .. } if family == Family::H3 => Ok(vec![vec![(text.clone(), 1.0)]]),
         TextEncodeMode::MiniMax { .. } => Err("MiniMax H3 pictures on another text encoder".into()),
@@ -544,6 +606,8 @@ struct ModelSettings {
     windows: Option<h3window::ContextWindows>,
     /// `SnapRef`, on Anima.
     snapref: Option<Box<SnapRefPatch>>,
+    /// SD: `ModelSamplingDiscrete`'s prediction type, in place of the checkpoint's.
+    v_pred: Option<bool>,
 }
 
 /// MiniMax-H3-Image's `MiniMaxH3ImageModelSampling`: the sigma grid its heads were distilled on, from the file.
@@ -563,16 +627,27 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::H3 => ModelSampling::Flow { shift: h3::SHIFT_VIDEO },
         // ComfyUI's SeedVR2 sampling_settings
         Family::SeedVr2 => ModelSampling::Flow { shift: 1.0 },
+        Family::Sd => ModelSampling::Discrete,
     };
-    let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None, snapref: None };
+    let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None, snapref: None, v_pred: None };
     let mut sparse = None;
     for p in &model.patches {
         match p {
             ModelPatch::SamplingFlux { max_shift, base_shift, width, height } if matches!(family, Family::Krea2 | Family::Qwen21) => {
                 s.model_sampling = ModelSampling::Flux { shift: flux_shift(*max_shift, *base_shift, *width, *height) }
             }
-            ModelPatch::SamplingAuraFlow { shift, sampling } if family != Family::Krea2 && sampling == "flow" => {
+            ModelPatch::SamplingAuraFlow { shift, sampling } if !matches!(family, Family::Krea2 | Family::Sd) && sampling == "flow" => {
                 s.model_sampling = ModelSampling::Flow { shift: *shift }
+            }
+            ModelPatch::SamplingDiscrete { sampling, zsnr } if family == Family::Sd => {
+                if *zsnr {
+                    return Err(unsupported("ModelSamplingDiscrete's zsnr"));
+                }
+                s.v_pred = Some(match sampling.as_str() {
+                    "eps" => false,
+                    "v_prediction" => true,
+                    other => return Err(unsupported(format!("ModelSamplingDiscrete sampling {other}"))),
+                });
             }
             ModelPatch::MiniMaxH3Shift { shift_video, shift_audio } if family == Family::H3 => {
                 s.model_sampling = ModelSampling::Flow { shift: *shift_video };
@@ -606,8 +681,9 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
                     b => return Err(unsupported(format!("attention backend {b}"))),
                 }
             }
-            // H3's latent packs two streams, which ComfyUI's patches read as nested tensors.
-            ModelPatch::RescaleCfg { multiplier } if family != Family::H3 => {
+            // H3's latent packs two streams, which ComfyUI's patches read as nested tensors. RescaleCFG's other branch,
+            // for EPS and v-prediction models, isn't ported.
+            ModelPatch::RescaleCfg { multiplier } if !matches!(family, Family::H3 | Family::Sd) => {
                 s.tweaks.function = Some(CfgFunction::Rescale { multiplier: *multiplier as f32 })
             }
             ModelPatch::RenormCfg { cfg_trunc, renorm_cfg } if family != Family::H3 => {
@@ -957,6 +1033,8 @@ impl NativeEngine {
             Family::H3Image => (self.gen().ensure_h3(&file.path), "minimax-h3-image"),
             Family::Qwen21 => (self.gen().ensure_qwen21(&file.path), "qwen-image-2.1"),
             Family::SeedVr2 => (self.gen().ensure_seedvr(&file.path), "seedvr2"),
+            Family::Sd if sd_file_is_xl(file)? => (self.gen().ensure_sd(&file.path), "stable-diffusion-xl-v1-base"),
+            Family::Sd => (self.gen().ensure_sd(&file.path), "stable-diffusion-v1"),
         };
         family.map_err(internal)?;
         Ok(ModelHandle::new(Some(file.clone()), Some(name.into()), Opaque::none()))
@@ -1398,6 +1476,120 @@ impl NativeEngine {
         tracing::info!("moss: {batch} image(s): text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
         Ok(latent)
     }
+
+    /// SD 1.x and SDXL. Their latents pass between nodes raw, as in ComfyUI, and are scaled only for sampling.
+    fn sample_sd(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, plan: &Plan, progress: &mut dyn ProgressSink)
+        -> EngineResult<Vec<f32>> {
+        let (batch, lh, lw) = shape;
+        let mode = self.preview_mode(req);
+        let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
+        let xl = sd_file_is_xl(file)?;
+        let (cond, positive) = single_prompt(&req.positive, Family::Sd)?;
+        let mut sampling = sampling(req, settings, plan, batch)?;
+        let (negative_cond, negative) = if sampling.uses_negative() {
+            let (c, p) = single_prompt(&req.negative, Family::Sd)?;
+            check_text_encoder_loras(cond, c)?;
+            (Some(c), p)
+        } else {
+            (None, Prompt::new(Vec::new()))
+        };
+        for c in std::iter::once(cond).chain(negative_cond) {
+            if c.text_encoder != file.path {
+                return Err(unsupported("a CLIP from another checkpoint than the model's"));
+            }
+            if c.clip_layer != cond.clip_layer {
+                return Err(unsupported("different CLIP Stop At Layer on the positive and negative prompts"));
+            }
+        }
+        let size = |c: &DeferredCond| match c.sdxl_size {
+            Some(s) => SizeCond {
+                width: s.width as f32,
+                height: s.height as f32,
+                crop_w: s.crop_w as f32,
+                crop_h: s.crop_h as f32,
+                target_width: s.target_width as f32,
+                target_height: s.target_height as f32,
+            },
+            None => SizeCond::of(lw * 8, lh * 8),
+        };
+        let scale = if xl { diffusion::sdvae::SDXL_SCALE } else { diffusion::sdvae::SD1_SCALE };
+        // process_latent_in
+        if let Some(l) = &mut sampling.latent {
+            l.iter_mut().for_each(|v| *v *= scale);
+        }
+        let r = SdRequest {
+            positive,
+            negative,
+            width: lw * 8,
+            height: lh * 8,
+            positive_size: size(cond),
+            negative_size: size(negative_cond.unwrap_or(cond)),
+            clip_layer: cond.clip_layer,
+            v_pred: settings.v_pred,
+            sampling,
+            noise: plan.noise(req, batch, (diffusion::unet::CH, lh, lw)),
+        };
+        let mut gen = self.gen();
+        gen.ensure_sd(&file.path).map_err(internal)?;
+        gen.set_int8_attention(settings.int8_attention);
+        gen.set_loras(&settings.loras).map_err(internal)?;
+        gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
+        let (mut latent, stats) = gen
+            .sample_sd(&r, |step| report(mode, progress, batch, step, |x0| (preview::sd(x0, lh, lw, xl), lh, lw)), None)
+            .map_err(internal)?;
+        tracing::info!("{}: {batch} image(s): text {:.0} ms, sampling {:.0} ms", if xl { "sdxl" } else { "sd1" }, stats.text_ms, stats.sample_ms);
+        // process_latent_out
+        latent.iter_mut().for_each(|v| *v /= scale);
+        Ok(latent)
+    }
+
+    /// An SD VAE on `pixels`, alpha dropped as ComfyUI's VAEEncode does: raw latents `[batch, 4, h/8, w/8]`.
+    fn encode_sd(&self, file: &ModelFile, pixels: &ImageBatch) -> EngineResult<Latent> {
+        let c = pixels.channels as usize;
+        if c < 3 {
+            return Err(unsupported("VAE encoding of a greyscale image"));
+        }
+        let (w, h) = (pixels.width as usize, pixels.height as usize);
+        let mut gen = self.gen();
+        gen.ensure_sd_vae(&file.path).map_err(internal)?;
+        let scale = gen.sd_vae_scale().ok_or_else(|| unsupported("an SD VAE"))?;
+        let (mut data, mut size) = (Vec::new(), (0, 0));
+        for i in 0..pixels.count {
+            let rgb: Vec<f32> = pixels.frame_f32(i).chunks_exact(c).flat_map(|px| [px[0], px[1], px[2]]).collect();
+            let r = gen.encode_sd(&rgb, w, h).map_err(internal)?;
+            data.extend(r.latent.iter().map(|v| v / scale));
+            size = (r.height, r.width);
+        }
+        let (lh, lw) = size;
+        let tensor = LatentTensor {
+            format: LatentFormat::Image4Ch,
+            shape: vec![pixels.count as usize, diffusion::unet::CH, lh, lw],
+            data: Opaque::new(HostLatent { data }),
+        };
+        Ok(Latent::single(tensor, PixelInfo::image(lw as u32 * 8, lh as u32 * 8, pixels.count)))
+    }
+
+    /// An SD VAE on raw latents `[batch, 4, lh, lw]`.
+    fn decode_sd(&self, file: &ModelFile, batch: usize, channels: usize, (lh, lw): (usize, usize), latent: &[f32], progress: &mut dyn ProgressSink)
+        -> EngineResult<ImageBatch> {
+        if channels != diffusion::unet::CH {
+            return Err(unsupported(format!("an SD VAE on a {channels}-channel latent")));
+        }
+        let mut gen = self.gen();
+        gen.ensure_sd_vae(&file.path).map_err(internal)?;
+        let scale = gen.sd_vae_scale().ok_or_else(|| unsupported("an SD VAE"))?;
+        let (width, height) = (lw * 8, lh * 8);
+        let mut rgb = Vec::with_capacity(batch * height * width * 3);
+        for (i, image) in latent.chunks_exact(channels * lh * lw).enumerate() {
+            if progress.interrupted() {
+                return Err(EngineError::Interrupted);
+            }
+            let scaled: Vec<f32> = image.iter().map(|v| v * scale).collect();
+            rgb.extend_from_slice(&gen.decode_sd(&scaled, width, height).map_err(internal)?);
+            progress.progress(i as u32 + 1, batch as u32);
+        }
+        Ok(ImageBatch::from_u8(batch as u32, height as u32, width as u32, 3, rgb))
+    }
 }
 
 /// Checks that each Pixal3D file is what its slot needs, before anything is unloaded for it.
@@ -1502,7 +1694,17 @@ impl Engine for NativeEngine {
 
     fn load_checkpoint(&self, req: &LoadCheckpoint) -> EngineResult<(ModelHandle, TextEncoderHandle, VaeHandle)> {
         // SwarmUI picks this loader for anything in its Stable-Diffusion folder, by folder alone.
-        // The file holds only the diffusion model; SwarmUI adds its own CLIPLoader and VAELoader.
+        if check_dit(&req.file)? == Family::Sd {
+            // an SD checkpoint carries its CLIP and VAE, which load with the model
+            let model = self.load_model(&req.file)?;
+            let st = diffusion::st::SafeTensors::open(&req.file.path).map_err(internal)?;
+            let encoder_type = if sd_file_is_xl(&req.file)? { SDXL_ENCODER } else { SD1_ENCODER };
+            let sources = if diffusion::clip::has_clip_l(&st) { vec![req.file.clone()] } else { Vec::new() };
+            let te = TextEncoderHandle { sources, encoder_type: encoder_type.into(), device: "default".into(), engine: Opaque::none(), patches: vec![] };
+            let vae = VaeHandle::new(is_sd_vae(&req.file).then(|| req.file.clone()), Opaque::none());
+            return Ok((model, te, vae));
+        }
+        // The other families' files hold only the diffusion model; SwarmUI adds its own CLIPLoader and VAELoader.
         Ok((
             self.load_model(&req.file)?,
             TextEncoderHandle { sources: vec![], encoder_type: String::new(), device: "default".into(), engine: Opaque::none(), patches: vec![] },
@@ -1561,6 +1763,8 @@ impl Engine for NativeEngine {
         let mut gen = self.gen();
         if is_qwen21_vae(&req.file) {
             gen.ensure_vae21(&req.file.path)
+        } else if is_sd_vae(&req.file) {
+            gen.ensure_sd_vae(&req.file.path)
         } else if is_flux2_vae(&req.file) {
             gen.ensure_flux2_vae(&req.file.path)
         } else {
@@ -1572,7 +1776,7 @@ impl Engine for NativeEngine {
 
     fn encode_text(&self, req: &TextEncodeRequest) -> EngineResult<Conditioning> {
         let [file] = req.text_encoder.sources.as_slice() else {
-            return Err(unsupported("this text encoder (Krea 2 needs one Qwen3-VL 4B file, Anima one Qwen3 file, MOSS Image one Qwen3.5 file, Qwen Image 2.1 one Qwen3-VL 8B file, MiniMax H3 one Qwen3-VL 32B file)"));
+            return Err(unsupported("this text encoder (Krea 2 needs one Qwen3-VL 4B file, Anima one Qwen3 file, MOSS Image one Qwen3.5 file, Qwen Image 2.1 one Qwen3-VL 8B file, MiniMax H3 one Qwen3-VL 32B file, SD 1.x and SDXL their checkpoint's CLIP)"));
         };
         let family = match req.text_encoder.encoder_type.as_str() {
             ANIMA_ENCODER => Family::Anima,
@@ -1580,6 +1784,7 @@ impl Engine for NativeEngine {
             MINIMAX_ENCODER => Family::H3,
             QWEN21_ENCODER => Family::Qwen21,
             KREA_ENCODER => Family::Krea2,
+            SD1_ENCODER | SDXL_ENCODER => Family::Sd,
             t => return Err(unsupported(format!("text encoder type {t}"))),
         };
         let images = match &req.mode {
@@ -1593,9 +1798,18 @@ impl Engine for NativeEngine {
         let minimax = match &req.mode {
             TextEncodeMode::Swarm(s) => s.minimax_refs.clone(),
             TextEncodeMode::MiniMax { refs, .. } => Some(refs.clone()),
-            TextEncodeMode::Plain { .. } => None,
+            TextEncodeMode::Plain { .. } | TextEncodeMode::Sdxl { .. } => None,
         };
-        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), images, loras, minimax };
+        let clip_layer = req.text_encoder.patches.iter().rev().find_map(|p| match p {
+            TextEncoderPatch::StopAtLayer { layer } => Some(*layer),
+            _ => None,
+        });
+        let sdxl_size = match &req.mode {
+            TextEncodeMode::Sdxl { size, .. } => Some(*size),
+            TextEncodeMode::Swarm(s) => Some(SdxlSize { width: s.width, height: s.height, crop_w: 0, crop_h: 0, target_width: s.target_width, target_height: s.target_height }),
+            _ => None,
+        };
+        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), images, loras, minimax, clip_layer, sdxl_size };
         Ok(Conditioning::single(Opaque::new(cond), CondMeta::default()))
     }
 
@@ -1690,6 +1904,7 @@ impl Engine for NativeEngine {
             Family::Anima => self.sample_anima(req, shape, &settings, &plan, progress)?,
             Family::Moss => self.sample_moss(req, shape, &settings, &plan, progress)?,
             Family::Qwen21 => self.sample_qwen21(req, shape, &settings, &plan, progress)?,
+            Family::Sd => self.sample_sd(req, shape, &settings, &plan, progress)?,
             Family::H3 | Family::H3Image | Family::SeedVr2 => unreachable!("H3 and SeedVR2 sample above"),
         })
     }
@@ -1729,6 +1944,9 @@ impl Engine for NativeEngine {
         if is_qwen21_vae(file) {
             return self.decode_qwen21(file, batch, channels, (lh, lw), &latent.data, progress);
         }
+        if is_sd_vae(file) {
+            return self.decode_sd(file, batch, channels, (lh, lw), &latent.data, progress);
+        }
         let flux2 = is_flux2_vae(file);
         if flux2 != (channels == diffusion::moss::CH) {
             return Err(unsupported(format!("this VAE on a {channels}-channel latent")));
@@ -1763,6 +1981,9 @@ impl Engine for NativeEngine {
         }
         if is_flux2_vae(file) {
             return self.encode_flux2(file, &req.pixels);
+        }
+        if is_sd_vae(file) {
+            return self.encode_sd(file, &req.pixels);
         }
         if is_h3_vae(file) {
             return self.encode_h3(file, &req.pixels);
@@ -1825,6 +2046,7 @@ impl Engine for NativeEngine {
                 ANIMA_ENCODER => gen.ensure_qwen3(&f.path),
                 MOSS_ENCODER => gen.ensure_qwen35(&f.path),
                 MINIMAX_ENCODER => gen.ensure_h3_te(&f.path),
+                SD1_ENCODER | SDXL_ENCODER => gen.ensure_sd(&f.path),
                 // the 8B of Qwen Image 2.1 as ensure_te takes it too
                 _ => gen.ensure_te(&f.path),
             }
@@ -1835,6 +2057,8 @@ impl Engine for NativeEngine {
                 gen.ensure_seedvr_vae(&f.path)
             } else if is_qwen21_vae(f) {
                 gen.ensure_vae21(&f.path)
+            } else if is_sd_vae(f) {
+                gen.ensure_sd_vae(&f.path)
             } else if is_flux2_vae(f) {
                 gen.ensure_flux2_vae(&f.path)
             } else {
@@ -2027,6 +2251,13 @@ mod tests {
             let chunks = prompt_chunks(&ParsedPrompt::parse("a (red:1.2) <weight[1.5]:lake>"), 8, family).unwrap();
             assert_eq!(chunks, [[("a (red:1.2) ".to_string(), 1.0), ("lake".to_string(), 1.5)]]);
         }
+    }
+
+    #[test]
+    fn sd_swarm_pieces_are_literal_with_breaks() {
+        // SwarmTextEncodeAdvanced tokenizes each piece with weights off: parentheses stay, escapes lose their backslash
+        let chunks = prompt_chunks(&ParsedPrompt::parse(r"a (red:1.2) \(b\) <weight[1.5]:lake><break>c"), 8, Family::Sd).unwrap();
+        assert_eq!(chunks, vec![vec![("a (red:1.2) (b) ".to_string(), 1.0), ("lake".to_string(), 1.5)], vec![("c".to_string(), 1.0)]]);
     }
 
     #[test]

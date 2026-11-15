@@ -13,6 +13,7 @@ mod h3;
 mod krea;
 mod moss;
 mod qwen21;
+mod sd;
 mod seedvr;
 
 pub use anima::{AnimaRequest, SnapRefRequest};
@@ -20,6 +21,7 @@ pub use h3::{h3_presentation, h3_tokens, image_pictures, ref2va_pictures, ref2va
 pub use krea::KreaRequest;
 pub use moss::{moss_tokens, MossRequest};
 pub use qwen21::Qwen21Request;
+pub use sd::{is_sd, SdRequest, SizeCond};
 pub use seedvr::SeedVrRequest;
 pub use crate::samplers::Inpaint;
 
@@ -231,7 +233,7 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
         let masked: Vec<f32>;
         let v = match &mask {
             Some(m) => {
-                masked = Inpaint::input(m, v, sigma, noise, latent);
+                masked = Inpaint::input(s.model_sampling, m, v, sigma, noise, latent);
                 &masked
             }
             None => v,
@@ -406,8 +408,13 @@ struct Env {
 
 impl Env {
     fn check_size(&self, width: usize, height: usize) -> Result<()> {
-        if width % 16 != 0 || height % 16 != 0 || width == 0 || height == 0 {
-            bail!("width and height must be positive multiples of 16");
+        self.check_size_of(width, height, 16)
+    }
+
+    /// Sides positive multiples of `multiple`, within the pixel limit.
+    fn check_size_of(&self, width: usize, height: usize, multiple: usize) -> Result<()> {
+        if width % multiple != 0 || height % multiple != 0 || width == 0 || height == 0 {
+            bail!("width and height must be positive multiples of {multiple}");
         }
         if width * height > self.max_pixels {
             bail!("{width}x{height} exceeds the {} pixel limit", self.max_pixels);
@@ -572,6 +579,7 @@ enum Kind {
     Moss,
     Qwen21,
     H3,
+    Sd,
 }
 
 impl Kind {
@@ -605,6 +613,7 @@ enum Family {
     Moss(moss::Moss),
     Qwen21(qwen21::Qwen21),
     H3(h3::H3),
+    Sd(sd::Sd),
 }
 
 impl Family {
@@ -615,6 +624,7 @@ impl Family {
             Kind::Moss => Family::Moss(Default::default()),
             Kind::Qwen21 => Family::Qwen21(Default::default()),
             Kind::H3 => Family::H3(Default::default()),
+            Kind::Sd => Family::Sd(Default::default()),
         }
     }
 
@@ -626,6 +636,7 @@ impl Family {
             Family::Moss(_) => Kind::Moss,
             Family::Qwen21(_) => Kind::Qwen21,
             Family::H3(_) => Kind::H3,
+            Family::Sd(_) => Kind::Sd,
         })
     }
 
@@ -637,6 +648,7 @@ impl Family {
             Family::Moss(f) => f,
             Family::Qwen21(f) => f,
             Family::H3(f) => f,
+            Family::Sd(f) => f,
         })
     }
 }

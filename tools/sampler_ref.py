@@ -42,6 +42,11 @@ def short(values):
 
 
 def model_sampling(kind, shift):
+    if kind == "eps":
+        # SD 1.x and SDXL: ModelSamplingDiscrete's default linear schedule
+        class M(comfy.model_sampling.ModelSamplingDiscrete, comfy.model_sampling.EPS):
+            pass
+        return M(SimpleNamespace(sampling_settings={}))
     if kind == "flow":
         class M(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
             pass
@@ -57,6 +62,9 @@ evals = []
 def calc_cond_batch(model, conds, x, timestep, model_options):
     s = timestep[0]
     evals.append(float(s))
+    if KIND == "eps":
+        # the same mock on sigma squashed into 0 to 1
+        s = s / (1 + s)
     cond = TARGET * (0.8 + 0.2 * s) + 0.3 * torch.tanh(x) * (1.0 - s)
     uncond = 0.5 * TARGET + 0.1 * x
     return [cond, uncond if conds[1] is not None else torch.zeros_like(x)]
@@ -101,7 +109,8 @@ def swarm_sigmas(ms, scheduler, steps, lw, lh):
     return ideogram4_sigmas(steps, lw * 16, lh * 16, 0.5, 1.75)
 
 
-MS = [("flow", 3.0), ("flow", 5.0), ("flow", 1.0), ("flux", 1.15), ("flux", 0.5)]
+KIND = None
+MS = [("flow", 3.0), ("flow", 5.0), ("flow", 1.0), ("flux", 1.15), ("flux", 0.5), ("eps", 0.0)]
 schedules = []
 for kind, shift in MS:
     ms = model_sampling(kind, shift)
@@ -112,14 +121,15 @@ for kind, shift in MS:
             for sampler in ("euler", "dpm_2", "uni_pc"):
                 s = ksampler_sigmas(ms, sampler, scheduler, steps)
                 schedules.append(dict(kind=kind, shift=shift, sampler=sampler, scheduler=scheduler, steps=steps, sigmas=short(s.tolist())))
-        for scheduler in ("turbo", "flux2", "align_your_steps", "ideogram4", "ideogram4turbo"):
+        for scheduler in ("turbo", "align_your_steps") if kind == "eps" else ("turbo", "flux2", "align_your_steps", "ideogram4", "ideogram4turbo"):
             s = swarm_sigmas(ms, scheduler, steps, 128, 128)
             schedules.append(dict(kind=kind, shift=shift, sampler="euler", scheduler=scheduler, steps=steps, sigmas=short(s.tolist())))
 
 CASES = [("flow", 3.0, "simple", 8, 1.0), ("flow", 5.0, "karras", 9, 4.0), ("flux", 1.15, "beta", 7, 3.0), ("flux", 1.15, "simple", 3, 1.0),
-         ("flow", 3.0, "normal", 20, 5.0)]
+         ("flow", 3.0, "normal", 20, 5.0), ("eps", 0.0, "normal", 10, 6.0), ("eps", 0.0, "karras", 9, 1.0), ("eps", 0.0, "simple", 6, 4.0)]
 runs = []
 for kind, shift, scheduler, steps, cfg in CASES:
+    KIND = kind
     ms = model_sampling(kind, shift)
     for name in comfy.samplers.SAMPLER_NAMES:
         evals.clear()

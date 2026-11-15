@@ -21,6 +21,9 @@ extern "C" void launch_sage_attn_kernel(const void* q, const void* k, const void
     int output_dtype_code, cudaStream_t stream, const float* mask_tile_bias);
 
 static int cta_k_for(int lk, int d) { return lk > 1024 && d != 64 ? 128 : 64; }
+// The quantizer's query warp: 16 rows at head dim 256, 32 otherwise; each warp keeps 8 scales.
+static int warp_q(int d) { return d == 256 ? 16 : 32; }
+static int q_scales(int64_t d) { return 128 / warp_q((int)d) * 8; }
 
 // Scratch bytes needed for b batches, h/hk heads, lengths lq/lk, head dim 128.
 extern "C" int64_t gpu_int8_attn_workspace_d(int b, int h, int hk, int lq, int lk, int head_dim) {
@@ -31,7 +34,7 @@ extern "C" int64_t gpu_int8_attn_workspace_d(int b, int h, int hk, int lq, int l
     auto add = [&](int64_t bytes) { n += (bytes + 255) / 256 * 256; };
     add((int64_t)b * h * lq * d);                                  // q int8
     add((int64_t)b * hk * lk * d);                                 // k int8
-    add((int64_t)b * h * ((lq + 127) / 128) * 32 * 4);            // q scale
+    add((int64_t)b * h * ((lq + 127) / 128) * q_scales(d) * 4);   // q scale
     add((int64_t)b * hk * ((lk + ck - 1) / ck) * 4 * 4);          // k scale
     add((int64_t)b * hk * d * plk);                                // v int8 (transposed, padded)
     add((int64_t)b * hk * d * 4);                                  // v scale
@@ -77,13 +80,13 @@ static int int8_attn(const void* q, const void* k, const void* v, void* o, void*
         auto take = [&](int64_t bytes) { char* r = p; p += (bytes + 255) / 256 * 256; return r; };
         int8_t* qi = (int8_t*)take((int64_t)b * h * lq * D);
         int8_t* ki = (int8_t*)take((int64_t)b * hk * lk * D);
-        float* qs = (float*)take((int64_t)b * h * ((lq + 127) / 128) * 32 * 4);
+        float* qs = (float*)take((int64_t)b * h * ((lq + 127) / 128) * q_scales(D) * 4);
         float* ks = (float*)take((int64_t)b * hk * ((lk + ck - 1) / ck) * 4 * 4);
         int8_t* vi = (int8_t*)take((int64_t)b * hk * D * plk);
         float* vs = (float*)take((int64_t)b * hk * D * 4);
         void* anchors = take((int64_t)b * hk * 4);
         // inputs are [B, H, L, D] views: (batch, head, seq) strides
-        launch_quant_qk_per_thread_int8(q, qi, qs, k, ki, ks, b, h, lq, hk, lk, D, 128, 32, ck, ck, q_bs, q_hs, q_rs,
+        launch_quant_qk_per_thread_int8(q, qi, qs, k, ki, ks, b, h, lq, hk, lk, D, 128, warp_q(D), ck, ck, q_bs, q_hs, q_rs,
                                         k_bs, k_hs, k_rs, dt, anchors, st);
         launch_quant_v_int8_kernel(v, vi, vs, b, hk, lk, D, plk, v_bs, v_hs, v_rs, dt, st);
         const int64_t qh = (int64_t)lq * D, kh = (int64_t)lk * D, vh = (int64_t)D * plk;

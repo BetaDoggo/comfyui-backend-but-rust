@@ -58,7 +58,7 @@ There is no Rust binding to a tensor library. CUDA, NVML and the kernels are cal
 |---|---|---|
 | CUDA 13 toolkit | Installed, `CUDA_PATH` | `nvcc`, the static CUDA runtime, streams, events, pinned memory |
 | cuBLASLt | Linked from the toolkit | bf16 and fp32 GEMMs, such as text encoders and non-quantized layers |
-| [CUTLASS](https://github.com/NVIDIA/cutlass) | Build-time checkout, BSD-3-Clause | Int8 GEMMs with fused dequantization, and VAE 2D convolutions |
+| [CUTLASS](https://github.com/NVIDIA/cutlass) | Build-time checkout, BSD-3-Clause | Int8 GEMMs with fused dequantization, VAE 2D convolutions, and the SD UNet's fp16 convolutions |
 | [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) | Copied into `csrc/vendor/`, Apache-2.0 | The int8 GEMM kernel, INT8 attention, and H3's Sol-Attn block-sparse attention |
 | [SageAttention](https://github.com/thu-ml/SageAttention) | Reaches us through comfy-kitchen, Apache-2.0 | Origin of the INT8 attention, the default for the diffusion models |
 | [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) | Build-time checkout, BSD-3-Clause | bf16 attention, selected with `--attention flash` |
@@ -91,6 +91,7 @@ the baked weights match ComfyUI's bit for bit. Sampling then runs the normal int
 | Pixal3D | `src/trellis.rs`, int8 ConvRot | DINOv3 ViT-L and NAF, `src/dino3.rs` | Sparse convolution shape and texture decoders, `src/trellis_vae.rs` |
 | SeedVR2 3B | `src/seedvr.rs`, int8 ConvRot | none: a fixed prompt stored in the checkpoint | Causal video VAE, a frame at a time, `src/seedvr_vae.rs` |
 | TripoSplat / Idol | `src/triposplat.rs`, fp16 | DINOv3 ViT-H, `src/dino3.rs`, and the Flux 2 VAE's encoder | Octree gaussian decoder, `src/triposplat.rs` |
+| SD 1.x and SDXL | `src/unet.rs`, fp16, transformer linears int8 by default | CLIP-L, and OpenCLIP bigG on SDXL, `src/clip.rs` | The 4-channel KL VAE, `src/sdvae.rs` |
 
 Each model is written directly against its checkpoint, with no general layer or graph abstraction. That is what allows
 operations to be fused and work to be cached. For example, Anima's cross-attention k and v are computed once per prompt,
@@ -250,6 +251,24 @@ How each stage maps to ComfyUI:
 * **VAE** (`src/vae.rs`, shared with Anima): for one frame every causal 3D conv equals a 2D conv with the kernel's last
   temporal slice, so the decoder runs as NHWC CUTLASS implicit-GEMM 2D convolutions.
 
+### SD 1.x and SDXL
+
+One UNet ([`src/unet.rs`](../src/unet.rs)) serves both: its blocks, widths, heads and transformer depths are read from
+the checkpoint's keys. It runs NHWC in fp16 with float32 accumulation, as ComfyUI does with these checkpoints, with the
+GroupNorm and LayerNorm epsilons of ComfyUI's `openaimodel`. Convolutions are CUTLASS implicit-GEMM fp16 kernels, with
+64x64 tiles where 128x128 ones would leave SMs idle (the 8x8 and 16x16 levels). The transformer linears are quantized to
+int8 per row as the checkpoint loads (W8A8, ConvRot-rotated in Hadamard groups of 256, or of 64 for SD 1.5's 320 and
+640-wide inputs, which took its int8 picture from 21 to 27 dB of ComfyUI's), unless `--no-quant` keeps them in fp16.
+Attention is int8 by default, with SD 1.5's 40, 80 and 160-wide heads zero-padded to 64, 128 and 256; `--attention flash`
+runs exact fp16 attention as a GEMM and a softmax instead. The cross-attention keys and values depend only on the prompt,
+so they are computed once per prompt and every image of a batch reads them, its queries folded into one sequence.
+
+The text encoders ([`src/clip.rs`](../src/clip.rs)) compute in float32 from fp16-rounded weights, as ComfyUI's
+`manual_cast` does, with the tokenizer, chunking, weighting against an empty prompt and layer choice of `sd1_clip`. SDXL's
+pooled output and size conditioning build the UNet's `adm` input. The VAE ([`src/sdvae.rs`](../src/sdvae.rs)) runs in
+bf16, as ComfyUI picks on this card. Sampling uses ComfyUI's `ModelSamplingDiscrete` with EPS or v-prediction
+([`src/samplers.rs`](../src/samplers.rs)); every sampler takes its EPS branches there.
+
 ### Pixal3D
 
 [`src/pixal3d.rs`](../src/pixal3d.rs) runs the example workflow's stages one after another and keeps only one in VRAM at
@@ -311,6 +330,7 @@ csrc/seedvr.cu      SeedVR2: patch embedding input, window attention reordering,
 csrc/trellis.cu     Pixal3D: per-head QK norm, voxel hashing and sparse-conv gathers, NAF attention, feature sampling
 csrc/triposplat.cu  TripoSplat: fp16 gated adds, RePo rotary + q/k RMS norm, SiLU gating
 csrc/birefnet.cu    BiRefNet: im2col, deformable-conv columns, Swin window gather and attention, bilinear resize
+csrc/sd.cu          SD 1.x and SDXL: fp16 CUTLASS convolutions, GroupNorm, GEGLU, CLIP pieces, int8 row quantizer
 csrc/wddm.cu        VRAM queries under Windows
 csrc/sparse_attn.cu block-sparse attention over the vendored Sol-Attn kernels, and the SLA top-k threshold
 csrc/vendor/        comfy-kitchen CUTLASS int8 GEMM, Sage INT8 attention and Sol-Attn (Apache-2.0)

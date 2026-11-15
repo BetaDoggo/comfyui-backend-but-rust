@@ -3,7 +3,7 @@
  "areas": {
   "other_arch": {
    "title": "Other model architectures",
-   "swarm_params": "Stock ComfyUI nodes for model families beyond the five targets (SD1/SDXL, SD3, Flux, Wan, LTX-V, Hunyuan, Cosmos, ...). Routed to Engine::custom_node when the engine claims them"
+   "swarm_params": "Stock ComfyUI nodes for model families the native engine does not run (SD3, Flux, Wan, LTX-V, Hunyuan, Cosmos, ...). Routed to Engine::custom_node when the engine claims them"
   },
   "third_party": {
    "title": "Third-party custom nodes (optional features)",
@@ -57,131 +57,6 @@
     "python_module": "custom_nodes",
     "category": "loaders",
     "output_node": false
-   }
-  },
-  "CLIPTextEncodeSDXL": {
-   "area": "other_arch",
-   "needs": "arch",
-   "note": "SDXL",
-   "triggers": [],
-   "swarm_source": [
-    "WorkflowGenerator.cs:2496",
-    "WorkflowGeneratorSteps.cs:2449"
-   ],
-   "object_info": {
-    "input": {
-     "required": {
-      "clip": [
-       "CLIP",
-       {}
-      ],
-      "width": [
-       "INT",
-       {
-        "default": 1024,
-        "min": 0,
-        "max": 16384
-       }
-      ],
-      "height": [
-       "INT",
-       {
-        "default": 1024,
-        "min": 0,
-        "max": 16384
-       }
-      ],
-      "crop_w": [
-       "INT",
-       {
-        "advanced": true,
-        "default": 0,
-        "min": 0,
-        "max": 16384
-       }
-      ],
-      "crop_h": [
-       "INT",
-       {
-        "advanced": true,
-        "default": 0,
-        "min": 0,
-        "max": 16384
-       }
-      ],
-      "target_width": [
-       "INT",
-       {
-        "default": 1024,
-        "min": 0,
-        "max": 16384
-       }
-      ],
-      "target_height": [
-       "INT",
-       {
-        "default": 1024,
-        "min": 0,
-        "max": 16384
-       }
-      ],
-      "text_g": [
-       "STRING",
-       {
-        "multiline": true,
-        "dynamicPrompts": true
-       }
-      ],
-      "text_l": [
-       "STRING",
-       {
-        "multiline": true,
-        "dynamicPrompts": true
-       }
-      ]
-     }
-    },
-    "input_order": {
-     "required": [
-      "clip",
-      "width",
-      "height",
-      "crop_w",
-      "crop_h",
-      "target_width",
-      "target_height",
-      "text_g",
-      "text_l"
-     ]
-    },
-    "is_input_list": false,
-    "output": [
-     "CONDITIONING"
-    ],
-    "output_is_list": [
-     false
-    ],
-    "output_name": [
-     "CONDITIONING"
-    ],
-    "output_tooltips": [
-     null
-    ],
-    "output_matchtypes": null,
-    "name": "CLIPTextEncodeSDXL",
-    "display_name": "CLIP Text Encode (SDXL)",
-    "description": "",
-    "python_module": "comfy_extras.nodes_clip_sdxl",
-    "category": "model/conditioning/stable diffusion",
-    "output_node": false,
-    "deprecated": false,
-    "experimental": false,
-    "dev_only": false,
-    "api_node": false,
-    "price_badge": null,
-    "search_aliases": null,
-    "essentials_category": null,
-    "has_intermediate_output": false
    }
   },
   "CheckpointLoaderNF4": {

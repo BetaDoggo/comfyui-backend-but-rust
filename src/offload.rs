@@ -142,6 +142,11 @@ impl Layout {
         *self.offsets.get(key).unwrap_or_else(|| panic!("layout key {key}"))
     }
 
+    /// The keys of every entry.
+    pub fn keys(&self) -> Vec<String> {
+        self.offsets.keys().cloned().collect()
+    }
+
     /// Every tensor of this unit that comes from the file, with its place.
     pub fn tensors(&self, st: &SafeTensors) -> Result<Vec<(String, Placed)>> {
         let mut v = Vec::new();

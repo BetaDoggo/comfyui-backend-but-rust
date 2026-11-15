@@ -51,7 +51,7 @@ cargo run --release -p comfy-server --features native -- --engine native --model
 On Windows, [`start-backend.bat`](start-backend.bat) does this for the folder in `MODELS_ROOT`, and prints what to enter
 in SwarmUI. Extra arguments go to the server, so `--models-root` can add a second folder.
 
-Extra flags: `--reserve-vram MB` (left for the desktop and other apps), `--max-side 2048`, `--live-previews` (off by default), `--no-quant` (runs bf16 MOSS Image checkpoints in bf16 instead of quantizing them to int8 as they load)
+Extra flags: `--reserve-vram MB` (left for the desktop and other apps), `--max-side 2048`, `--live-previews` (off by default), `--no-quant` (runs bf16 MOSS Image checkpoints in bf16 instead of quantizing them to int8 as they load, and keeps SD 1.x and SDXL's transformer linears in fp16)
 and `--extra-model-paths-config <file>` (a ComfyUI `extra_model_paths` YAML, repeatable, searched before `--models-root`).
 VRAM is managed as ComfyUI's DynamicVRAM does (see
 [ComfyUI memory management](../docs/TECHNICAL_OVERVIEW.md#comfyui-memory-management)), and `--reserve-vram` defaults to
@@ -76,7 +76,9 @@ about 3 s to MOSS Image with the files cached.
 | Prompt Images | Yes, with `index` and `index_timestep_zero` reference latents | Not supported | Refused | Refused |
 
 The table covers the most-used families. [Models](../docs/MODELS.md#support-matrix) has the full support matrix, and a
-section for each family.
+section for each family. SD 1.x and SDXL checkpoints run from SwarmUI's Stable-Diffusion folder with their own CLIP and
+VAE, through `CheckpointLoaderSimple`; they work in SwarmUI itself
+([SD 1.x and SDXL](../docs/MODELS.md#sd-1x-and-sdxl)).
 
 These work on every family: all samplers and schedulers except `ltxv-image`, any CFG with a negative prompt, Sampler Sigma
 Min, Sigma Max and Rho, LoRAs, live previews with `--live-previews`, Conditioning Multiplier, Negative Conditioning Multiplier and Zero Negative. See [Usage](../docs/USAGE.md) and [Models](../docs/MODELS.md).

@@ -6,8 +6,8 @@ a status report: the native engine does only part of it, and [STATUS](../../docs
 Everything here was traced from SwarmUI's `WorkflowGenerator*.cs` / `WGNodeData.cs` and the Swarm
 Python nodes (`ExtraNodes/SwarmComfyCommon`), cloned 2026-10-29 (SwarmUI `e7f38c3`, ComfyUI `fd7639f`).
 The fixtures in `crates/comfy-server/tests/fixtures/` are concrete examples of each graph.
-To add another model, see [ADDING_MODELS.md](ADDING_MODELS.md). HyperFlow H3 Flash, MiniMax-H3-Image, SnapRef and
-Idol don't have sections here yet; their fixtures, and the [Models](../../docs/MODELS.md) sections, show what they take.
+To add another model, see [ADDING_MODELS.md](ADDING_MODELS.md). SD 1.x and SDXL are in [section 12](#12-sd-1x-and-sdxl).
+HyperFlow H3 Flash, MiniMax-H3-Image, SnapRef and Idol don't have sections here yet; their fixtures, and the [Models](../../docs/MODELS.md) sections, show what they take.
 
 **Verified against a live SwarmUI** (built from the clone above, "ComfyUI API By URL" → this server,
 mock engine, fake model files tagged via `modelspec.architecture`): backend loads with all Swarm-node
@@ -456,3 +456,26 @@ picture or clip doesn't fit, as ComfyUI does. It refuses `VAEDecodeTiled` / `VAE
 that patch SeedVR2, other formats of the model, and Variation Seed or a noise mask on a clip. SwarmUI puts every LoRA
 not confined to a section on the SeedVR model's loader too; ComfyUI skips keys that name nothing in the model, so a
 LoRA that patches none of SeedVR2's modules is skipped here, with a warning in the server log.
+
+## 12. SD 1.x and SDXL
+
+**Detected as:** compat classes `stable-diffusion-v1` and `stable-diffusion-xl-v1-base`, from SwarmUI's model metadata.
+Traced from `WorkflowGenerator.cs` and `WorkflowGeneratorSteps.cs`; the fixtures `sdxl_t2i.json` and `sd15_img2img.json`
+were written from that code, not captured from a live SwarmUI.
+
+| Node | Inputs | Engine |
+|---|---|---|
+| `CheckpointLoaderSimple` | the checkpoint, from the Stable-Diffusion folder | `load_checkpoint`: the model, a text encoder handle of type `sd1` or `sdxl` on the same file, and the file's VAE |
+| `VAELoader` | only when the user picks a VAE | `load_vae`, any 4-channel SD VAE |
+| `CLIPSetLastLayer` | CLIP Stop At Layer, `stop_at_clip_layer` | `TextEncoderPatch::StopAtLayer`: the hidden layer read, final-normed on SD 1.x only, as ComfyUI |
+| `ModelSamplingDiscrete` | only when the model's metadata names a prediction type | `ModelPatch::SamplingDiscrete`: `eps` or `v_prediction`; `zsnr` is refused |
+| `CLIPTextEncodeSDXL` | SDXL prompts without Swarm syntax: `text_g` = `text_l` = the prompt, crop 0, target = the image size, and with Model Specific Enhancements on (the default) width and height 1.5 times the size for the positive and 0.8 times for the negative, rounded to 64 | `TextEncodeMode::Sdxl`, its sizes as SDXL's size conditioning; different `text_g` and `text_l` are refused |
+| `CLIPTextEncode` | SD 1.x prompts without Swarm syntax | `TextEncodeMode::Plain`, with ComfyUI's `(word:1.2)` emphasis |
+| `SwarmTextEncodeAdvanced` | a prompt with `<break>`, `<weight>`, parentheses or other Swarm syntax | `TextEncodeMode::Swarm`: each piece tokenized literally at its weight, `<break>` chunks joined, and on SDXL its width, height and targets as the size conditioning |
+| `EmptyLatentImage` | Width, Height, Batch Size | `EmptyLatentKind::Image4Ch` → `[B, 4, H/8, W/8]` |
+| `SwarmKSampler` | as Krea 2 | the discrete EPS (or v) model sampling |
+| `VAEEncode`, `VAEDecode` | the checkpoint's VAE or the picked one | raw latents, scaled only while sampling, as ComfyUI passes them between nodes |
+
+A prompt without size conditioning (`CLIPTextEncode` on SDXL) takes the latent's size, as ComfyUI's `encode_model_conds`
+does. The engine refuses LoRAs, embeddings, the SDXL refiner and SD 2.x, CLIP from a file other than the model's
+checkpoint, and RescaleCFG. Sides can be any multiple of 8, as in ComfyUI.

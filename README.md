@@ -19,6 +19,7 @@ It really generates with these image, video and image-to-3D models, from specifi
 | Anima | Text to image | 115 ms/step | 199 ms/step |
 | MOSS Image | Text to image | 550 to 573 ms/step at CFG 4 | 601 ms/step |
 | Qwen Image 2.1 | Text to image with alpha, and edits with reference images | 0.36 s/step, 0.22 to 0.44 s/step with references | 0.46 s/step |
+| SD 1.x and SDXL | Text to image from fp16 checkpoints, linears quantized to int8 at load | SDXL 0.19 s/step at CFG 7; SD 1.5 45 ms/step at 512x512 | 0.29 s/step; 50 ms/step |
 | MiniMax H3 | Text to video with audio | 0.24 s/step, 5 frames at 512x512 | 1.59 s/step |
 | HyperFlow H3 Flash | Text to video with audio, 6 steps | 0.49 s/step, 22 frames at 512x512 | needs custom nodes, not timed |
 | MiniMax-H3-Image | Text to image, 6 steps | 0.35 s/step, 1.07 s/step at 2048x2048 | 0.68 s/step, 1.34 s/step at 2048x2048 |
@@ -27,7 +28,7 @@ It really generates with these image, video and image-to-3D models, from specifi
 | SeedVR2 3B | Restores a picture or clip, as SwarmUI's SeedVR stage | 0.79 s per 1024 restore, DiT 145 ms | DiT 235 ms |
 
 The image and video models take every ComfyUI sampler and scheduler and LoRAs, with exceptions listed in
-[Models](docs/MODELS.md): HyperFlow H3 Flash samples with `euler` and `res_multistep` only, and it and MiniMax-H3-Image refuse LoRAs. Init
+[Models](docs/MODELS.md): HyperFlow H3 Flash samples with `euler` and `res_multistep` only, and it, MiniMax-H3-Image, SD 1.x and SDXL refuse LoRAs. Init
 images, inpainting and refiners work on the image models. ControlNet and every other model family don't work yet. The
 server accepts far more of SwarmUI's features than that, but they only reach a mock engine, so run this beside a normal
 ComfyUI backend. [Status](docs/STATUS.md) lists what works and what's left, in priority order.
@@ -65,6 +66,8 @@ Put your models in one folder, keeping these subfolders, and point `MODELS_ROOT`
 | MiniMax H3 | `minimax_h3_fl2va_pruned_w6a8.safetensors` | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `MiniMaxH3/minimax_h3_video_vae_int8_convrot.safetensors`, `MiniMaxH3/minimax_h3_audio_vae_fp32.safetensors` |
 | HyperFlow H3 Flash | `minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors`, or the `fl2va` file, from the `_comfyui` folders of [its repository](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash) | as MiniMax H3 | as MiniMax H3 |
 | MiniMax-H3-Image | `minimax_h3_image_pruned_int8_convrot.safetensors` | as MiniMax H3 | `MiniMaxH3/minimax_h3_image_vae_fp16.safetensors` |
+| SD 1.x | `v1-5-pruned-emaonly-fp16.safetensors`, or another SD 1.x checkpoint | in the checkpoint | in the checkpoint, or any SD VAE |
+| SDXL | `sd_xl_base_1.0.safetensors`, or another SDXL base checkpoint | in the checkpoint | in the checkpoint, or any SD VAE |
 
 Pixal3D uses other folders: `diffusion_models/Pixal3D/pixal3d_int8_convrot.safetensors`, `clip_vision/dino_v3_L_naf_fp32.safetensors`,
 and `VAE/Pixal3D/trellis_2_shape_vae_bf16.safetensors` with `trellis_2_texture_vae_bf16.safetensors`, all from
@@ -93,7 +96,11 @@ target/release/diffusion.exe --anima -p "no humans, scenery, mountain lake at su
 target/release/diffusion.exe --moss -p "a stone lighthouse on a sea cliff at dawn" --steps 20 --cfg 4 -o lighthouse.png
 ```
 
-Add `--lora path/to/lora.safetensors:0.8` to any of them. H3 has its own [example](docs/MODELS.md#minimax-h3).
+```bash
+target/release/diffusion.exe --sdxl --scheduler normal -p "no humans, scenery, a lighthouse on a rocky coast at sunset" -o lighthouse_xl.png
+```
+
+Add `--lora path/to/lora.safetensors:0.8` to any of them but SD 1.x and SDXL. H3 has its own [example](docs/MODELS.md#minimax-h3).
 
 ### Generate from SwarmUI
 

@@ -1,0 +1,10 @@
+{
+  "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+  "100": {"class_type": "CLIPSetLastLayer", "inputs": {"clip": ["4", 1], "stop_at_clip_layer": -2}},
+  "5": {"class_type": "EmptyLatentImage", "inputs": {"batch_size": 1, "height": 1216, "width": 832}},
+  "6": {"class_type": "CLIPTextEncodeSDXL", "inputs": {"clip": ["100", 0], "text_g": "no humans, scenery, a lighthouse on a rocky coast at sunset, dramatic clouds", "text_l": "no humans, scenery, a lighthouse on a rocky coast at sunset, dramatic clouds", "crop_w": 0, "crop_h": 0, "width": 1280, "height": 1856, "target_width": 832, "target_height": 1216}},
+  "7": {"class_type": "CLIPTextEncodeSDXL", "inputs": {"clip": ["100", 0], "text_g": "blurry, low quality", "text_l": "blurry, low quality", "crop_w": 0, "crop_h": 0, "width": 640, "height": 960, "target_width": 832, "target_height": 1216}},
+  "10": {"class_type": "SwarmKSampler", "inputs": {"model": ["4", 0], "noise_seed": 11, "steps": 20, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0], "start_at_step": 0, "end_at_step": 10000, "return_with_leftover_noise": "disable", "add_noise": "enable", "control_after_generate": "fixed", "var_seed": 0, "var_seed_strength": 0.0, "sigma_min": -1.0, "sigma_max": -1.0, "rho": 7.0, "previews": "default", "tile_sample": false, "tile_size": 1024, "model_negative": null}},
+  "8": {"class_type": "VAEDecode", "inputs": {"vae": ["4", 2], "samples": ["10", 0]}},
+  "9": {"class_type": "SwarmSaveImageWS", "inputs": {"images": ["8", 0], "bit_depth": "8bit"}}
+}

@@ -16,17 +16,19 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--image`, `--ref-image`, `--ref-method` | Krea 2 reference images, see [Krea 2 reference images](MODELS.md#reference-images) |
 | `--prompt-file f.txt`, `-n N` | many prompts / seeds with the models loaded once. `--prompt-file` is read by Krea 2, MOSS Image and MiniMax-H3-Image |
 | `--batch N` | sample up to N of a prompt's `-n` images together, through the model at once. Each image keeps its own seed's noise, and the sampler's own noise is one tensor for the batch, as in ComfyUI, so stochastic samplers give other images than with `--batch 1` |
-| `--attention flash` | bf16 FlashAttention-2 like ComfyUI's default (closest numerics, ~15% slower per step); the default is `int8`, comfy-kitchen's SageAttention-style INT8 attention |
+| `--attention flash` | bf16 FlashAttention-2 like ComfyUI's default (closest numerics, ~15% slower per step); the default is `int8`, comfy-kitchen's SageAttention-style INT8 attention. On SD 1.x and SDXL, `flash` is exact fp16 attention as a GEMM and a softmax, about twice as slow as `int8` |
 | `--reserve-vram MB` | VRAM left untouched for the desktop (default 256, as ComfyUI's `--reserve-vram`; 512 with `--legacy-offload`) |
 | `--slots N` | cast buffers for streamed blocks (default 2, ComfyUI's offload streams); the streaming ring's slots with `--legacy-offload` |
 | `--legacy-offload` | plan VRAM residency from estimates, the older offloading, instead of the default [ComfyUI memory management](TECHNICAL_OVERVIEW.md#comfyui-memory-management) |
 | `--resident-blocks N` | with `--legacy-offload`: force the number of diffusion blocks kept in VRAM |
 | `--anima`, `--moss`, `--qwen21`, `--h3`, `--h3-image` | pick the model family; the default is Krea 2. `--h3` with a MiniMax-H3-Image `--dit` runs it too; see [MiniMax-H3-Image](MODELS.md#minimax-h3-image) |
+| `--sd`, `--sdxl` | an SD 1.x or SDXL checkpoint, `--dit` (default SD 1.5's or SDXL base 1.0's file), with the CLIP and VAE it carries; `--vae` takes another VAE. `--steps` defaults to 20 and `--cfg` to 7; set `--width` and `--height` to the model's size, in multiples of 8. See [SD 1.x and SDXL](MODELS.md#sd-1x-and-sdxl) |
+| `--clip-layer N` | SD 1.x and SDXL: `CLIPSetLastLayer`'s `stop_at_clip_layer`, `-2` for "clip skip 2" |
 | `--snapref file`, `--image a.png`, `--snapref-mode`, `--snapref-strength`, `--snapref-fidelity`, `--snapref-megapixels` | Anima: the SnapRef reference adapter with pictures of a character (repeatable `--image`); see [SnapRef](MODELS.md#snapref) |
 | `--image a.png` | Qwen Image 2.1 edits: each image goes to the text encoder and into the sequence as a reference latent (repeatable); the prompt then says what to change, as in `put the boat from picture 2 on the sea in picture 1`. Output is RGBA |
 | `--image a.png`, `--first-frame a.png`, `--last-frame b.png` | MiniMax H3: reference pictures, `<Picture n>` in the prompt (repeatable), and keyframes stretched to the clip. MiniMax-H3-Image: pictures to edit or refer to. See [reference pictures](MODELS.md#reference-pictures-and-keyframes) |
 | `--qwen21-vae-check ref.safetensors` | Qwen Image 2.1: compare the VAE with `tools/qwen21_ref.py --vae-only` |
-| `--no-quant` | MOSS Image: run a bf16 checkpoint in bf16, rather than quantizing its blocks to int8 as it loads |
+| `--no-quant` | MOSS Image: run a bf16 checkpoint in bf16, rather than quantizing its blocks to int8 as it loads. SD 1.x and SDXL: keep the UNet's transformer linears in fp16 rather than int8 |
 | `--flux2-vae-check ref.safetensors` | MOSS Image: compare the Flux 2 VAE encoder with `tools/flux2_vae_ref.py` |
 | `--frames N` | H3 video length, snapped up to the 17k + 5 grid (default 5) |
 | `--sparse sol` or `--sparse sla` | H3 block-sparse attention, as ComfyUI's Model Sparse Attention node: Sol-Attn's adaptive threshold (`--sparse-tau`, default 1.3) or SLA-style top-k (`--sparse-keep` percent, default 10). `--sparse-start` (default 0.2), `--sparse-min-tokens` (default 12288) and `--sparse-extra-tokens` (default 256) are the node's start_percent, min_tokens and extra_tokens; see [sparse attention](MODELS.md#sparse-attention) |
@@ -129,8 +131,8 @@ The Brownian samplers reimplement `torchsde.BrownianTree` and `numpy.random.Seed
 
 | Check | Result |
 |---|---|
-| 1105 schedules (5 model samplings, 7 step counts) | worst relative error 1.7e-6 |
-| 45 samplers in 5 setups (225 runs), same sigmas passed to the model in the same order | worst relative error 8.1e-6, most about 1e-7 |
+| Every scheduler, on flow, Flux and SD's discrete EPS model samplings at several step counts | worst relative error 1.7e-6 |
+| Every sampler in several setups on the same three, same sigmas passed to the model in the same order | worst relative error 1.3e-5 (`dpmpp_sde_gpu`), most about 1e-7 |
 | Brownian increments at full latent size, CPU and GPU | equal to rounding |
 
 So the gap to ComfyUI on a real model is the gap the model already has. Stochastic and high CFG paths magnify it: on

@@ -9,6 +9,7 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | Anima | Images | `er_sde`, `simple` | int8 ConvRot only |
 | MOSS Image | Images | `euler`, `simple` | int8 ConvRot or bf16, with fused q/k/v |
 | Qwen Image 2.1 | Images with alpha, and edits | `euler`, `simple` | int8 ConvRot only |
+| SD 1.x and SDXL | Images | `euler`, `simple`, 20 steps, CFG 7 on the CLI | fp16 base checkpoints with their CLIP and VAE |
 | MiniMax H3 | Video with audio | `res_multistep`, `simple` | `w6a8` only |
 | HyperFlow H3 Flash | Video with audio, with reference pictures on `ref2va` | `euler` or `res_multistep`, `hyperflow`, 6 steps | int8 ConvRot, ComfyUI's single file of either task |
 | MiniMax-H3-Image | Images | `euler`, `simple`, 6 steps | int8 ConvRot (`minimax_h3_image_pruned_int8_convrot`) only |
@@ -22,32 +23,34 @@ What each family does through this backend. **Yes** means it produced real outpu
 [STATUS](STATUS.md) say how it was tested and against what. **Refused** means the engine returns an error that SwarmUI
 shows, and never drops the setting. **Not tested** means the code accepts it but nothing has run it on that family.
 
-| | Krea 2 Turbo | Anima | MOSS Image | Qwen Image 2.1 | MiniMax H3 | Pixal3D |
-|---|---|---|---|---|---|---|
-| Makes | Images | Images | Images | Images with alpha | Video with audio | A mesh from one image |
-| Checkpoint | W8A8 int8 | int8 ConvRot | int8 ConvRot, fused q/k/v | int8 ConvRot | `w6a8` | int8 ConvRot |
-| Other file formats (bf16, fp8, ...) | Refused | Refused | Refused | Refused | Refused | Refused |
-| Run through SwarmUI itself | Yes | Yes | Yes | Yes | Yes | Not yet (CLI and `comfy-server` only) |
-| Every sampler and scheduler | Yes | Yes | Yes | Yes | Yes | Fixed to the example's four `euler` |
-| CFG and negative prompts | Yes | Yes | Yes | Yes | Yes | - |
-| Rescale, Renorm, Zero Star, TCFG | Yes | Yes | Yes | Not tested | Refused | - |
-| Conditioning multipliers, Zero Negative | Yes | Yes | Yes | Not tested | Not tested | - |
-| Batch size (sampled together) | Yes | Yes | Yes | Yes (CLI) | Refused above 1 | First image only |
-| Variation seed | Yes | Not tested | Not tested | Not tested | Yes | - |
-| Live previews | Yes | Yes | Yes | Not tested | First frame only | - |
-| LoRAs | Yes | Yes | Yes | Yes | Yes (the turbo LoRA's ComfyUI file) | - |
-| Text encoder LoRAs | Yes | Yes | Yes | Not tested (the code is shared with Krea 2) | Not tested | - |
-| Prompt Images and reference images | Yes | Refused | Refused | Yes (one and two tested) | Yes (pictures and keyframes, not compared with ComfyUI) | The input itself |
-| Prompt weights | Refused | Yes | Yes | Refused | Yes | - |
-| `<break>` | Yes | Refused | Yes | Refused | Refused | - |
-| `<alternate>`, `<fromto>` | Refused | Refused | Refused | Refused | Refused | - |
-| Init images, refiners, inpainting (partial sampling) | Yes | Yes (refiner not tested) | Yes | Yes (refiner not tested) | Refused | - |
-| VAE tiling, Seamless Tileable | Refused | Refused | Refused | Refused | Only the 256 / 64 tile | - |
-| Background removal | - | - | - | - | - | Yes (BiRefNet) |
+| | Krea 2 Turbo | Anima | MOSS Image | Qwen Image 2.1 | SD 1.x and SDXL | MiniMax H3 | Pixal3D |
+|---|---|---|---|---|---|---|---|
+| Makes | Images | Images | Images | Images with alpha | Images | Video with audio | A mesh from one image |
+| Checkpoint | W8A8 int8 | int8 ConvRot | int8 ConvRot, fused q/k/v | int8 ConvRot | fp16 with its CLIP and VAE, linears quantized to int8 at load | `w6a8` | int8 ConvRot |
+| Other file formats (bf16, fp8, ...) | Refused | Refused | Refused | Refused | bf16 and fp32 not tested; int8 and fp8 refused | Refused | Refused |
+| Run through SwarmUI itself | Yes | Yes | Yes | Yes | Yes | Yes | Not yet (CLI and `comfy-server` only) |
+| Every sampler and scheduler | Yes | Yes | Yes | Yes | `euler` on the models; all match ComfyUI's EPS code on a mock | Yes | Fixed to the example's four `euler` |
+| CFG and negative prompts | Yes | Yes | Yes | Yes | Yes | Yes | - |
+| Rescale, Renorm, Zero Star, TCFG | Yes | Yes | Yes | Not tested | Rescale refused, the others not tested | Refused | - |
+| Conditioning multipliers, Zero Negative | Yes | Yes | Yes | Not tested | Not tested | Not tested | - |
+| Batch size (sampled together) | Yes | Yes | Yes | Yes (CLI) | Yes (CLI) | Refused above 1 | First image only |
+| Variation seed | Yes | Not tested | Not tested | Not tested | Not tested | Yes | - |
+| Live previews | Yes | Yes | Yes | Not tested | Not tested | First frame only | - |
+| LoRAs | Yes | Yes | Yes | Yes | Refused | Yes (the turbo LoRA's ComfyUI file) | - |
+| Text encoder LoRAs | Yes | Yes | Yes | Not tested (the code is shared with Krea 2) | Refused | Not tested | - |
+| Prompt Images and reference images | Yes | Refused | Refused | Yes (one and two tested) | Refused | Yes (pictures and keyframes, not compared with ComfyUI) | The input itself |
+| Prompt weights | Refused | Yes | Yes | Refused | Yes | Yes | - |
+| `<break>` | Yes | Refused | Yes | Refused | Yes | Refused | - |
+| `<alternate>`, `<fromto>` | Refused | Refused | Refused | Refused | Refused | Refused | - |
+| Init images, refiners, inpainting (partial sampling) | Yes | Yes (refiner not tested) | Yes | Yes (refiner not tested) | Init images (`comfy-server`); refiner and inpainting not tested | Refused | - |
+| VAE tiling, Seamless Tileable | Refused | Refused | Refused | Refused | Refused | Only the 256 / 64 tile | - |
+| Background removal | - | - | - | - | - | - | Yes (BiRefNet) |
 
 HyperFlow H3 Flash, MiniMax-H3-Image, Idol and SeedVR2 aren't in this matrix; their own sections below say what they
 take. ControlNet, regions, IP-Adapter, style models, GLIGEN, LoRA hooks and embeddings are refused on every family. Anima
-takes both `(word:1.2)` and `<weight>`; Qwen Image 2.1's encoder reads `(word:1.2)` as plain text.
+takes both `(word:1.2)` and `<weight>`; Qwen Image 2.1's encoder reads `(word:1.2)` as plain text. SD 1.x and SDXL take
+`(word:1.2)` in a plain prompt and `<weight>` through SwarmUI's text node, which reads parentheses literally, as
+SwarmUI's own node does.
 
 ### Batches
 
@@ -312,6 +315,62 @@ edit keeps its transparency.
 Not tested: SwarmUI itself (the two graphs SwarmUI makes for alpha text to image and a two-picture edit ran through
 `comfy-server` over HTTP, 8 s and 11 s from a cold start), more than two reference images, and the fp8 and bf16 files,
 which are refused.
+
+## SD 1.x and SDXL
+
+Runs SD 1.x and SDXL base checkpoints, each one file with the CLIP text encoders and VAE it carries. Tested on SD 1.5
+(`v1-5-pruned-emaonly-fp16`) and SDXL base 1.0 (`sd_xl_base_1.0`), both fp16. As ComfyUI runs them, the UNet computes in
+fp16 with float32 accumulation, CLIP in float32 from fp16-rounded weights and the VAE in bf16. By default the UNet's
+transformer linears are quantized to int8 per row as the file loads, and attention runs int8; `--no-quant` keeps the
+linears in fp16, and `--attention flash` runs exact fp16 attention (a GEMM and a softmax, not FlashAttention).
+Convolutions, norms and everything else stay fp16. A checkpoint with ComfyUI's `v_pred` key samples as v-prediction, and
+`ModelSamplingDiscrete` can set either prediction type; no v-prediction checkpoint was tried.
+
+```bash
+target/release/diffusion.exe --sd --width 512 --height 512 --scheduler normal -p "no humans, scenery, a lighthouse on a rocky coast at sunset" --negative "blurry, low quality" -o lighthouse.png
+target/release/diffusion.exe --sdxl --clip-layer -2 --scheduler normal -p "no humans, scenery, a lighthouse on a rocky coast at sunset" -o lighthouse_xl.png
+```
+
+Measured here (RTX 5070, 12 GB), 20 steps of `euler` with `normal` at CFG 7, sampling after warm-up. ComfyUI ran the
+same files with its PyTorch attention:
+
+| | ComfyUI | int8 (default) | `--no-quant` | `--no-quant --attention flash` |
+|---|---|---|---|---|
+| SD 1.5, 512x512 | 1.01 s | 0.90 s | 0.91 s | 1.61 s |
+| SDXL, 1024x1024 | 5.72 s | 3.79 s | 5.29 s | 9.25 s |
+
+Int8 linears with exact attention (`--attention flash` alone) took 1.61 s and 8.16 s. Two SD 1.5 images sampled
+together took 1.51 s. The VAE decodes 512x512 in about 170 ms and 1024x1024 in about 340 ms. Before GroupNorm stopped
+dividing in double precision and the small levels' convolutions took smaller tiles, SD 1.5 took 1.37 s.
+
+**Against ComfyUI** (same seed and noise, its own code on the same files, `tools/sd_ref.py`):
+
+| | fp16 | int8 |
+|---|---|---|
+| CLIP output: plain, a weighted prompt of two chunks, CLIP skip 2 | 4.5e-7 to 1.5e-6 relative; SDXL's pooled output 7e-7 to 1.1e-6 | the same: the text encoders don't change |
+| First evaluation's prediction, at the highest sigma | 2.2 to 3.3% relative | 2.5 to 9.1% relative, the most on SD 1.5 |
+| Picture after 20 steps | 27.2 to 43.9 dB | 26.1 to 33.4 dB |
+| VAE round trip of a picture | SDXL 31.70 dB from the picture, ComfyUI's 31.70, ours against theirs 35.4 dB; SD 1.5 31.03 against 31.24, 48.4 dB apart | - |
+
+The pictures compared were SD 1.5 at 512x512 and 512x768 and SDXL at 1024x1024 and 832x1216, of scenery; they show the
+same scene with small differences in detail. Batched images came out 32.4 and 41.5 dB from the same images sampled one at
+a time with int8, which is within the int8 and fp16 spread above.
+
+**Through the server.** `CheckpointLoaderSimple` hands out the checkpoint's CLIP and VAE with the model. SwarmUI's
+`CLIPTextEncodeSDXL`, its size conditioning (SwarmUI sends 1.5 times the size for the positive prompt and 0.8 times for
+the negative) and `SwarmTextEncodeAdvanced`'s width and height go to SDXL's `adm` input; a prompt without them takes the
+latent's size, as ComfyUI does. `CLIPSetLastLayer` (CLIP Stop At Layer) is honoured. Latents pass between nodes raw, as in
+ComfyUI, and are scaled only while sampling, so a separately loaded SD VAE decodes either family. An SDXL graph with
+`CLIPTextEncodeSDXL` and CLIP skip at 832x1216, and an SD 1.5 img2img graph with `SwarmTextEncodeAdvanced`, `<break>` and a
+weighted plain negative, ran through `comfy-server` over HTTP with the real engine. SD 1.x and SDXL work in SwarmUI itself.
+
+Refused: LoRAs, embeddings, SD 2.x, the SDXL refiner, inpainting and instruct UNets, int8 and fp8 checkpoint files, CLIP
+files loaded apart from a checkpoint, a CLIP from another checkpoint than the model's, different `text_g` and `text_l`
+prompts, and RescaleCFG (only its flow branch is ported). Sides can be any multiple of 8, as in ComfyUI: the UNet rounds
+odd sides up as it downsamples and crops each upsample to its skip connection. SD 1.5 at 520x584 and SDXL at 1000x1080
+came out 45.7 and 41.8 dB from ComfyUI in fp16 (first evaluation 2.4 and 2.0% relative), 32.4 and 34.1 dB with int8, and
+two SD 1.5 images batched at 520x584 matched the single image at 39.2 dB. Not tested: samplers other than `euler` on the real models, live
+previews, Variation Seed, inpainting, refiners, bf16 and fp32 checkpoints, and SD VAE files loaded on their own.
 
 ## MiniMax H3
 

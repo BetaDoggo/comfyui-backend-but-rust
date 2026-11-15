@@ -47,6 +47,8 @@ const MODEL_FILES: &[&str] = &[
     "clip_vision/sigclip_vision_patch14_384.safetensors",
     "controlnet/controlnet_test.safetensors",
     "Stable-Diffusion/svd_test.safetensors",
+    "Stable-Diffusion/sd_xl_base_1.0.safetensors",
+    "Stable-Diffusion/v1-5-pruned-emaonly-fp16.safetensors",
     "controlnet/fake_union_controlnet.safetensors",
     "controlnet/fake_alimama_inpaint.safetensors",
     "controlnet/fake_qwen_diffpatch.safetensors",
@@ -362,6 +364,23 @@ async fn moss_image_text_to_image() {
     assert_eq!(r.outputs.len(), 1);
     assert_eq!(png_dims(&r.outputs[0].bytes), (1024, 1024));
     assert_eq!(png_alpha_range(&r.outputs[0].bytes), None, "Flux 2 VAE is RGB");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sdxl_checkpoint_with_size_conditioning_and_clip_skip() {
+    let s = TestServer::start(0).await;
+    let r = run_like_swarm(&s, fixture("sdxl_t2i.json"), |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    assert_eq!(r.outputs.len(), 1);
+    assert_eq!(png_dims(&r.outputs[0].bytes), (832, 1216));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sd15_checkpoint_img2img_with_swarm_prompt() {
+    let s = TestServer::start(0).await;
+    let r = run_like_swarm(&s, fixture("sd15_img2img.json"), |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    assert_eq!(png_dims(&r.outputs[0].bytes), (512, 768));
 }
 
 #[tokio::test(flavor = "multi_thread")]

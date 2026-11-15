@@ -173,6 +173,25 @@ extern "C" {
     pub fn gpu_seedvr_unwindow(x: P, c: i32, src: P, offs: P, rows: i32, out: PM, s: PM) -> i32;
     pub fn gpu_seedvr_stack3(a: P, b: P, c: P, out: PM, px: i64, ch: i32, s: PM) -> i32;
     pub fn gpu_pixel_shuffle2_bf16(x: P, out: PM, h: i32, w: i32, c: i32, s: PM) -> i32;
+
+    // SD 1.x and SDXL (csrc/sd.cu): fp16 UNet, float32 CLIP
+    pub fn gpu_conv2d_f16(x: P, w: P, bias: P, out: PM, n: i32, h: i32, w_: i32, c: i32, cout: i32, r: i32, stride: i32, s: PM) -> i32;
+    pub fn gpu_sd_group_norm(x: P, out: PM, w: P, b: P, sums: PM, n: i32, p: i64, c: i32, g: i32, eps: f32, silu: i32, s: PM) -> i32;
+    pub fn gpu_sd_layer_norm(dtype: i32, x: P, x_stride: i64, out: PM, out_stride: i64, w: P, b: P, m: i32, k: i32, eps: f32, s: PM) -> i32;
+    pub fn gpu_sd_geglu(inp: P, out: PM, m: i64, i: i32, s: PM) -> i32;
+    pub fn gpu_sd_add(x: PM, y: P, n: i64, s: PM) -> i32;
+    pub fn gpu_sd_upsample(x: P, out: PM, n: i32, h: i32, w: i32, oh: i32, ow: i32, c: i32, s: PM) -> i32;
+    pub fn gpu_sd_add_emb(x: PM, emb: P, n: i32, p: i64, c: i32, s: PM) -> i32;
+    pub fn gpu_sd_silu(x: PM, n: i64, s: PM) -> i32;
+    pub fn gpu_sd_clip_act(x: PM, n: i64, mode: i32, s: PM) -> i32;
+    pub fn gpu_sd_clip_embed(tok: P, pos: P, ids: P, out: PM, l: i32, d: i32, s: PM) -> i32;
+    pub fn gpu_sd_unet_in(lat: P, out: PM, n: i32, c: i32, hw: i64, cs: i32, sigmas: P, s: PM) -> i32;
+    pub fn gpu_sd_unet_out(y: P, x: P, out: PM, n: i32, c: i32, hw: i64, cs: i32, sigmas: P, v: i32, s: PM) -> i32;
+    pub fn gpu_sd_pad_heads(src: P, stride: i64, dst: PM, l: i64, h: i32, d: i32, dp: i32, s: PM) -> i32;
+    pub fn gpu_sd_unpad_heads(src: P, dst: PM, l: i64, h: i32, d: i32, dp: i32, s: PM) -> i32;
+    pub fn gpu_sd_softmax(scores: P, p: PM, rows: i32, n: i32, scale: f32, s: PM) -> i32;
+    pub fn gpu_sd_vae_in(lat: P, out: PM, c: i32, hw: i64, cs: i32, scale: f32, s: PM) -> i32;
+    pub fn gpu_sd_quant_rows(x: P, x_stride: i64, q: PM, scales: PM, m: i32, k: i32, rotate: i32, s: PM) -> i32;
 }
 
 /// Most key groups [`gpu_attn_merge`] takes.

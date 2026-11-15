@@ -156,6 +156,21 @@ pub enum TextEncodeMode {
     Swarm(SwarmTextEncode),
     /// `MiniMaxH3ImageConditioning`: a plain prompt with pictures shown before it (MiniMax-H3-Image edits).
     MiniMax { text: String, refs: MiniMaxReferences },
+    /// `CLIPTextEncodeSDXL`: SwarmUI's encoder for SDXL base models when the prompt needs no Swarm tags. `text_g` goes
+    /// to CLIP-G and `text_l` to CLIP-L (SwarmUI sends the same prompt to both); the sizes are SDXL's size
+    /// conditioning.
+    Sdxl { text_g: String, text_l: String, size: SdxlSize },
+}
+
+/// SDXL's size conditioning, as `CLIPTextEncodeSDXL` and `SwarmTextEncodeAdvanced` set it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SdxlSize {
+    pub width: u32,
+    pub height: u32,
+    pub crop_w: u32,
+    pub crop_h: u32,
+    pub target_width: u32,
+    pub target_height: u32,
 }
 
 #[derive(Clone, Debug)]

@@ -100,6 +100,20 @@ const H3_VIDEO: ([[f32; 3]; 24], [f32; 3]) = ([
     [0.004224, 0.017284, 0.027196],
 ], [0.057426, -0.022078, -0.071449]);
 
+const SD15: ([[f32; 3]; 4], [f32; 3]) = ([
+    [0.3512, 0.2297, 0.3227],
+    [0.3250, 0.4974, 0.2350],
+    [-0.2829, 0.1762, 0.2721],
+    [-0.2120, -0.2616, -0.7177],
+], [0.0, 0.0, 0.0]);
+
+const SDXL: ([[f32; 3]; 4], [f32; 3]) = ([
+    [0.3651, 0.4232, 0.4341],
+    [-0.2533, -0.0042, 0.1068],
+    [0.1076, 0.1111, -0.0362],
+    [-0.3165, -0.2492, -0.2188],
+], [0.1084, -0.0175, -0.0011]);
+
 /// `preview_to_image` of the `factors` map: RGB8 rows. `at(c, y, x)` reads one latent value.
 fn rgb(factors: &[[f32; 3]], bias: [f32; 3], h: usize, w: usize, at: impl Fn(usize, usize, usize) -> f32) -> Vec<u8> {
     let mut out = Vec::with_capacity(h * w * 3);
@@ -127,6 +141,12 @@ pub fn qwen21(x0: &[f32], h: usize, w: usize) -> Vec<u8> {
 /// MOSS Image: a [128, h, w] latent to [2h, 2w, 3], each channel group being 32 of 2 x 2 pixels.
 pub fn flux2(x0: &[f32], h: usize, w: usize) -> Vec<u8> {
     rgb(&FLUX2.0, FLUX2.1, h * 2, w * 2, |c, y, x| x0[((c * 4 + y % 2 * 2 + x % 2) * h + y / 2) * w + x / 2])
+}
+
+/// SD 1.x (`xl` false) or SDXL: a [4, h, w] latent at the sampler's scale to [h, w, 3].
+pub fn sd(x0: &[f32], h: usize, w: usize, xl: bool) -> Vec<u8> {
+    let (factors, bias) = if xl { &SDXL } else { &SD15 };
+    rgb(factors, *bias, h, w, |c, y, x| x0[(c * h + y) * w + x])
 }
 
 /// MiniMax H3: the first frame of a [24, t, h, w] latent to [h, w, 3].

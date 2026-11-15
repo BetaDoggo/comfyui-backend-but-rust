@@ -1,4 +1,4 @@
-//! ComfyUI's samplers and schedulers for flow (`CONST`) models, on the host.
+//! ComfyUI's samplers and schedulers for flow (`CONST`) and discrete `EPS` models, on the host.
 //!
 //! Each one follows `comfy/k_diffusion/sampling.py`, `comfy/samplers.py` and `extra_samplers/uni_pc.py`
 //! step for step, in f32 like the original, so a seed gives the same noise and the same model inputs.
@@ -43,13 +43,36 @@ pub fn forces_uncond(sampler: &str) -> bool {
     sampler.ends_with("_cfg_pp")
 }
 
-/// `ModelSamplingDiscreteFlow` with multiplier 1, `ModelSamplingFlux`, or a flow model whose timestep walks an explicit
-/// sigma grid.
+/// `ModelSamplingDiscreteFlow` with multiplier 1, `ModelSamplingFlux`, a flow model whose timestep walks an explicit
+/// sigma grid, or `ModelSamplingDiscrete` of an `EPS` model (SD 1.x and SDXL, v-prediction too: ComfyUI's samplers only
+/// tell `CONST` apart).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ModelSampling {
     Flow { shift: f64 },
     Flux { shift: f64 },
     Grid(SigmaGrid),
+    /// The linear beta schedule from 0.00085 to 0.012 over 1000 timesteps.
+    Discrete,
+}
+
+/// `ModelSamplingDiscrete`'s sigmas and their logs, in float32 from the float64 schedule.
+fn discrete_table() -> &'static (V, V) {
+    static T: std::sync::OnceLock<(V, V)> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let (a, b) = (0.00085f64.sqrt(), 0.012f64.sqrt());
+        let n = 1000;
+        let step = (b - a) / (n - 1) as f64;
+        let mut cum = 1.0f64;
+        let mut sigmas = Vec::with_capacity(n);
+        for i in 0..n {
+            // torch.linspace in float64, squared
+            let v = if i < n / 2 { a + step * i as f64 } else { b - step * (n - i - 1) as f64 };
+            cum *= 1.0 - v * v;
+            sigmas.push(((1.0 - cum) / cum).sqrt() as f32);
+        }
+        let logs = sigmas.iter().map(|s| s.ln()).collect();
+        (sigmas, logs)
+    })
 }
 
 /// `MiniMaxH3ImageModelSampling`: sigma is linear in the grid index, so the stock schedulers at the grid's step count
@@ -96,16 +119,85 @@ fn flux_shift(mu: f64, t: f32) -> f32 {
 }
 
 impl ModelSampling {
+    /// `model_sampling.sigma(timestep)`.
     pub fn sigma(self, t: f32) -> f32 {
         match self {
             ModelSampling::Flow { shift } if shift == 1.0 => t,
             ModelSampling::Flow { shift } => shift as f32 * t / (1.0 + (shift - 1.0) as f32 * t),
             ModelSampling::Flux { shift } => flux_shift(shift, t),
             ModelSampling::Grid(g) => g.sigma(t),
+            ModelSampling::Discrete => {
+                let logs = &discrete_table().1;
+                let t = t.clamp(0.0, (logs.len() - 1) as f32);
+                let (lo, hi) = (t.floor() as usize, t.ceil() as usize);
+                let w = t - t.floor();
+                ((1.0 - w) * logs[lo] + w * logs[hi]).exp()
+            }
         }
     }
 
+    /// `model_sampling.timestep(sigma)`: the sigma itself on flow models, the nearest of the 1000 on discrete ones.
+    pub fn timestep(self, sigma: f32) -> f32 {
+        if self.is_flow() {
+            return sigma;
+        }
+        let ls = sigma.ln();
+        // argmin keeps the first of equal distances
+        let mut best = (f32::INFINITY, 0usize);
+        for (i, l) in discrete_table().1.iter().enumerate() {
+            let d = (ls - l).abs();
+            if d < best.0 {
+                best = (d, i);
+            }
+        }
+        best.1 as f32
+    }
+
+    /// False for `EPS` models.
+    pub fn is_flow(self) -> bool {
+        !matches!(self, ModelSampling::Discrete)
+    }
+
+    /// `sigma_to_half_log_snr`.
+    pub fn half_log_snr(self, sigma: f32) -> f32 {
+        if self.is_flow() { -(sigma / (1.0 - sigma)).ln() } else { -sigma.ln() }
+    }
+
+    /// `half_log_snr_to_sigma`.
+    pub fn sigma_of_half_log_snr(self, l: f32) -> f32 {
+        if self.is_flow() { 1.0 / (1.0 + l.exp()) } else { (-l).exp() }
+    }
+
+    /// `noise_scaling`: the sampler's start at `sigma` from `latent`, or from zeros.
+    pub fn noise_scaling(self, sigma: f32, noise: &[f32], latent: Option<&[f32]>, max_denoise: bool) -> V {
+        if self.is_flow() {
+            return match latent {
+                Some(l) => lc(&[(noise, sigma), (l, 1.0 - sigma)]),
+                None => lc(&[(noise, sigma)]),
+            };
+        }
+        let scale = if max_denoise { (1.0 + sigma * sigma).sqrt() } else { sigma };
+        match latent {
+            Some(l) => noise.iter().zip(l).map(|(n, l)| n * scale + l).collect(),
+            None => lc(&[(noise, scale)]),
+        }
+    }
+
+    /// `inverse_noise_scaling` of a result at the run's last sigma.
+    pub fn inverse_noise_scaling(self, sigma: f32, x: V) -> V {
+        if self.is_flow() && sigma != 0.0 { x.iter().map(|v| v / (1.0 - sigma)).collect() } else { x }
+    }
+
+    /// `model_sampling.sigma_max`.
+    pub fn sigma_max(self) -> f32 {
+        let t = self.table();
+        t[t.len() - 1]
+    }
+
     fn table(self) -> V {
+        if self == ModelSampling::Discrete {
+            return discrete_table().0.clone();
+        }
         let n = self.table_len();
         (1..=n).map(|i| self.sigma(i as f32 / n as f32)).collect()
     }
@@ -116,12 +208,15 @@ impl ModelSampling {
 
     /// `model_sampling.sigma_min`: the table's first entry.
     pub fn sigma_min(self) -> f32 {
+        if self == ModelSampling::Discrete {
+            return discrete_table().0[0];
+        }
         self.sigma(1.0 / self.table_len() as f32)
     }
 
     pub fn percent_to_sigma(self, percent: f64) -> f32 {
         if percent <= 0.0 {
-            return 1.0;
+            return if self.is_flow() { 1.0 } else { 999999999.9 };
         }
         if percent >= 1.0 {
             return 0.0;
@@ -134,6 +229,7 @@ impl ModelSampling {
             ModelSampling::Flow { shift } if shift == 1.0 => t,
             ModelSampling::Flow { shift } => shift * t / (1.0 + (shift - 1.0) * t),
             ModelSampling::Flux { shift } => shift.exp() / (shift.exp() + (1.0 / t - 1.0)),
+            ModelSampling::Discrete => return self.sigma((t * 999.0) as f32),
             ModelSampling::Grid(_) => unreachable!(),
         }) as f32
     }
@@ -153,9 +249,9 @@ impl Inpaint {
     /// The mask at `sigma` of a run over `sigmas`: `DifferentialDiffusion.forward` when it applies.
     pub fn mask_at(&self, ms: ModelSampling, sigmas: &[f32], sigma: f32) -> std::borrow::Cow<'_, [f32]> {
         let Some(strength) = self.differential else { return std::borrow::Cow::Borrowed(&self.mask) };
-        // a flow model's timestep is its sigma (times a multiplier of 1)
         let to = ms.sigma_min().max(sigmas[sigmas.len() - 1]);
-        let threshold = (sigma - to) / (sigmas[0] - to);
+        let (ts_from, ts_to) = (ms.timestep(sigmas[0]), ms.timestep(to));
+        let threshold = (ms.timestep(sigma) - ts_to) / (ts_from - ts_to);
         let binary = |m: f32| if m >= threshold { 1.0 } else { 0.0 };
         std::borrow::Cow::Owned(if strength != 0.0 && strength < 1.0 {
             self.mask.iter().map(|&m| strength * binary(m) + (1.0 - strength) * m).collect()
@@ -165,8 +261,9 @@ impl Inpaint {
     }
 
     /// The model's input at `sigma`: `x` where `mask` denoises, else the latent noised to `sigma` (`noise_scaling`).
-    pub fn input(mask: &[f32], x: &[f32], sigma: f32, noise: &[f32], latent: &[f32]) -> V {
-        (0..x.len()).map(|j| x[j] * mask[j] + (sigma * noise[j] + (1.0 - sigma) * latent[j]) * (1.0 - mask[j])).collect()
+    pub fn input(ms: ModelSampling, mask: &[f32], x: &[f32], sigma: f32, noise: &[f32], latent: &[f32]) -> V {
+        let kept = ms.noise_scaling(sigma, noise, Some(latent), false);
+        (0..x.len()).map(|j| x[j] * mask[j] + kept[j] * (1.0 - mask[j])).collect()
     }
 
     /// The prediction the sampler sees: the model's where `mask` denoises, else the latent.
@@ -292,7 +389,7 @@ fn ndtri(u: f64) -> f64 {
 }
 
 fn normal_scheduler(ms: ModelSampling, table: &[f32], steps: usize, sgm: bool) -> V {
-    let (start, end) = (table[table.len() - 1], table[0]);
+    let (start, end) = (ms.timestep(table[table.len() - 1]), ms.timestep(table[0]));
     let mut steps = steps;
     let mut append_zero = true;
     let ts = if sgm {
@@ -790,17 +887,10 @@ fn ancestral_step(from: f32, to: f32, eta: f32) -> (f32, f32) {
     ((to * to - up * up).powf(0.5), up)
 }
 
-fn lambda(sigma: f32) -> f32 {
-    -(sigma / (1.0 - sigma)).ln()
-}
-
-fn sigma_of(lambda: f32) -> f32 {
-    1.0 / (1.0 + lambda.exp())
-}
 
 fn offset_first(sigmas: &[f32], ms: ModelSampling) -> V {
     let mut s = sigmas.to_vec();
-    if s.len() > 1 && s[0] >= 1.0 {
+    if ms.is_flow() && s.len() > 1 && s[0] >= 1.0 {
         s[0] = ms.percent_to_sigma(1e-4);
     }
     s
@@ -1069,7 +1159,16 @@ impl Run<'_> {
         let mut noise = self.noise();
         for i in 0..s.len() - 1 {
             let den = self.den(&x, s[i])?;
-            if s[i + 1] == 0.0 {
+            if !self.ms.is_flow() {
+                let (sd, su) = ancestral_step(s[i], s[i + 1], 1.0);
+                if sd == 0.0 {
+                    x = den;
+                } else {
+                    let d = to_d(&x, &den, s[i]);
+                    let z = noise.next(s[i], s[i + 1]);
+                    x = lc(&[(&x, 1.0), (&d, sd - s[i]), (&z, su)]);
+                }
+            } else if s[i + 1] == 0.0 {
                 x = den;
             } else {
                 let (sd, a1, ad, renoise) = rf_step(s[i], s[i + 1]);
@@ -1090,8 +1189,8 @@ impl Run<'_> {
             if s[i + 1] == 0.0 {
                 x = den;
             } else {
-                let alpha_s = s[i] * lambda(s[i]).exp();
-                let alpha_t = s[i + 1] * lambda(s[i + 1]).exp();
+                let alpha_s = s[i] * self.ms.half_log_snr(s[i]).exp();
+                let alpha_t = s[i + 1] * self.ms.half_log_snr(s[i + 1]).exp();
                 let scaled = lc(&[(&und, alpha_s)]);
                 let d = to_d(&x, &scaled, s[i]);
                 let (sd, su) = ancestral_step(s[i] / alpha_s, s[i + 1] / alpha_t, eta);
@@ -1179,7 +1278,13 @@ impl Run<'_> {
         let mut noise = self.noise();
         for i in 0..s.len() - 1 {
             let den = self.den(&x, s[i])?;
-            let (sd, a1, ad, renoise) = rf_step(s[i], s[i + 1]);
+            let (sd, a1, ad, renoise) = if self.ms.is_flow() {
+                rf_step(s[i], s[i + 1])
+            } else {
+                // plain ancestral: x + noise * sigma_up
+                let (sd, su) = ancestral_step(s[i], s[i + 1], 1.0);
+                (sd, 1.0, 1.0, su)
+            };
             let d = to_d(&x, &den, s[i]);
             if sd == 0.0 {
                 x = lc(&[(&x, 1.0), (&d, sd - s[i])]);
@@ -1228,8 +1333,8 @@ impl Run<'_> {
         let mut old_den: Option<V> = None;
         for i in 0..s.len() - 1 {
             let (den, und) = self.pair(&x, s[i], Uncond::IfGuided)?;
-            let alpha_s = s[i] * lambda(s[i]).exp();
-            let alpha_t = if s[i + 1] != 0.0 { s[i + 1] * lambda(s[i + 1]).exp() } else { 1.0 };
+            let alpha_s = s[i] * self.ms.half_log_snr(s[i]).exp();
+            let alpha_t = if s[i + 1] != 0.0 { s[i + 1] * self.ms.half_log_snr(s[i + 1]).exp() } else { 1.0 };
             let scaled = lc(&[(&und, alpha_s)]);
             let cur_und_d = to_d(&x, &scaled, s[i]);
             let dt = s[i + 1] - s[i];
@@ -1365,6 +1470,9 @@ impl Run<'_> {
     }
 
     fn dpmpp_2s_ancestral(&mut self, mut x: V, s: &[f32]) -> Result<V> {
+        if !self.ms.is_flow() {
+            return self.dpmpp_2s_ancestral_eps(x, s);
+        }
         let mut noise = self.noise();
         let lambda_fn = |s: f32| ((1.0 - s) / s).ln();
         let sigma_fn = |l: f32| 1.0 / (l.exp() + 1.0);
@@ -1388,6 +1496,33 @@ impl Run<'_> {
                 x = lc(&[(&x, r), (&d_i, 1.0 - r)]);
                 let z = noise.next(s[i], s[i + 1]);
                 x = lc(&[(&x, a1 / ad), (&z, renoise)]);
+            }
+            self.done(i)?;
+        }
+        Ok(x)
+    }
+
+    fn dpmpp_2s_ancestral_eps(&mut self, mut x: V, s: &[f32]) -> Result<V> {
+        let mut noise = self.noise();
+        let sig = |t: f32| (-t).exp();
+        let t_fn = |s: f32| -s.ln();
+        for i in 0..s.len() - 1 {
+            let den = self.den(&x, s[i])?;
+            let (sd, su) = ancestral_step(s[i], s[i + 1], 1.0);
+            if sd == 0.0 {
+                let d = to_d(&x, &den, s[i]);
+                x = lc(&[(&x, 1.0), (&d, sd - s[i])]);
+            } else {
+                let (t, next) = (t_fn(s[i]), t_fn(sd));
+                let h = next - t;
+                let ss = t + 0.5 * h;
+                let x2 = lc(&[(&x, sig(ss) / sig(t)), (&den, -(-h * 0.5).exp_m1())]);
+                let den2 = self.den(&x2, sig(ss))?;
+                x = lc(&[(&x, sig(next) / sig(t)), (&den2, -(-h).exp_m1())]);
+            }
+            if s[i + 1] > 0.0 {
+                let z = noise.next(s[i], s[i + 1]);
+                x = lc(&[(&x, 1.0), (&z, su)]);
             }
             self.done(i)?;
         }
@@ -1434,10 +1569,10 @@ impl Run<'_> {
             if s[i + 1] == 0.0 {
                 x = den;
             } else {
-                let (ls, lt) = (lambda(s[i]), lambda(s[i + 1]));
+                let (ls, lt) = (self.ms.half_log_snr(s[i]), self.ms.half_log_snr(s[i + 1]));
                 let h = lt - ls;
                 let ls1 = ls + R * h;
-                let s1 = sigma_of(ls1);
+                let s1 = self.ms.sigma_of_half_log_snr(ls1);
                 let (alpha_s, alpha_s1, alpha_t) = (s[i] * ls.exp(), s1 * ls1.exp(), s[i + 1] * lt.exp());
 
                 let (sd, su) = ancestral_step((-ls).exp(), (-ls1).exp(), 1.0);
@@ -1515,7 +1650,7 @@ impl Run<'_> {
             if s[i + 1] == 0.0 {
                 x = den.clone();
             } else {
-                let (ls, lt) = (lambda(s[i]), lambda(s[i + 1]));
+                let (ls, lt) = (self.ms.half_log_snr(s[i]), self.ms.half_log_snr(s[i + 1]));
                 h = lt - ls;
                 let alpha_t = s[i + 1] * lt.exp();
                 let e = -(-2.0 * h).exp_m1();
@@ -1545,7 +1680,7 @@ impl Run<'_> {
             if s[i + 1] == 0.0 {
                 x = den.clone();
             } else {
-                let (ls, lt) = (lambda(s[i]), lambda(s[i + 1]));
+                let (ls, lt) = (self.ms.half_log_snr(s[i]), self.ms.half_log_snr(s[i + 1]));
                 let hv: f32 = lt - ls;
                 h = Some(hv);
                 let h_eta = hv * 2.0;
@@ -1605,7 +1740,7 @@ impl Run<'_> {
             x = self.den(&x, s[i])?;
             if s[i + 1] > 0.0 {
                 let z = noise.next(s[i], s[i + 1]);
-                x = lc(&[(&z, s[i + 1]), (&x, 1.0 - s[i + 1])]);
+                x = self.ms.noise_scaling(s[i + 1], &z, Some(&x), false);
             }
             self.done(i)?;
         }
@@ -1782,7 +1917,7 @@ impl Run<'_> {
         let scaler = |x: f32| x * (x.powf(0.3).exp() + 10.0);
         let mut noise = self.noise();
         let s = offset_first(sigmas, self.ms);
-        let lam: V = s.iter().map(|&v| (-lambda(v)).exp()).collect();
+        let lam: V = s.iter().map(|&v| (-self.ms.half_log_snr(v)).exp()).collect();
         let (mut old, mut old_d) = (V::new(), V::new());
         for i in 0..s.len() - 1 {
             let den = self.den(&x, s[i])?;
@@ -1835,11 +1970,11 @@ impl Run<'_> {
                 self.done(i)?;
                 continue;
             }
-            let (ls, lt) = (lambda(s[i]), lambda(s[i + 1]));
+            let (ls, lt) = (self.ms.half_log_snr(s[i]), self.ms.half_log_snr(s[i + 1]));
             let h = lt - ls;
             let h_eta = h * (eta + 1.0);
             let ls1 = lerp(ls, lt, r);
-            let s1 = sigma_of(ls1);
+            let s1 = self.ms.sigma_of_half_log_snr(ls1);
             let (alpha_s1, alpha_t) = (s1 * ls1.exp(), s[i + 1] * lt.exp());
             let mut x2 = lc(&[(&x, s1 / s[i] * (-r * h * eta).exp()), (&den, -(alpha_s1 * phi1(-r * h_eta)))]);
             let mut sde = V::new();
@@ -1881,11 +2016,11 @@ impl Run<'_> {
                 self.done(i)?;
                 continue;
             }
-            let (ls, lt) = (lambda(s[i]), lambda(s[i + 1]));
+            let (ls, lt) = (self.ms.half_log_snr(s[i]), self.ms.half_log_snr(s[i + 1]));
             let h = lt - ls;
             let h_eta = h * (eta + 1.0);
             let (l1, l2) = (lerp(ls, lt, r1), lerp(ls, lt, r2));
-            let (s1, s2) = (sigma_of(l1), sigma_of(l2));
+            let (s1, s2) = (self.ms.sigma_of_half_log_snr(l1), self.ms.sigma_of_half_log_snr(l2));
             let (alpha_1, alpha_2, alpha_t) = (s1 * l1.exp(), s2 * l2.exp(), s[i + 1] * lt.exp());
 
             let x2 = lc(&[(&x, s1 / s[i] * (-r1 * h * eta).exp()), (&den, -(alpha_1 * phi1(-r1 * h_eta)))]);
@@ -1921,7 +2056,7 @@ impl Run<'_> {
         const CORR: usize = 4;
         let mut gen = self.noise();
         let s = offset_first(sigmas, self.ms);
-        let lam: V = s.iter().map(|&v| lambda(v)).collect();
+        let lam: V = s.iter().map(|&v| self.ms.half_log_snr(v)).collect();
         let (start, end) = (self.ms.percent_to_sigma(0.2), self.ms.percent_to_sigma(0.8));
         let tau_fn = |sigma: f32| if start >= sigma && sigma >= end { 1.0f32 } else { 0.0 };
         let last = s.len() - 1;
@@ -2089,9 +2224,9 @@ impl Run<'_> {
             self.done(index)?;
         }
         let alpha = vp_alpha(ts[last]);
-        // ComfyUI sets a last sigma of 0 to 0.001 in place, so `inverse_noise_scaling` divides by 1 - 0.001 after
-        // this; any other last sigma is divided out by `sample`
-        let quirk = if sigmas[last] == 0.0 { 1.0 - ts[last] } else { 1.0 };
+        // ComfyUI sets a last sigma of 0 to 0.001 in place, so a flow model's `inverse_noise_scaling` divides by
+        // 1 - 0.001 after this; any other last sigma is divided out by `sample`
+        let quirk = if sigmas[last] == 0.0 && self.ms.is_flow() { 1.0 - ts[last] } else { 1.0 };
         Ok(x.iter().map(|v| v / alpha / quirk).collect())
     }
 }
@@ -2140,13 +2275,12 @@ pub fn sample(sampler: &str, ms: ModelSampling, sigmas: &[f32], noise: &[f32], l
     let Some(&s0) = sigmas.first() else {
         return Ok(latent.map_or_else(|| vec![0.0; noise.len()], <[f32]>::to_vec));
     };
-    // CONST.noise_scaling
-    let x = match latent {
-        Some(l) => lc(&[(noise, s0), (l, 1.0 - s0)]),
-        None => lc(&[(noise, s0)]),
-    };
+    // KSampler.max_denoise: math.isclose(sigma_max, sigmas[0], rel_tol=1e-05) or above
+    let top = ms.sigma_max();
+    let max_denoise = (top - s0).abs() <= 1e-5 * top.abs().max(s0.abs()) || s0 > top;
+    let x = ms.noise_scaling(s0, noise, latent, max_denoise);
     if sigmas.len() == 1 {
-        return Ok(if s0 != 0.0 { x.iter().map(|v| v / (1.0 - s0)).collect() } else { x });
+        return Ok(ms.inverse_noise_scaling(s0, x));
     }
     let s = sigmas;
     let mut r = Run { ms, eval, step, total: s.len() - 1, seed, batch, n: noise.len() };
@@ -2197,8 +2331,7 @@ pub fn sample(sampler: &str, ms: ModelSampling, sigmas: &[f32], noise: &[f32], l
         "uni_pc_bh2" => r.unipc(x, s, true),
         other => bail!("unknown sampler {other}"),
     }?;
-    let last = s[s.len() - 1];
-    Ok(if last != 0.0 { out.iter().map(|v| v / (1.0 - last)).collect() } else { out })
+    Ok(ms.inverse_noise_scaling(s[s.len() - 1], out))
 }
 
 #[cfg(test)]

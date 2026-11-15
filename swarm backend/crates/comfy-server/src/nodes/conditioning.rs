@@ -2,8 +2,8 @@
 
 use swarm_engine_api::requests::minimax_h3;
 use swarm_engine_api::{
-    AddonKind, CondMask, EmptyLatentKind, EmptyLatentRequest, GligenBox, MiniMaxKeyframe, MiniMaxRefStyle, MiniMaxReferences, ParsedPrompt, SwarmTextEncode,
-    TextEncodeMode, TextEncodeRequest, VaeEncodeRequest,
+    AddonKind, CondMask, EmptyLatentKind, EmptyLatentRequest, GligenBox, MiniMaxKeyframe, MiniMaxRefStyle, MiniMaxReferences, ParsedPrompt, SdxlSize,
+    SwarmTextEncode, TextEncodeMode, TextEncodeRequest, VaeEncodeRequest,
 };
 
 use super::{NodeOutput, NodeRegistry};
@@ -23,6 +23,36 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
         },
         |i, ctx| {
             let req = TextEncodeRequest { text_encoder: i.clip("clip")?.clone(), mode: TextEncodeMode::Plain { text: i.string("text")?.to_string() } };
+            Ok(NodeOutput::one(Value::Conditioning(ctx.engine.encode_text(&req)?)))
+        },
+    );
+
+    r.add(
+        env,
+        |_| {
+            NodeSchema::new("CLIPTextEncodeSDXL", "CLIP Text Encode (SDXL)", "model/conditioning/stable diffusion")
+                .input(link("clip", "CLIP"))
+                .input(int("width", 1024, 0, MAX_RESOLUTION))
+                .input(int("height", 1024, 0, MAX_RESOLUTION))
+                .input(int("crop_w", 0, 0, MAX_RESOLUTION).advanced())
+                .input(int("crop_h", 0, 0, MAX_RESOLUTION).advanced())
+                .input(int("target_width", 1024, 0, MAX_RESOLUTION))
+                .input(int("target_height", 1024, 0, MAX_RESOLUTION))
+                .input(string("text_g", "", true).no_default())
+                .input(string("text_l", "", true).no_default())
+                .output("CONDITIONING", "CONDITIONING")
+        },
+        |i, ctx| {
+            let size = SdxlSize {
+                width: i.uint("width")?,
+                height: i.uint("height")?,
+                crop_w: i.uint("crop_w")?,
+                crop_h: i.uint("crop_h")?,
+                target_width: i.uint("target_width")?,
+                target_height: i.uint("target_height")?,
+            };
+            let mode = TextEncodeMode::Sdxl { text_g: i.string("text_g")?.to_string(), text_l: i.string("text_l")?.to_string(), size };
+            let req = TextEncodeRequest { text_encoder: i.clip("clip")?.clone(), mode };
             Ok(NodeOutput::one(Value::Conditioning(ctx.engine.encode_text(&req)?)))
         },
     );

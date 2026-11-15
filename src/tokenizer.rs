@@ -1,4 +1,5 @@
-//! Qwen2 byte-level BPE tokenizer (matches transformers' Qwen2Tokenizer as used by ComfyUI).
+//! Qwen2 byte-level BPE tokenizer (matches transformers' Qwen2Tokenizer as used by ComfyUI), the CLIP tokenizer of SD 1.x
+//! and SDXL, and ComfyUI's prompt weights.
 
 use anyhow::{anyhow, Result};
 use fancy_regex::Regex;
@@ -138,6 +139,168 @@ impl Tokenizer {
         }
         parts
     }
+}
+
+const CLIP_VOCAB: &str = include_str!("../assets/sd1_tokenizer/vocab.json");
+const CLIP_MERGES: &str = include_str!("../assets/sd1_tokenizer/merges.txt");
+const CLIP_PATTERN: &str = r"(?i)<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+";
+pub const CLIP_START: u32 = 49406;
+pub const CLIP_END: u32 = 49407;
+/// Tokens in one CLIP chunk, start and end included.
+pub const CLIP_CHUNK: usize = 77;
+/// `SDTokenizer.max_word_length`: a segment this long may be split between chunks.
+const MAX_WORD: usize = 8;
+
+/// transformers' `CLIPTokenizer` as ComfyUI runs it, without ftfy: its `BasicTokenizer` cleans and lowercases the text,
+/// then byte-level BPE with `</w>` ending each word.
+pub struct ClipTokenizer {
+    vocab: HashMap<String, u32>,
+    ranks: HashMap<(String, String), u32>,
+    re: Regex,
+    byte_enc: [char; 256],
+}
+
+/// `BasicTokenizer._is_chinese_char`.
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF | 0x2A700..=0x2B73F | 0x2B740..=0x2B81F | 0x2B820..=0x2CEAF
+        | 0xF900..=0xFAFF | 0x2F800..=0x2FA1F)
+}
+
+/// Format characters (category Cf), which `BasicTokenizer._is_control` drops with the control characters.
+fn is_format(c: char) -> bool {
+    matches!(c as u32, 0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
+        | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+impl ClipTokenizer {
+    pub fn new() -> Result<Self> {
+        let vocab: HashMap<String, u32> = serde_json::from_str(CLIP_VOCAB)?;
+        let mut ranks = HashMap::new();
+        // CLIPTokenizer reads merges[1 : 49152 - 256 - 2 + 1]
+        for (i, line) in CLIP_MERGES.lines().skip(1).take(49152 - 256 - 2).enumerate() {
+            if let Some((a, b)) = line.split_once(' ') {
+                ranks.insert((a.to_string(), b.to_string()), i as u32);
+            }
+        }
+        Ok(ClipTokenizer { vocab, ranks, re: Regex::new(CLIP_PATTERN)?, byte_enc: bytes_to_unicode() })
+    }
+
+    /// `BasicTokenizer(strip_accents=False, do_split_on_punc=False).tokenize`, joined with spaces.
+    fn clean(text: &str) -> String {
+        let mut s = String::with_capacity(text.len());
+        for c in text.chars() {
+            if c == '\0' || c == '\u{fffd}' || (c.is_control() && !matches!(c, '\t' | '\n' | '\r')) || is_format(c) {
+                continue;
+            }
+            if c.is_whitespace() {
+                s.push(' ');
+            } else if is_cjk(c) {
+                s.push(' ');
+                s.push(c);
+                s.push(' ');
+            } else {
+                s.push(c);
+            }
+        }
+        let norm: String = s.nfc().collect();
+        norm.split_whitespace().map(|w| w.to_lowercase()).collect::<Vec<_>>().join(" ")
+    }
+
+    /// The ids of `text`, without the start and end tokens the tokenizer adds.
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        let clean = Self::clean(text);
+        let mut out = Vec::new();
+        for m in self.re.find_iter(&clean) {
+            match m?.as_str() {
+                "<|startoftext|>" => out.push(CLIP_START),
+                "<|endoftext|>" => out.push(CLIP_END),
+                m => {
+                    let piece: Vec<String> = m.bytes().map(|b| self.byte_enc[b as usize].to_string()).collect();
+                    for tok in self.bpe(piece) {
+                        out.push(self.vocab.get(&tok).copied().unwrap_or(CLIP_END));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn bpe(&self, mut parts: Vec<String>) -> Vec<String> {
+        if let Some(last) = parts.last_mut() {
+            last.push_str("</w>");
+        }
+        while parts.len() > 1 {
+            let mut best: Option<(u32, usize)> = None;
+            for i in 0..parts.len() - 1 {
+                if let Some(&r) = self.ranks.get(&(parts[i].clone(), parts[i + 1].clone())) {
+                    if best.map_or(true, |b| r < b.0) {
+                        best = Some((r, i));
+                    }
+                }
+            }
+            let Some((_, i)) = best else { break };
+            let (a, b) = (parts[i].clone(), parts[i + 1].clone());
+            let mut merged = Vec::with_capacity(parts.len());
+            let mut j = 0;
+            while j < parts.len() {
+                if j + 1 < parts.len() && parts[j] == a && parts[j + 1] == b {
+                    merged.push(format!("{a}{b}"));
+                    j += 2;
+                } else {
+                    merged.push(parts[j].clone());
+                    j += 1;
+                }
+            }
+            parts = merged;
+        }
+        parts
+    }
+}
+
+/// True when ComfyUI would read `text` as naming a textual inversion embedding: `embedding:` at its start or after
+/// whitespace.
+fn names_embedding(text: &str) -> bool {
+    text.starts_with("embedding:") || text.char_indices().any(|(i, c)| c.is_whitespace() && text[i + c.len_utf8()..].starts_with("embedding:"))
+}
+
+/// `SDTokenizer.tokenize_with_weights` for weighted segments (from [`token_weights`]): chunks of [`CLIP_CHUNK`] (token,
+/// weight) pairs, each starting and ending with the start and end tokens and padded with `pad`. A segment shorter than
+/// eight tokens that doesn't fit moves whole to the next chunk. Embedding names are refused: none load here.
+pub fn clip_chunks(t: &ClipTokenizer, segments: &[(String, f32)], pad: u32) -> Result<Vec<Vec<(u32, f32)>>> {
+    let mut groups: Vec<Vec<(u32, f32)>> = Vec::new();
+    for (text, weight) in segments {
+        if text.is_empty() {
+            continue;
+        }
+        if names_embedding(text) {
+            return Err(crate::lora::Unsupported("textual inversion embeddings in prompts".into()).into());
+        }
+        groups.push(t.encode(text)?.into_iter().map(|id| (id, *weight)).collect());
+    }
+    let mut chunks = Vec::new();
+    let mut batch = vec![(CLIP_START, 1.0)];
+    for mut g in groups {
+        let large = g.len() >= MAX_WORD;
+        while !g.is_empty() {
+            if g.len() + batch.len() > CLIP_CHUNK - 1 {
+                let remaining = CLIP_CHUNK - batch.len() - 1;
+                if large {
+                    batch.extend(g.drain(..remaining));
+                    batch.push((CLIP_END, 1.0));
+                } else {
+                    batch.push((CLIP_END, 1.0));
+                    batch.resize(batch.len() + remaining, (pad, 1.0));
+                }
+                chunks.push(std::mem::replace(&mut batch, vec![(CLIP_START, 1.0)]));
+            } else {
+                batch.append(&mut g);
+            }
+        }
+    }
+    batch.push((CLIP_END, 1.0));
+    batch.resize(CLIP_CHUNK.max(batch.len()), (pad, 1.0));
+    chunks.push(batch);
+    Ok(chunks)
 }
 
 const T5_JSON: &[u8] = include_bytes!("../assets/t5_tokenizer/tokenizer.json");

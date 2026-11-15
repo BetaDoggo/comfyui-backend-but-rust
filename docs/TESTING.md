@@ -87,7 +87,7 @@ the ones on `ref/ComfyUI` with `ref/venv/Scripts/python.exe`.
 |---|---|
 | SwarmUI's, through `SWARM_DIR` | `birefnet_ref`, `flux2_vae_ref`, `h3_ref`, `h3_image_ref`, `krea_image_ref`, `lora_ref`, `pixal3d_ref`, `qwen21_ref`, `seedvr_ref`, `snapref_ref`, `triposplat_ref` |
 | SwarmUI's, with the SwarmUI folder as the first argument | `cfg_ref`, `latent_ops_ref`, `partial_ref`, `swarm_prompt_ref` |
-| `ref/ComfyUI` | `anima_ref`, `moss_ref`, `ref_dump` (Krea 2), `sampler_ref`, `te_hidden`, `te_l0`, `chk_dtypes`, `chk_te` |
+| `ref/ComfyUI` | `anima_ref`, `moss_ref`, `ref_dump` (Krea 2), `sampler_ref`, `sd_ref` (or `COMFY_DIR`), `te_hidden`, `te_l0`, `chk_dtypes`, `chk_te` |
 | None: they compare, inspect or write files | Every `*_cmp.py` except `qwen21_cmp`, `compare.py`, `psnr.py`, `glb_preview.py`, `st_header.py`, `h3_refiner_check`, `lora_formats` |
 
 `qwen21_cmp` imports SwarmUI's ComfyUI. `sparse_attn_ref` and `te_q` need `comfy_kitchen`, which SwarmUI's Python has.
@@ -127,7 +127,16 @@ python tools/moss_cmp.py refout/moss/ref.safetensors refout/moss/ours.safetensor
 ```
 
 The other families follow the same pattern with their own `*_ref.py` and `*_cmp.py`; check each docstring for the
-arguments. [AGENTS.md](../AGENTS.md#comparing-with-comfyui) has the rules for judging the result: tokens and hidden
+arguments. SD 1.x and SDXL compare in the reference script itself: run the engine first with `--dump`, then pass its dump
+and picture to `tools/sd_ref.py` with `--compare`, using the same prompt, seed, size and sampler:
+
+```bash
+target/release/diffusion.exe --sdxl --no-quant --attention flash --seed 1 --scheduler normal -p "no humans, scenery, a lighthouse on a rocky coast at sunset" --negative "blurry, low quality" -o refout/sd/ours.png --dump refout/sd/ours.safetensors
+```
+
+```bash
+ref/venv/Scripts/python.exe tools/sd_ref.py refout/sd/comfy "$MODELS_ROOT/Stable-diffusion/sd_xl_base_1.0.safetensors" "no humans, scenery, a lighthouse on a rocky coast at sunset" --seed 1 --compare refout/sd/ours.safetensors refout/sd/ours.png
+``` [AGENTS.md](../AGENTS.md#comparing-with-comfyui) has the rules for judging the result: tokens and hidden
 states before PSNR, warm runs against warm runs, and `int8` against `flash` attention first.
 
 ## Testing in SwarmUI

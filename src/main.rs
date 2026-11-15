@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(version, about = "Int8 text-to-image for Krea 2, Anima and MOSS Image, ComfyUI-compatible")]
 struct Args {
     /// Text prompt
@@ -93,6 +93,16 @@ struct Args {
     /// Run MOSS Image instead of Krea 2 (--dit, --te and --vae then default to the MOSS files, --shift to 5)
     #[arg(long)]
     moss: bool,
+    /// Run an SD 1.x checkpoint (--dit defaults to SD 1.5; its text encoder and VAE come from the same file unless
+    /// --vae is given). --steps defaults to 20 and --cfg to 7
+    #[arg(long)]
+    sd: bool,
+    /// Run an SDXL checkpoint, as --sd does (--dit defaults to SDXL base 1.0)
+    #[arg(long)]
+    sdxl: bool,
+    /// SD 1.x and SDXL: CLIPSetLastLayer's stop_at_clip_layer, -1 for the last layer, -2 for "clip skip 2"
+    #[arg(long, allow_hyphen_values = true)]
+    clip_layer: Option<i32>,
     /// Run a bf16 MOSS Image checkpoint in bf16. By default its blocks are quantized to int8 ConvRot as it loads, for
     /// speed (in RAM; the file is only read)
     #[arg(long)]
@@ -303,6 +313,8 @@ const ANIMA_DIT: &str = "Stable-diffusion/animaInt8Mxfp8_turboV11Int8.safetensor
 const ANIMA_TE: &str = "clip/qwen_3_600m.safetensors";
 const MOSS_DIT: &str = "Stable-diffusion/moss_image_sft_int8_convrot_attn.safetensors";
 const MOSS_TE: &str = "clip/qwen3.5_9b_int8_convrot.safetensors";
+const SD1_DIT: &str = "Stable-diffusion/v1-5-pruned-emaonly-fp16.safetensors";
+const SDXL_DIT: &str = "Stable-diffusion/sd_xl_base_1.0.safetensors";
 const MOSS_VAE: &str = "VAE/flux2-vae.safetensors";
 const SEEDVR_DIT: &str = "diffusion_models/SeedVR2/seedvr2_3b_int8_convrot.safetensors";
 const SEEDVR_VAE: &str = "VAE/SeedVR2/seedvr2_ema_vae_fp16.safetensors";
@@ -456,6 +468,65 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
                 let i = p * args.count + group.0 + j;
                 let t1 = Instant::now();
                 let rgb = gen.decode_moss(latent, args.width, args.height)?;
+                eprintln!("VAE decode {:.0} ms", t1.elapsed().as_secs_f64() * 1e3);
+                let path = out_path(&args.out, i, prompts.len() * args.count);
+                std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                eprintln!("[{i}] saved {} (seed {})", path.display(), args.seed + (group.0 + j) as u64);
+            }
+            eprintln!("{} image(s) done in {:.2}s", group.1, t0.elapsed().as_secs_f64());
+            if let Some(d) = &args.dump {
+                write_safetensors(d, &dump)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_sd(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
+    let dit = args.model(&args.dit, if args.sdxl { SDXL_DIT } else { SD1_DIT });
+    let mut args = args.clone();
+    if args.steps == 8 {
+        args.steps = 20;
+    }
+    if args.cfg == 1.0 {
+        args.cfg = 7.0;
+    }
+    let args = &args;
+    let mut gen = pipeline::Generator::new(&load)?;
+    gen.ensure_sd(&dit)?;
+    if let Some(vae) = &args.vae {
+        gen.ensure_sd_vae(vae)?;
+    }
+    if gen.sd_is_xl() != args.sdxl {
+        bail!("{} is {}", dit.display(), if gen.sd_is_xl() { "SDXL: use --sdxl" } else { "not SDXL: use --sd" });
+    }
+    apply_loras(&mut gen, args)?;
+    let (lw, lh) = (args.width / 8, args.height / 8);
+    let n = 4 * lh * lw;
+    let prompts = args.prompts()?;
+    for (p, prompt) in prompts.iter().enumerate() {
+        for group in args.batches() {
+            let size = pipeline::SizeCond::of(args.width, args.height);
+            let r = pipeline::SdRequest {
+                positive: Prompt::new(diffusion::tokenizer::token_weights(prompt.trim(), 1.0)),
+                negative: Prompt::new(diffusion::tokenizer::token_weights(args.negative.trim(), 1.0)),
+                width: args.width,
+                height: args.height,
+                positive_size: size,
+                negative_size: size,
+                clip_layer: args.clip_layer,
+                v_pred: None,
+                sampling: args.batch_sampling("euler", ModelSampling::Discrete, group, (lw, lh))?,
+                noise: args.noise(group, n)?,
+            };
+            let mut dump = pipeline::Dump::new();
+            let t0 = Instant::now();
+            let (latents, _) = gen.sample_sd(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
+            for (j, latent) in latents.chunks_exact(n).enumerate() {
+                let i = p * args.count + group.0 + j;
+                let t1 = Instant::now();
+                let rgb = gen.decode_sd(latent, args.width, args.height)?;
                 eprintln!("VAE decode {:.0} ms", t1.elapsed().as_secs_f64() * 1e3);
                 let path = out_path(&args.out, i, prompts.len() * args.count);
                 std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
@@ -1008,6 +1079,9 @@ fn main() -> Result<()> {
     }
     if args.qwen21 {
         return run_qwen21(&args, load);
+    }
+    if args.sd || args.sdxl {
+        return run_sd(&args, load);
     }
     run_krea(&args, load)
 }

@@ -10,7 +10,7 @@ comfy-server does not implement yet. Consumed by gen_todo_nodes.py.
 """
 
 AREAS = {
-    'other_arch': ('Other model architectures', 'Stock ComfyUI nodes for model families beyond the five targets (SD1/SDXL, SD3, Flux, Wan, LTX-V, Hunyuan, Cosmos, ...). Routed to Engine::custom_node when the engine claims them'),
+    'other_arch': ('Other model architectures', 'Stock ComfyUI nodes for model families the native engine does not run (SD3, Flux, Wan, LTX-V, Hunyuan, Cosmos, ...). Routed to Engine::custom_node when the engine claims them'),
     'third_party': ('Third-party custom nodes (optional features)', 'SwarmUI only uses these when the backend advertises them; real ComfyUI needs extra node packs for them. Routed to Engine::custom_node when the engine claims them'),
 }
 
@@ -24,7 +24,6 @@ NODES = {
     # ---------------------------------------------------------------- controlnet
     # ---------------------------------------------------------------- video / audio plumbing
     # ---------------------------------------------------------------- other architectures
-    'CLIPTextEncodeSDXL': ('other_arch', 'arch', 'SDXL'),
     'InstructPixToPixConditioning': ('other_arch', 'arch', 'SD1.5 InstructPix2Pix'),
     'SVD_img2vid_Conditioning': ('other_arch', 'arch', 'Stable Video Diffusion'),
     'SwarmOffsetEmptyLatentImage': ('other_arch', 'arch', 'SD-family offset-noise latents'),

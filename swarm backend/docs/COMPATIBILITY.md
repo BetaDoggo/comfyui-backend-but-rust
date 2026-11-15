@@ -15,7 +15,7 @@ It was measured, not guessed. `tools/probe_swarm_params.py` drove a live SwarmUI
 Every node class SwarmUI can emit is either implemented natively or has a schema here, so every workflow SwarmUI builds validates and runs:
 
 - **Native**: the server implements the node, lowering it to typed engine requests, patches and metadata (see [INPUT_MAPPING.md](INPUT_MAPPING.md)). This covers everything SwarmUI does with the five target models.
-- **Generic** (87 node classes, listed below): other model families' stock ComfyUI nodes and third-party node packs. The schemas live in [`crates/comfy-server/src/todo_nodes.json`](../crates/comfy-server/src/todo_nodes.json). Stock schemas come from a real ComfyUI dump; third-party ones are written in `tools/third_party_schemas.py`. At startup the server asks `Engine::supports_custom_node(class)` for each. Claimed classes are registered with that schema and listed in `/object_info`, which makes SwarmUI enable the matching features. They execute through `Engine::custom_node`, with their resolved inputs and with model-file combos resolved to files. The mock engine claims all of them and returns typed placeholder outputs; run it with `--mock-native-only` to turn that off.
+- **Generic** (86 node classes, listed below): other model families' stock ComfyUI nodes and third-party node packs. The schemas live in [`crates/comfy-server/src/todo_nodes.json`](../crates/comfy-server/src/todo_nodes.json). Stock schemas come from a real ComfyUI dump; third-party ones are written in `tools/third_party_schemas.py`. At startup the server asks `Engine::supports_custom_node(class)` for each. Claimed classes are registered with that schema and listed in `/object_info`, which makes SwarmUI enable the matching features. They execute through `Engine::custom_node`, with their resolved inputs and with model-file combos resolved to files. The mock engine claims all of them and returns typed placeholder outputs; run it with `--mock-native-only` to turn that off.
 - An unclaimed class fails validation before anything runs. The `missing_node_type` error names the node, its area and the parameters behind it, and SwarmUI shows it to the user. `--advertise-todo-nodes` lists unclaimed schemas in `/object_info` anyway, for inspecting workflows; running them still fails validation.
 - To make a node native: register it under `crates/comfy-server/src/nodes/` (a native schema always wins), remove it from `tools/todo_catalog.py`, then regenerate (see the end of this file).
 
@@ -27,13 +27,12 @@ Every node class SwarmUI can emit is either implemented natively or has a schema
 
 ## Generic-route nodes by area
 
-### Other model architectures (58)
+### Other model architectures (57)
 
-SwarmUI features: Stock ComfyUI nodes for model families beyond the five targets (SD1/SDXL, SD3, Flux, Wan, LTX-V, Hunyuan, Cosmos, ...). Routed to Engine::custom_node when the engine claims them.
+SwarmUI features: Stock ComfyUI nodes for model families the native engine does not run (SD3, Flux, Wan, LTX-V, Hunyuan, Cosmos, ...). Routed to Engine::custom_node when the engine claims them.
 
 | Node | Needs | What it does | Emitted for (observed live) |
 |---|---|---|---|
-| `CLIPTextEncodeSDXL` | new arch | SDXL | (not observed with these models; WorkflowGenerator.cs:2496, WorkflowGeneratorSteps.cs:2449) |
 | `CosmosImageToVideoLatent` | new arch | Cosmos | (not observed with these models; WorkflowGenerator.cs:1536) |
 | `EmptyChromaRadianceLatentImage` | new arch | Chroma Radiance (pixel space) | (not observed with these models; WorkflowGenerator.cs:3002, WorkflowGeneratorModelSupport.cs:334) |
 | `EmptyCosmosLatentVideo` | new arch | Cosmos | (not observed with these models; WorkflowGeneratorModelSupport.cs:334) |

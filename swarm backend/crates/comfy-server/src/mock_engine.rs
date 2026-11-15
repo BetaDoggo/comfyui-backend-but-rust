@@ -230,6 +230,10 @@ impl Engine for MockEngine {
                 );
                 (hash_of(&s.prompt.raw), s.guidance)
             }
+            TextEncodeMode::Sdxl { text_g, text_l, size } => {
+                tracing::info!("[mock] encode_text sdxl type={} text_g={text_g:?} text_l={text_l:?} size={size:?}", req.text_encoder.encoder_type);
+                (hash_of(text_g), None)
+            }
             TextEncodeMode::MiniMax { text, refs } => {
                 tracing::info!("[mock] encode_text minimax type={} text={text:?} pictures={} style={:?} vae={}", req.text_encoder.encoder_type, refs.images.len(), refs.style,
                     refs.vae.is_some());

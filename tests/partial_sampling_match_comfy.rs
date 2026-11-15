@@ -88,7 +88,7 @@ fn partial_runs_match_comfy() {
             evals.push(s);
             let Some(i) = &inpaint else { return Ok(mock(x, s, mode, &target, cfg)) };
             let m = i.mask_at(ms, &sigmas, s);
-            let e = mock(&Inpaint::input(&m, x, s, &noise, &latent), s, mode, &target, cfg);
+            let e = mock(&Inpaint::input(ms, &m, x, s, &noise, &latent), s, mode, &target, cfg);
             Ok(Eval { denoised: Inpaint::prediction(&m, &e.denoised, &latent), uncond: e.uncond })
         };
         let mut step = |_: usize, _: usize| Ok(());

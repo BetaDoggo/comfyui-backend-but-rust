@@ -20,7 +20,7 @@ use diffusion::h3;
 use diffusion::h3window;
 use diffusion::pipeline::{
     AnimaRequest, Cancelled, Generator, H3Conds, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, SdRequest, SeedVrRequest,
-    SizeCond, SnapRefRequest, Step,
+    SizeCond, SnapRefRequest, Step, StyleRequest,
 };
 use diffusion::pixal3d;
 use diffusion::triposplat;
@@ -606,6 +606,8 @@ struct ModelSettings {
     windows: Option<h3window::ContextWindows>,
     /// `SnapRef`, on Anima.
     snapref: Option<Box<SnapRefPatch>>,
+    /// `BrokeAnimaStyleReference`, on Anima.
+    style: Option<Box<StyleRefPatch>>,
     /// SD: `ModelSamplingDiscrete`'s prediction type, in place of the checkpoint's.
     v_pred: Option<bool>,
 }
@@ -629,7 +631,7 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::SeedVr2 => ModelSampling::Flow { shift: 1.0 },
         Family::Sd => ModelSampling::Discrete,
     };
-    let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None, snapref: None, v_pred: None };
+    let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None, snapref: None, style: None, v_pred: None };
     let mut sparse = None;
     for p in &model.patches {
         match p {
@@ -707,6 +709,15 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
                     return Err(unsupported("SnapRef's ref_guidance_on (its extra model call per step)"));
                 }
                 s.snapref = Some(p.clone());
+            }
+            ModelPatch::StyleReference(p) => {
+                if family != Family::Anima {
+                    return Err(unsupported("Broke Anima Style Reference on this model (it works with Anima only)"));
+                }
+                if s.style.is_some() {
+                    return Err(unsupported("more than one Broke Anima Style Reference node on a model"));
+                }
+                s.style = Some(p.clone());
             }
             other => {
                 let name = format!("{other:?}");
@@ -1100,13 +1111,18 @@ impl NativeEngine {
             Prompt::new(Vec::new())
         };
         let snapref = settings.snapref.as_deref().map(|p| self.snapref_request(p, cond)).transpose()?;
+        if snapref.is_some() && settings.style.is_some() {
+            return Err(unsupported("SnapRef and Broke Anima Style Reference on the same model"));
+        }
+        let steps = sampling.sigmas.len().saturating_sub(1);
+        let style = settings.style.as_deref().map(|p| self.style_request(p, cond, steps)).transpose()?;
         let mut gen = self.gen();
         gen.ensure_anima(&file.path).map_err(internal)?;
         gen.ensure_qwen3(text_encoder).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
         gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
-        let r = AnimaRequest { positive, negative, width: lw * 8, height: lh * 8, sampling, noise: plan.noise(req, batch, (16, lh, lw)), snapref };
+        let r = AnimaRequest { positive, negative, width: lw * 8, height: lh * 8, sampling, noise: plan.noise(req, batch, (16, lh, lw)), snapref, style };
         let (latent, stats) = gen
             .sample_anima(&r, |step| report(mode, progress, batch, step, |x0| (preview::wan21(x0, lh, lw), lh, lw)), None)
             .map_err(internal)?;
@@ -1156,6 +1172,29 @@ impl NativeEngine {
             in_uncond: p.ref_in_uncond,
             uncond_bias: (p.fidelity < 1.0 && !p.ref_in_uncond).then(|| (1.0 - p.fidelity).max(1e-6).ln() as f32),
         })
+    }
+
+    /// The `BrokeAnimaStyleReference` node's picture, encoded as it does (`_encode_image` at 0.5 megapixels), and its
+    /// settings over `steps` sampling steps. `prompt` is the positive's conditioning, whose text encoder the node's
+    /// caption must share.
+    fn style_request(&self, p: &StyleRefPatch, prompt: &DeferredCond, steps: usize) -> EngineResult<StyleRequest> {
+        let (cc, caption) = single_prompt(&p.caption, Family::Anima)?;
+        if cc.text_encoder != prompt.text_encoder {
+            return Err(unsupported("a Broke Anima Style Reference CLIP other than the prompt's text encoder"));
+        }
+        check_text_encoder_loras(prompt, cc)?;
+        let vae = p.vae.source.as_ref().ok_or_else(|| unsupported("Broke Anima Style Reference with the pixel-space VAE"))?;
+        if is_qwen21_vae(vae) || is_flux2_vae(vae) || is_h3_vae(vae) {
+            return Err(unsupported("Broke Anima Style Reference with a VAE other than Anima's"));
+        }
+        let (rgb, w, h) = diffusion::snapref::shrink(&rgb_f32(&p.image), p.image.width as usize, p.image.height as usize,
+            StyleRequest::NODE_MEGAPIXELS);
+        let mut gen = self.gen();
+        gen.ensure_vae(&vae.path).map_err(internal)?;
+        let reference = gen.encode_image(&rgb, w, h).map_err(internal)?;
+        let mut r = StyleRequest::node(reference, p.stats_match as f32, p.restyle, steps);
+        r.caption = caption;
+        Ok(r)
     }
 
     fn encode_qwen21(&self, file: &ModelFile, pixels: &ImageBatch) -> EngineResult<Latent> {

@@ -19,6 +19,7 @@ mod sampling;
 mod seedvr;
 mod segment;
 mod snapref;
+mod broke_style_ref;
 mod three_d;
 mod video;
 mod vae;
@@ -154,6 +155,7 @@ impl NodeRegistry {
         custom_sampling::register(&mut r, env);
         three_d::register(&mut r, env);
         snapref::register(&mut r, env);
+        broke_style_ref::register(&mut r, env);
         seedvr::register(&mut r, env);
         r
     }

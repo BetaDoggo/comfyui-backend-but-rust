@@ -33,6 +33,7 @@ pub mod sdvae;
 pub mod seedvr_vae;
 pub mod snapref;
 pub mod st;
+pub mod steer;
 pub mod te;
 pub mod tokenizer;
 pub mod trellis;

@@ -49,6 +49,51 @@ pub struct Dit {
     /// bf16 [blocks][3][shift | scale | gate] by sigma bits: it depends on nothing else, and
     /// repeated schedules skip 250 small kernels per step.
     mods: HashMap<u32, DevBuf>,
+    /// Activation steering (see [`crate::steer`]): the denoising step being evaluated, set by the pipeline before each
+    /// evaluation, and whether it is the negative prompt's. Reference passes are never recorded or steered.
+    pub step: Option<usize>,
+    pub negative: bool,
+    /// Records the positive prompt's block outputs.
+    pub recorder: Option<crate::steer::Recorder>,
+    /// Keeps some of the positive prompt's tokens whole.
+    pub sampler: Option<crate::steer::TokenSampler>,
+    /// Every steering applied, in order.
+    pub steer: Vec<crate::steer::Steer>,
+    /// Concept steering in cross-attention, see [`Concept`].
+    pub concept: Option<Concept>,
+    /// Blocks whose self-attention reads a target pass's reference keys (half-open); every block by default.
+    pub ref_blocks: (usize, usize),
+    /// Residual AdaIN towards a style reference, see [`AdaIn`].
+    pub adain: Option<AdaIn>,
+}
+
+/// Residual AdaIN towards a style reference: after each chosen block, every channel of the target's tokens is moved
+/// towards the reference's mean and standard deviation at the same block and sigma. Only per-channel statistics
+/// cross over, so nothing positional (no object) can.
+pub struct AdaIn {
+    /// f32 [blocks][2][F]: column sums and sums of squares of the reference pass's block outputs
+    pub stats: DevBuf,
+    /// Reference tokens the sums are over.
+    pub rows: usize,
+    pub lambda: f32,
+    /// Half-open range of blocks.
+    pub blocks: (usize, usize),
+    /// Reference passes fill `stats`.
+    pub capture: bool,
+    /// Target passes apply them (set per evaluation).
+    pub active: bool,
+}
+
+/// Concept steering in cross-attention: each block's cross-attention output gains
+/// `alpha * (attn(q, concept) - attn(q, null))`, the change the concept's prompt makes to what each image token reads
+/// from the text. Both prompts are encoded once; their keys and values are the steering asset.
+pub struct Concept {
+    pub concept: Context,
+    pub null: Context,
+    pub alpha: f32,
+    /// Half-open ranges of steps and blocks steered.
+    pub steps: (usize, usize),
+    pub blocks: (usize, usize),
 }
 
 /// One prompt, ready for the blocks.
@@ -65,18 +110,19 @@ pub struct Context {
 #[derive(Clone, Copy)]
 pub enum Pass<'a> {
     Plain,
-    /// A target evaluation: the adapter's "tgt" LoRA, and the references' keys and values when `read` is set.
-    Target { adapter: &'a Adapter, read: Option<(&'a RefKv, &'a RefRead)> },
+    /// A target evaluation: the adapter's "tgt" LoRA (SnapRef) or none (a training-free style reference), and the
+    /// references' keys and values when `read` is set.
+    Target { adapter: Option<&'a Adapter>, read: Option<(&'a RefKv, &'a RefRead)> },
     /// A reference: its "ref" LoRA, recording each block's self-attention k and v at row `row0` of `out`.
-    Reference { adapter: &'a Adapter, out: &'a RefKv, row0: usize },
+    Reference { adapter: Option<&'a Adapter>, out: &'a RefKv, row0: usize },
 }
 
 impl Pass<'_> {
     fn lora(&self) -> Option<(&Adapter, LoraStream)> {
         match *self {
             Pass::Plain => None,
-            Pass::Target { adapter, .. } => Some((adapter, LoraStream::Tgt)),
-            Pass::Reference { adapter, .. } => Some((adapter, LoraStream::Ref)),
+            Pass::Target { adapter, .. } => adapter.map(|a| (a, LoraStream::Tgt)),
+            Pass::Reference { adapter, .. } => adapter.map(|a| (a, LoraStream::Ref)),
         }
     }
 }
@@ -253,7 +299,8 @@ impl Dit {
         let layouts = (0..n_blocks(st)?).map(|i| block_layout(st, i)).collect::<Result<Vec<_>>>()?;
         let p = plan(&layouts, block_budget, slots);
         let blocks = WeightSet::load("anima blocks", st, layouts, p, threads)?;
-        Ok(Dit { prefix: prefix(st)?.to_string(), globals, gl, blocks, attn_variant: 0, int8_attn: true, mods: HashMap::new(), prof: crate::prof::Prof::new() })
+        Ok(Dit { prefix: prefix(st)?.to_string(), globals, gl, blocks, attn_variant: 0, int8_attn: true, mods: HashMap::new(), prof: crate::prof::Prof::new(),
+            step: None, negative: false, recorder: None, sampler: None, steer: Vec::new(), concept: None, ref_blocks: (0, usize::MAX), adain: None })
     }
 
     fn g(&self, key: &str) -> PM {
@@ -537,7 +584,29 @@ impl Dit {
         rope.upload(0, &crate::st::f32_bytes(&table), st)?;
         let t = self.time(0.0, adapter.mode_embed(mode, F)?, st)?;
         let (x, _) = self.embed(latent, 1, h, w, st)?;
-        self.blocks(&x, 1, ht * wt, c, rope.ptr(), &t, None, &Pass::Reference { adapter, out, row0 }, st, &mut None)
+        self.blocks(&x, 1, ht * wt, c, rope.ptr(), &t, None, &Pass::Reference { adapter: Some(adapter), out, row0 }, st, &mut None)
+    }
+
+    /// A training-free style reference: `latent` (f32 [16, h, w], already noised to `sigma`) through the plain model at
+    /// `sigma`, prompted by `c`, as RoPE frame `frame` centred on a target of `target` latent pixels. Every block's
+    /// self-attention k and v go to `out` from row 0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_style_reference(&mut self, latent: &DevBuf, h: usize, w: usize, target: (usize, usize), sigma: f32, frame: f32,
+        c: &Context, out: &RefKv, st: &Stream) -> Result<()> {
+        if h % PATCH != 0 || w % PATCH != 0 {
+            bail!("reference latent size must be even");
+        }
+        let (ht, wt) = (h / PATCH, w / PATCH);
+        if ht * wt > out.rows || out.row_bytes != KV * 2 {
+            bail!("reference keys don't fit their cache");
+        }
+        let (h0, w0) = snapref::offset(target, (ht, wt));
+        let table = rope_positions(ht, wt, frame, h0, w0);
+        let rope = DevBuf::alloc_async(table.len() * 4, st)?;
+        rope.upload(0, &crate::st::f32_bytes(&table), st)?;
+        let t = self.time(sigma, None, st)?;
+        let (x, _) = self.embed(latent, 1, h, w, st)?;
+        self.blocks(&x, 1, ht * wt, c, rope.ptr(), &t, Some(sigma), &Pass::Reference { adapter: None, out, row0: 0 }, st, &mut None)
     }
 
     /// The transformer blocks over `x` (bf16 [batch * l, F] tokens), in place. `sigma` keys the modulation cache; the
@@ -605,12 +674,17 @@ impl Dit {
             unsafe {
                 let b = batch as i32;
                 crate::ffi::gpu_int8_attn_workspace(b, H as i32, H as i32, l as i32, lk_self as i32)
-                    .max(crate::ffi::gpu_int8_attn_workspace(b, H as i32, H as i32, l as i32, c.len as i32)) as usize
+                    .max(crate::ffi::gpu_int8_attn_workspace(b, H as i32, H as i32, l as i32, c.len as i32))
+                    .max(self.concept.as_ref().map_or(0, |cc| crate::ffi::gpu_int8_attn_workspace(b, H as i32, H as i32, l as i32,
+                        cc.concept.len.max(cc.null.len) as i32))) as usize
             }
         } else {
             H * rows * 4
         };
         let ws = DevBuf::alloc_async(ws_bytes, st)?;
+        // concept steering's two cross-attention reads
+        let concept_rows = if self.concept.is_some() && sigma.is_some() { rows } else { 1 };
+        let (cpt, nul) = (DevBuf::alloc_async(concept_rows * F * 2, st)?, DevBuf::alloc_async(concept_rows * F * 2, st)?);
         let xp = x.ptr();
         let q = qkv.ptr();
         let lc = c.len;
@@ -683,7 +757,8 @@ impl Dit {
                     break;
                 }
             }
-            match (read, &cat, &merge, &groups) {
+            let read_here = read.filter(|_| (self.ref_blocks.0..self.ref_blocks.1).contains(&b));
+            match (read_here, &cat, &merge, &groups) {
                 (Some((kv, _)), Some(cat), _, _) => {
                     let lk = kv.rows + l;
                     for i in 0..batch {
@@ -739,6 +814,18 @@ impl Dit {
             k!(gpu_qk_norm_rope(DT_BF16, HD as i32, q, fi, 0, 0, H as i32, 0, wp("qn_cross"), null(), EPS, null(), 0, m, s(st)))?;
             self.prof.mark("rope", st)?;
             self.attention(q, kv, off(kv, F * 2), attn.ptr(), ws.ptr(), batch, l, lc, F, KV, true, st)?;
+            if let (Some(cc), Some(step), Some(_), false) = (&self.concept, self.step, sigma, matches!(pass, Pass::Reference { .. })) {
+                if (cc.steps.0..cc.steps.1).contains(&step) && (cc.blocks.0..cc.blocks.1).contains(&b) {
+                    // the concept's keys and values against the null prompt's, read by the same queries
+                    let read = |ctx: &Context, out: PM| -> Result<()> {
+                        let kvc = off(ctx.kv.ptr(), b * ctx.len * KV * 2);
+                        self.attention(q, kvc, off(kvc, F * 2), out, ws.ptr(), batch, l, ctx.len, F, KV, true, st)
+                    };
+                    read(&cc.concept, cpt.ptr())?;
+                    read(&cc.null, nul.ptr())?;
+                    k!(gpu_steer_axpy(attn.ptr(), fi, cpt.ptr(), nul.ptr(), fi, m, F as i32, cc.alpha, s(st)))?;
+                }
+            }
             self.prof.mark("cross attn", st)?;
             out_proj(Module::CrossOut, "wo_cross", "so_cross", 1, attn.ptr(), F)?;
             self.prof.mark("out proj", st)?;
@@ -774,6 +861,41 @@ impl Dit {
             }
             self.prof.mark("mlp2", st)?;
             self.blocks.release(b, st)?;
+            if let (Some(step), Some(_), false) = (self.step, sigma, matches!(pass, Pass::Reference { .. })) {
+                if !self.negative {
+                    if let Some(r) = self.recorder.as_mut() {
+                        r.record(step, b, xp, rows, st)?;
+                    }
+                    if let Some(t) = self.sampler.as_mut() {
+                        t.record(step, b, xp, batch, l, st)?;
+                    }
+                }
+                for sv in &self.steer {
+                    sv.apply(step, b, xp, rows, st)?;
+                }
+            }
+            if let Some(ad) = self.adain.as_ref().filter(|ad| (ad.blocks.0..ad.blocks.1).contains(&b)) {
+                let fi32 = F as i32;
+                match pass {
+                    Pass::Reference { .. } if ad.capture => {
+                        let at = ad.stats.at(b * 2 * F * 4);
+                        k!(gpu_zero_f32(at, (2 * F) as i64, s(st)))?;
+                        k!(gpu_colstats(xp, rows as i32, fi32, at, s(st)))?;
+                    }
+                    Pass::Reference { .. } => {}
+                    _ if ad.active && !self.negative && sigma.is_some() && ad.lambda != 0.0 => {
+                        let ts = DevBuf::alloc_async(2 * F * 4, st)?;
+                        for i in 0..batch {
+                            let xi = off(xp, i * l * F * 2);
+                            k!(gpu_zero_f32(ts.ptr(), (2 * F) as i64, s(st)))?;
+                            k!(gpu_colstats(xi, l as i32, fi32, ts.ptr(), s(st)))?;
+                            k!(gpu_adain(xi, l as i32, fi32, ts.ptr(), l as f32, ad.stats.at(b * 2 * F * 4), ad.rows as f32, ad.lambda,
+                                s(st)))?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if let Some(p) = probe.as_mut() {
                 p(&format!("block{b}"), x, rows * F * 2);
             }

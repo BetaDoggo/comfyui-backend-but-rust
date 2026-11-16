@@ -207,6 +207,7 @@ Flow-matching sampling with the Flux-style resolution-dependent shift. Attention
 | LoRAs | `LoraLoader` (`anima/lora` class) | model + text-encoder LoRA patches |
 | ControlNet (Anima LLLite) | `ModelPatchLoader` + `AnimaLLLiteApply` | `ModelPatch::AnimaLLLite` (see "Shared features") |
 | SnapRef group (SwarmUI-SnapRef extension) | `SnapRef` after the model loader and LoRAs: the prompt images as `image`, `image_2`, `image_3` (at most 3, each `weight_N` = SnapRef Strength), `adapter` = the chosen version's file in the LoRA folder (SwarmUI downloads it first), `mode`, `ref_megapixels`, `ref_caption`, `fidelity`, `ref_in_uncond` false. The prompt images then no longer reach the text encoder | `ModelPatch::SnapRef` |
+| Broke Anima Style Reference group (SwarmUI-BrokeAnimaStyleReference extension) | `BrokeAnimaStyleReference` after the model loader, LoRAs and SnapRef: the first prompt image as `image` (not resized), `stats_match` = Style Match, `restyle` = Style Restyle, and the text encoder as `clip` for its fixed caption. The prompt images then no longer reach the text encoder. Can't be combined with SnapRef | `ModelPatch::StyleReference` |
 
 Note: SwarmUI's "Images: N" becomes N separate prompts with consecutive seeds (`batch_size` stays 1);
 only the "Batch Size" param raises `batch_size`.

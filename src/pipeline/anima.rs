@@ -22,6 +22,9 @@ pub struct AnimaRequest {
     pub noise: Vec<f32>,
     /// SnapRef's reference adapter, if any.
     pub snapref: Option<SnapRefRequest>,
+    /// A training-free style reference for this request (the `BrokeAnimaStyleReference` node); without one, the one set
+    /// with [`super::Generator::style_anima`], if any.
+    pub style: Option<StyleRequest>,
 }
 
 /// The SnapRef node's settings (see [`crate::snapref`]).
@@ -41,6 +44,87 @@ pub struct SnapRefRequest {
     pub in_uncond: bool,
     /// Fidelity below 1: the negative's evaluations read the references, at this extra bias. Ignored with `in_uncond`.
     pub uncond_bias: Option<f32>,
+}
+
+/// A training-free style reference: the picture is noised to each step's sigma with fixed noise and run through the
+/// plain model, and the target's self-attention also reads its keys and values ("shared attention").
+#[derive(Clone)]
+pub struct StyleRequest {
+    /// The picture's latent at model scale.
+    pub reference: Reference,
+    /// The reference pass's prompt.
+    pub caption: Prompt,
+    /// Natural log of the weight on the reference's attention logits.
+    pub bias: f32,
+    /// Half-open ranges of the steps and blocks that read the reference.
+    pub steps: (usize, usize),
+    pub blocks: (usize, usize),
+    /// The reference's RoPE frame: 0 puts its tokens on the target's positions.
+    pub frame: f32,
+    /// Seed of the noise the picture is noised with.
+    pub seed: u64,
+    /// The target's self-attention reads the reference's keys and values.
+    pub attention: bool,
+    /// Residual AdaIN towards the reference's statistics (see [`anima::AdaIn`]): its strength (0 = off), and blocks.
+    pub adain: f32,
+    pub adain_blocks: (usize, usize),
+    /// Shuffle the reference's latent in square tiles of this many latent pixels (even; 0 = off), so that its local
+    /// texture survives but no object does.
+    pub shuffle: usize,
+}
+
+impl StyleRequest {
+    /// The `BrokeAnimaStyleReference` node's prompt for the reference pass.
+    pub const NODE_CAPTION: &'static str = "no humans, scenery, detailed background";
+    /// The node shrinks the picture to this area (never enlarging it).
+    pub const NODE_MEGAPIXELS: f64 = 0.5;
+    /// The node's noise for the picture: `torch.randn` from this seed on the CPU, as [`crate::sampling::torch_randn`].
+    pub const NODE_SEED: u64 = 0x5EED;
+
+    /// The `BrokeAnimaStyleReference` node (and the SwarmUI extension): residual AdaIN at `stats_match` in every block, no
+    /// shared attention. With `restyle`, the first quarter of the `steps` (rounded) runs without the picture.
+    pub fn node(reference: Reference, stats_match: f32, restyle: bool, steps: usize) -> Self {
+        let first = if restyle { (steps as f64 * 0.25).round() as usize } else { 0 };
+        StyleRequest {
+            reference,
+            caption: Prompt::new(tokenizer::token_weights(Self::NODE_CAPTION, 1.0)),
+            bias: 0.0,
+            steps: (first, usize::MAX),
+            blocks: (0, usize::MAX),
+            frame: 0.0,
+            seed: Self::NODE_SEED,
+            attention: false,
+            adain: stats_match,
+            adain_blocks: (0, usize::MAX),
+            shuffle: 0,
+        }
+    }
+}
+
+/// `latent` (f32 [ch, h, w]) cut into `tile` x `tile` tiles, rearranged by a permutation from `seed`. Edge tiles that
+/// don't fill a whole tile stay where they are.
+pub fn shuffle_tiles(latent: &[f32], ch: usize, h: usize, w: usize, tile: usize, seed: u64) -> Vec<f32> {
+    let (th, tw) = (h / tile, w / tile);
+    let n = th * tw;
+    let mut perm: Vec<usize> = (0..n).collect();
+    let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+    for i in (1..n).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        perm.swap(i, (x % (i as u64 + 1)) as usize);
+    }
+    let mut out = latent.to_vec();
+    for (dst, &src) in perm.iter().enumerate() {
+        let (dy, dx, sy, sx) = (dst / tw * tile, dst % tw * tile, src / tw * tile, src % tw * tile);
+        for c in 0..ch {
+            for y in 0..tile {
+                let (o, i) = (c * h * w + (dy + y) * w + dx, c * h * w + (sy + y) * w + sx);
+                out[o..o + tile].copy_from_slice(&latent[i..i + tile]);
+            }
+        }
+    }
+    out
 }
 
 /// What the cached reference keys depend on, hashed.
@@ -75,6 +159,8 @@ pub(super) struct Anima {
     snapref: Option<snapref::Adapter>,
     /// The latest references' keys and values, by [`ref_key`]. They come out of the diffusion model and the caption.
     ref_kv: Option<(u64, snapref::RefKv)>,
+    /// A training-free style reference for every request until cleared.
+    style: Option<StyleRequest>,
 }
 
 impl FamilyState for Anima {
@@ -98,6 +184,9 @@ impl FamilyState for Anima {
 
     fn clear_prompts(&mut self) {
         self.contexts.clear();
+        if let Some(m) = &mut self.model {
+            m.dit.concept = None;
+        }
         self.ref_kv = None;
     }
 
@@ -262,6 +351,73 @@ impl Generator {
         Ok(())
     }
 
+    /// Record the loaded Anima model's block outputs over `steps` steps from now on (see [`crate::steer`]).
+    pub fn record_anima(&mut self, steps: usize) -> Result<()> {
+        let st = &self.env.st;
+        let a = self.family.anima().context("Anima not entered")?;
+        let dit = &mut a.model.as_mut().context("no diffusion model loaded")?.dit;
+        dit.recorder = Some(crate::steer::Recorder::new(dit.blocks.len(), anima::WIDTH, steps, st)?);
+        Ok(())
+    }
+
+    /// Keep every `stride`-th token of `blocks` at `steps` from now on (see [`crate::steer::TokenSampler`]).
+    pub fn sample_anima_tokens(&mut self, blocks: Vec<usize>, steps: (usize, usize), stride: usize) -> Result<()> {
+        let a = self.family.anima().context("Anima not entered")?;
+        let dit = &mut a.model.as_mut().context("no diffusion model loaded")?.dit;
+        dit.sampler = Some(crate::steer::TokenSampler::new(anima::WIDTH, blocks, steps, stride));
+        Ok(())
+    }
+
+    /// Write what [`Self::sample_anima_tokens`] kept, and stop.
+    pub fn save_anima_tokens(&mut self, path: &Path) -> Result<()> {
+        let a = self.family.anima().context("Anima not entered")?;
+        let dit = &mut a.model.as_mut().context("no diffusion model loaded")?.dit;
+        dit.sampler.take().context("no tokens kept")?.save(path)
+    }
+
+    /// Steer the loaded Anima model's cross-attention towards `concept` and away from `null` from now on (see
+    /// [`anima::Concept`]); `blocks` defaults to every block.
+    pub fn concept_anima(&mut self, concept: &Prompt, null: &Prompt, alpha: f32, steps: (usize, usize), blocks: Option<(usize, usize)>)
+        -> Result<()> {
+        let st = &self.env.st;
+        let a = self.family.anima().context("Anima not entered")?;
+        let mut take = |p: &Prompt| -> Result<anima::Context> {
+            a.context(p, st, None)?;
+            let i = a.contexts.iter().position(|(k, _)| k == p).context("prompt not encoded")?;
+            Ok(a.contexts.remove(i).1)
+        };
+        let (concept, null) = (take(concept)?, take(null)?);
+        let dit = &mut a.model.as_mut().context("no diffusion model loaded")?.dit;
+        let blocks = blocks.unwrap_or((0, dit.blocks.len()));
+        dit.concept = Some(anima::Concept { concept, null, alpha, steps, blocks });
+        Ok(())
+    }
+
+    /// Write what [`Self::record_anima`] recorded, and stop recording.
+    pub fn save_anima_record(&mut self, path: &Path) -> Result<()> {
+        let st = &self.env.st;
+        let a = self.family.anima().context("Anima not entered")?;
+        let dit = &mut a.model.as_mut().context("no diffusion model loaded")?.dit;
+        dit.recorder.take().context("nothing recorded")?.save(path, st)
+    }
+
+    /// Also steer the loaded Anima model with the vector or map file at `path` from now on; `blocks` defaults to every block.
+    pub fn steer_anima(&mut self, path: &Path, alpha: f32, blocks: Option<(usize, usize)>, steps: (usize, usize), preserve_norm: bool)
+        -> Result<()> {
+        let st = &self.env.st;
+        let a = self.family.anima().context("Anima not entered")?;
+        let dit = &mut a.model.as_mut().context("no diffusion model loaded")?.dit;
+        let nb = dit.blocks.len();
+        dit.steer.push(crate::steer::Steer::load(path, alpha, blocks.unwrap_or((0, nb)), steps, preserve_norm, nb, anima::WIDTH, st)?);
+        Ok(())
+    }
+
+    /// Use (or with `None`, stop using) a training-free style reference for every Anima request from now on.
+    pub fn style_anima(&mut self, style: Option<StyleRequest>) -> Result<()> {
+        self.family.anima().context("Anima not entered")?.style = style;
+        Ok(())
+    }
+
     /// Anima latents, sampled as ComfyUI's KSampler does.
     pub fn sample_anima(&mut self, r: &AnimaRequest, mut progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>)
         -> Result<(Vec<f32>, Stats)> {
@@ -301,12 +457,31 @@ impl Generator {
             }
             _ => 0,
         };
+        // a style reference: its own pass and keys, and the keys beside each image's
+        let mut style = r.style.clone().or_else(|| a.style.clone());
+        if let Some(s) = style.as_mut().filter(|s| s.shuffle > 0) {
+            let (rh, rw) = (s.reference.height, s.reference.width);
+            s.reference.latent = shuffle_tiles(&s.reference.latent, dit::CH, rh, rw, s.shuffle, s.seed);
+        }
+        let style_rows = style.as_ref().map_or(0, |s| (s.reference.height / 2) * (s.reference.width / 2));
+        let snap_need = snap_need + if style.is_some() { anima::snapref_step_bytes((lh / 2) * (lw / 2), style_rows, 1) } else { 0 };
         let together = {
             let m = a.model.as_mut().context("no diffusion model loaded")?;
-            let together = env.batch_fit(&m.dit.blocks, images, 0, step_need(r.width, r.height) + snap_need)?;
-            env.plan(&mut m.dit.blocks, &m.st, anima_need(r.width, r.height, together) + together * snap_need)?;
+            let style_fixed = if style.is_some() {
+                anima::reference_bytes(style_rows) + anima::ref_kv_bytes(m.dit.blocks.len(), style_rows)
+            } else {
+                0
+            };
+            let together = env.batch_fit(&m.dit.blocks, images, style_fixed, step_need(r.width, r.height) + snap_need)?;
+            env.plan(&mut m.dit.blocks, &m.st, anima_need(r.width, r.height, together) + together * snap_need + style_fixed)?;
             together
         };
+        if let Some(s) = &style {
+            if r.snapref.is_some() {
+                bail!("a style reference and SnapRef can't be used together");
+            }
+            a.context(&s.caption, st, None)?;
+        }
         let guided = r.sampling.uses_negative();
         if guided {
             a.context(&r.negative, st, None)?;
@@ -326,8 +501,8 @@ impl Generator {
         });
         let (pos_pass, neg_pass) = match (&reads, a.snapref.as_ref(), a.ref_kv.as_ref()) {
             (Some((pr, nr)), Some(adapter), Some((_, kv))) => (
-                anima::Pass::Target { adapter, read: Some((kv, pr)) },
-                anima::Pass::Target { adapter, read: nr.as_ref().map(|n| (kv, n)) },
+                anima::Pass::Target { adapter: Some(adapter), read: Some((kv, pr)) },
+                anima::Pass::Target { adapter: Some(adapter), read: nr.as_ref().map(|n| (kv, n)) },
             ),
             (Some(_), _, _) => bail!("SnapRef's references weren't encoded"),
             _ => (anima::Pass::Plain, anima::Pass::Plain),
@@ -336,9 +511,42 @@ impl Generator {
         let find = |p: &Prompt| contexts.iter().find(|(k, _)| k == p).map(|(_, c)| c).unwrap();
         let pos = find(&r.positive);
         let neg = guided.then(|| find(&r.negative));
+        let style_ctx = style.as_ref().map(|s| find(&s.caption));
+        let style_buf = match &style {
+            Some(s) => {
+                let (rh, rw) = (s.reference.height, s.reference.width);
+                if s.reference.latent.len() != dit::CH * rh * rw {
+                    bail!("style reference latent has {} values for {rh}x{rw}", s.reference.latent.len());
+                }
+                let kv = snapref::RefKv::alloc(m.dit.blocks.len(), vec![style_rows], anima::REF_ROW_BYTES)?;
+                if s.shuffle % 2 != 0 {
+                    bail!("the style reference's shuffle tile must be even");
+                }
+                let noise = crate::sampling::torch_randn(s.seed, s.reference.latent.len());
+                let xref = DevBuf::alloc(s.reference.latent.len() * 4)?;
+                Some((kv, noise, xref, snapref::RefRead { biases: vec![s.bias] }))
+            }
+            None => None,
+        };
+        m.dit.ref_blocks = style.as_ref().map_or((0, usize::MAX), |s| s.blocks);
+        m.dit.adain = match &style {
+            Some(s) if s.adain != 0.0 => Some(anima::AdaIn {
+                stats: DevBuf::alloc(m.dit.blocks.len() * 2 * anima::WIDTH * 4)?,
+                rows: style_rows,
+                lambda: s.adain,
+                blocks: s.adain_blocks,
+                capture: true,
+                active: false,
+            }),
+            _ => None,
+        };
         let rope = m.dit.rope(lh / 2, lw / 2, st)?;
         let copied0 = m.dit.blocks.copied_bytes;
+        let sigmas = r.sampling.sigmas.clone();
         let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, eval: usize, k: usize| -> Result<()> {
+            // the step whose sigma this is, for activation steering; a solver's intermediate sigma takes the step it is in
+            m.dit.step = sigmas.windows(2).position(|w| sigma <= w[0] && sigma > w[1]);
+            m.dit.negative = negative;
             if negative {
                 // the negative's first block, for SnapRef's Fidelity
                 let mut first: Option<Vec<u8>> = None;
@@ -359,6 +567,23 @@ impl Generator {
             if eval > 0 {
                 env.relieve(&mut m.dit.blocks, &m.st, k * step_need(r.width, r.height))?;
             }
+            // the style reference, noised to this sigma, through the plain model; its keys are read in this evaluation
+            if let Some(ad) = m.dit.adain.as_mut() {
+                ad.active = false;
+            }
+            let pos_pass = match (&style, &style_buf, m.dit.step) {
+                (Some(s), Some((kv, noise, xref, read)), Some(step)) if (s.steps.0..s.steps.1).contains(&step) => {
+                    let mix: Vec<f32> = s.reference.latent.iter().zip(noise).map(|(x0, e)| (1.0 - sigma) * x0 + sigma * e).collect();
+                    xref.upload(0, &st::f32_bytes(&mix), st)?;
+                    let (rh, rw) = (s.reference.height, s.reference.width);
+                    m.dit.encode_style_reference(xref, rh, rw, (lh, lw), sigma, s.frame, style_ctx.unwrap(), kv, st)?;
+                    if let Some(ad) = m.dit.adain.as_mut() {
+                        ad.active = true;
+                    }
+                    if s.attention { anima::Pass::Target { adapter: None, read: Some((kv, read)) } } else { pos_pass }
+                }
+                _ => pos_pass,
+            };
             let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
             {
                 let mut probe = |name: &str, b: &DevBuf, bytes: usize| {
@@ -379,6 +604,9 @@ impl Generator {
             Ok(())
         };
         let latent = run_batches(&r.sampling, &r.noise, together, st, &mut stats, &mut model, &mut progress)?;
+        m.dit.step = None;
+        m.dit.ref_blocks = (0, usize::MAX);
+        m.dit.adain = None;
         stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
         eprintln!("{:.2} GB streamed over PCIe", stats.streamed_gb);
         if let Some(dm) = dump {

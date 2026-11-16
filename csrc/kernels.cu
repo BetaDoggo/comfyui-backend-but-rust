@@ -1333,3 +1333,141 @@ GPU_API int gpu_attn_merge(const MergeGroups* groups, int n, void* out, int b, i
     KCHECK();
     return 0;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Activation steering (src/steer.rs): statistics of a block's output tokens, and a direction added to them.
+
+// Column sums of bf16 x [rows, cols] added to sum (f32 [cols]); 64 rows per block row of the grid.
+__global__ void steer_colsum_kernel(const bf16* x, int rows, int cols, float* sum) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    const int r0 = blockIdx.y * 64, r1 = min(rows, r0 + 64);
+    float a = 0.f;
+    for (int r = r0; r < r1; ++r) a += __bfloat162float(x[(int64_t)r * cols + c]);
+    atomicAdd(sum + c, a);
+}
+
+// The rows' L2 norms, summed into norm[0]: one block per row.
+__global__ void steer_rownorm_kernel(const bf16* x, int cols, float* norm) {
+    __shared__ float red[33];
+    const bf16* row = x + (int64_t)blockIdx.x * cols;
+    float a = 0.f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        const float v = __bfloat162float(row[c]);
+        a += v * v;
+    }
+    a = block_sum(a, red);
+    if (threadIdx.x == 0) atomicAdd(norm, sqrtf(a));
+}
+
+GPU_API int gpu_steer_record(const void* x, int rows, int cols, float* sum, float* norm, void* stream) {
+    const cudaStream_t s = (cudaStream_t)stream;
+    steer_colsum_kernel<<<dim3((cols + 255) / 256, (rows + 63) / 64), 256, 0, s>>>((const bf16*)x, rows, cols, sum);
+    KCHECK();
+    steer_rownorm_kernel<<<rows, 256, 0, s>>>((const bf16*)x, cols, norm);
+    KCHECK();
+    return 0;
+}
+
+// x[r] += amount * dir for every row; with `preserve`, each row is then scaled back to its old L2 norm.
+// One block of 256 threads per row; cols <= 256 * 32.
+__global__ void steer_add_kernel(bf16* x, int cols, const float* dir, float amount, int preserve) {
+    __shared__ float red[33];
+    bf16* row = x + (int64_t)blockIdx.x * cols;
+    float v[32];
+    float old = 0.f, now = 0.f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        const int c = threadIdx.x + i * 256;
+        if (c < cols) {
+            const float a = __bfloat162float(row[c]);
+            const float b = a + amount * dir[c];
+            old += a * a;
+            now += b * b;
+            v[i] = b;
+        }
+    }
+    float k = 1.f;
+    if (preserve) {
+        old = block_sum(old, red);
+        now = block_sum(now, red);
+        k = now > 0.f ? sqrtf(old / now) : 1.f;
+    }
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        const int c = threadIdx.x + i * 256;
+        if (c < cols) row[c] = __float2bfloat16_rn(v[i] * k);
+    }
+}
+
+GPU_API int gpu_steer_add(void* x, int rows, int cols, const float* dir, float amount, int preserve, void* stream) {
+    if (cols > 256 * 32) return (int)cudaErrorInvalidValue;
+    steer_add_kernel<<<rows, 256, 0, (cudaStream_t)stream>>>((bf16*)x, cols, dir, amount, preserve);
+    KCHECK();
+    return 0;
+}
+
+// x += alpha * (a - b), all bf16 [rows, cols] with row strides.
+__global__ void steer_axpy_kernel(bf16* x, int64_t xs, const bf16* a, const bf16* b, int64_t ys, int rows, int cols, float alpha) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)rows * cols) return;
+    const int64_t r = i / cols, c = i % cols;
+    const float d = __bfloat162float(a[r * ys + c]) - __bfloat162float(b[r * ys + c]);
+    x[r * xs + c] = __float2bfloat16_rn(__bfloat162float(x[r * xs + c]) + alpha * d);
+}
+
+GPU_API int gpu_steer_axpy(void* x, int64_t xs, const void* a, const void* b, int64_t ys, int rows, int cols, float alpha,
+                           void* stream) {
+    const int64_t n = (int64_t)rows * cols;
+    steer_axpy_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((bf16*)x, xs, (const bf16*)a,
+                                                                                    (const bf16*)b, ys, rows, cols, alpha);
+    KCHECK();
+    return 0;
+}
+
+// Column sums and sums of squares of bf16 x [rows, cols], added to stats (f32 [2][cols]); 64 rows per grid row.
+__global__ void colstats_kernel(const bf16* x, int rows, int cols, float* stats) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    const int r0 = blockIdx.y * 64, r1 = min(rows, r0 + 64);
+    float s = 0.f, q = 0.f;
+    for (int r = r0; r < r1; ++r) {
+        const float v = __bfloat162float(x[(int64_t)r * cols + c]);
+        s += v;
+        q += v * v;
+    }
+    atomicAdd(stats + c, s);
+    atomicAdd(stats + cols + c, q);
+}
+
+GPU_API int gpu_colstats(const void* x, int rows, int cols, float* stats, void* stream) {
+    colstats_kernel<<<dim3((cols + 255) / 256, (rows + 63) / 64), 256, 0, (cudaStream_t)stream>>>((const bf16*)x, rows, cols, stats);
+    KCHECK();
+    return 0;
+}
+
+// AdaIN of x's columns towards a reference's: x += lambda * ((x - mt) / st * sr + mr - x), where (mt, st) come from
+// tstats over trows rows and (mr, sr) from rstats over rrows rows (both f32 [2][cols] of sums and sums of squares).
+__global__ void adain_kernel(bf16* x, int rows, int cols, const float* tstats, float trows, const float* rstats, float rrows,
+                             float lambda) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)rows * cols) return;
+    const int c = (int)(i % cols);
+    const float mt = tstats[c] / trows, vt = fmaxf(tstats[cols + c] / trows - mt * mt, 0.f);
+    const float mr = rstats[c] / rrows, vr = fmaxf(rstats[cols + c] / rrows - mr * mr, 0.f);
+    const float v = __bfloat162float(x[i]);
+    const float y = (v - mt) * sqrtf((vr + 1e-5f) / (vt + 1e-5f)) + mr;
+    x[i] = __float2bfloat16_rn(v + lambda * (y - v));
+}
+
+GPU_API int gpu_adain(void* x, int rows, int cols, const float* tstats, float trows, const float* rstats, float rrows, float lambda,
+                      void* stream) {
+    const int64_t n = (int64_t)rows * cols;
+    adain_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((bf16*)x, rows, cols, tstats, trows, rstats, rrows, lambda);
+    KCHECK();
+    return 0;
+}
+
+GPU_API int gpu_zero_f32(float* x, int64_t n, void* stream) {
+    return (int)cudaMemsetAsync(x, 0, n * sizeof(float), (cudaStream_t)stream);
+}

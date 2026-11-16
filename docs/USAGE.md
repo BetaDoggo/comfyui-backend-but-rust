@@ -14,7 +14,7 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--steps`, `--shift`, `--seed` | sampler settings; the seed gives the **same noise as ComfyUI's KSampler** |
 | `--sampler`, `--scheduler`, `--cfg`, `--negative` | any ComfyUI sampler and scheduler, on any model |
 | `--image`, `--ref-image`, `--ref-method` | Krea 2 reference images, see [Krea 2 reference images](MODELS.md#reference-images) |
-| `--prompt-file f.txt`, `-n N` | many prompts / seeds with the models loaded once. `--prompt-file` is read by Krea 2, MOSS Image and MiniMax-H3-Image |
+| `--prompt-file f.txt`, `-n N` | many prompts / seeds with the models loaded once. `--prompt-file` is read by Krea 2, Anima, MOSS Image and MiniMax-H3-Image |
 | `--batch N` | sample up to N of a prompt's `-n` images together, through the model at once. Each image keeps its own seed's noise, and the sampler's own noise is one tensor for the batch, as in ComfyUI, so stochastic samplers give other images than with `--batch 1` |
 | `--attention flash` | bf16 FlashAttention-2 like ComfyUI's default (closest numerics, ~15% slower per step); the default is `int8`, comfy-kitchen's SageAttention-style INT8 attention. On SD 1.x and SDXL, `flash` is exact fp16 attention as a GEMM and a softmax, about twice as slow as `int8` |
 | `--reserve-vram MB` | VRAM left untouched for the desktop (default 256, as ComfyUI's `--reserve-vram`; 512 with `--legacy-offload`) |
@@ -24,6 +24,10 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--anima`, `--moss`, `--qwen21`, `--h3`, `--h3-image` | pick the model family; the default is Krea 2. `--h3` with a MiniMax-H3-Image `--dit` runs it too; see [MiniMax-H3-Image](MODELS.md#minimax-h3-image) |
 | `--sd`, `--sdxl` | an SD 1.x or SDXL checkpoint, `--dit` (default SD 1.5's or SDXL base 1.0's file), with the CLIP and VAE it carries; `--vae` takes another VAE. `--steps` defaults to 20 and `--cfg` to 7; set `--width` and `--height` to the model's size, in multiples of 8. See [SD 1.x and SDXL](MODELS.md#sd-1x-and-sdxl) |
 | `--clip-layer N` | SD 1.x and SDXL: `CLIPSetLastLayer`'s `stop_at_clip_layer`, `-2` for "clip skip 2" |
+| `--style-image a.png`, `--style-adain`, `--style-no-attention`, `--style-strength`, `--style-steps`, `--style-blocks`, `--style-adain-blocks`, `--style-frame`, `--style-shuffle`, `--style-caption`, `--style-megapixels` | Anima: take a picture's art style without training, see [Activation steering](STEERING.md#style-from-a-picture-anima-experimental) |
+| `--init-image a.png`, `--denoise` | Anima: img2img from a picture resized to `--width` x `--height` |
+| `--concept`, `--concept-null`, `--concept-alpha`, `--concept-steps`, `--concept-blocks` | Anima: steer cross-attention towards a concept prompt, see [Activation steering](STEERING.md) |
+| `--steer FILE[:ALPHA[:STEPS[:BLOCKS]]]`, `--steer-record`, `--steer-tokens` | Anima: residual steering vectors and maps, and the recordings they are fitted from, see [Activation steering](STEERING.md) |
 | `--snapref file`, `--image a.png`, `--snapref-mode`, `--snapref-strength`, `--snapref-fidelity`, `--snapref-megapixels` | Anima: the SnapRef reference adapter with pictures of a character (repeatable `--image`); see [SnapRef](MODELS.md#snapref) |
 | `--image a.png` | Qwen Image 2.1 edits: each image goes to the text encoder and into the sequence as a reference latent (repeatable); the prompt then says what to change, as in `put the boat from picture 2 on the sea in picture 1`. Output is RGBA |
 | `--image a.png`, `--first-frame a.png`, `--last-frame b.png` | MiniMax H3: reference pictures, `<Picture n>` in the prompt (repeatable), and keyframes stretched to the clip. MiniMax-H3-Image: pictures to edit or refer to. See [reference pictures](MODELS.md#reference-pictures-and-keyframes) |

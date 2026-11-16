@@ -69,6 +69,12 @@ extern "C" {
     pub fn gpu_gelu_tanh_bf16(x: PM, n: i64, s: PM) -> i32;
     pub fn gpu_add_gated_bf16(x: PM, x_stride: i64, y: P, y_stride: i64, gate: P, rows: i32, cols: i32, s: PM) -> i32;
     pub fn gpu_add_vec_bf16(out: PM, a: P, b: P, b_is_f32: i32, n: i32, s: PM) -> i32;
+    pub fn gpu_steer_record(x: P, rows: i32, cols: i32, sum: PM, norm: PM, s: PM) -> i32;
+    pub fn gpu_steer_add(x: PM, rows: i32, cols: i32, dir: P, amount: f32, preserve: i32, s: PM) -> i32;
+    pub fn gpu_zero_f32(x: PM, n: i64, s: PM) -> i32;
+    pub fn gpu_colstats(x: P, rows: i32, cols: i32, stats: PM, s: PM) -> i32;
+    pub fn gpu_adain(x: PM, rows: i32, cols: i32, tstats: P, trows: f32, rstats: P, rrows: f32, lambda: f32, s: PM) -> i32;
+    pub fn gpu_steer_axpy(x: PM, xs: i64, a: P, b: P, ys: i64, rows: i32, cols: i32, alpha: f32, s: PM) -> i32;
     pub fn gpu_f32_to_bf16(inp: P, out: PM, n: i64, s: PM) -> i32;
     pub fn gpu_bf16_to_f32(inp: P, out: PM, n: i64, s: PM) -> i32;
     pub fn gpu_randn_threads() -> i32;

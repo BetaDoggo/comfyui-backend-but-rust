@@ -66,6 +66,9 @@ pub enum ModelPatch {
     /// `SnapRef` (ArcAnima's SnapRef node pack, which the SwarmUI-SnapRef extension emits): a reference adapter for
     /// Anima that takes pictures of a character. See [`SnapRefPatch`].
     SnapRef(Box<SnapRefPatch>),
+    /// `BrokeAnimaStyleReference` (Broke Anima Style Reference, the SwarmUI-BrokeAnimaStyleReference extension's node): a training-free art style from a picture,
+    /// for Anima. See [`StyleRefPatch`].
+    StyleReference(Box<StyleRefPatch>),
     /// `SwarmReferenceOnly` (Use Reference Only): the latent batch is `[reference..., latent...]`
     /// (`batch` in total). In every self-attention, each sample's keys and values are extended
     /// with the queries of the first sample of its group of `batch`, so the generation attends to
@@ -123,6 +126,23 @@ pub struct SnapRefPatch {
     pub stitch: bool,
     /// `ref_guidance_on`: `ref_guidance`, `correction` (`apg`, `rescale`, `none`) and `ref_end`. SwarmUI never sends it.
     pub ref_guidance: Option<(f64, String, f64)>,
+}
+
+/// The `BrokeAnimaStyleReference` node's inputs, resolved. Each step the picture is noised to that step's sigma and run
+/// through the plain model with a fixed neutral caption, and after every block the positive's image tokens move
+/// `stats_match` of the way to the picture's per-channel mean and standard deviation.
+#[derive(Clone, Debug)]
+pub struct StyleRefPatch {
+    /// The VAE that encodes the picture.
+    pub vae: VaeHandle,
+    /// The node's fixed caption (`no humans, scenery, detailed background`), encoded by its CLIP.
+    pub caption: Conditioning,
+    /// The picture (the first frame of `image`); the engine shrinks it to 0.5 megapixels and VAE-encodes it.
+    pub image: ImageBatch,
+    /// 0 to 1: the share of the way each channel moves (0 = off).
+    pub stats_match: f64,
+    /// The first quarter of the steps runs without the picture.
+    pub restyle: bool,
 }
 
 /// Which axes Seamless Tileable wraps around (`tile_axis`: `Both` / `X` / `Y`).

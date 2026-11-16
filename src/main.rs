@@ -90,6 +90,91 @@ struct Args {
     /// Run Anima instead of Krea 2 (--dit and --te then default to the Anima files, --shift to 3)
     #[arg(long)]
     anima: bool,
+    /// Anima: record each block's mean image token and mean token norm, per step, averaged over every image of the
+    /// run, to this safetensors file (activation steering, see docs/STEERING.md)
+    #[arg(long)]
+    steer_record: Option<PathBuf>,
+    /// Anima: steer the image tokens with this vector (tools/steer_build.py) or map (tools/steer_fit.py) file.
+    /// Repeatable as FILE[:ALPHA[:STEPS[:BLOCKS]]], each part defaulting to --steer-alpha, --steer-steps, --steer-blocks
+    #[arg(long)]
+    steer: Vec<String>,
+    /// Steering strength, in multiples of the vector file's `norm` (tools/steer_build.py: the recorded difference)
+    #[arg(long, default_value_t = 1.0, allow_hyphen_values = true)]
+    steer_alpha: f32,
+    /// Blocks steered, "a-b" with b exclusive (default every block)
+    #[arg(long)]
+    steer_blocks: Option<String>,
+    /// Steps steered, "a-b" with b exclusive, counted from 0
+    #[arg(long, default_value = "0-3")]
+    steer_steps: String,
+    /// Don't rescale steered tokens back to their norm
+    #[arg(long)]
+    steer_no_preserve: bool,
+    /// Anima: start from this picture (PNG, resized to --width x --height) instead of empty noise: img2img
+    #[arg(long)]
+    init_image: Option<PathBuf>,
+    /// With --init-image: how much of the schedule runs, as ComfyUI's KSampler denoise
+    #[arg(long, default_value_t = 1.0)]
+    denoise: f64,
+    /// Anima: a training-free style reference picture (PNG), read through shared self-attention, see docs/STEERING.md
+    #[arg(long)]
+    style_image: Option<PathBuf>,
+    /// Weight on the reference's attention logits (1 = as the image's own tokens)
+    #[arg(long, default_value_t = 1.0)]
+    style_strength: f32,
+    /// The reference pass's prompt
+    #[arg(long, default_value = "no humans, scenery, detailed background")]
+    style_caption: String,
+    /// Steps that read the reference, "a-b" with b exclusive
+    #[arg(long, default_value = "0-8")]
+    style_steps: String,
+    /// Blocks that read the reference, "a-b" with b exclusive (default every block)
+    #[arg(long)]
+    style_blocks: Option<String>,
+    /// The reference's RoPE frame: 0 overlays it on the target's positions, higher sets it apart in time
+    #[arg(long, default_value_t = 0.0)]
+    style_frame: f32,
+    /// Don't read the reference's keys and values in self-attention (with --style-adain: statistics only)
+    #[arg(long)]
+    style_no_attention: bool,
+    /// Residual AdaIN towards the reference's per-channel statistics, 0 to 1 (0 = off)
+    #[arg(long, default_value_t = 0.0)]
+    style_adain: f32,
+    /// Blocks AdaIN runs after, "a-b" with b exclusive (default every block)
+    #[arg(long)]
+    style_adain_blocks: Option<String>,
+    /// Shuffle the reference in square tiles of this many pixels (a multiple of 16; 0 = off): texture stays, objects don't
+    #[arg(long, default_value_t = 0)]
+    style_shuffle: usize,
+    /// The reference is shrunk to this many megapixels before encoding
+    #[arg(long, default_value_t = 0.5)]
+    style_megapixels: f64,
+    /// Anima: concept steering in cross-attention, towards this prompt and away from --concept-null
+    #[arg(long)]
+    concept: Option<String>,
+    #[arg(long, default_value = "")]
+    concept_null: String,
+    /// Concept steering's strength
+    #[arg(long, default_value_t = 1.0, allow_hyphen_values = true)]
+    concept_alpha: f32,
+    /// Concept steering's steps, "a-b" with b exclusive
+    #[arg(long, default_value = "0-8")]
+    concept_steps: String,
+    /// Concept steering's blocks, "a-b" with b exclusive (default every block)
+    #[arg(long)]
+    concept_blocks: Option<String>,
+    /// Anima: keep every --steer-token-stride-th image token of --steer-token-blocks at --steer-token-steps whole, to
+    /// this safetensors file (for tools/steer_fit.py)
+    #[arg(long)]
+    steer_tokens: Option<PathBuf>,
+    /// Blocks whose tokens are kept, comma separated
+    #[arg(long, default_value = "8,13,18")]
+    steer_token_blocks: String,
+    /// Steps whose tokens are kept, "a-b" with b exclusive
+    #[arg(long, default_value = "0-4")]
+    steer_token_steps: String,
+    #[arg(long, default_value_t = 33)]
+    steer_token_stride: usize,
     /// Run MOSS Image instead of Krea 2 (--dit, --te and --vae then default to the MOSS files, --shift to 5)
     #[arg(long)]
     moss: bool,
@@ -411,16 +496,93 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         }
         None => None,
     };
+    if args.steer_record.is_some() {
+        gen.record_anima(args.steps)?;
+    }
+    if args.steer_tokens.is_some() {
+        let blocks = args.steer_token_blocks.split(',').map(|b| b.trim().parse::<usize>()).collect::<Result<Vec<_>, _>>()?;
+        gen.sample_anima_tokens(blocks, diffusion::steer::parse_range(&args.steer_token_steps)?, args.steer_token_stride)?;
+    }
+    if let Some(p) = &args.style_image {
+        let img = read_png(p)?;
+        let (rgb, w, h) = diffusion::snapref::shrink(&img.rgb, img.width, img.height, args.style_megapixels);
+        let reference = gen.encode_image(&rgb, w, h)?;
+        if args.style_strength <= 0.0 {
+            bail!("--style-strength must be above 0");
+        }
+        let steps = diffusion::steer::parse_range(&args.style_steps)?;
+        let blocks = args.style_blocks.as_deref().map(diffusion::steer::parse_range).transpose()?.unwrap_or((0, usize::MAX));
+        eprintln!("style reference {} at {}x{}, strength {}, steps {steps:?}, blocks {blocks:?}, frame {}", p.display(), w, h,
+            args.style_strength, args.style_frame);
+        gen.style_anima(Some(pipeline::StyleRequest {
+            reference,
+            caption: Prompt::new(diffusion::tokenizer::token_weights(&args.style_caption, 1.0)),
+            bias: args.style_strength.ln(),
+            steps,
+            blocks,
+            frame: args.style_frame,
+            seed: args.seed ^ 0x5eed,
+            attention: !args.style_no_attention,
+            adain: args.style_adain,
+            shuffle: args.style_shuffle / 8,
+            adain_blocks: args.style_adain_blocks.as_deref().map(diffusion::steer::parse_range).transpose()?.unwrap_or((0, usize::MAX)),
+        }))?;
+    }
+    if let Some(c) = &args.concept {
+        let p = |t: &str| Prompt::new(diffusion::tokenizer::token_weights(t, 1.0));
+        let steps = diffusion::steer::parse_range(&args.concept_steps)?;
+        let blocks = args.concept_blocks.as_deref().map(diffusion::steer::parse_range).transpose()?;
+        gen.concept_anima(&p(c), &p(&args.concept_null), args.concept_alpha, steps, blocks)?;
+        eprintln!("concept steering towards {c:?} at alpha {} over steps {steps:?}, blocks {blocks:?}", args.concept_alpha);
+    }
+    for spec in &args.steer {
+        // FILE[:ALPHA[:STEPS[:BLOCKS]]]; a drive letter's colon stays in the file
+        let (file, rest) = match spec.find(".safetensors") {
+            Some(i) => spec.split_at(i + ".safetensors".len()),
+            None => (spec.as_str(), ""),
+        };
+        let parts: Vec<&str> = rest.split(':').skip(1).collect();
+        let alpha = match parts.first() {
+            Some(a) => a.parse::<f32>()?,
+            None => args.steer_alpha,
+        };
+        let steps = diffusion::steer::parse_range(parts.get(1).copied().unwrap_or(&args.steer_steps))?;
+        let blocks = parts.get(2).copied().or(args.steer_blocks.as_deref()).map(diffusion::steer::parse_range).transpose()?;
+        gen.steer_anima(Path::new(file), alpha, blocks, steps, !args.steer_no_preserve)?;
+        eprintln!("steering with {file} at alpha {alpha} over blocks {blocks:?}, steps {steps:?}");
+    }
     let n = 16 * (args.height / 8) * (args.width / 8);
+    let init = match &args.init_image {
+        Some(p) => {
+            let img = read_png(p)?;
+            let rgb = diffusion::pixal3d::lanczos_f32(&img.rgb, img.width, img.height, 3, args.width, args.height);
+            Some(gen.encode_image(&rgb, args.width, args.height)?.latent)
+        }
+        None => None,
+    };
+    let prompts = args.prompts()?;
+    let total = prompts.len() * args.count;
+    for (pi, prompt) in prompts.iter().enumerate() {
     for group in args.batches() {
         let r = pipeline::AnimaRequest {
-            positive: Prompt::new(diffusion::tokenizer::token_weights(&args.prompt, 1.0)),
+            positive: Prompt::new(diffusion::tokenizer::token_weights(prompt, 1.0)),
             negative: Prompt::new(diffusion::tokenizer::token_weights(&args.negative, 1.0)),
             width: args.width,
             height: args.height,
-            sampling: args.batch_sampling("er_sde", ModelSampling::Flow { shift }, group, (args.width / 8, args.height / 8))?,
+            sampling: {
+                let mut s = args.batch_sampling("er_sde", ModelSampling::Flow { shift }, group, (args.width / 8, args.height / 8))?;
+                if let Some(l) = &init {
+                    let (sampler, sched, lat) = (s.sampler.clone(), args.scheduler.clone(), (args.width / 8, args.height / 8));
+                    let schedule = |k| diffusion::samplers::sigmas(ModelSampling::Flow { shift }, &sampler, &sched, k, lat, None);
+                    s.sigmas = diffusion::samplers::ksampler_sigmas(args.steps, args.denoise, 0, args.steps, false, schedule)?
+                        .context("--denoise leaves no step")?;
+                    s.latent = Some(l.repeat(group.1));
+                }
+                s
+            },
             noise: args.noise(group, n)?,
             snapref: snapref.clone(),
+            style: None,
         };
         let mut dump = pipeline::Dump::new();
         let t0 = Instant::now();
@@ -428,15 +590,24 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         for (j, latent) in latents.chunks_exact(n).enumerate() {
             let i = group.0 + j;
             let rgb = gen.decode_latent(latent, args.width, args.height)?;
-            let path = out_path(&args.out, i, args.count);
+            let path = out_path(&args.out, pi * args.count + i, total);
             std::fs::write(&path, pipeline::encode_png(args.width, args.height, &rgb)?)
                 .with_context(|| format!("writing {}", path.display()))?;
-            eprintln!("[{i}] saved {} (seed {})", path.display(), args.seed + i as u64);
+            eprintln!("[{}] saved {} (seed {})", pi * args.count + i, path.display(), args.seed + i as u64);
         }
         eprintln!("{} image(s) done in {:.2}s", group.1, t0.elapsed().as_secs_f64());
         if let Some(d) = &args.dump {
             write_safetensors(d, &dump)?;
         }
+    }
+    }
+    if let Some(p) = &args.steer_record {
+        gen.save_anima_record(p)?;
+        eprintln!("steering statistics written to {}", p.display());
+    }
+    if let Some(p) = &args.steer_tokens {
+        gen.save_anima_tokens(p)?;
+        eprintln!("tokens written to {}", p.display());
     }
     Ok(())
 }

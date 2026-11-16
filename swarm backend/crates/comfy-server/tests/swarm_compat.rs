@@ -1646,3 +1646,29 @@ async fn background_removal_nodes_make_a_mask() {
     assert_eq!(r.status(), "success", "{:#}", r.history_entry());
 }
 
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broke_anima_style_reference_patches_the_model_like_the_swarm_extension() {
+    let engine = RecordingEngine::new();
+    let s = TestServer::start_engine(engine.clone(), 0, false).await;
+    let r = run_like_swarm(&s, fixture("anima_broke_style_ref.json"), |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    let seen = engine.seen.lock().unwrap();
+    let p = seen.model_patches.iter().find(|p| p.starts_with("StyleReference")).expect("style reference patch");
+    assert!(seen.model_patches[0].starts_with("Lora"), "{:?}", seen.model_patches);
+    for want in ["ImageBatch(300x200x3, 1 frame(s)", "stats_match: 0.45", "restyle: true"] {
+        assert!(p.contains(want), "{want} missing from {p}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broke_anima_style_reference_at_zero_leaves_the_model_alone() {
+    let engine = RecordingEngine::new();
+    let s = TestServer::start_engine(engine.clone(), 0, false).await;
+    let mut w = fixture("anima_broke_style_ref.json");
+    w["104"]["inputs"]["stats_match"] = json!(0.0);
+    let r = run_like_swarm(&s, w, |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    let seen = engine.seen.lock().unwrap();
+    assert!(!seen.model_patches.iter().any(|p| p.starts_with("StyleReference")), "{:?}", seen.model_patches);
+}

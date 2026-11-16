@@ -16,7 +16,7 @@ mod qwen21;
 mod sd;
 mod seedvr;
 
-pub use anima::{AnimaRequest, SnapRefRequest};
+pub use anima::{AnimaRequest, SnapRefRequest, StyleRequest};
 pub use h3::{h3_presentation, h3_tokens, image_pictures, ref2va_pictures, ref2va_size, resize as h3_resize, size_short_edge, H3Conds, H3Picture, H3Request};
 pub use krea::KreaRequest;
 pub use moss::{moss_tokens, MossRequest};

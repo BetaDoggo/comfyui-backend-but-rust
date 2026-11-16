@@ -73,6 +73,31 @@ pub(crate) fn conv_krsc_rgb(st: &SafeTensors, name: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Most elements of a conv's input or output in one `gpu_conv2d` call. CUTLASS refuses a tensor of 2 GB or more.
+const CONV_ELEMENTS: usize = 1 << 29;
+
+/// `gpu_conv2d` of one NHWC bf16 image (stride 1, 'same' padding) of any size. Past [`CONV_ELEMENTS`] it goes through
+/// in bands of rows, each with `r / 2` rows of halo on either side whose outputs are dropped.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv2d(x: PM, wk: PM, bk: PM, out: PM, h: usize, w: usize, cin: usize, cout: usize, r: usize, st: &Stream) -> Result<()> {
+    let run = |x: PM, out: PM, rows: usize| -> Result<()> {
+        k!(gpu_conv2d(x, wk, bk, out, 1, rows as i32, w as i32, cin as i32, cout as i32, r as i32, s(st)))
+    };
+    let halo = r / 2;
+    let band = (CONV_ELEMENTS / (w * cin.max(cout))).saturating_sub(2 * halo).max(1);
+    if band >= h {
+        return run(x, out, h);
+    }
+    let tmp = DevBuf::alloc_async((band + 2 * halo) * w * cout * 2, st)?;
+    for y0 in (0..h).step_by(band) {
+        let y1 = (y0 + band).min(h);
+        let (a, b) = (y0.saturating_sub(halo), (y1 + halo).min(h));
+        run(off(x, a * w * cin * 2), tmp.ptr(), b - a)?;
+        crate::cuda::memcpy_d2d(off(out, y0 * w * cout * 2), off(tmp.ptr(), (y0 - a) * w * cout * 2), (y1 - y0) * w * cout * 2, st)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn bias_pad(st: &SafeTensors, name: &str, pad: usize) -> Result<Vec<u8>> {
     let mut v = st.f32_vec(name, false)?;
     v.resize(pad.max(v.len()), 0.0);
@@ -186,8 +211,7 @@ impl Vae {
 
     fn conv(&self, key: &str, x: PM, out: PM, h: usize, w: usize, cin: usize, cout: usize, r: usize, st: &Stream)
         -> Result<()> {
-        k!(gpu_conv2d(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), out, 1, h as i32, w as i32,
-            cin as i32, cout as i32, r as i32, s(st)))
+        conv2d(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), out, h, w, cin, cout, r, st)
     }
 
     /// Peak activation memory (bytes) for decoding an h x w latent.

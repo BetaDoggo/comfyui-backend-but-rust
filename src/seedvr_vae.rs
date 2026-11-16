@@ -28,8 +28,6 @@ const EPS: f32 = 1e-6;
 pub const SCALE: f32 = 0.9152;
 pub const Z: usize = 16;
 const LEVELS: usize = 4;
-/// Most elements of a conv's input or output in one `gpu_conv2d` call.
-const CONV_ELEMENTS: usize = 1 << 29;
 
 pub struct Vae {
     buf: DevBuf,
@@ -247,26 +245,7 @@ impl Vae {
 
     #[allow(clippy::too_many_arguments)]
     fn conv(&self, key: &str, x: PM, out: PM, h: usize, w: usize, cin: usize, cout: usize, r: usize, st: &Stream) -> Result<()> {
-        let (wk, bk) = (self.w(&format!("{key}.w")), self.w(&format!("{key}.b")));
-        let run = |x: PM, out: PM, rows: usize| -> Result<()> {
-            k!(gpu_conv2d(x, wk, bk, out, 1, rows as i32, w as i32, cin as i32, cout as i32, r as i32, s(st)))
-        };
-        // CUTLASS's conv indexes with 32 bits: a large picture goes through in bands of rows, each with a row of halo
-        // on either side whose outputs are dropped
-        let halo = r / 2;
-        let band = (CONV_ELEMENTS / (w * cin.max(cout))).saturating_sub(2 * halo).max(1);
-        if band >= h {
-            return run(x, out, h);
-        }
-        let tmp = DevBuf::alloc_async((band + 2 * halo) * w * cout * 2, st)?;
-        for y0 in (0..h).step_by(band) {
-            let y1 = (y0 + band).min(h);
-            let (a, b) = (y0.saturating_sub(halo), (y1 + halo).min(h));
-            run(crate::ffi::off(x, a * w * cin * 2), tmp.ptr(), b - a)?;
-            crate::cuda::memcpy_d2d(crate::ffi::off(out, y0 * w * cout * 2), crate::ffi::off(tmp.ptr(), (y0 - a) * w * cout * 2), (y1 - y0) * w * cout * 2,
-                st)?;
-        }
-        Ok(())
+        crate::vae::conv2d(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), out, h, w, cin, cout, r, st)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -79,45 +79,58 @@ GPU_API int gpu_to_rgba8(const void* x, int cstride, uint8_t* out, int64_t P, vo
 // ---------------------------------------------------------------------------------------------
 // Exact attention of a run of tokens that see everything before them, and of each other causally: query i of
 // the run attends to keys 0 .. offset + i. q [lq, h * 128], k and v [lk, h * 128] (bf16, rows `*_stride` apart).
+// The keys go through in tiles of PREFIX_TILE with a running max and sum, so a long prefix (a large reference image
+// before the text) needs no more shared memory. With one tile it is the plain softmax.
 // ---------------------------------------------------------------------------------------------
+constexpr int PREFIX_TILE = 8192;
+
 __global__ void attn_prefix_kernel(const bf16* q, int64_t q_stride, const bf16* kp, const bf16* vp, int64_t kv_stride, int offset,
                                    bf16* out, int64_t out_stride, float scale) {
     extern __shared__ float sm[];
     constexpr int D = 128;
     float* qs = sm;       // D
-    float* p = sm + D;    // keys
+    float* p = sm + D;    // one tile of keys
     __shared__ float red[33];
     const int i = blockIdx.x, h = blockIdx.y, e0 = threadIdx.x;
     qs[e0] = __bfloat162float(q[(int64_t)i * q_stride + h * D + e0]);
     __syncthreads();
     const int n = offset + i + 1;
-    float mx = -INFINITY;
-    for (int j = threadIdx.x; j < n; j += blockDim.x) {
-        const bf16* kr = kp + (int64_t)j * kv_stride + h * D;
-        float s = 0.f;
-        for (int e = 0; e < D; ++e) s += qs[e] * __bfloat162float(kr[e]);
-        s *= scale;
-        p[j] = s;
-        mx = fmaxf(mx, s);
+    float m = -INFINITY, l = 0.f, acc = 0.f;
+    for (int t0 = 0; t0 < n; t0 += PREFIX_TILE) {
+        const int tn = min(PREFIX_TILE, n - t0);
+        float mx = -INFINITY;
+        for (int j = threadIdx.x; j < tn; j += blockDim.x) {
+            const bf16* kr = kp + (int64_t)(t0 + j) * kv_stride + h * D;
+            float s = 0.f;
+            for (int e = 0; e < D; ++e) s += qs[e] * __bfloat162float(kr[e]);
+            s *= scale;
+            p[j] = s;
+            mx = fmaxf(mx, s);
+        }
+        const float mn = fmaxf(m, block_max(mx, red));
+        float sum = 0.f;
+        for (int j = threadIdx.x; j < tn; j += blockDim.x) {
+            const float e = expf(p[j] - mn);
+            p[j] = e;
+            sum += e;
+        }
+        sum = block_sum(sum, red);
+        const float corr = expf(m - mn);
+        float a = 0.f;
+        for (int j = 0; j < tn; ++j) a += p[j] * __bfloat162float(vp[(int64_t)(t0 + j) * kv_stride + h * D + e0]);
+        acc = acc * corr + a;
+        l = l * corr + sum;
+        m = mn;
+        __syncthreads();  // every thread is done with p before the next tile overwrites it
     }
-    mx = block_max(mx, red);
-    float sum = 0.f;
-    for (int j = threadIdx.x; j < n; j += blockDim.x) {
-        const float e = expf(p[j] - mx);
-        p[j] = e;
-        sum += e;
-    }
-    sum = block_sum(sum, red);
-    float acc = 0.f;
-    for (int j = 0; j < n; ++j) acc += p[j] * __bfloat162float(vp[(int64_t)j * kv_stride + h * D + e0]);
-    out[(int64_t)i * out_stride + h * D + e0] = __float2bfloat16_rn(acc / sum);
+    out[(int64_t)i * out_stride + h * D + e0] = __float2bfloat16_rn(acc / l);
 }
 
 GPU_API int gpu_attn_prefix(const void* q, int64_t q_stride, const void* k, const void* v, int64_t kv_stride, int h, int lq, int offset,
                               void* out, int64_t out_stride, float scale, void* stream) {
+    if (lq <= 0) return 0;
     dim3 grid(lq, h);
-    const size_t smem = ((size_t)128 + offset + lq) * sizeof(float);
-    if (smem > 48 * 1024) cudaFuncSetAttribute(attn_prefix_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    const size_t smem = ((size_t)128 + std::min(offset + lq, PREFIX_TILE)) * sizeof(float);
     attn_prefix_kernel<<<grid, 128, smem, (cudaStream_t)stream>>>((const bf16*)q, q_stride, (const bf16*)k, (const bf16*)v, kv_stride, offset,
                                                                   (bf16*)out, out_stride, scale);
     KCHECK();

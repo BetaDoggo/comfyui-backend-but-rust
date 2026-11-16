@@ -206,8 +206,7 @@ impl Vae {
 
     #[allow(clippy::too_many_arguments)]
     fn conv(&self, key: &str, x: PM, out: PM, h: usize, w: usize, cin: usize, cout: usize, r: usize, st: &Stream) -> Result<()> {
-        k!(gpu_conv2d(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), out, 1, h as i32, w as i32, cin as i32, cout as i32, r as i32,
-            s(st)))
+        crate::vae::conv2d(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), out, h, w, cin, cout, r, st)
     }
 
     /// Peak activation memory (bytes) for decoding an h x w latent, or encoding the image it stands for.

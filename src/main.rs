@@ -146,8 +146,8 @@ struct Args {
     /// Shuffle the reference in square tiles of this many pixels (a multiple of 16; 0 = off): texture stays, objects don't
     #[arg(long, default_value_t = 0)]
     style_shuffle: usize,
-    /// The reference is shrunk to this many megapixels before encoding
-    #[arg(long, default_value_t = 0.5)]
+    /// The reference is shrunk (never enlarged) to this many megapixels before encoding
+    #[arg(long, default_value_t = 1.0)]
     style_megapixels: f64,
     /// Anima: concept steering in cross-attention, towards this prompt and away from --concept-null
     #[arg(long)]

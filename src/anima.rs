@@ -113,8 +113,8 @@ pub enum Pass<'a> {
     /// A target evaluation: the adapter's "tgt" LoRA (SnapRef) or none (a training-free style reference), and the
     /// references' keys and values when `read` is set.
     Target { adapter: Option<&'a Adapter>, read: Option<(&'a RefKv, &'a RefRead)> },
-    /// A reference: its "ref" LoRA, recording each block's self-attention k and v at row `row0` of `out`.
-    Reference { adapter: Option<&'a Adapter>, out: &'a RefKv, row0: usize },
+    /// A reference: its "ref" LoRA, recording each block's self-attention k and v at row `row0` of `out` (if any).
+    Reference { adapter: Option<&'a Adapter>, out: Option<&'a RefKv>, row0: usize },
 }
 
 impl Pass<'_> {
@@ -584,20 +584,20 @@ impl Dit {
         rope.upload(0, &crate::st::f32_bytes(&table), st)?;
         let t = self.time(0.0, adapter.mode_embed(mode, F)?, st)?;
         let (x, _) = self.embed(latent, 1, h, w, st)?;
-        self.blocks(&x, 1, ht * wt, c, rope.ptr(), &t, None, &Pass::Reference { adapter: Some(adapter), out, row0 }, st, &mut None)
+        self.blocks(&x, 1, ht * wt, c, rope.ptr(), &t, None, &Pass::Reference { adapter: Some(adapter), out: Some(out), row0 }, st, &mut None)
     }
 
     /// A training-free style reference: `latent` (f32 [16, h, w], already noised to `sigma`) through the plain model at
     /// `sigma`, prompted by `c`, as RoPE frame `frame` centred on a target of `target` latent pixels. Every block's
-    /// self-attention k and v go to `out` from row 0.
+    /// self-attention k and v go to `out` from row 0, if given (for shared attention).
     #[allow(clippy::too_many_arguments)]
     pub fn encode_style_reference(&mut self, latent: &DevBuf, h: usize, w: usize, target: (usize, usize), sigma: f32, frame: f32,
-        c: &Context, out: &RefKv, st: &Stream) -> Result<()> {
+        c: &Context, out: Option<&RefKv>, st: &Stream) -> Result<()> {
         if h % PATCH != 0 || w % PATCH != 0 {
             bail!("reference latent size must be even");
         }
         let (ht, wt) = (h / PATCH, w / PATCH);
-        if ht * wt > out.rows || out.row_bytes != KV * 2 {
+        if out.is_some_and(|out| ht * wt > out.rows || out.row_bytes != KV * 2) {
             bail!("reference keys don't fit their cache");
         }
         let (h0, w0) = snapref::offset(target, (ht, wt));
@@ -749,9 +749,10 @@ impl Dit {
                     wp("kn_self"), EPS, rope, 2, l as i32, s(st)))?;
             }
             self.prof.mark("rope", st)?;
-            if let Pass::Reference { out, row0, .. } = pass {
+            if let Pass::Reference { out: Some(out), row0, .. } = pass {
                 cuda::memcpy_2d_d2d(off(out.block(b), row0 * KV * 2), KV * 2, off(q, F * 2), QKV * 2, KV * 2, rows, st)?;
-                if b + 1 == nb {
+                // AdaIN's capture needs the last block's output too
+                if b + 1 == nb && !self.adain.as_ref().is_some_and(|ad| ad.capture) {
                     // nothing after the last block's keys reaches them
                     self.blocks.release(b, st)?;
                     break;

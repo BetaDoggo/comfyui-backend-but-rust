@@ -78,9 +78,9 @@ and run through the unmodified model, prompted by `--style-caption`. Then:
 * Unless `--style-no-attention` is set, the target's self-attention also reads the picture's keys and values, in
   `--style-blocks`, with logits weighted by `--style-strength` (shared attention).
 * `--style-steps` limits both to some steps. `--style-frame` places the picture at another RoPE frame.
-  `--style-shuffle N` rearranges it in N-pixel tiles first. `--style-megapixels` sets its size.
+  `--style-shuffle N` rearranges it in N-pixel tiles first. `--style-megapixels` sets the size it's shrunk to (1 by default; never enlarged).
 
-Measured with six Anima-made references (watercolour, pixel art, ukiyo-e, ink sketch, oil, flat vector) and six unrelated
+Measured with `--style-megapixels 0.5` and six Anima-made references (watercolour, pixel art, ukiyo-e, ink sketch, oil, flat vector) and six unrelated
 prompts at seeds 21 and 22. Qwen3-VL-4B (Krea 2's text encoder file) judged style match 0 to 10, and whether the
 reference's subject leaked in:
 
@@ -99,13 +99,28 @@ CFG above 1, batches above 1, and SwarmUI. SnapRef and a style reference can't b
 
 ## Broke Anima Style Reference (ComfyUI node, SwarmUI extension, comfy-server)
 
-The AdaIN-only setting is packaged as the `BrokeAnimaStyleReference` node, with two controls: `stats_match` (0.6) and
-`restyle` (on, which skips the first quarter of the steps, rounded). The reference pass is prompted by
-`no humans, scenery, detailed background`. The picture is shrunk to 0.5 megapixels and noised with `torch.randn` from
+The AdaIN-only setting is packaged as the `BrokeAnimaStyleReference` node, with three controls: `stats_match` (0.6),
+`restyle` (on, which skips the first quarter of the steps, rounded) and `reference_megapixels` (1, from 0.5 to 4). The reference pass is prompted by
+`no humans, scenery, detailed background`. The picture is shrunk (never enlarged) to `reference_megapixels` and noised with `torch.randn` from
 seed `0x5EED`. There is no shared attention and there are no tags. Its ComfyUI node and the SwarmUI extension that emits
 it (the style picture is the first prompt-box image, as for SnapRef) are a separate project, SwarmUI-BrokeAnimaStyleReference. The comfy-server
 handles the node as `ModelPatch::StyleReference` (see `swarm backend/docs/INPUT_MAPPING.md`), and the engine sets
 `AnimaRequest::style` from `StyleRequest::node`. Not combinable with SnapRef. Only the positive prompt's evaluations are
-matched.
+matched. With AdaIN alone, the engine keeps none of the reference's keys and values.
+
+Reference size, with the node's settings at 1024x1024 (the six references and prompts, seeds 21 / 22; Qwen3-VL style
+score, and the time the reference pass adds to a step with restyle):
+
+| `reference_megapixels` | Style | Step time added | By eye |
+|---|---|---|---|
+| 0.25 | 2.6 / 2.8 | 29% | textured pictures break into speckle noise |
+| 0.5 | 4.4 / 4.7 | 52% | pixel-art blocks smaller than the picture's |
+| 1 | 4.0 / 4.5 | 108% | pixel-art blocks closest to the picture's |
+| 2 | | 240% | blocks soften |
+| 4 | | 620% | falls apart |
+
+The 1 megapixel score is lower mostly through the ink sketch (1.7 / 2.0 against 3.0 / 3.2). The 0.25 row predates the last-block fix below. The 2 and 4 megapixel rows
+are one pixel-art image each. ComfyUI took 70 s at 2 megapixels and 451 s at 4 on a 12 GB GPU (against 5 s at 1); this
+engine took 2.6 and 5.2 s. The reference pass now runs every block, so the last block's statistics are matched too.
 
 `--init-image a.png --denoise 0.6` is plain img2img for Anima: the picture is resized to `--width` x `--height`.

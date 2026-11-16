@@ -1174,7 +1174,7 @@ impl NativeEngine {
         })
     }
 
-    /// The `BrokeAnimaStyleReference` node's picture, encoded as it does (`_encode_image` at 0.5 megapixels), and its
+    /// The `BrokeAnimaStyleReference` node's picture, encoded as it does (`_encode_image` at `reference_megapixels`), and its
     /// settings over `steps` sampling steps. `prompt` is the positive's conditioning, whose text encoder the node's
     /// caption must share.
     fn style_request(&self, p: &StyleRefPatch, prompt: &DeferredCond, steps: usize) -> EngineResult<StyleRequest> {
@@ -1187,8 +1187,11 @@ impl NativeEngine {
         if is_qwen21_vae(vae) || is_flux2_vae(vae) || is_h3_vae(vae) {
             return Err(unsupported("Broke Anima Style Reference with a VAE other than Anima's"));
         }
+        if !StyleRequest::NODE_MEGAPIXELS_RANGE.contains(&p.reference_megapixels) {
+            return Err(EngineError::InvalidInput(format!("reference_megapixels {} (0.5 to 4)", p.reference_megapixels)));
+        }
         let (rgb, w, h) = diffusion::snapref::shrink(&rgb_f32(&p.image), p.image.width as usize, p.image.height as usize,
-            StyleRequest::NODE_MEGAPIXELS);
+            p.reference_megapixels);
         let mut gen = self.gen();
         gen.ensure_vae(&vae.path).map_err(internal)?;
         let reference = gen.encode_image(&rgb, w, h).map_err(internal)?;

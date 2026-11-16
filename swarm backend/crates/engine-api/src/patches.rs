@@ -137,12 +137,14 @@ pub struct StyleRefPatch {
     pub vae: VaeHandle,
     /// The node's fixed caption (`no humans, scenery, detailed background`), encoded by its CLIP.
     pub caption: Conditioning,
-    /// The picture (the first frame of `image`); the engine shrinks it to 0.5 megapixels and VAE-encodes it.
+    /// The picture (the first frame of `image`); the engine shrinks it to `reference_megapixels` and VAE-encodes it.
     pub image: ImageBatch,
     /// 0 to 1: the share of the way each channel moves (0 = off).
     pub stats_match: f64,
     /// The first quarter of the steps runs without the picture.
     pub restyle: bool,
+    /// 0.5 to 4: the area the picture is shrunk to (never enlarged), aspect kept.
+    pub reference_megapixels: f64,
 }
 
 /// Which axes Seamless Tileable wraps around (`tile_axis`: `Both` / `X` / `Y`).

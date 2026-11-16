@@ -76,8 +76,10 @@ pub struct StyleRequest {
 impl StyleRequest {
     /// The `BrokeAnimaStyleReference` node's prompt for the reference pass.
     pub const NODE_CAPTION: &'static str = "no humans, scenery, detailed background";
-    /// The node shrinks the picture to this area (never enlarging it).
-    pub const NODE_MEGAPIXELS: f64 = 0.5;
+    /// The node's default `reference_megapixels`: it shrinks the picture to this area (never enlarging it).
+    pub const NODE_MEGAPIXELS: f64 = 1.0;
+    /// The range the node accepts for `reference_megapixels`.
+    pub const NODE_MEGAPIXELS_RANGE: std::ops::RangeInclusive<f64> = 0.5..=4.0;
     /// The node's noise for the picture: `torch.randn` from this seed on the CPU, as [`crate::sampling::torch_randn`].
     pub const NODE_SEED: u64 = 0x5EED;
 
@@ -464,11 +466,13 @@ impl Generator {
             s.reference.latent = shuffle_tiles(&s.reference.latent, dit::CH, rh, rw, s.shuffle, s.seed);
         }
         let style_rows = style.as_ref().map_or(0, |s| (s.reference.height / 2) * (s.reference.width / 2));
-        let snap_need = snap_need + if style.is_some() { anima::snapref_step_bytes((lh / 2) * (lw / 2), style_rows, 1) } else { 0 };
+        // shared attention: the reference's keys beside each image's; AdaIN alone keeps no keys
+        let style_attention = style.as_ref().is_some_and(|s| s.attention);
+        let snap_need = snap_need + if style_attention { anima::snapref_step_bytes((lh / 2) * (lw / 2), style_rows, 1) } else { 0 };
         let together = {
             let m = a.model.as_mut().context("no diffusion model loaded")?;
             let style_fixed = if style.is_some() {
-                anima::reference_bytes(style_rows) + anima::ref_kv_bytes(m.dit.blocks.len(), style_rows)
+                anima::reference_bytes(style_rows) + if style_attention { anima::ref_kv_bytes(m.dit.blocks.len(), style_rows) } else { 0 }
             } else {
                 0
             };
@@ -518,7 +522,7 @@ impl Generator {
                 if s.reference.latent.len() != dit::CH * rh * rw {
                     bail!("style reference latent has {} values for {rh}x{rw}", s.reference.latent.len());
                 }
-                let kv = snapref::RefKv::alloc(m.dit.blocks.len(), vec![style_rows], anima::REF_ROW_BYTES)?;
+                let kv = s.attention.then(|| snapref::RefKv::alloc(m.dit.blocks.len(), vec![style_rows], anima::REF_ROW_BYTES)).transpose()?;
                 if s.shuffle % 2 != 0 {
                     bail!("the style reference's shuffle tile must be even");
                 }
@@ -576,11 +580,14 @@ impl Generator {
                     let mix: Vec<f32> = s.reference.latent.iter().zip(noise).map(|(x0, e)| (1.0 - sigma) * x0 + sigma * e).collect();
                     xref.upload(0, &st::f32_bytes(&mix), st)?;
                     let (rh, rw) = (s.reference.height, s.reference.width);
-                    m.dit.encode_style_reference(xref, rh, rw, (lh, lw), sigma, s.frame, style_ctx.unwrap(), kv, st)?;
+                    m.dit.encode_style_reference(xref, rh, rw, (lh, lw), sigma, s.frame, style_ctx.unwrap(), kv.as_ref(), st)?;
                     if let Some(ad) = m.dit.adain.as_mut() {
                         ad.active = true;
                     }
-                    if s.attention { anima::Pass::Target { adapter: None, read: Some((kv, read)) } } else { pos_pass }
+                    match kv {
+                        Some(kv) => anima::Pass::Target { adapter: None, read: Some((kv, read)) },
+                        None => pos_pass,
+                    }
                 }
                 _ => pos_pass,
             };

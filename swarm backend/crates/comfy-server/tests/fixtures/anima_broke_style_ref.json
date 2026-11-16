@@ -4,7 +4,7 @@
   "101": { "class_type": "VAELoader", "inputs": { "vae_name": "qwen_image_vae.safetensors" } },
   "2000": { "class_type": "LoraLoader", "inputs": { "model": ["4", 0], "clip": ["100", 0], "lora_name": "anima/flat_color_style.safetensors", "strength_model": 0.8, "strength_clip": 0.8 } },
   "102": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": "$IMAGE_B64" } },
-  "104": { "class_type": "BrokeAnimaStyleReference", "inputs": { "model": ["2000", 0], "clip": ["2000", 1], "vae": ["101", 0], "image": ["102", 0], "stats_match": 0.45, "restyle": true } },
+  "104": { "class_type": "BrokeAnimaStyleReference", "inputs": { "model": ["2000", 0], "clip": ["2000", 1], "vae": ["101", 0], "image": ["102", 0], "stats_match": 0.45, "restyle": true, "reference_megapixels": 2.0 } },
   "6": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["2000", 1], "text": "no humans, scenery, a harbor town at sunset, detailed background" } },
   "7": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["2000", 1], "text": "" } },
   "5": { "class_type": "EmptySD3LatentImage", "inputs": { "batch_size": 1, "height": 1024, "width": 1024 } },

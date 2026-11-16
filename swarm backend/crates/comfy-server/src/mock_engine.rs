@@ -326,8 +326,8 @@ impl Engine for MockEngine {
                     p.ref_guidance,
                 ),
                 ModelPatch::StyleReference(p) => format!(
-                    "StyleReference(image={}x{} stats_match={} restyle={})",
-                    p.image.width, p.image.height, p.stats_match, p.restyle
+                    "StyleReference(image={}x{} stats_match={} restyle={} megapixels={})",
+                    p.image.width, p.image.height, p.stats_match, p.restyle, p.reference_megapixels
                 ),
                 other => format!("{other:?}"),
             }).collect::<Vec<_>>(),

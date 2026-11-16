@@ -1656,7 +1656,7 @@ async fn broke_anima_style_reference_patches_the_model_like_the_swarm_extension(
     let seen = engine.seen.lock().unwrap();
     let p = seen.model_patches.iter().find(|p| p.starts_with("StyleReference")).expect("style reference patch");
     assert!(seen.model_patches[0].starts_with("Lora"), "{:?}", seen.model_patches);
-    for want in ["ImageBatch(300x200x3, 1 frame(s)", "stats_match: 0.45", "restyle: true"] {
+    for want in ["ImageBatch(300x200x3, 1 frame(s)", "stats_match: 0.45", "restyle: true", "reference_megapixels: 2.0"] {
         assert!(p.contains(want), "{want} missing from {p}");
     }
 }
@@ -1671,4 +1671,28 @@ async fn broke_anima_style_reference_at_zero_leaves_the_model_alone() {
     assert_eq!(r.status(), "success", "{:#}", r.history);
     let seen = engine.seen.lock().unwrap();
     assert!(!seen.model_patches.iter().any(|p| p.starts_with("StyleReference")), "{:?}", seen.model_patches);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broke_anima_style_reference_defaults_to_one_megapixel() {
+    let engine = RecordingEngine::new();
+    let s = TestServer::start_engine(engine.clone(), 0, false).await;
+    let mut w = fixture("anima_broke_style_ref.json");
+    w["104"]["inputs"].as_object_mut().unwrap().remove("reference_megapixels");
+    let r = run_like_swarm(&s, w, |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    let seen = engine.seen.lock().unwrap();
+    let p = seen.model_patches.iter().find(|p| p.starts_with("StyleReference")).expect("style reference patch");
+    assert!(p.contains("reference_megapixels: 1.0"), "{p}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broke_anima_style_reference_refuses_megapixels_out_of_range() {
+    let s = TestServer::start(0).await;
+    let mut w = fixture("anima_broke_style_ref.json");
+    w["104"]["inputs"]["reference_megapixels"] = json!(4.5);
+    // rejected by the schema's max at submission, as ComfyUI does
+    let body: Value = s.post("prompt", json!({ "prompt": w })).await.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "prompt_outputs_failed_validation", "{body:#}");
+    assert!(body.to_string().contains("reference_megapixels"), "{body:#}");
 }

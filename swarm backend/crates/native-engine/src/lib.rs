@@ -606,7 +606,7 @@ struct ModelSettings {
     windows: Option<h3window::ContextWindows>,
     /// `SnapRef`, on Anima.
     snapref: Option<Box<SnapRefPatch>>,
-    /// `BrokeAnimaStyleReference`, on Anima.
+    /// `BrokeAnimaStyleReference`, on Anima and Krea 2.
     style: Option<Box<StyleRefPatch>>,
     /// SD: `ModelSamplingDiscrete`'s prediction type, in place of the checkpoint's.
     v_pred: Option<bool>,
@@ -711,8 +711,8 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
                 s.snapref = Some(p.clone());
             }
             ModelPatch::StyleReference(p) => {
-                if family != Family::Anima {
-                    return Err(unsupported("Broke Anima Style Reference on this model (it works with Anima only)"));
+                if !matches!(family, Family::Anima | Family::Krea2) {
+                    return Err(unsupported("Broke Anima Style Reference on this model (it works with Anima and Krea 2)"));
                 }
                 if s.style.is_some() {
                     return Err(unsupported("more than one Broke Anima Style Reference node on a model"));
@@ -1069,6 +1069,8 @@ impl NativeEngine {
         } else {
             (Prompt::text(""), Vec::new())
         };
+        let steps = sampling.sigmas.len().saturating_sub(1);
+        let style = settings.style.as_deref().map(|p| self.style_request(p, cond, steps, Family::Krea2)).transpose()?;
         let mut gen = self.gen();
         gen.ensure_krea(&file.path).map_err(internal)?;
         gen.ensure_te(&cond.text_encoder).map_err(internal)?;
@@ -1087,6 +1089,7 @@ impl NativeEngine {
             negative_images,
             references,
             timestep_zero,
+            style,
         };
         let (latent, stats) = gen
             .sample_krea(&r, |step| report(mode, progress, batch, step, |x0| (preview::wan21(x0, lh, lw), lh, lw)), None)
@@ -1115,7 +1118,7 @@ impl NativeEngine {
             return Err(unsupported("SnapRef and Broke Anima Style Reference on the same model"));
         }
         let steps = sampling.sigmas.len().saturating_sub(1);
-        let style = settings.style.as_deref().map(|p| self.style_request(p, cond, steps)).transpose()?;
+        let style = settings.style.as_deref().map(|p| self.style_request(p, cond, steps, Family::Anima)).transpose()?;
         let mut gen = self.gen();
         gen.ensure_anima(&file.path).map_err(internal)?;
         gen.ensure_qwen3(text_encoder).map_err(internal)?;
@@ -1175,17 +1178,17 @@ impl NativeEngine {
     }
 
     /// The `BrokeAnimaStyleReference` node's picture, encoded as it does (`_encode_image` at `reference_megapixels`), and its
-    /// settings over `steps` sampling steps. `prompt` is the positive's conditioning, whose text encoder the node's
-    /// caption must share.
-    fn style_request(&self, p: &StyleRefPatch, prompt: &DeferredCond, steps: usize) -> EngineResult<StyleRequest> {
-        let (cc, caption) = single_prompt(&p.caption, Family::Anima)?;
+    /// settings over `steps` sampling steps of `family` (Anima or Krea 2). `prompt` is the positive's conditioning, whose
+    /// text encoder the node's caption must share.
+    fn style_request(&self, p: &StyleRefPatch, prompt: &DeferredCond, steps: usize, family: Family) -> EngineResult<StyleRequest> {
+        let (cc, caption) = single_prompt(&p.caption, family)?;
         if cc.text_encoder != prompt.text_encoder {
             return Err(unsupported("a Broke Anima Style Reference CLIP other than the prompt's text encoder"));
         }
         check_text_encoder_loras(prompt, cc)?;
         let vae = p.vae.source.as_ref().ok_or_else(|| unsupported("Broke Anima Style Reference with the pixel-space VAE"))?;
         if is_qwen21_vae(vae) || is_flux2_vae(vae) || is_h3_vae(vae) {
-            return Err(unsupported("Broke Anima Style Reference with a VAE other than Anima's"));
+            return Err(unsupported("Broke Anima Style Reference with a VAE other than the Qwen Image VAE"));
         }
         if !StyleRequest::NODE_MEGAPIXELS_RANGE.contains(&p.reference_megapixels) {
             return Err(EngineError::InvalidInput(format!("reference_megapixels {} (0.5 to 4)", p.reference_megapixels)));

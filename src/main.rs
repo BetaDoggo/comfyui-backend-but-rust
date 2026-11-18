@@ -116,15 +116,16 @@ struct Args {
     /// With --init-image: how much of the schedule runs, as ComfyUI's KSampler denoise
     #[arg(long, default_value_t = 1.0)]
     denoise: f64,
-    /// Anima: a training-free style reference picture (PNG), read through shared self-attention, see docs/STEERING.md
+    /// A training-free style reference picture (PNG), see docs/STEERING.md. Anima: read through shared self-attention
+    /// and/or --style-adain. Krea 2: residual AdaIN only, at --style-adain (the node's 0.6; --style-steps 2-8 is its restyle)
     #[arg(long)]
     style_image: Option<PathBuf>,
     /// Weight on the reference's attention logits (1 = as the image's own tokens)
     #[arg(long, default_value_t = 1.0)]
     style_strength: f32,
-    /// The reference pass's prompt
-    #[arg(long, default_value = "no humans, scenery, detailed background")]
-    style_caption: String,
+    /// The reference pass's prompt (default: the node's for the model family)
+    #[arg(long)]
+    style_caption: Option<String>,
     /// Steps that read the reference, "a-b" with b exclusive
     #[arg(long, default_value = "0-8")]
     style_steps: String,
@@ -354,8 +355,9 @@ fn read_png(path: &Path) -> Result<diffusion::vision::PromptImage> {
     let channels = info.color_type.samples();
     let rgb = buf[..info.buffer_size()].chunks_exact(channels).flat_map(|px| {
         let (c, a) = (if channels >= 3 { [px[0], px[1], px[2]] } else { [px[0]; 3] }, px[channels - 1] as f32 / 255.0);
-        let alpha = if channels % 2 == 0 { a } else { 1.0 };
-        c.map(|v| v as f32 / 255.0 * alpha + 1.0 - alpha)
+        // composite on white only where a pixel isn't opaque: `* 1.0 + 1.0 - 1.0` rounds values a hair below their 8-bit
+        // level, and the lanczos resize (as ComfyUI's) truncates them back to the level below
+        if channels % 2 == 0 && a < 1.0 { c.map(|v| v as f32 / 255.0 * a + 1.0 - a) } else { c.map(|v| v as f32 / 255.0) }
     }).collect();
     Ok(diffusion::vision::PromptImage { width: info.width as usize, height: info.height as usize, rgb })
 }
@@ -516,7 +518,8 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             args.style_strength, args.style_frame);
         gen.style_anima(Some(pipeline::StyleRequest {
             reference,
-            caption: Prompt::new(diffusion::tokenizer::token_weights(&args.style_caption, 1.0)),
+            caption: Prompt::new(diffusion::tokenizer::token_weights(
+                args.style_caption.as_deref().unwrap_or(pipeline::StyleRequest::NODE_CAPTION), 1.0)),
             bias: args.style_strength.ln(),
             steps,
             blocks,
@@ -1275,6 +1278,22 @@ fn run_krea(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         let i = read_png(p)?;
         gen.encode_image(&i.rgb, i.width, i.height)
     }).collect::<Result<Vec<_>>>()?;
+    let style = match &args.style_image {
+        Some(p) => {
+            if args.style_adain <= 0.0 {
+                bail!("--style-image on Krea 2 needs --style-adain above 0 (the node's default is 0.6)");
+            }
+            let img = read_png(p)?;
+            let (rgb, w, h) = diffusion::snapref::shrink(&img.rgb, img.width, img.height, args.style_megapixels);
+            let mut s = pipeline::StyleRequest::node(gen.encode_image(&rgb, w, h)?, args.style_adain, false, args.steps);
+            s.steps = diffusion::steer::parse_range(&args.style_steps)?;
+            s.adain_blocks = args.style_adain_blocks.as_deref().map(diffusion::steer::parse_range).transpose()?.unwrap_or((0, usize::MAX));
+            s.caption = Prompt::text(args.style_caption.as_deref().unwrap_or(pipeline::StyleRequest::KREA2_NODE_CAPTION));
+            eprintln!("style reference {} at {w}x{h}, AdaIN {}, steps {:?}", p.display(), args.style_adain, s.steps);
+            Some(s)
+        }
+        None => None,
+    };
     for (p, prompt, group) in jobs {
         let req = pipeline::KreaRequest {
             prompt: Prompt::text(prompt),
@@ -1288,6 +1307,7 @@ fn run_krea(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             negative_images: images.clone(),
             references: references.clone(),
             timestep_zero,
+            style: style.clone(),
         };
         let mut dump = pipeline::Dump::new();
         if let Some(r) = references.first() {

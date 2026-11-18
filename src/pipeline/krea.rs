@@ -1,7 +1,7 @@
 //! Krea 2: its diffusion model and encoded prompts. The text encoder and the VAE are the generator's.
 
 use super::{run_batches, Dump, Env, FamilyState, Generator, Kind, Prompt, Reference, Sampling, SharedTe, Stats, Step, MB};
-use super::{nothing_for, shared_te_loras, upload};
+use super::{nothing_for, shared_te_loras, upload, StyleRequest};
 use crate::cuda::{self, DevBuf, Stream};
 use crate::vision::{self, PromptImage};
 use crate::{dit, lora, offload, sampling, st, te, vae};
@@ -30,6 +30,9 @@ pub struct KreaRequest {
     pub references: Vec<Reference>,
     /// ComfyUI's `index_timestep_zero` rather than `index`.
     pub timestep_zero: bool,
+    /// A training-free style reference (the `BrokeAnimaStyleReference` node): residual AdaIN only, so its `attention`,
+    /// `shuffle`, `bias`, `blocks` and `frame` aren't read.
+    pub style: Option<StyleRequest>,
 }
 
 /// A prompt as the text encoder saw it.
@@ -203,8 +206,26 @@ impl Generator {
         let extra = pos_vision.iter().chain(&neg_vision).map(|e| e.tokens).max().unwrap_or(0) * r.images.len().max(r.negative_images.len())
             + ref_grids.iter().map(|(h, w)| h * w).sum::<usize>();
         let images = r.sampling.images;
-        let together = env.batch_fit(&m.dit.blocks, images, 0, step_need(r.width, r.height, extra))?;
-        env.plan(&mut m.dit.blocks, &m.st, activation_need(r.width, r.height, extra, together))?;
+        m.dit.adain = None;
+        // a style reference: its own pass before each positive evaluation, as one image of its own size
+        let style = r.style.as_ref().filter(|s| s.adain != 0.0);
+        if let Some(s) = style {
+            if s.attention || s.shuffle != 0 {
+                bail!("Krea 2's style reference takes residual AdaIN only (no shared attention or shuffle)");
+            }
+            let (rh, rw) = (s.reference.height, s.reference.width);
+            if s.reference.latent.len() != dit::CH * rh * rw {
+                bail!("style reference latent has {} values for {rh}x{rw}", s.reference.latent.len());
+            }
+            if rh % dit::PATCH != 0 || rw % dit::PATCH != 0 {
+                bail!("style reference latent size must be even");
+            }
+        }
+        let style_rows = style.map_or(0, |s| (s.reference.height / dit::PATCH) * (s.reference.width / dit::PATCH));
+        let style_fixed = style.map_or(0, |s| 2 * s.reference.latent.len() * 4 + m.dit.blocks.len() * 2 * dit::F * 4);
+        let style_need = style.map_or(0, |_| dit::step_activation_bytes(LT_MAX + style_rows));
+        let together = env.batch_fit(&m.dit.blocks, images, style_fixed, step_need(r.width, r.height, extra))?;
+        env.plan(&mut m.dit.blocks, &m.st, activation_need(r.width, r.height, extra, together).max(style_need) + style_fixed)?;
         let st = &env.st;
         let mut stats = Stats::default();
         let (lh, lw) = (r.height / 8, r.width / 8);
@@ -231,6 +252,28 @@ impl Generator {
             st.sync()?;
             k.negative = Some((key, cond, ctx));
         }
+        // the style reference's caption, its RoPE grid (its own size), its fixed noise and buffers
+        let style_pass = match style {
+            Some(s) => {
+                let cond = krea_cond(&mut te.enc, &s.caption, &[], st)?;
+                let sctx = m.dit.encode_context(&cond.ctx, cond.len, st)?;
+                let (rh, rw) = (s.reference.height, s.reference.width);
+                let rope = upload(&dit::Dit::rope_table(cond.len, rh / dit::PATCH, rw / dit::PATCH, &[]), st)?;
+                let noise = sampling::torch_randn(s.seed, s.reference.latent.len());
+                let xref = DevBuf::alloc(s.reference.latent.len() * 4)?;
+                let xout = DevBuf::alloc(s.reference.latent.len() * 4)?;
+                m.dit.adain = Some(crate::anima::AdaIn {
+                    stats: DevBuf::alloc(m.dit.blocks.len() * 2 * dit::F * 4)?,
+                    rows: style_rows,
+                    lambda: s.adain,
+                    blocks: s.adain_blocks,
+                    capture: false,
+                    active: false,
+                });
+                Some((s, sctx, cond.len, rope, noise, xref, xout))
+            }
+            None => None,
+        };
         stats.text_ms = vision_ms + t0.elapsed().as_secs_f64() * 1e3;
         let (_, cond, ctx) = k.prompt.as_ref().unwrap();
         if let Some(d) = dump.as_deref_mut() {
@@ -263,6 +306,7 @@ impl Generator {
 
         // denoise
         let copied0 = m.dit.blocks.copied_bytes;
+        let sigmas = r.sampling.sigmas.clone();
         let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, neg: bool, eval: usize, k: usize| -> Result<()> {
             if neg {
                 let (c, len) = negative.unwrap();
@@ -270,6 +314,21 @@ impl Generator {
             }
             if eval > 0 {
                 env.relieve(&mut m.dit.blocks, &m.st, k * step_need(r.width, r.height, extra))?;
+            }
+            // the style reference, noised to this sigma, through the plain model; its statistics move this evaluation's
+            if let Some((s, sctx, slt, rope, noise, xref, xout)) = &style_pass {
+                // a solver's intermediate sigma takes the step it is in
+                let step = sigmas.windows(2).position(|w| sigma <= w[0] && sigma > w[1]);
+                if step.is_some_and(|i| (s.steps.0..s.steps.1).contains(&i)) {
+                    let mix: Vec<f32> = s.reference.latent.iter().zip(noise).map(|(x0, e)| (1.0 - sigma) * x0 + sigma * e).collect();
+                    xref.upload(0, &st::f32_bytes(&mix), st)?;
+                    let ad = m.dit.adain.as_mut().unwrap();
+                    ad.capture = true;
+                    m.dit.step(xref, 1, s.reference.height, s.reference.width, sctx, *slt, None, rope, sigma, sigma, st, Some(xout), None)?;
+                    let ad = m.dit.adain.as_mut().unwrap();
+                    ad.capture = false;
+                    ad.active = true;
+                }
             }
             let mut probe_store: Vec<(String, Vec<u8>)> = Vec::new();
             {
@@ -284,6 +343,9 @@ impl Generator {
                     if dump.is_some() { Some(&mut probe) } else { None };
                 m.dit.step(x, k, lh, lw, ctx, lt, references.as_ref(), &rope_d, sigma, sigma, st, Some(out), probe_ref)?;
             }
+            if let Some(ad) = m.dit.adain.as_mut() {
+                ad.active = false;
+            }
             if let Some(d) = dump.as_deref_mut() {
                 for (name, v) in probe_store {
                     let shape = if name == "dit_out_tokens" { vec![(lh / 2) * (lw / 2), 64] } else { vec![v.len() / 2 / dit::F, dit::F] };
@@ -292,7 +354,9 @@ impl Generator {
             }
             Ok(())
         };
-        let latent = run_batches(&r.sampling, &noise, together, st, &mut stats, &mut model, &mut progress)?;
+        let latent = run_batches(&r.sampling, &noise, together, st, &mut stats, &mut model, &mut progress);
+        m.dit.adain = None;
+        let latent = latent?;
         stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
         eprintln!("{:.2} GB streamed over PCIe", stats.streamed_gb);
         if let Some(d) = dump {

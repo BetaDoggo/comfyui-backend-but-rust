@@ -1425,23 +1425,36 @@ GPU_API int gpu_steer_axpy(void* x, int64_t xs, const void* a, const void* b, in
     return 0;
 }
 
-// Column sums and sums of squares of bf16 x [rows, cols], added to stats (f32 [2][cols]); 64 rows per grid row.
+// Column sums and sums of squares of bf16 x [rows, cols], added to stats (f32 [2][cols]). One block per 32 columns: its
+// COLSTATS_LANES row lanes each sum every COLSTATS_LANES-th row, then lane 0 adds the lanes in order. No atomics, so the
+// result doesn't depend on scheduling (atomicAdd's order did, and turbo samplers magnify the difference).
+#define COLSTATS_LANES 16
 __global__ void colstats_kernel(const bf16* x, int rows, int cols, float* stats) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= cols) return;
-    const int r0 = blockIdx.y * 64, r1 = min(rows, r0 + 64);
+    __shared__ float ss[COLSTATS_LANES][32], sq[COLSTATS_LANES][32];
+    const int c = blockIdx.x * 32 + threadIdx.x;
     float s = 0.f, q = 0.f;
-    for (int r = r0; r < r1; ++r) {
-        const float v = __bfloat162float(x[(int64_t)r * cols + c]);
-        s += v;
-        q += v * v;
+    if (c < cols) {
+        for (int r = threadIdx.y; r < rows; r += COLSTATS_LANES) {
+            const float v = __bfloat162float(x[(int64_t)r * cols + c]);
+            s += v;
+            q += v * v;
+        }
     }
-    atomicAdd(stats + c, s);
-    atomicAdd(stats + cols + c, q);
+    ss[threadIdx.y][threadIdx.x] = s;
+    sq[threadIdx.y][threadIdx.x] = q;
+    __syncthreads();
+    if (threadIdx.y == 0 && c < cols) {
+        for (int l = 1; l < COLSTATS_LANES; ++l) {
+            s += ss[l][threadIdx.x];
+            q += sq[l][threadIdx.x];
+        }
+        stats[c] += s;
+        stats[cols + c] += q;
+    }
 }
 
 GPU_API int gpu_colstats(const void* x, int rows, int cols, float* stats, void* stream) {
-    colstats_kernel<<<dim3((cols + 255) / 256, (rows + 63) / 64), 256, 0, (cudaStream_t)stream>>>((const bf16*)x, rows, cols, stats);
+    colstats_kernel<<<(cols + 31) / 32, dim3(32, COLSTATS_LANES), 0, (cudaStream_t)stream>>>((const bf16*)x, rows, cols, stats);
     KCHECK();
     return 0;
 }

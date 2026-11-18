@@ -33,6 +33,9 @@ pub struct Dit {
     /// Use INT8 (Sage-style) attention for the main blocks instead of FlashAttention-2 bf16.
     pub int8_attn: bool,
     pub prof: crate::prof::Prof,
+    /// Residual AdaIN towards a style reference (see [`crate::anima::AdaIn`]) over each image's tokens after the
+    /// text's: with `capture`, a step fills `stats` from its first image; with `active`, it moves its images towards them.
+    pub adain: Option<crate::anima::AdaIn>,
 }
 
 /// Reference images as DiT tokens, added after the image's.
@@ -146,7 +149,7 @@ impl Dit {
         let layouts = (0..nb).map(|i| block_layout(st, i)).collect::<Result<Vec<_>>>()?;
         let p = plan(&layouts, block_budget, slots);
         let blocks = WeightSet::load("dit blocks", st, layouts, p, threads)?;
-        Ok(Dit { globals, gl, txt, blocks, attn_variant: 0, int8_attn: false, prof: crate::prof::Prof::new() })
+        Ok(Dit { globals, gl, txt, blocks, attn_variant: 0, int8_attn: false, prof: crate::prof::Prof::new(), adain: None })
     }
 
     fn g(&self, key: &str) -> PM {
@@ -450,6 +453,23 @@ impl Dit {
             }
             self.prof.mark("gemm down", st)?;
             self.blocks.release(b, st)?;
+            // the style reference's statistics, over the tokens after the text's (ComfyUI's `img_slice`)
+            if let Some(ad) = self.adain.as_ref().filter(|ad| (ad.blocks.0..ad.blocks.1).contains(&b)) {
+                let (fi32, img) = (F as i32, (l - lt) as i32);
+                let at = ad.stats.at(b * 2 * F * 4);
+                if ad.capture {
+                    k!(gpu_zero_f32(at, (2 * F) as i64, s(st)))?;
+                    k!(gpu_colstats(off(xp, lt * F * 2), img, fi32, at, s(st)))?;
+                } else if ad.active && ad.lambda != 0.0 {
+                    let ts = DevBuf::alloc_async(2 * F * 4, st)?;
+                    for i in 0..batch {
+                        let xi = off(xp, (i * l + lt) * F * 2);
+                        k!(gpu_zero_f32(ts.ptr(), (2 * F) as i64, s(st)))?;
+                        k!(gpu_colstats(xi, img, fi32, ts.ptr(), s(st)))?;
+                        k!(gpu_adain(xi, img, fi32, ts.ptr(), img as f32, at, ad.rows as f32, ad.lambda, s(st)))?;
+                    }
+                }
+            }
             if let Some(p) = probe.as_mut() {
                 p(&format!("block{b}"), &x, rows * F * 2);
             }

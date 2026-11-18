@@ -76,6 +76,8 @@ pub struct StyleRequest {
 impl StyleRequest {
     /// The `BrokeAnimaStyleReference` node's prompt for the reference pass.
     pub const NODE_CAPTION: &'static str = "no humans, scenery, detailed background";
+    /// The node's prompt for the reference pass on Krea 2 (`KREA2_CAPTION`), whose text encoder reads sentences.
+    pub const KREA2_NODE_CAPTION: &'static str = "scenery with a detailed background, no people";
     /// The node's default `reference_megapixels`: it shrinks the picture to this area (never enlarging it).
     pub const NODE_MEGAPIXELS: f64 = 1.0;
     /// The range the node accepts for `reference_megapixels`.

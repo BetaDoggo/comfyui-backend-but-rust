@@ -512,6 +512,8 @@ struct Recorded {
     latent_ops: Vec<String>,
     /// The latent shape of every `sample`, in order.
     sample_shapes: Vec<Vec<usize>>,
+    /// The text of every plain `encode_text`, in order.
+    plain_texts: Vec<String>,
 }
 
 struct RecordingEngine {
@@ -548,6 +550,9 @@ impl Engine for RecordingEngine {
             panic!("engine bug");
         }
         self.seen.lock().unwrap().text_encoder_patches = r.text_encoder.patches.iter().map(|p| format!("{p:?}")).collect();
+        if let TextEncodeMode::Plain { text } = &r.mode {
+            self.seen.lock().unwrap().plain_texts.push(text.clone());
+        }
         self.inner.encode_text(r)
     }
     fn empty_latent(&self, r: &EmptyLatentRequest) -> EngineResult<Latent> {
@@ -1659,6 +1664,23 @@ async fn broke_anima_style_reference_patches_the_model_like_the_swarm_extension(
     for want in ["ImageBatch(300x200x3, 1 frame(s)", "stats_match: 0.45", "restyle: true", "reference_megapixels: 2.0"] {
         assert!(p.contains(want), "{want} missing from {p}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broke_anima_style_reference_on_krea2_uses_its_caption() {
+    let engine = RecordingEngine::new();
+    let s = TestServer::start_engine(engine.clone(), 0, false).await;
+    let mut w = fixture("anima_broke_style_ref.json");
+    w["4"]["inputs"]["unet_name"] = json!("krea2/krea2_fp8_scaled.safetensors");
+    w["100"]["inputs"] = json!({ "clip_name": "qwen3vl_4b.safetensors", "type": "krea2", "device": "default" });
+    w["2000"]["inputs"]["lora_name"] = json!("qwen21_style.safetensors");
+    w["10"]["inputs"]["sampler_name"] = json!("euler");
+    let r = run_like_swarm(&s, w, |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    let seen = engine.seen.lock().unwrap();
+    assert!(seen.model_patches.iter().any(|p| p.starts_with("StyleReference")), "{:?}", seen.model_patches);
+    assert!(seen.plain_texts.iter().any(|t| t == "scenery with a detailed background, no people"), "{:?}", seen.plain_texts);
+    assert!(!seen.plain_texts.iter().any(|t| t == "no humans, scenery, detailed background"), "{:?}", seen.plain_texts);
 }
 
 #[tokio::test(flavor = "multi_thread")]

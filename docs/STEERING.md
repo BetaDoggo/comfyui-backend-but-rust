@@ -97,7 +97,7 @@ that, but it also stops most of the style. AdaIN at 1.0 breaks the image. Adding
 unstyled composition (thumbnail correlation 0.62 against 0.46). Not tested: real artwork or photos as references,
 CFG above 1, batches above 1, and SwarmUI. SnapRef and a style reference can't be combined.
 
-## Broke Anima Style Reference (ComfyUI node, SwarmUI extension, comfy-server)
+## Broke Anima Style Reference (ComfyUI node, SwarmUI extension, comfy-server; Anima and Krea 2)
 
 The AdaIN-only setting is packaged as the `BrokeAnimaStyleReference` node, with three controls: `stats_match` (0.6),
 `restyle` (on, which skips the first quarter of the steps, rounded) and `reference_megapixels` (1, from 0.5 to 4). The reference pass is prompted by
@@ -122,5 +122,34 @@ score, and the time the reference pass adds to a step with restyle):
 The 1 megapixel score is lower mostly through the ink sketch (1.7 / 2.0 against 3.0 / 3.2). The 0.25 row predates the last-block fix below. The 2 and 4 megapixel rows
 are one pixel-art image each. ComfyUI took 70 s at 2 megapixels and 451 s at 4 on a 12 GB GPU (against 5 s at 1); this
 engine took 2.6 and 5.2 s. The reference pass now runs every block, so the last block's statistics are matched too.
+
+The statistics are summed in a fixed order (`gpu_colstats`). They used to be summed with atomics, so the same seed gave
+slightly different images run to run (24.7 dB apart on Krea 2), which turbo sampling magnifies.
+
+### On Krea 2
+
+The node also takes Krea 2. Krea 2 is single-stream: text and image tokens share one sequence, so the statistics are
+taken over, and applied to, the tokens after the text's (ComfyUI's `img_slice`, image and any reference latents). Its
+reference pass is prompted by `scenery with a detailed background, no people`, which comfy-server picks when the model's
+architecture is `krea-2`. The engine sets `KreaRequest::style`. On the CLI, `--style-image a.png --style-adain 0.6
+--style-steps 2-8` is the node's default.
+
+Measured with ComfyUI's node on Krea 2 Turbo (`kroma-v0.3.1-turbo-opd-W8A8`, 8 steps, CFG 1, euler) at 1024x1024, with
+the same six references and prompts (as sentences) at seed 21, and the same judge. Layout is the correlation of
+thumbnails with each model's own unstyled image:
+
+| `stats_match` | Style | Content kept | Reference subject leaked | Layout |
+|---|---|---|---|---|
+| unstyled | 0.00 | 100% | 0% | 1.00 |
+| 0.4 | 2.50 | 100% | 0% | 0.85 |
+| 0.6 | 3.25 | 100% | 0% | 0.84 |
+| 0.8 | 3.50 | 100% | 0% | 0.83 |
+| Anima at 0.6, for comparison | 3.97 | 92% | 3% | 0.74 |
+
+Pixel art scores 5.2 at 0.6 and 6.7 at 0.8, and the image doesn't break at 0.8. The ink sketch scores 0 at every
+strength: the image turns pale but stays shaded. On one pixel-art image (0.6, restyle), this engine through
+comfy-server and the CLI gave identical images, 21.2 dB from ComfyUI's; unstyled, the same prompt is 18.9 dB from
+ComfyUI's. Sampling took 1.0 s per evaluation against 0.59 s unstyled. Not tested on Krea 2: CFG above 1, batches above
+1, reference latents together with a style reference, and SwarmUI itself.
 
 `--init-image a.png --denoise 0.6` is plain img2img for Anima: the picture is resized to `--width` x `--height`.

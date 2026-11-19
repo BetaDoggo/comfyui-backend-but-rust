@@ -153,9 +153,16 @@ Measured at 1024x1024 with 8 steps, CFG 1 and `er_sde`, after warm-up:
 
 | | ComfyUI | This engine (`--attention flash`) | This engine (default, `int8`) |
 |---|---|---|---|
-| Sampling | 1.59 s (199 ms/step) | 1.31 s (164 ms/step) | 0.92 s (115 ms/step) |
+| Sampling | 1.59 s (199 ms/step) | 1.31 s (164 ms/step) | 0.90 s (113 ms/step) |
 
-A whole image takes about 1.04 s from the command line and 1.14 s through SwarmUI, decode included.
+A whole image took about 1.04 s from the command line and 1.14 s through SwarmUI, decode included, before the
+quantizer's rotation was sped up; not measured again since. The int8 column is the average of warm steps over four
+runs alternated with the previous build, which averaged 116.5 ms/step on the same runs. Steps vary from 111 to 119 ms
+between runs as the GPU warms. The faster rotation gives bit-identical images and was tested through SwarmUI.
+
+Where the time goes per step: int8 GEMMs about 60 ms, at or near this GPU's int8 peak, self-attention about 19 ms plus
+7 ms quantizing and rotating its inputs, row quantization about 13 ms, and cross-attention about 5 ms, most of it
+spent on the prompt's padding to 512 tokens.
 
 Where it is faster than ComfyUI:
 

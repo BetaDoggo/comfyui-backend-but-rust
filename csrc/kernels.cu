@@ -69,10 +69,12 @@ __device__ __forceinline__ void load8(const float* p, float* v) {
 // holds 8 consecutive elements of each of its groups in registers; the 256-point transform runs in
 // a per-warp shared buffer with warp-level syncs only.
 constexpr int kMaxGroupsPerWarp = 4;
+// Floats of a warp's ConvRot buffer: 256 values, one pad after every 8.
+constexpr int kRotPad = 288;
 
 template <typename T, int PRO>
 __global__ void __launch_bounds__(1024) quant_rows_kernel(QuantParams p) {
-    extern __shared__ float wbuf[];  // [nwarps][256]
+    extern __shared__ float wbuf[];  // [nwarps][kRotPad]
     __shared__ float red[33];
     constexpr int G = kMaxGroupsPerWarp;
     const int K = p.K;
@@ -178,34 +180,43 @@ __global__ void __launch_bounds__(1024) quant_rows_kernel(QuantParams p) {
         }
     }
 
-    // ConvRot: 4 radix-4 stages (strides 1, 4, 16, 64) per group, same op order as comfy-kitchen
+    // ConvRot: 4 radix-4 stages (strides 1, 4, 16, 64) per group, same op order as comfy-kitchen. Element i sits at
+    // i + i / 8 in the warp's buffer: unpadded, each lane's 8-wide stride put 8 lanes on one bank.
     float amax = 0.f;
-    float* wb = wbuf + warp * 256;
+    float* wb = wbuf + warp * kRotPad;
+    auto at = [](int i) { return i + (i >> 3); };
 #pragma unroll
     for (int gi = 0; gi < G; ++gi) {
         const int g = warp + gi * nwarps;
         if (g >= ngroups) break;
         if (p.rotate) {
+            // stride 1 stays inside each lane's 8 values, so it runs in registers
 #pragma unroll
-            for (int j = 0; j < 8; ++j) wb[lane * 8 + j] = v[gi][j];
+            for (int bb = 0; bb < 2; ++bb) {
+                float* x = v[gi] + 4 * bb;
+                const float x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+#pragma unroll
+                for (int d = 0; d < 4; ++d) wb[lane * 9 + 4 * bb + d] = 0.5f * h4_row(d, x0, x1, x2, x3);
+            }
             __syncwarp();
 #pragma unroll
-            for (int stage = 0; stage < 4; ++stage) {
+            for (int stage = 1; stage < 4; ++stage) {
                 const int s = 1 << (2 * stage);
 #pragma unroll
                 for (int bb = 0; bb < 2; ++bb) {
                     const int r = lane * 2 + bb;
                     const int i0 = (r / s) * (s << 2) + (r % s);
-                    const float x0 = wb[i0], x1 = wb[i0 + s], x2 = wb[i0 + 2 * s], x3 = wb[i0 + 3 * s];
-                    wb[i0] = 0.5f * h4_row(0, x0, x1, x2, x3);
-                    wb[i0 + s] = 0.5f * h4_row(1, x0, x1, x2, x3);
-                    wb[i0 + 2 * s] = 0.5f * h4_row(2, x0, x1, x2, x3);
-                    wb[i0 + 3 * s] = 0.5f * h4_row(3, x0, x1, x2, x3);
+                    const int a0 = at(i0), a1 = at(i0 + s), a2 = at(i0 + 2 * s), a3 = at(i0 + 3 * s);
+                    const float x0 = wb[a0], x1 = wb[a1], x2 = wb[a2], x3 = wb[a3];
+                    wb[a0] = 0.5f * h4_row(0, x0, x1, x2, x3);
+                    wb[a1] = 0.5f * h4_row(1, x0, x1, x2, x3);
+                    wb[a2] = 0.5f * h4_row(2, x0, x1, x2, x3);
+                    wb[a3] = 0.5f * h4_row(3, x0, x1, x2, x3);
                 }
                 __syncwarp();
             }
 #pragma unroll
-            for (int j = 0; j < 8; ++j) v[gi][j] = wb[lane * 8 + j];
+            for (int j = 0; j < 8; ++j) v[gi][j] = wb[lane * 9 + j];
             __syncwarp();
         }
 #pragma unroll
@@ -251,7 +262,7 @@ static int launch_quant(const QuantParams& p, int M, cudaStream_t st) {
     const int ngroups = p.K / 256;
     const int warps = (ngroups + kMaxGroupsPerWarp - 1) / kMaxGroupsPerWarp;
     if (warps > 32) return -2;
-    quant_rows_kernel<T, PRO><<<M, warps * 32, p.rotate ? warps * 256 * sizeof(float) : 0, st>>>(p);
+    quant_rows_kernel<T, PRO><<<M, warps * 32, p.rotate ? warps * kRotPad * sizeof(float) : 0, st>>>(p);
     KCHECK();
     return 0;
 }

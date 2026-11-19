@@ -18,7 +18,7 @@ mod seedvr;
 
 pub use anima::{AnimaRequest, SnapRefRequest, StyleRequest};
 pub use h3::{h3_presentation, h3_tokens, image_pictures, ref2va_pictures, ref2va_size, resize as h3_resize, size_short_edge, H3Conds, H3Picture, H3Request};
-pub use krea::KreaRequest;
+pub use krea::{KreaEntry, KreaRequest};
 pub use moss::{moss_tokens, MossRequest};
 pub use qwen21::Qwen21Request;
 pub use sd::{is_sd, SdRequest, SizeCond};
@@ -113,6 +113,64 @@ impl Prompt {
     }
 }
 
+/// When and where a conditioning entry applies: ComfyUI's `start_percent` / `end_percent` (SwarmUI's `<alternate>` and
+/// `<fromto>` steps, `ConditioningSetTimestepRange`) and `ConditioningSetMask` (`<region>`, `<object>`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Region {
+    pub start_percent: f64,
+    pub end_percent: f64,
+    /// `mask * mask_strength` at the latent's resolution, `[lh * lw]`, the same for every image and channel; `None`
+    /// is everywhere at strength 1.
+    pub mask: Option<Vec<f32>>,
+}
+
+/// The whole image for the whole run.
+pub const EVERYWHERE: Region = Region { start_percent: 0.0, end_percent: 1.0, mask: None };
+/// One entry, everywhere: what a plain prompt is.
+pub const PLAIN: &[Region] = &[EVERYWHERE];
+
+impl Region {
+    /// `get_area_and_mult`'s timestep test: active while `timestep_end <= sigma <= timestep_start`.
+    pub fn active(&self, ms: ModelSampling, sigma: f32) -> bool {
+        sigma <= ms.percent_to_sigma(self.start_percent) && sigma >= ms.percent_to_sigma(self.end_percent)
+    }
+
+    pub fn is_everywhere(&self) -> bool {
+        *self == EVERYWHERE
+    }
+}
+
+/// One conditioning entry: a prompt and where it applies. A side of a request is a list of these, combined as
+/// ComfyUI's `calc_cond_batch` does: each active entry is a model evaluation, weighted by its mask.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cond {
+    pub prompt: Prompt,
+    pub region: Region,
+}
+
+impl Cond {
+    pub fn plain(prompt: Prompt) -> Self {
+        Cond { prompt, region: EVERYWHERE }
+    }
+}
+
+/// The regions of a side's entries, for [`run_batches`].
+pub fn regions(conds: &[Cond]) -> Vec<Region> {
+    conds.iter().map(|c| c.region.clone()).collect()
+}
+
+/// Which prediction a model evaluation computes: the positive or the negative side, and which of that side's entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Side {
+    pub negative: bool,
+    pub entry: usize,
+}
+
+impl Side {
+    pub const POSITIVE: Side = Side { negative: false, entry: 0 };
+    pub const NEGATIVE: Side = Side { negative: true, entry: 0 };
+}
+
 /// One step of a run: `denoised` is the latest prediction of its images, one after another.
 pub struct Step<'a> {
     pub index: usize,
@@ -197,8 +255,8 @@ impl std::error::Error for Cancelled {}
 
 /// One run of a sampler. `model(x, out, sigma, negative, evaluation)` writes a denoised latent, and
 /// is called twice per evaluation under CFG, always positive first.
-fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
-    model: &mut dyn FnMut(&DevBuf, &DevBuf, f32, bool, usize) -> Result<()>, progress: &mut dyn FnMut(Step) -> bool) -> Result<Vec<f32>> {
+fn run_sampler(s: &Sampling, noise: &[f32], regions: [&[Region]; 2], st: &Stream, stats: &mut Stats,
+    model: &mut dyn FnMut(&DevBuf, &DevBuf, f32, Side, usize) -> Result<()>, progress: &mut dyn FnMut(Step) -> bool) -> Result<Vec<f32>> {
     let threads = unsafe { ffi::gpu_randn_threads() };
     if threads <= 0 {
         bail!("could not read the GPU's core count");
@@ -208,6 +266,14 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
         bail!("{n} noise values don't split into {} images", s.images);
     }
     let per = n / s.images;
+    for side in regions {
+        if side.is_empty() {
+            bail!("a prompt without conditioning entries");
+        }
+        if let Some(m) = side.iter().find_map(|r| r.mask.as_ref().filter(|m| m.is_empty() || per % m.len() != 0)) {
+            bail!("a {} value region mask doesn't fit a {per} value latent", m.len());
+        }
+    }
     if s.latent.as_ref().is_some_and(|l| l.len() != n) || s.inpaint.as_ref().is_some_and(|i| i.mask.len() != n) {
         bail!("the latent or mask doesn't match the noise's {n} values");
     }
@@ -220,6 +286,8 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
         }
     };
     let (x, den, und) = (DevBuf::alloc_async(n * 4, st)?, DevBuf::alloc_async(n * 4, st)?, DevBuf::alloc_async(n * 4, st)?);
+    // an entry's prediction, when a side mixes several
+    let mut part: Option<DevBuf> = None;
     let (e0, e1) = (Event::timing()?, Event::timing()?);
     let cfg = s.cfg as f32;
     let guided = (s.cfg - 1.0).abs() > 1e-6;
@@ -239,10 +307,10 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
             None => v,
         };
         x.upload(0, &st::f32_bytes(v), st)?;
-        model(&x, &den, sigma, false, evals)?;
+        side_prediction(regions[0], false, &x, &den, &mut part, sigma, s.model_sampling, n, evals, st, model)?;
         let negative = guided || mode == Uncond::Force;
         if negative {
-            model(&x, &und, sigma, true, evals)?;
+            side_prediction(regions[1], true, &x, &und, &mut part, sigma, s.model_sampling, n, evals, st, model)?;
             if !s.tweaks.any() {
                 let (p, c) = ([und.ptr() as ffi::P, den.ptr() as ffi::P], [1.0 - cfg, cfg]);
                 ffi::k!(gpu_lincomb(den.ptr(), n as i64, 2, p.as_ptr(), c.as_ptr(), ffi::s(st)))?;
@@ -298,10 +366,54 @@ fn run_sampler(s: &Sampling, noise: &[f32], st: &Stream, stats: &mut Stats,
     Ok(out)
 }
 
+/// One side's prediction into `out`, as ComfyUI's `calc_cond_batch`: every entry active at `sigma` is evaluated, and
+/// the predictions are summed, each times its mask, over the summed masks (plus 1e-37). One active entry over the whole
+/// image is its prediction as it is, which is what that division gives.
+#[allow(clippy::too_many_arguments)]
+fn side_prediction(regions: &[Region], negative: bool, x: &DevBuf, out: &DevBuf, part: &mut Option<DevBuf>, sigma: f32, ms: ModelSampling,
+    n: usize, eval: usize, st: &Stream, model: &mut dyn FnMut(&DevBuf, &DevBuf, f32, Side, usize) -> Result<()>) -> Result<()> {
+    let active: Vec<usize> = (0..regions.len()).filter(|&i| regions[i].active(ms, sigma)).collect();
+    if let [entry] = active[..] {
+        if regions[entry].mask.is_none() {
+            return model(x, out, sigma, Side { negative, entry }, eval);
+        }
+    }
+    if part.is_none() {
+        *part = Some(DevBuf::alloc_async(n * 4, st)?);
+    }
+    let buf = part.as_ref().unwrap();
+    let mut sum = vec![0f32; n];
+    let mut count = vec![1e-37f32; n];
+    let mut bytes = vec![0u8; n * 4];
+    for entry in active {
+        model(x, buf, sigma, Side { negative, entry }, eval)?;
+        buf.download(0, &mut bytes, st)?;
+        let prediction = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        accumulate(&mut sum, &mut count, prediction, regions[entry].mask.as_deref());
+    }
+    let mixed: Vec<f32> = sum.iter().zip(&count).map(|(s, c)| s / c).collect();
+    out.upload(0, &st::f32_bytes(&mixed), st)
+}
+
+/// `out_conds += output * mult; out_counts += mult` for one entry. The latent is [image][channel][plane] and the mask
+/// one plane.
+fn accumulate(sum: &mut [f32], count: &mut [f32], prediction: impl Iterator<Item = f32>, mask: Option<&[f32]>) {
+    match mask {
+        None => sum.iter_mut().zip(count).zip(prediction).for_each(|((s, c), p)| {
+            *s += p;
+            *c += 1.0;
+        }),
+        Some(m) => sum.iter_mut().zip(count).zip(prediction).zip(m.iter().cycle()).for_each(|(((s, c), p), w)| {
+            *s += p * w;
+            *c += w;
+        }),
+    }
+}
+
 /// The images of `s` sampled in runs of at most `chunk`, each run's images together through the model, as
 /// `run_sampler` does one run. `model` gets the run's image count last. `dpm_adaptive` picks its steps per run.
-fn run_batches(s: &Sampling, noise: &[f32], chunk: usize, st: &Stream, stats: &mut Stats,
-    model: &mut dyn FnMut(&DevBuf, &DevBuf, f32, bool, usize, usize) -> Result<()>, progress: &mut dyn FnMut(Step) -> bool) -> Result<Vec<f32>> {
+fn run_batches(s: &Sampling, noise: &[f32], regions: [&[Region]; 2], chunk: usize, st: &Stream, stats: &mut Stats,
+    model: &mut dyn FnMut(&DevBuf, &DevBuf, f32, Side, usize, usize) -> Result<()>, progress: &mut dyn FnMut(Step) -> bool) -> Result<Vec<f32>> {
     if s.images == 0 || noise.len() % s.images != 0 {
         bail!("{} noise values don't split into {} images", noise.len(), s.images);
     }
@@ -321,7 +433,7 @@ fn run_batches(s: &Sampling, noise: &[f32], chunk: usize, st: &Stream, stats: &m
         if k < s.images {
             eprintln!("sampling images {} to {} of {} together", start + 1, start + k, s.images);
         }
-        out.extend(run_sampler(&run, &noise[r], st, stats, &mut |x, o, sigma, neg, eval| model(x, o, sigma, neg, eval, k), progress)?);
+        out.extend(run_sampler(&run, &noise[r], regions, st, stats, &mut |x, o, sigma, side, eval| model(x, o, sigma, side, eval, k), progress)?);
     }
     Ok(out)
 }
@@ -869,4 +981,36 @@ pub fn encode_png(w: usize, h: usize, rgb: &[u8]) -> Result<Vec<u8>> {
         enc.write_header()?.write_image_data(rgb)?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entries_mix_by_mask_as_calc_cond_batch_does() {
+        // two images of two channels on a 2x1 plane; a global entry at strength 0.25 and a region on the left pixel
+        let n = 2 * 2 * 2;
+        let (mut sum, mut count) = (vec![0f32; n], vec![1e-37f32; n]);
+        accumulate(&mut sum, &mut count, std::iter::repeat(1.0).take(n), Some(&[0.25, 0.25]));
+        accumulate(&mut sum, &mut count, std::iter::repeat(5.0).take(n), Some(&[1.0, 0.0]));
+        let mixed: Vec<f32> = sum.iter().zip(&count).map(|(s, c)| s / c).collect();
+        // left: (0.25 * 1 + 5) / 1.25, right: the global prediction alone
+        assert_eq!(mixed, [4.2, 1.0].repeat(4));
+        // one unmasked entry is its prediction exactly
+        let (mut sum, mut count) = (vec![0f32; 3], vec![1e-37f32; 3]);
+        accumulate(&mut sum, &mut count, [0.1f32, -3.5, 7.25].into_iter(), None);
+        assert_eq!(sum.iter().zip(&count).map(|(s, c)| s / c).collect::<Vec<_>>(), [0.1, -3.5, 7.25]);
+    }
+
+    #[test]
+    fn regions_are_active_on_comfy_timestep_bounds() {
+        let ms = ModelSampling::Flow { shift: 1.0 };
+        let first = Region { start_percent: -0.001, end_percent: 0.501, mask: None };
+        let second = Region { start_percent: 0.499, end_percent: 1.0, mask: None };
+        assert!(first.active(ms, 1.0) && !second.active(ms, 1.0));
+        // both near the boundary, as Swarm's widened ranges overlap
+        assert!(first.active(ms, 0.5) && second.active(ms, 0.5));
+        assert!(!first.active(ms, 0.2) && second.active(ms, 0.2));
+    }
 }

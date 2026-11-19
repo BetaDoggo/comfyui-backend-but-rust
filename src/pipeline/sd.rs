@@ -1,7 +1,7 @@
 //! SD 1.x and SDXL: a checkpoint's UNet, its CLIP text encoders and its VAE, and the prompts encoded through them.
 
-use super::{crop, nothing_for, remember, run_batches, touch, upload};
-use super::{Dump, FamilyState, Generator, Kind, Prompt, Reference, Sampling, SharedTe, Stats, Step, CONTEXTS};
+use super::{regions, Side, crop, nothing_for, remember, run_batches, touch, upload, PLAIN};
+use super::{Cond, Dump, FamilyState, Generator, Kind, Prompt, Reference, Sampling, SharedTe, Stats, Step, CONTEXTS};
 use crate::clip::{self, Clip};
 use crate::cuda::Stream;
 use crate::tokenizer::{clip_chunks, ClipTokenizer, CLIP_CHUNK, CLIP_END, CLIP_START};
@@ -35,14 +35,16 @@ impl SizeCond {
 }
 
 pub struct SdRequest {
-    pub positive: Prompt,
+    /// The positive's conditioning entries, each its own model evaluation while it is active.
+    pub positive: Vec<Cond>,
     /// Only encoded when the sampling uses it.
-    pub negative: Prompt,
+    pub negative: Vec<Cond>,
     pub width: usize,
     pub height: usize,
-    /// SDXL: each prompt's size conditioning.
-    pub positive_size: SizeCond,
-    pub negative_size: SizeCond,
+    /// SDXL: each entry's size conditioning, one per entry of `positive` and of `negative`; `encode_adm` reads them
+    /// per entry, with the entry's pooled output.
+    pub positive_size: Vec<SizeCond>,
+    pub negative_size: Vec<SizeCond>,
     /// `CLIPSetLastLayer`'s `stop_at_clip_layer` (-1 is the last layer), if the graph has one.
     pub clip_layer: Option<i32>,
     /// `ModelSamplingDiscrete`'s prediction type, in place of the checkpoint's (its `v_pred` key).
@@ -190,8 +192,8 @@ impl Sd {
         Ok((self.chunks(prompt)?, layer, prompt.scale.to_bits()))
     }
 
-    /// Move the encoding of `key` to the end of the cache, encoding it if needed.
-    fn encode(&mut self, key: &Key, st: &Stream) -> Result<()> {
+    /// Move the encoding of `key` to the end of the cache, encoding it if needed, and keep at most `keep` encodings.
+    fn encode(&mut self, key: &Key, keep: usize, st: &Stream) -> Result<()> {
         if touch(&mut self.contexts, |(k, _)| k == key) {
             return Ok(());
         }
@@ -231,7 +233,20 @@ impl Sd {
         let e = Encoded { ctx: m.unet.context(&ctx, st)?, pooled: xl.then(|| pooled).flatten(), hidden: ctx };
         st.sync()?;
         eprintln!("text: {} chunk(s) in {:.0} ms", chunks.len(), t0.elapsed().as_secs_f64() * 1e3);
-        remember(&mut self.contexts, (key.clone(), e), CONTEXTS);
+        remember(&mut self.contexts, (key.clone(), e), keep);
+        Ok(())
+    }
+
+    /// Encode every key a run needs. They all stay cached for the run: the cache keeps at least as many as there are,
+    /// and drops back to [`CONTEXTS`] on the next run that needs fewer.
+    fn encode_all(&mut self, keys: &[&Key], st: &Stream) -> Result<()> {
+        let keep = CONTEXTS.max((0..keys.len()).filter(|&i| !keys[..i].contains(&keys[i])).count());
+        while self.contexts.len() > keep {
+            self.contexts.remove(0);
+        }
+        for key in keys {
+            self.encode(key, keep, st)?;
+        }
         Ok(())
     }
 }
@@ -324,35 +339,43 @@ impl Generator {
         let mut stats = Stats::default();
         let t0 = Instant::now();
         let guided = r.sampling.uses_negative();
-        let pos_key = f.key(&r.positive, r.clip_layer)?;
-        let neg_key = f.key(&r.negative, r.clip_layer)?;
-        if guided {
-            f.encode(&neg_key, st)?;
+        if r.positive.is_empty() || (guided && r.negative.is_empty()) {
+            bail!("a prompt without conditioning entries");
         }
-        f.encode(&pos_key, st)?;
+        if r.positive_size.len() != r.positive.len() || (guided && r.negative_size.len() != r.negative.len()) {
+            bail!("{} and {} size conditionings for {} and {} prompt entries", r.positive_size.len(), r.negative_size.len(),
+                r.positive.len(), r.negative.len());
+        }
+        let pos_keys = r.positive.iter().map(|c| f.key(&c.prompt, r.clip_layer)).collect::<Result<Vec<_>>>()?;
+        let neg_keys = if guided { r.negative.iter().map(|c| f.key(&c.prompt, r.clip_layer)).collect::<Result<Vec<_>>>()? } else { Vec::new() };
+        f.encode_all(&pos_keys.iter().chain(&neg_keys).collect::<Vec<_>>(), st)?;
         stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;
         let m = f.model.as_ref().context("no diffusion model loaded")?;
         let find = |k: &Key| f.contexts.iter().find(|(c, _)| c == k).map(|(_, e)| e).unwrap();
-        let pos = find(&pos_key);
-        let neg = guided.then(|| find(&neg_key));
-        let adm = |e: &Encoded, s: &SizeCond| -> Option<Vec<f32>> {
-            let pooled = e.pooled.as_ref()?;
-            Some(unet::sdxl_adm(pooled, s.width, s.height, s.crop_w, s.crop_h, s.target_width, s.target_height))
+        // each entry with its own `adm`, from its pooled output and its size conditioning
+        let entries = |keys: &[Key], sizes: &[SizeCond]| -> Vec<(&Encoded, Option<Vec<f32>>)> {
+            keys.iter().zip(sizes).map(|(k, s)| {
+                let e = find(k);
+                let adm = e.pooled.as_ref().map(|p| unet::sdxl_adm(p, s.width, s.height, s.crop_w, s.crop_h, s.target_width, s.target_height));
+                (e, adm)
+            }).collect()
         };
-        let (pos_adm, neg_adm) = (adm(pos, &r.positive_size), neg.and_then(|e| adm(e, &r.negative_size)));
+        let pos = entries(&pos_keys, &r.positive_size);
+        let neg = entries(&neg_keys, &r.negative_size);
         if let Some(d) = dump.as_deref_mut() {
             let width = m.unet.context_dim;
-            d.insert("cond".into(), ("F32".into(), vec![pos.hidden.len() / width, width], st::f32_bytes(&pos.hidden).to_vec()));
-            if let Some(p) = &pos.pooled {
+            let first = pos[0].0;
+            d.insert("cond".into(), ("F32".into(), vec![first.hidden.len() / width, width], st::f32_bytes(&first.hidden).to_vec()));
+            if let Some(p) = &first.pooled {
                 d.insert("pooled".into(), ("F32".into(), vec![p.len()], st::f32_bytes(p).to_vec()));
             }
         }
         let ms = r.sampling.model_sampling;
         let v_pred = r.v_pred.unwrap_or(m.v_pred);
-        let mut model = |x: &crate::cuda::DevBuf, out: &crate::cuda::DevBuf, sigma: f32, negative: bool, eval: usize, k: usize| -> Result<()> {
-            let (e, a) = if negative { (neg.unwrap(), neg_adm.as_deref()) } else { (pos, pos_adm.as_deref()) };
-            m.unet.predict(x, k, lh, lw, &e.ctx, a, sigma, ms.timestep(sigma), v_pred, out, st)?;
-            if let (Some(d), 0, false) = (dump.as_deref_mut(), eval, negative) {
+        let mut model = |x: &crate::cuda::DevBuf, out: &crate::cuda::DevBuf, sigma: f32, side: Side, eval: usize, k: usize| -> Result<()> {
+            let (e, adm) = if side.negative { &neg[side.entry] } else { &pos[side.entry] };
+            m.unet.predict(x, k, lh, lw, &e.ctx, adm.as_deref(), sigma, ms.timestep(sigma), v_pred, out, st)?;
+            if let (Some(d), 0, Side::POSITIVE) = (dump.as_deref_mut(), eval, side) {
                 let mut v = vec![0u8; k * unet::CH * lh * lw * 4];
                 out.download(0, &mut v, st)?;
                 d.insert("denoised0".into(), ("F32".into(), vec![k, unet::CH, lh, lw], v));
@@ -360,7 +383,8 @@ impl Generator {
             Ok(())
         };
         let together = images;
-        let latent = run_batches(&r.sampling, &r.noise, together, st, &mut stats, &mut model, &mut progress)?;
+        let neg_regions = if guided { regions(&r.negative) } else { PLAIN.to_vec() };
+        let latent = run_batches(&r.sampling, &r.noise, [&regions(&r.positive), &neg_regions], together, st, &mut stats, &mut model, &mut progress)?;
         Ok((latent, stats))
     }
 

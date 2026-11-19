@@ -1,9 +1,9 @@
 //! Krea 2 single-stream MMDiT (W8A8 int8 ConvRot blocks), bf16 activations like ComfyUI.
 
-use crate::cuda::{DevBuf, Stream};
-use crate::ffi::{k, null, off, s, DT_BF16, PRO_GATE, PRO_PLAIN, PRO_RMS, PRO_SWIGLU, PM};
+use crate::cuda::{memcpy_2d_d2d, DevBuf, Stream};
+use crate::ffi::{k, null, off, s, MergeGroups, DT_BF16, MERGE_GROUPS, PRO_GATE, PRO_PLAIN, PRO_RMS, PRO_SWIGLU, P, PM};
 use crate::offload::{plan, Layout, Store, WeightSet};
-use crate::st::{bf16_bytes, SafeTensors};
+use crate::st::{bf16_bytes, f32_bytes, SafeTensors};
 use anyhow::{bail, Result};
 
 pub const F: usize = 6144; // features
@@ -129,6 +129,113 @@ pub fn n_blocks(st: &SafeTensors) -> usize {
     (0..).take_while(|i| st.has(&format!("blocks.{i}.mod.lin"))).count()
 }
 
+/// The logit bias `attn1_token_weight_patch` gives a key weighted `w` above 1: (w - 1) * 2, in a tensor of q's dtype.
+fn key_bias(w: f32) -> f32 {
+    half::bf16::from_f32(((w as f64 - 1.0) * 2.0) as f32).to_f32()
+}
+
+/// The distinct logit biases of `weights` (see [`key_bias`]), in order: FlashAttention takes a group of keys for each.
+pub fn bias_values(weights: &[(usize, f32)]) -> Vec<f32> {
+    let mut out: Vec<f32> = Vec::new();
+    for &(_, w) in weights.iter().filter(|(_, w)| *w > 1.0) {
+        let b = key_bias(w);
+        if !out.contains(&b) {
+            out.push(b);
+        }
+    }
+    out
+}
+
+/// Most distinct biases FlashAttention takes, one merged key group each next to the plain attention.
+pub const BIAS_GROUPS: usize = MERGE_GROUPS - 1;
+
+/// Each bias of `weights` with the runs of consecutive positions (start, length) that take it and their count.
+fn bias_runs(weights: &[(usize, f32)]) -> Vec<(f32, Vec<(usize, usize)>, usize)> {
+    bias_values(weights).into_iter().map(|b| {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for &(p, _) in weights.iter().filter(|(_, w)| *w > 1.0 && key_bias(*w) == b) {
+            match runs.last_mut() {
+                Some((start, len)) if *start + *len == p => *len += 1,
+                _ => runs.push((p, 1)),
+            }
+        }
+        let n = runs.iter().map(|r| r.1).sum();
+        (b, runs, n)
+    }).collect()
+}
+
+/// `SwarmAttnTokenWeights` in one evaluation, as ComfyUI's `attn1_token_weight_patch` does on Krea 2, whose `img_slice`
+/// always spans the whole sequence, so every block takes it: v of the keys weighted below 1 is multiplied by the
+/// weight, and the keys weighted above 1 get [`key_bias`] on their logits, for every image. Positions past the sequence
+/// are skipped.
+struct TokenWeights {
+    /// Rows of v to scale (image * l + position, i32), their factors (f32) and their count.
+    v_scale: Option<(DevBuf, DevBuf, usize)>,
+    /// INT8 attention: every key's bias, f32 [l].
+    bias: Option<DevBuf>,
+    /// FlashAttention: the biased keys in groups.
+    groups: Option<BiasGroups>,
+}
+
+struct BiasGroups {
+    /// (bias, runs of positions, keys) per group
+    groups: Vec<(f32, Vec<(usize, usize)>, usize)>,
+    /// Each group's keys and values, bf16 [batch, keys, 2 * HK * HD].
+    kv: Vec<DevBuf>,
+    /// The plain attention's output, then each group's, bf16 [rows, F]; and each group's log-sum-exp, f32 [batch, HQ, l].
+    outs: DevBuf,
+    lses: DevBuf,
+}
+
+impl TokenWeights {
+    fn new(weights: &[(usize, f32)], batch: usize, l: usize, int8: bool, st: &Stream) -> Result<Self> {
+        let mut tw = TokenWeights { v_scale: None, bias: None, groups: None };
+        let scaled: Vec<(usize, f32)> = weights.iter().copied().filter(|&(p, w)| w < 1.0 && p < l).collect();
+        if !scaled.is_empty() {
+            let rows: Vec<u8> = (0..batch).flat_map(|b| scaled.iter().map(move |&(p, _)| (b * l + p) as i32)).flat_map(i32::to_le_bytes).collect();
+            let factors: Vec<f32> = (0..batch).flat_map(|_| scaled.iter().map(|&(_, w)| w)).collect();
+            let (r, f) = (DevBuf::alloc_async(rows.len(), st)?, DevBuf::alloc_async(factors.len() * 4, st)?);
+            r.upload(0, &rows, st)?;
+            f.upload(0, &f32_bytes(&factors), st)?;
+            tw.v_scale = Some((r, f, factors.len()));
+        }
+        let biased: Vec<(usize, f32)> = weights.iter().copied().filter(|&(p, w)| w > 1.0 && p < l).collect();
+        if biased.is_empty() {
+            return Ok(tw);
+        }
+        if int8 {
+            let mut bias = vec![0f32; l];
+            for &(p, w) in &biased {
+                bias[p] = key_bias(w);
+            }
+            let b = DevBuf::alloc_async(l * 4, st)?;
+            b.upload(0, &f32_bytes(&bias), st)?;
+            tw.bias = Some(b);
+            return Ok(tw);
+        }
+        let groups = bias_runs(&biased);
+        if groups.len() > BIAS_GROUPS {
+            return Err(crate::lora::Unsupported(format!("{} different prompt weights above 1 with FlashAttention (at most {BIAS_GROUPS})",
+                groups.len())).into());
+        }
+        let kv = groups.iter().map(|g| DevBuf::alloc_async(batch * g.2 * 2 * HK * HD * 2, st)).collect::<Result<Vec<_>>>()?;
+        let rows = batch * l;
+        let outs = DevBuf::alloc_async((groups.len() + 1) * rows * F * 2, st)?;
+        let lses = DevBuf::alloc_async(groups.len() * HQ * rows * 4, st)?;
+        tw.groups = Some(BiasGroups { groups, kv, outs, lses });
+        Ok(tw)
+    }
+}
+
+/// Activation bytes [`TokenWeights`] adds to a step of `l` tokens per image, with FlashAttention.
+pub fn token_weight_bytes(weights: &[(usize, f32)], int8: bool, l: usize) -> usize {
+    let groups = bias_values(weights).len();
+    if int8 || groups == 0 {
+        return 0;
+    }
+    l * ((groups + 1) * F * 2 + groups * HQ * 4 + 2 * HK * HD * 2)
+}
+
 /// Rough activation footprint of one denoising step (bytes) for `l` tokens.
 pub fn step_activation_bytes(l: usize) -> usize {
     l * (F * 2 /*x*/ + QKVG * 2 + F * 2 /*attn*/ + 2 * MLP * 2 /*gate|up*/ + MLP /*int8*/ + 16) + HQ * l * 4 + (64 << 20)
@@ -167,6 +274,38 @@ impl Dit {
         let (obs, ors) = ((sl * orow) as i64, orow as i64);
         k!(gpu_flash_attn(q, kp, v, o, lse, b as i32, sl as i32, sl as i32, h as i32, hk as i32, bs, rs, hs, bs, rs,
             hs, bs, rs, hs, obs, ors, hs, 1.0 / (HD as f32).sqrt(), self.attn_variant, s(st)))
+    }
+
+    /// The blocks' attention with `g`'s keys biased: plain attention over every key, and over each group's keys alone,
+    /// merged by their log-sum-exp with log(e^bias - 1) on each group's, which adds e^bias - 1 more of their weight.
+    fn flash_biased(&self, q: PM, g: &BiasGroups, out: PM, lse: PM, batch: usize, l: usize, st: &Stream) -> Result<()> {
+        let rows = batch * l;
+        let o = |i: usize| off(g.outs.ptr(), i * rows * F * 2);
+        let lses = |i: usize| if i == 0 { lse } else { off(g.lses.ptr(), (i - 1) * HQ * rows * 4) };
+        let (qb, qr, hs) = ((l * QKVG) as i64, QKVG as i64, HD as i64);
+        let (ob, or) = ((l * F) as i64, F as i64);
+        let (bi, li, sc) = (batch as i32, l as i32, 1.0 / (HD as f32).sqrt());
+        let kvw = 2 * HK * HD;
+        let mut mg = MergeGroups { o: [null(); MERGE_GROUPS], lse: [null(); MERGE_GROUPS], bias: [0.0; MERGE_GROUPS] };
+        k!(gpu_flash_attn(q, off(q, HQ * HD * 2), off(q, (HQ + HK) * HD * 2), o(0), lses(0), bi, li, li, HQ as i32, HK as i32, qb, qr, hs,
+            qb, qr, hs, qb, qr, hs, ob, or, hs, sc, self.attn_variant, s(st)))?;
+        (mg.o[0], mg.lse[0]) = (o(0) as P, lses(0) as P);
+        for (i, ((bias, runs, n), kv)) in g.groups.iter().zip(&g.kv).enumerate() {
+            for b in 0..batch {
+                let mut at = 0;
+                for &(start, len) in runs {
+                    let src = off(q, ((b * l + start) * QKVG + HQ * HD) * 2);
+                    memcpy_2d_d2d(off(kv.ptr(), (b * n + at) * kvw * 2), kvw * 2, src, QKVG * 2, kvw * 2, len, st)?;
+                    at += len;
+                }
+            }
+            let (kb, kr) = ((n * kvw) as i64, kvw as i64);
+            k!(gpu_flash_attn(q, kv.ptr(), off(kv.ptr(), HK * HD * 2), o(i + 1), lses(i + 1), bi, li, *n as i32, HQ as i32, HK as i32, qb,
+                qr, hs, kb, kr, hs, kb, kr, hs, ob, or, hs, sc, self.attn_variant, s(st)))?;
+            (mg.o[i + 1], mg.lse[i + 1]) = (o(i + 1) as P, lses(i + 1) as P);
+            mg.bias[i + 1] = (*bias as f64).exp_m1().ln() as f32;
+        }
+        k!(gpu_attn_merge(&mg, (g.groups.len() + 1) as i32, out, bi, li, HQ as i32, HD as i32, s(st)))
     }
 
     /// One text-fusion block on x [nb*sl, 2560] (bf16), attention within groups of `sl` rows.
@@ -326,11 +465,12 @@ impl Dit {
     }
 
     /// One model evaluation + Euler update of `latent` (f32 [batch, 16, H, W]) from sigma to sigma_next. The images
-    /// share the prompt, the references and the sigma, and go through every block together.
+    /// share the prompt, the references and the sigma, and go through every block together. `weights` are
+    /// `SwarmAttnTokenWeights`' (sequence position, weight) pairs, see [`TokenWeights`].
     #[allow(clippy::too_many_arguments)]
     pub fn step(&mut self, latent: &DevBuf, batch: usize, h: usize, w: usize, ctx: &DevBuf, lt: usize, refs: Option<&References>, rope: &DevBuf,
-        sigma: f32, sigma_next: f32, st: &Stream, denoised: Option<&DevBuf>, probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>)
-        -> Result<()> {
+        sigma: f32, sigma_next: f32, st: &Stream, denoised: Option<&DevBuf>, probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>,
+        weights: &[(usize, f32)]) -> Result<()> {
         if h % PATCH != 0 || w % PATCH != 0 {
             bail!("latent size must be even");
         }
@@ -373,8 +513,13 @@ impl Dit {
         let attn = DevBuf::alloc_async(rows * F * 2, st)?;
         let gu = DevBuf::alloc_async(rows * 2 * MLP * 2, st)?;
         let lse = DevBuf::alloc_async(HQ * rows * 4, st)?;
+        let tw = TokenWeights::new(weights, batch, l, self.int8_attn, st)?;
         let int8_ws = if self.int8_attn {
-            let n = unsafe { crate::ffi::gpu_int8_attn_workspace(batch as i32, HQ as i32, HK as i32, l as i32, l as i32) };
+            let n = if tw.bias.is_some() {
+                unsafe { crate::ffi::gpu_int8_attn_key_bias_workspace(batch as i32, HQ as i32, HK as i32, l as i32, l as i32) }
+            } else {
+                unsafe { crate::ffi::gpu_int8_attn_workspace(batch as i32, HQ as i32, HK as i32, l as i32, l as i32) }
+            };
             Some(DevBuf::alloc_async(n as usize, st)?)
         } else {
             None
@@ -417,10 +562,19 @@ impl Dit {
             self.prof.mark("rope", st)?;
             let q = qkvg.ptr();
             let (kp, vp) = (off(q, HQ * HD * 2), off(q, (HQ + HK) * HD * 2));
+            if let Some((rows, factors, n)) = &tw.v_scale {
+                k!(gpu_scale_rows_bf16(vp, QKVG as i64, rows.ptr(), factors.ptr(), *n as i32, (HK * HD) as i32, s(st)))?;
+            }
             if let Some(ws) = &int8_ws {
                 let (bs, rs, hs) = ((l * QKVG) as i64, QKVG as i64, HD as i64);
-                k!(gpu_int8_attn(q, kp, vp, attn.ptr(), ws.ptr(), batch as i32, l as i32, l as i32, HQ as i32, HK as i32, bs, rs,
-                    hs, bs, rs, hs, bs, rs, hs, (l * F) as i64, fi, hs, 1.0 / (HD as f32).sqrt(), s(st)))?;
+                match &tw.bias {
+                    Some(bias) => k!(gpu_int8_attn_key_bias(q, kp, vp, attn.ptr(), ws.ptr(), batch as i32, l as i32, l as i32, HQ as i32,
+                        HK as i32, bs, rs, hs, bs, rs, hs, bs, rs, hs, (l * F) as i64, fi, hs, 1.0 / (HD as f32).sqrt(), bias.ptr(), s(st)))?,
+                    None => k!(gpu_int8_attn(q, kp, vp, attn.ptr(), ws.ptr(), batch as i32, l as i32, l as i32, HQ as i32, HK as i32, bs, rs,
+                        hs, bs, rs, hs, bs, rs, hs, (l * F) as i64, fi, hs, 1.0 / (HD as f32).sqrt(), s(st)))?,
+                }
+            } else if let Some(g) = &tw.groups {
+                self.flash_biased(q, g, attn.ptr(), lse.ptr(), batch, l, st)?;
             } else {
                 self.flash(q, kp, vp, attn.ptr(), lse.ptr(), batch, l, HQ, HK, QKVG, F, st)?;
             }
@@ -514,6 +668,16 @@ mod tests {
         let omega = 1.0f64 / 1000f64.powf(2.0 / 32.0);
         assert_eq!(t[128 + 2], 1.0);
         assert!((t[128 * 2 + 2] - omega.cos() as f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn biased_keys_group_by_their_bf16_bias() {
+        // 1.3 and 2.6 from nested <weight>; below 1 only scales v
+        let w = [(3, 1.3), (4, 1.3), (5, 2.6), (6, 2.6), (9, 1.3), (10, 0.5)];
+        assert_eq!(key_bias(1.3), half::bf16::from_f32(0.6).to_f32());
+        assert_eq!(bias_runs(&w), vec![(key_bias(1.3), vec![(3, 2), (9, 1)], 3), (key_bias(2.6), vec![(5, 2)], 2)]);
+        assert_eq!(bias_values(&[(0, 0.5)]), Vec::<f32>::new());
+        assert_eq!(token_weight_bytes(&w, true, 100), 0);
     }
 
     #[test]

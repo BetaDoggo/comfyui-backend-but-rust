@@ -172,7 +172,15 @@ extern "C" {
     pub fn gpu_attn_prefix(q: P, q_stride: i64, k: P, v: P, kv_stride: i64, h: i32, lq: i32, offset: i32, out: PM, out_stride: i64,
         scale: f32, s: PM) -> i32;
     pub fn gpu_tanh_bf16(x: PM, n: i64, s: PM) -> i32;
+    pub fn gpu_scale_bf16(x: PM, n: i64, scale: f32, s: PM) -> i32;
     pub fn gpu_attn_merge(groups: *const MergeGroups, n: i32, out: PM, b: i32, sq: i32, h: i32, d: i32, s: PM) -> i32;
+    /// Krea 2's attention token weights: `x[rows[r] * stride + c] *= factors[r]` in bf16 (`rows` i32, `factors` f32).
+    pub fn gpu_scale_rows_bf16(x: PM, stride: i64, rows: P, factors: P, n: i32, cols: i32, s: PM) -> i32;
+    /// `gpu_int8_attn` with `bias` (f32 [lk], every image's) added to each key's logits.
+    pub fn gpu_int8_attn_key_bias_workspace(b: i32, h: i32, hk: i32, lq: i32, lk: i32) -> i64;
+    pub fn gpu_int8_attn_key_bias(q: P, k: P, v: P, o: PM, ws: PM, b: i32, lq: i32, lk: i32, h: i32, hk: i32, q_bs: i64,
+        q_rs: i64, q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64, v_hs: i64, o_bs: i64, o_rs: i64,
+        o_hs: i64, scale: f32, bias: P, s: PM) -> i32;
 
     // SeedVR2 (csrc/seedvr.cu)
     pub fn gpu_seedvr_patch_in(x: P, cond: P, tok: PM, h: i32, w: i32, ld: i32, s: PM) -> i32;

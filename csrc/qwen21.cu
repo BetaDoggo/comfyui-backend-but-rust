@@ -148,3 +148,16 @@ GPU_API int gpu_tanh_bf16(void* x, int64_t n, void* stream) {
     KCHECK();
     return 0;
 }
+
+// x = x * s, bf16, rounded once as torch's bf16 multiply is
+__global__ void scale_bf16_kernel(bf16* x, int64_t n, float s) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) * s);
+}
+
+GPU_API int gpu_scale_bf16(void* x, int64_t n, float s, void* stream) {
+    if (n <= 0) return 0;
+    scale_bf16_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((bf16*)x, n, s);
+    KCHECK();
+    return 0;
+}

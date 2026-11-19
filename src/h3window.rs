@@ -42,6 +42,9 @@ pub struct ContextWindows {
     pub overlap: usize,
     pub fuse: Fuse,
     pub freenoise: bool,
+    /// `split_conds_to_windows`: each window takes one of a side's several conditioning entries by its place in the
+    /// clip. Only refused with several entries; with one it changes nothing.
+    pub split_conds: bool,
 }
 
 /// One window: its video latents and the audio latents of the same time span.
@@ -82,7 +85,7 @@ impl ContextWindows {
         }
         let length = h3::video_latent_t(length);
         let overlap = h3::video_latent_t(overlap).min(length - 5);
-        Ok(ContextWindows { length, overlap, fuse, freenoise })
+        Ok(ContextWindows { length, overlap, fuse, freenoise, split_conds: false })
     }
 
     /// True when the clip is longer than one window. Otherwise sampling runs as without windows.

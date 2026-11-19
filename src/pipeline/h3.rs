@@ -1,8 +1,8 @@
 //! MiniMax H3: its diffusion model, text encoder with its vision tower, video and audio decoders, the VAE encoder for
 //! reference pictures and keyframes, and encoded prompts.
 
-use super::{nothing_for, remember, run_sampler, scale_rows, touch};
-use super::{Dump, FamilyState, Generator, Kind, Prompt, Sampling, SharedTe, Stats, Step, TokenKey, CONTEXTS, VISION_CACHE};
+use super::{PLAIN, Side, nothing_for, regions, remember, run_sampler, scale_rows, touch};
+use super::{Cond, Dump, FamilyState, Generator, Kind, Prompt, Sampling, SharedTe, Stats, Step, TokenKey, CONTEXTS, VISION_CACHE};
 use crate::cuda::{self, DevBuf, Stream};
 use crate::st::f32_bytes;
 use crate::vision::{self, PromptImage};
@@ -20,8 +20,8 @@ pub struct H3Picture {
     pub latent: Option<PromptImage>,
 }
 
-/// What the positive prompt is conditioned on besides its text.
-#[derive(Clone, Default)]
+/// What a positive conditioning entry is conditioned on besides its text.
+#[derive(Clone, Default, PartialEq)]
 pub struct H3Conds {
     /// The label before each picture in the text encoder's presentation, `{}` its number from 1: `<Picture {}>: ` for
     /// the video model's references, `Picture {}: ` for MiniMax-H3-Image's edits.
@@ -81,9 +81,10 @@ pub fn ref2va_pictures(images: &[PromptImage], clip: (usize, usize), max: bool, 
 }
 
 pub struct H3Request {
-    pub prompt: Prompt,
-    /// Only encoded when the sampling uses it.
-    pub negative: Prompt,
+    /// The positive conditioning entries, mixed as ComfyUI's `calc_cond_batch` does.
+    pub positive: Vec<Cond>,
+    /// Only encoded when the sampling uses it. Takes no pictures or keyframes.
+    pub negative: Vec<Cond>,
     pub shape: h3::Shape,
     pub sampling: Sampling,
     /// video, audio
@@ -95,8 +96,8 @@ pub struct H3Request {
     /// Video Context Window: each evaluation runs on overlapping windows of the clip. FreeNoise
     /// is applied to `noise` by the caller.
     pub windows: Option<h3window::ContextWindows>,
-    /// Reference pictures and keyframes of the positive prompt.
-    pub conds: H3Conds,
+    /// Reference pictures and keyframes of each positive entry.
+    pub conds: Vec<H3Conds>,
     /// The sampler's seed, which the conditions' noise is drawn from.
     pub seed: u64,
 }
@@ -173,6 +174,32 @@ impl FamilyState for H3 {
     }
 }
 
+/// Drop the oldest entries of `cache` until one more fits within [`CONTEXTS`], never one `kept` holds on to.
+fn evict<T>(cache: &mut Vec<T>, kept: impl Fn(&T) -> bool) {
+    while cache.len() >= CONTEXTS {
+        match cache.iter().position(|e| !kept(e)) {
+            Some(i) => drop(cache.remove(i)),
+            None => break,
+        }
+    }
+}
+
+/// The distinct (prompt, pictures and keyframes) of a run's entries, and which one each entry of each side uses.
+fn units<K: PartialEq, C: PartialEq>(positive: impl IntoIterator<Item = (K, C)>, negative: impl IntoIterator<Item = (K, C)>) -> (Vec<(K, C)>, [Vec<usize>; 2]) {
+    let mut units: Vec<(K, C)> = Vec::new();
+    let mut map = [Vec::new(), Vec::new()];
+    for (side, entries) in [(0, positive.into_iter().collect::<Vec<_>>()), (1, negative.into_iter().collect())] {
+        for u in entries {
+            let i = units.iter().position(|v| *v == u).unwrap_or_else(|| {
+                units.push(u);
+                units.len() - 1
+            });
+            map[side].push(i);
+        }
+    }
+    (units, map)
+}
+
 /// Token ids and per-token factors of a MiniMax H3 prompt, which has no template.
 pub fn h3_tokens(t: &tokenizer::Tokenizer, segments: &[(String, f32)]) -> Result<(Vec<u32>, Vec<f32>)> {
     let (mut ids, mut factors) = (Vec::new(), Vec::new());
@@ -231,18 +258,22 @@ impl H3 {
         Ok(out)
     }
 
-    /// Move the refined context of `prompt` with `pictures` before it to the end of the cache, encoding it if needed,
-    /// and return its key.
-    fn context(&mut self, prompt: &Prompt, label: &str, pictures: &[PromptImage], threads: usize, st: &Stream, dump: Option<&mut Dump>) -> Result<H3Key> {
+    /// The cache key of `prompt` with `pictures` before it.
+    fn key(&self, prompt: &Prompt, label: &str, pictures: &[PromptImage]) -> Result<H3Key> {
         let tok = self.tokenizer.as_ref().context("no H3 tokenizer")?;
         let (ids, mut factors) = h3_presentation(tok, label, pictures.len(), prompt.segments()?)?;
         factors.iter_mut().for_each(|f| *f *= prompt.scale);
-        let key = (vec![(ids, factors)], pictures.to_vec());
-        if touch(&mut self.contexts, |(k, ..)| *k == key) {
-            return Ok(key);
+        Ok((vec![(ids, factors)], pictures.to_vec()))
+    }
+
+    /// Move the refined context of `key` to the end of the cache, encoding it if needed. A new one makes room by
+    /// dropping the oldest that isn't in `keep`, the run's others.
+    fn context(&mut self, key: &H3Key, keep: &[&H3Key], threads: usize, st: &Stream, dump: Option<&mut Dump>) -> Result<()> {
+        if touch(&mut self.contexts, |(k, ..)| k == key) {
+            return Ok(());
         }
         let t0 = Instant::now();
-        let embeds = self.vision_embeds(pictures, threads, st)?;
+        let embeds = self.vision_embeds(&key.1, threads, st)?;
         let refs: Vec<&vision::Embeds> = embeds.iter().map(|e| &**e).collect();
         let (ids, factors) = &key.0[0];
         // each picture's factor and tags cover its tokens
@@ -268,11 +299,9 @@ impl H3 {
         let ctx = m.dit.encode_context(&cond, len, st)?;
         st.sync()?;
         eprintln!("text encoded in {:.2}s, {len} tokens", t0.elapsed().as_secs_f64());
-        if self.contexts.len() >= CONTEXTS {
-            self.contexts.remove(0);
-        }
+        evict(&mut self.contexts, |(k, ..)| keep.contains(&k));
         self.contexts.push((key.clone(), len, ctx, tags));
-        Ok(key)
+        Ok(())
     }
 
     /// The sampler's latents of `pictures` through the encoder of `vae`, through the cache.
@@ -425,51 +454,80 @@ impl Generator {
         }
         dit.shifts = shifts;
         dit.sparse = r.sparse.clone();
-        let c = &r.conds;
-        let conditioned = !c.keyframes.is_empty() || c.pictures.iter().any(|p| p.latent.is_some());
-        if conditioned && (r.windows.as_ref().is_some_and(|w| w.applies(&r.shape)) || r.sparse.is_some()) {
+        if r.conds.len() != r.positive.len() {
+            bail!("{} sets of pictures and keyframes for {} positive entries", r.conds.len(), r.positive.len());
+        }
+        let windowed = r.windows.as_ref().is_some_and(|w| w.applies(&r.shape));
+        let conditioned = |c: &H3Conds| !c.keyframes.is_empty() || c.pictures.iter().any(|p| p.latent.is_some());
+        if r.conds.iter().any(conditioned) && (windowed || r.sparse.is_some()) {
             bail!("keyframes and reference pictures with context windows or sparse attention");
         }
-        let neg_key = if r.sampling.uses_negative() { Some(f.context(&r.negative, "", &[], env.threads, st, None)?) } else { None };
-        let vision: Vec<PromptImage> = c.pictures.iter().map(|p| p.vision.clone()).collect();
-        let pos_key = f.context(&r.prompt, &c.label, &vision, env.threads, st, dump.as_deref_mut())?;
-        // keyframes, then the references, as they pack
-        let mut extra = h3::Extra::default();
-        let mut latents: Vec<(Arc<Vec<f32>>, usize, usize, usize)> = Vec::new();
-        for (index, z) in &c.keyframes {
-            if z.len() != 24 * r.shape.h * r.shape.w {
-                bail!("a keyframe latent of {} values for a {}x{} clip", z.len(), r.shape.w * 16, r.shape.h * 16);
-            }
-            extra.keyframes.push((*index, 1));
-            latents.push((Arc::new(z.clone()), 1, r.shape.h, r.shape.w));
+        let several = r.positive.len() > 1 || r.sampling.uses_negative() && r.negative.len() > 1;
+        if windowed && several && r.windows.as_ref().is_some_and(|w| w.split_conds) {
+            bail!("split_conds_to_windows with several conditioning entries");
         }
-        let to_encode: Vec<&PromptImage> = c.pictures.iter().filter_map(|p| p.latent.as_ref()).collect();
-        if !to_encode.is_empty() {
-            let vae = c.vae.as_ref().context("reference pictures to encode without a VAE")?;
-            for (z, img) in f.ref_latents(vae, &to_encode, st)?.into_iter().zip(&to_encode) {
-                extra.refs.push((img.height / 16, img.width / 16));
-                latents.push((z, 1, img.height / 16, img.width / 16));
+        // each distinct prompt with its pictures and keyframes is encoded and packed once
+        let none = H3Conds::default();
+        let mut positive = Vec::with_capacity(r.positive.len());
+        for (p, c) in r.positive.iter().zip(&r.conds) {
+            let vision: Vec<PromptImage> = c.pictures.iter().map(|p| p.vision.clone()).collect();
+            positive.push((f.key(&p.prompt, &c.label, &vision)?, c));
+        }
+        let mut negative = Vec::new();
+        if r.sampling.uses_negative() {
+            for n in &r.negative {
+                negative.push((f.key(&n.prompt, "", &[])?, &none));
             }
         }
-        if let Some(d) = dump.as_deref_mut() {
-            for (i, (z, ..)) in latents.iter().skip(c.keyframes.len()).enumerate() {
-                d.insert(format!("ref{i}"), ("F32".into(), vec![z.len()], f32_bytes(z).to_vec()));
-            }
+        let (units, map) = units(positive, negative);
+        let Some(&main) = map[0].first() else { bail!("a positive prompt without conditioning entries") };
+        let needed: Vec<&H3Key> = units.iter().map(|(k, _)| k).collect();
+        for (u, (key, _)) in units.iter().enumerate() {
+            f.context(key, &needed, env.threads, st, if u == main { dump.as_deref_mut() } else { None })?;
         }
-        let m = f.model.as_ref().context("no H3 model")?;
-        let cond_rows = if extra.is_empty() {
-            None
-        } else {
-            let views: Vec<(&[f32], usize, usize, usize)> = latents.iter().map(|(z, t, h, w)| (z.as_slice(), *t, *h, *w)).collect();
-            Some(m.dit.cond_rows(&views, r.seed, st)?)
-        };
+        // per unit: keyframes, then the references, as they pack, and their embedded rows
+        let mut packs: Vec<(h3::Extra, Option<DevBuf>)> = Vec::with_capacity(units.len());
+        for (u, (_, c)) in units.iter().enumerate() {
+            let mut extra = h3::Extra::default();
+            let mut latents: Vec<(Arc<Vec<f32>>, usize, usize, usize)> = Vec::new();
+            for (index, z) in &c.keyframes {
+                if z.len() != 24 * r.shape.h * r.shape.w {
+                    bail!("a keyframe latent of {} values for a {}x{} clip", z.len(), r.shape.w * 16, r.shape.h * 16);
+                }
+                extra.keyframes.push((*index, 1));
+                latents.push((Arc::new(z.clone()), 1, r.shape.h, r.shape.w));
+            }
+            let to_encode: Vec<&PromptImage> = c.pictures.iter().filter_map(|p| p.latent.as_ref()).collect();
+            if !to_encode.is_empty() {
+                let vae = c.vae.as_ref().context("reference pictures to encode without a VAE")?;
+                for (z, img) in f.ref_latents(vae, &to_encode, st)?.into_iter().zip(&to_encode) {
+                    extra.refs.push((img.height / 16, img.width / 16));
+                    latents.push((z, 1, img.height / 16, img.width / 16));
+                }
+            }
+            if let (true, Some(d)) = (u == main, dump.as_deref_mut()) {
+                for (i, (z, ..)) in latents.iter().skip(c.keyframes.len()).enumerate() {
+                    d.insert(format!("ref{i}"), ("F32".into(), vec![z.len()], f32_bytes(z).to_vec()));
+                }
+            }
+            let m = f.model.as_ref().context("no H3 model")?;
+            let rows = if extra.is_empty() {
+                None
+            } else {
+                let views: Vec<(&[f32], usize, usize, usize)> = latents.iter().map(|(z, t, h, w)| (z.as_slice(), *t, *h, *w)).collect();
+                Some(m.dit.cond_rows(&views, r.seed, st)?)
+            };
+            packs.push((extra, rows));
+        }
         stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;
         let contexts = &f.contexts;
-        let find = |key: &H3Key| contexts.iter().find(|(k, ..)| k == key).map(|(_, len, ctx, tags)| (ctx, *len, tags.as_slice())).unwrap();
-        let (pos, text, pos_tags) = find(&pos_key);
-        let neg = neg_key.as_ref().map(find);
-        let pos_pack = h3::Pack { tags: pos_tags, cond: cond_rows.as_ref().map(|c| (c, &extra)) };
+        let mut encoded: Vec<(&DevBuf, usize, &[u8])> = Vec::with_capacity(units.len());
+        for (key, _) in &units {
+            let (_, len, ctx, tags) = contexts.iter().find(|(k, ..)| k == key).context("an encoded prompt left the cache")?;
+            encoded.push((ctx, *len, tags.as_slice()));
+        }
         if let Some(d) = dump.as_deref_mut() {
+            let (pos, text, _) = encoded[main];
             let bytes = text * 5376 * 2;
             let mut v = vec![0u8; bytes];
             pos.download(0, &mut v, st)?;
@@ -486,15 +544,16 @@ impl Generator {
             None => vec![r.shape],
         };
         let largest = shapes.iter().map(|s| 2 * s.audio_t + s.t * (s.h / 2) * (s.w / 2)).max().unwrap_or(0);
-        let tokens = (text + extra.rows(&r.shape)).max(neg.map_or(0, |n| n.1)) + largest;
+        let tokens = encoded.iter().zip(&packs).map(|((_, len, _), (extra, _))| len + extra.rows(&r.shape)).max().unwrap_or(0) + largest;
         let budget = (cuda::device_free()? + m.dit.blocks_vram()).saturating_sub(env.reserve + (1 << 29) + m.dit.step_activation_bytes(tokens) + m.dit.attn_workspace(tokens));
         m.dit.reserve(budget, env.slots)?;
-        // a rope table per window shape: windows can differ by an audio latent
-        let mut ropes: Vec<(h3::Shape, DevBuf, Option<DevBuf>)> = Vec::new();
-        for s in &shapes {
-            if !ropes.iter().any(|(k, ..)| k == s) {
-                let none = h3::Extra::default();
-                ropes.push((*s, m.dit.rope(text, s, &extra, st)?, neg.map(|(_, l, _)| m.dit.rope(l, s, &none, st)).transpose()?));
+        // a rope table per text length, packed extras and window shape: windows can differ by an audio latent
+        let mut ropes: Vec<(usize, &h3::Extra, h3::Shape, DevBuf)> = Vec::new();
+        for ((_, len, _), (extra, _)) in encoded.iter().zip(&packs) {
+            for s in &shapes {
+                if !ropes.iter().any(|(l, e, k, _)| l == len && *e == extra && k == s) {
+                    ropes.push((*len, extra, *s, m.dit.rope(*len, s, extra, st)?));
+                }
             }
         }
         if let Some(c) = windows {
@@ -504,12 +563,18 @@ impl Generator {
         let n = r.noise.len();
         let mut first = dump;
         let sigmas = &r.sampling.sigmas;
-        let mut model = |x: &DevBuf, den: &DevBuf, sigma: f32, negative: bool, e: usize| -> Result<()> {
+        let mut model = |x: &DevBuf, den: &DevBuf, sigma: f32, side: Side, e: usize| -> Result<()> {
+            let u = *map[usize::from(side.negative)].get(side.entry).context("no such conditioning entry")?;
+            let (ctx, text, tags) = encoded[u];
+            let (extra, rows) = &packs[u];
+            let pack = h3::Pack { tags, cond: rows.as_ref().map(|c| (c, extra)) };
+            // the first evaluation of the first positive entry is dumped
+            let dumped = e == 0 && side == Side::POSITIVE;
             // the schedule's next sigma after the nearest one, as HyperFlow's ComfyUI node finds it
             let i = (0..sigmas.len()).min_by(|&a, &b| (sigmas[a] - sigma).abs().total_cmp(&(sigmas[b] - sigma).abs())).unwrap_or(0);
             let next = sigmas.get(i + 1).or(sigmas.last()).copied().unwrap_or(0.0);
             let mut keep = |name: &str, b: &DevBuf, bytes: usize| {
-                if let (0, false, Some(d)) = (e, negative, first.as_mut()) {
+                if let (true, Some(d)) = (dumped, first.as_mut()) {
                     let mut v = vec![0u8; bytes];
                     if b.download(0, &mut v, st).is_ok() {
                         d.insert(name.to_string(), ("BF16".into(), vec![bytes / 2], v));
@@ -517,11 +582,8 @@ impl Generator {
                 }
             };
             let mut call = |x: &DevBuf, sh: &h3::Shape, den: &DevBuf, probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>| -> Result<()> {
-                let (_, rope, rope_neg) = ropes.iter().find(|(k, ..)| k == sh).context("no rope table for this window")?;
-                match (negative, neg, rope_neg) {
-                    (true, Some((c, l, tags)), Some(rn)) => dit.predict(x, sh, c, l, h3::Pack { tags, cond: None }, rn, sigma, next, den, st, None),
-                    _ => dit.predict(x, sh, pos, text, pos_pack, rope, sigma, next, den, st, probe),
-                }
+                let (.., rope) = ropes.iter().find(|(l, e, k, _)| *l == text && *e == extra && k == sh).context("no rope table for this window")?;
+                dit.predict(x, sh, ctx, text, pack, rope, sigma, next, den, st, probe)
             };
             match windows {
                 None => call(x, &r.shape, den, Some(&mut keep))?,
@@ -541,19 +603,48 @@ impl Generator {
                     den.upload(0, &f32_bytes(&fused), st)?;
                 }
             }
-            if let (0, false, Some(d)) = (e, negative, first.as_mut()) {
+            if let (true, Some(d)) = (dumped, first.as_mut()) {
                 let mut b = vec![0u8; n * 4];
                 den.download(0, &mut b, st)?;
                 d.insert("denoised0".into(), ("F32".into(), vec![n], b));
             }
             Ok(())
         };
-        let mut out = run_sampler(&r.sampling, &r.noise, st, &mut stats, &mut model, &mut progress)?;
+        // the negative's entries are only read under guidance
+        let pos_regions = regions(&r.positive);
+        let neg_regions = if r.sampling.uses_negative() { regions(&r.negative) } else { PLAIN.to_vec() };
+        let mut out = run_sampler(&r.sampling, &r.noise, [&pos_regions, &neg_regions], st, &mut stats, &mut model, &mut progress)?;
         // the sampler carries the audio scaled onto the video schedule
         let scale = shifts.0 / shifts.1;
         for v in &mut out[r.shape.video_len()..] {
             *v /= scale;
         }
         Ok((out, stats))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entries_share_units_by_prompt_pictures_and_keyframes() {
+        let (units, map) = units([("a", 1), ("b", 1), ("a", 1), ("a", 2)], [("a", 0), ("n", 0)]);
+        assert_eq!(units, [("a", 1), ("b", 1), ("a", 2), ("a", 0), ("n", 0)]);
+        assert_eq!(map, [vec![0, 1, 0, 2], vec![3, 4]]);
+    }
+
+    #[test]
+    fn eviction_keeps_the_runs_prompts() {
+        let mut cache: Vec<usize> = (0..CONTEXTS).collect();
+        evict(&mut cache, |e| *e == 0);
+        assert_eq!(cache, (0..CONTEXTS).filter(|&e| e != 1).collect::<Vec<_>>());
+        // a run that needs more than CONTEXTS keeps them all
+        let mut cache: Vec<usize> = (0..CONTEXTS + 2).collect();
+        evict(&mut cache, |_| true);
+        assert_eq!(cache.len(), CONTEXTS + 2);
+        // and the next run trims back
+        evict(&mut cache, |_| false);
+        assert_eq!(cache.len(), CONTEXTS - 1);
     }
 }

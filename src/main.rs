@@ -568,8 +568,8 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     for (pi, prompt) in prompts.iter().enumerate() {
     for group in args.batches() {
         let r = pipeline::AnimaRequest {
-            positive: Prompt::new(diffusion::tokenizer::token_weights(prompt, 1.0)),
-            negative: Prompt::new(diffusion::tokenizer::token_weights(&args.negative, 1.0)),
+            positive: vec![pipeline::Cond::plain(Prompt::new(diffusion::tokenizer::token_weights(prompt, 1.0)))],
+            negative: vec![pipeline::Cond::plain(Prompt::new(diffusion::tokenizer::token_weights(&args.negative, 1.0)))],
             width: args.width,
             height: args.height,
             sampling: {
@@ -628,8 +628,8 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     for (p, prompt) in prompts.iter().enumerate() {
         for group in args.batches() {
             let r = pipeline::MossRequest {
-                positive: Prompt::text(prompt.trim()),
-                negative: Prompt::text(args.negative.trim()),
+                positive: vec![pipeline::Cond::plain(Prompt::text(prompt.trim()))],
+                negative: vec![pipeline::Cond::plain(Prompt::text(args.negative.trim()))],
                 width: args.width,
                 height: args.height,
                 sampling: args.batch_sampling("euler", ModelSampling::Flow { shift }, group, (args.width / 16, args.height / 16))?,
@@ -683,12 +683,12 @@ fn run_sd(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         for group in args.batches() {
             let size = pipeline::SizeCond::of(args.width, args.height);
             let r = pipeline::SdRequest {
-                positive: Prompt::new(diffusion::tokenizer::token_weights(prompt.trim(), 1.0)),
-                negative: Prompt::new(diffusion::tokenizer::token_weights(args.negative.trim(), 1.0)),
+                positive: vec![pipeline::Cond::plain(Prompt::new(diffusion::tokenizer::token_weights(prompt.trim(), 1.0)))],
+                negative: vec![pipeline::Cond::plain(Prompt::new(diffusion::tokenizer::token_weights(args.negative.trim(), 1.0)))],
                 width: args.width,
                 height: args.height,
-                positive_size: size,
-                negative_size: size,
+                positive_size: vec![size],
+                negative_size: vec![size],
                 clip_layer: args.clip_layer,
                 v_pred: None,
                 sampling: args.batch_sampling("euler", ModelSampling::Discrete, group, (lw, lh))?,
@@ -741,15 +741,15 @@ fn run_qwen21(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     let n = 64 * (args.height / 16) * (args.width / 16);
     for group in args.batches() {
         let r = pipeline::Qwen21Request {
-            positive: Prompt::text(args.prompt.trim()),
-            negative: Prompt::text(args.negative.trim()),
+            positive: vec![pipeline::Cond::plain(Prompt::text(args.prompt.trim()))],
+            negative: vec![pipeline::Cond::plain(Prompt::text(args.negative.trim()))],
             width: args.width,
             height: args.height,
             sampling: args.batch_sampling("euler", ModelSampling::Flux { shift }, group, (args.width / 16, args.height / 16))?,
             noise: args.noise(group, n)?,
-            images: images.clone(),
-            negative_images: images.clone(),
-            references: references.clone(),
+            images: [vec![images.clone()], vec![images.clone()]],
+            references: [vec![references.clone()], vec![references.clone()]],
+            attn_token_weights: None,
         };
         let mut dump = pipeline::Dump::new();
         let t0 = Instant::now();
@@ -813,15 +813,15 @@ fn run_h3_image(args: &Args, load: pipeline::LoadOptions, dit: PathBuf, te: Path
     let prompts = args.prompts()?;
     for (i, prompt) in prompts.iter().enumerate() {
         let r = pipeline::H3Request {
-            prompt: Prompt::text(prompt),
-            negative: Prompt::text(&args.negative),
+            positive: vec![pipeline::Cond::plain(Prompt::text(prompt))],
+            negative: vec![pipeline::Cond::plain(Prompt::text(&args.negative))],
             shape,
             sampling: sampling.clone(),
             shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO),
             noise: noise.clone(),
             sparse: None,
             windows: None,
-            conds: conds.clone(),
+            conds: vec![conds.clone()],
             seed: args.seed,
         };
         let mut dump = pipeline::Dump::new();
@@ -930,15 +930,15 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         keyframes,
     };
     let r = pipeline::H3Request {
-        prompt: Prompt::text(&args.prompt),
-        negative: Prompt::text(&args.negative),
+        positive: vec![pipeline::Cond::plain(Prompt::text(&args.prompt))],
+        negative: vec![pipeline::Cond::plain(Prompt::text(&args.negative))],
         shape,
         sampling,
         shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO),
         noise,
         sparse,
         windows,
-        conds,
+        conds: vec![conds],
         seed: args.seed,
     };
     let mut dump = pipeline::Dump::new();
@@ -1295,18 +1295,17 @@ fn run_krea(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         None => None,
     };
     for (p, prompt, group) in jobs {
+        let mut positive = pipeline::KreaEntry::new(Prompt::text(prompt), images.clone());
+        (positive.references, positive.timestep_zero) = (references.clone(), timestep_zero);
         let req = pipeline::KreaRequest {
-            prompt: Prompt::text(prompt),
-            negative: Prompt::text(&args.negative),
+            positive: vec![positive],
+            negative: vec![pipeline::KreaEntry::new(Prompt::text(&args.negative), images.clone())],
             seed: args.seed + group.0 as u64,
             width: args.width,
             height: args.height,
             sampling: args.batch_sampling("euler", ModelSampling::Flux { shift: args.shift }, group, (args.width / 8, args.height / 8))?,
             noise: Some(args.noise(group, n)?),
-            images: images.clone(),
-            negative_images: images.clone(),
-            references: references.clone(),
-            timestep_zero,
+            attn_token_weights: None,
             style: style.clone(),
         };
         let mut dump = pipeline::Dump::new();

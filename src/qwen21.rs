@@ -168,6 +168,9 @@ pub struct Prefix {
     rope: DevBuf,
     /// bf16 [blocks][2][rows][F]: each block's keys, then values
     kv: Option<DevBuf>,
+    /// (row of the sequence, factor): values multiplied before every attention, as SwarmAttnTokenWeights' attn1 patch
+    /// does. Rows past the prefix are the image's.
+    pub v_scale: Vec<(usize, f32)>,
 }
 
 impl Prefix {
@@ -300,7 +303,7 @@ impl Dit {
         let table = rope_table(&segs, target);
         let rope = DevBuf::alloc_async(table.len() * 4, st)?;
         rope.upload(0, &crate::st::f32_bytes(&table), st)?;
-        Ok(Prefix { rows, segs, tokens, rope, kv: None })
+        Ok(Prefix { rows, segs, tokens, rope, kv: None, v_scale: Vec::new() })
     }
 
     /// The modulation of the flow time `t`: the embedding, and the four vectors every block takes from it.
@@ -402,6 +405,9 @@ impl Dit {
         self.block(&format!("p{tag}"), base, lay, x, 1, p, m0, pf.rope.ptr(), st, &mut |qkv, attn, st| {
             let q = qkv.ptr();
             let (kp, vp) = (off(q, F * 2), off(q, 2 * F * 2));
+            for &(row, w) in pf.v_scale.iter().filter(|&&(row, _)| row < p) {
+                k!(gpu_scale_bf16(off(vp, row * QKV * 2), F as i64, w, s(st)))?;
+            }
             memcpy_2d_d2d(kout, F * 2, kp, QKV * 2, F * 2, p, st)?;
             memcpy_2d_d2d(vout, F * 2, vp, QKV * 2, F * 2, p, st)?;
             let mut at = 0;
@@ -503,6 +509,9 @@ impl Dit {
                     let (q, at) = (off(qkv.ptr(), i * lt * QKV * 2), (i * kl + p) * F * 2);
                     memcpy_2d_d2d(off(kc, at), F * 2, off(q, F * 2), QKV * 2, F * 2, lt, st)?;
                     memcpy_2d_d2d(off(vc, at), F * 2, off(q, 2 * F * 2), QKV * 2, F * 2, lt, st)?;
+                    for &(row, w) in pf.v_scale.iter().filter(|&&(row, _)| (p..kl).contains(&row)) {
+                        k!(gpu_scale_bf16(off(vc, (i * kl + row) * F * 2), F as i64, w, s(st)))?;
+                    }
                 }
                 self.attention(qkv.ptr(), kc, vc, attn.ptr(), batch, lt, kl, QKV, F, st)
             })?;

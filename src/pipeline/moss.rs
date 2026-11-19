@@ -1,7 +1,7 @@
 //! MOSS Image: its diffusion model, its Qwen3.5 text encoder, the Flux 2 VAE and the prompts encoded through them.
 
-use super::{crop, nothing_for, remember, run_batches, scale_rows, touch, upload};
-use super::{Dump, FamilyState, Generator, Kind, Prompt, Reference, Sampling, SharedTe, Stats, Step, TokenKey, CONTEXTS};
+use super::{regions, Side, crop, nothing_for, remember, run_batches, scale_rows, touch, upload, PLAIN};
+use super::{Cond, Dump, FamilyState, Generator, Kind, Prompt, Reference, Sampling, SharedTe, Stats, Step, TokenKey, CONTEXTS};
 use crate::cuda::{self, DevBuf, Stream};
 use crate::{ffi, flux2vae, lora, moss, offload, qwen35, st, tokenizer};
 use anyhow::{bail, Context, Result};
@@ -12,9 +12,10 @@ use std::time::Instant;
 const MOSS_TEXT: usize = 300;
 
 pub struct MossRequest {
-    pub positive: Prompt,
+    /// The positive's conditioning entries, each its own model evaluation while it is active.
+    pub positive: Vec<Cond>,
     /// Only encoded when the sampling uses it.
-    pub negative: Prompt,
+    pub negative: Vec<Cond>,
     pub width: usize,
     pub height: usize,
     /// Its `images` are sampled together.
@@ -116,8 +117,9 @@ impl Moss {
         }).collect()
     }
 
-    /// Move the context of `key` to the end of the cache, encoding it if needed. `dump` sees the first chunk.
-    fn context(&mut self, key: &TokenKey, st: &Stream, mut dump: Option<&mut Dump>) -> Result<()> {
+    /// Move the context of `key` to the end of the cache, encoding it if needed, and keep at most `keep` contexts.
+    /// `dump` sees the first chunk.
+    fn context(&mut self, key: &TokenKey, keep: usize, st: &Stream, mut dump: Option<&mut Dump>) -> Result<()> {
         if touch(&mut self.contexts, |(p, _)| p == key) {
             return Ok(());
         }
@@ -158,9 +160,27 @@ impl Moss {
             ctx.ctx.download(0, &mut b, st)?;
             d.insert("text_embedder_out".into(), ("BF16".into(), vec![total, 3072], b));
         }
-        remember(&mut self.contexts, (key.clone(), ctx), CONTEXTS);
+        remember(&mut self.contexts, (key.clone(), ctx), keep);
         Ok(())
     }
+
+    /// Encode every key a run needs. They all stay cached for the run: the cache keeps at least as many as there are,
+    /// and drops back to [`CONTEXTS`] on the next run that needs fewer.
+    fn contexts_for(&mut self, keys: &[&TokenKey], st: &Stream, mut dump: Option<&mut Dump>) -> Result<()> {
+        let keep = CONTEXTS.max(distinct(keys));
+        while self.contexts.len() > keep {
+            self.contexts.remove(0);
+        }
+        for (i, key) in keys.iter().enumerate() {
+            self.context(key, keep, st, if i == 0 { dump.as_deref_mut() } else { None })?;
+        }
+        Ok(())
+    }
+}
+
+/// How many different values `items` holds.
+fn distinct<T: PartialEq>(items: &[T]) -> usize {
+    (0..items.len()).filter(|&i| !items[..i].contains(&items[i])).count()
 }
 
 impl super::Family {
@@ -267,40 +287,48 @@ impl Generator {
         let mut stats = Stats::default();
         let t0 = Instant::now();
         let guided = r.sampling.uses_negative();
-        let pos_key = f.key(&r.positive)?;
-        let neg_key = f.key(&r.negative)?;
-        if guided {
-            f.context(&neg_key, st, None)?;
+        if r.positive.is_empty() || (guided && r.negative.is_empty()) {
+            bail!("a prompt without conditioning entries");
         }
-        f.context(&pos_key, st, dump.as_deref_mut())?;
+        let pos_keys = r.positive.iter().map(|c| f.key(&c.prompt)).collect::<Result<Vec<_>>>()?;
+        let neg_keys = if guided { r.negative.iter().map(|c| f.key(&c.prompt)).collect::<Result<Vec<_>>>()? } else { Vec::new() };
+        f.contexts_for(&pos_keys.iter().chain(&neg_keys).collect::<Vec<_>>(), st, dump.as_deref_mut())?;
         stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;
 
         let m = f.model.as_mut().unwrap();
         let contexts = &f.contexts;
         let find = |p: &TokenKey| contexts.iter().find(|(k, _)| k == p).map(|(_, c)| c).unwrap();
-        let pos = find(&pos_key);
-        let neg = guided.then(|| find(&neg_key));
-        let rope = m.dit.rope(lh, lw, pos.len, st)?;
-        let neg_rope = neg.map(|c| m.dit.rope(lh, lw, c.len, st)).transpose()?;
-        let copied0 = m.dit.blocks.copied_bytes;
-        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, eval: usize, k: usize| -> Result<()> {
-            if negative {
-                return m.dit.predict(x, k, lh, lw, neg.unwrap(), neg_rope.as_ref().unwrap(), sigma, out, st, None);
+        let pos: Vec<&moss::Context> = pos_keys.iter().map(find).collect();
+        let neg: Vec<&moss::Context> = neg_keys.iter().map(find).collect();
+        // the rope tables by text length
+        let mut ropes: Vec<(usize, DevBuf)> = Vec::new();
+        for c in pos.iter().chain(&neg) {
+            if !ropes.iter().any(|(len, _)| *len == c.len) {
+                ropes.push((c.len, m.dit.rope(lh, lw, c.len, st)?));
             }
+        }
+        let rope_of = |c: &moss::Context| &ropes.iter().find(|(len, _)| *len == c.len).unwrap().1;
+        let copied0 = m.dit.blocks.copied_bytes;
+        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, side: Side, eval: usize, k: usize| -> Result<()> {
+            if side.negative {
+                let c = neg[side.entry];
+                return m.dit.predict(x, k, lh, lw, c, rope_of(c), sigma, out, st, None);
+            }
+            let c = pos[side.entry];
             if eval > 0 {
                 env.relieve(&mut m.dit.blocks, &m.st, k * step_need(r.width, r.height))?;
             }
             let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
             {
                 let mut probe = |name: &str, b: &DevBuf, bytes: usize| {
-                    if eval == 0 && matches!(name, "video_embedder_out" | "block0" | "block1" | "block41" | "final_tokens") {
+                    if eval == 0 && side.entry == 0 && matches!(name, "video_embedder_out" | "block0" | "block1" | "block41" | "final_tokens") {
                         let mut v = vec![0u8; bytes];
                         b.download(0, &mut v, st).unwrap();
                         probes.push((name.to_string(), v));
                     }
                 };
                 let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if dump.is_some() { Some(&mut probe) } else { None };
-                m.dit.predict(x, k, lh, lw, pos, &rope, sigma, out, st, probe_ref)?;
+                m.dit.predict(x, k, lh, lw, c, rope_of(c), sigma, out, st, probe_ref)?;
             }
             if let Some(dm) = dump.as_deref_mut() {
                 for (name, v) in probes {
@@ -309,7 +337,8 @@ impl Generator {
             }
             Ok(())
         };
-        let latent = run_batches(&r.sampling, &r.noise, together, st, &mut stats, &mut model, &mut progress)?;
+        let neg_regions = if guided { regions(&r.negative) } else { PLAIN.to_vec() };
+        let latent = run_batches(&r.sampling, &r.noise, [&regions(&r.positive), &neg_regions], together, st, &mut stats, &mut model, &mut progress)?;
         stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
         eprintln!("{:.2} GB streamed over PCIe", stats.streamed_gb);
         if let Some(dm) = dump {
@@ -341,5 +370,17 @@ impl Generator {
         let latent = vae.encode(&cropped, ch, cw, st)?;
         eprintln!("VAE encode {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
         Ok(Reference { latent, height: ch / 16, width: cw / 16 })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::distinct;
+
+    #[test]
+    fn distinct_counts_each_value_once() {
+        // an <alternate> prompt's entries repeat their keys
+        assert_eq!(distinct(&["a", "b", "a", "b", "c"]), 3);
+        assert_eq!(distinct::<u8>(&[]), 0);
     }
 }

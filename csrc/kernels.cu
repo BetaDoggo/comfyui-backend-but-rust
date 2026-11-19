@@ -1334,6 +1334,24 @@ GPU_API int gpu_attn_merge(const MergeGroups* groups, int n, void* out, int b, i
     return 0;
 }
 
+// x[rows[r] * stride + c] = rnd(x * factors[r]) for c < cols: a bf16 tensor times a float, as torch computes it
+// (Krea 2's attention token weights on v)
+__global__ void scale_rows_bf16_kernel(bf16* x, int64_t stride, const int* rows, const float* factors, int n, int cols) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)n * cols) return;
+    const int r = (int)(i / cols), c = (int)(i % cols);
+    bf16* p = x + (int64_t)rows[r] * stride + c;
+    *p = __float2bfloat16_rn(__bfloat162float(*p) * factors[r]);
+}
+
+GPU_API int gpu_scale_rows_bf16(void* x, int64_t stride, const int* rows, const float* factors, int n, int cols, void* stream) {
+    const int64_t total = (int64_t)n * cols;
+    if (total == 0) return 0;
+    scale_rows_bf16_kernel<<<(unsigned)((total + 255) / 256), 256, 0, (cudaStream_t)stream>>>((bf16*)x, stride, rows, factors, n, cols);
+    KCHECK();
+    return 0;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Activation steering (src/steer.rs): statistics of a block's output tokens, and a direction added to them.
 

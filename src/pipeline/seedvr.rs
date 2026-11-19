@@ -4,7 +4,7 @@
 //! job, and entering a family drops the previous one. Under ComfyUI's memory management (the default) the other model's
 //! weights only move to RAM to make room. Under `--legacy-offload` SeedVR2's blocks leave VRAM again after each run.
 
-use super::{run_sampler, upload, Generator, Sampling, Stats, Step};
+use super::{PLAIN, Side, run_sampler, upload, Generator, Sampling, Stats, Step};
 use crate::cuda::{self, DevBuf};
 use crate::{seedvr, seedvr_vae, st};
 use anyhow::{bail, Context, Result};
@@ -105,10 +105,11 @@ impl Generator {
         let copied0 = m.dit.blocks.copied_bytes;
         let latent = {
             let dit = &mut m.dit;
-            let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, _eval: usize| -> Result<()> {
+            let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, side: Side, _eval: usize| -> Result<()> {
+                let negative = side.negative;
                 dit.predict(x, &cond, r.frames, lh, lw, sigma, negative, out, st, None)
             };
-            run_sampler(&r.sampling, &r.noise, st, &mut stats, &mut model, &mut progress)
+            run_sampler(&r.sampling, &r.noise, [PLAIN, PLAIN], st, &mut stats, &mut model, &mut progress)
         };
         stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
         if !env.comfy {

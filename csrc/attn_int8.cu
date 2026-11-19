@@ -99,6 +99,61 @@ static int int8_attn(const void* q, const void* k, const void* v, void* o, void*
     return cudaGetLastError() == cudaSuccess ? 0 : -401;
 }
 
+extern "C" void launch_sage_prepare_key_mask(const void* mask, float* packed, int batch, int heads, int length, int64_t stride_b,
+    int64_t stride_h, int64_t stride_k, int dtype_code, cudaStream_t stream);
+
+// sage's prepared key mask row for lk keys: each key's bias, then one value per 128-key tile
+static int64_t key_mask_width(int lk) {
+    const int64_t tiles = (lk + 127) / 128;
+    return (tiles * 129 + 3) / 4 * 4;
+}
+
+extern "C" int64_t gpu_int8_attn_key_bias_workspace(int b, int h, int hk, int lq, int lk) {
+    return gpu_int8_attn_workspace_d(b, h, hk, lq, lk, 128) + (key_mask_width(lk) * 4 + 255) / 256 * 256;
+}
+
+// gpu_int8_attn with bias (f32 [lk], the same for every batch item, query and head) added to each key's logits, as an
+// additive attention mask. Long sequences take sage's prepared key mask, short ones its per-key mask.
+extern "C" int gpu_int8_attn_key_bias(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk,
+                                     int h, int hk, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs,
+                                     int64_t k_hs, int64_t v_bs, int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs,
+                                     int64_t o_hs, float scale, const float* bias, void* stream) {
+    const int D = 128, dt = 2;
+    try {
+        cudaStream_t st = (cudaStream_t)stream;
+        const int ck = cta_k_for(lk, D);
+        const int plk = (lk + ck - 1) / ck * ck;
+        char* p = (char*)ws;
+        auto take = [&](int64_t bytes) { char* r = p; p += (bytes + 255) / 256 * 256; return r; };
+        int8_t* qi = (int8_t*)take((int64_t)b * h * lq * D);
+        int8_t* ki = (int8_t*)take((int64_t)b * hk * lk * D);
+        float* qs = (float*)take((int64_t)b * h * ((lq + 127) / 128) * q_scales(D) * 4);
+        float* ks = (float*)take((int64_t)b * hk * ((lk + ck - 1) / ck) * 4 * 4);
+        int8_t* vi = (int8_t*)take((int64_t)b * hk * D * plk);
+        float* vs = (float*)take((int64_t)b * hk * D * 4);
+        void* anchors = take((int64_t)b * hk * 4);
+        float* packed = (float*)take(key_mask_width(lk) * 4);
+        launch_quant_qk_per_thread_int8(q, qi, qs, k, ki, ks, b, h, lq, hk, lk, D, 128, warp_q(D), ck, ck, q_bs, q_hs, q_rs,
+                                        k_bs, k_hs, k_rs, dt, anchors, st);
+        launch_quant_v_int8_kernel(v, vi, vs, b, hk, lk, D, plk, v_bs, v_hs, v_rs, dt, st);
+        const int64_t qh = (int64_t)lq * D, kh = (int64_t)lk * D, vh = (int64_t)D * plk;
+        // the mask's (batch, head, query, key) strides: one row for everything
+        const void* mask = bias;
+        const float* tile_bias = nullptr;
+        if (ck == 128) {
+            launch_sage_prepare_key_mask(bias, packed, 1, 1, lk, 0, 0, 1, 0, st);
+            mask = packed;
+            tile_bias = packed + (lk + 127) / 128 * 128;
+        }
+        launch_sage_attn_kernel(qi, ki, vi, o, qs, ks, vs, mask, 0, 0, 0, 1, 0, ck, b, lq, lk, h, hk, D, h * qh, D,
+                                qh, hk * kh, D, kh, hk * vh, vh, plk, o_bs, (int)o_rs, o_hs, scale, dt, st, tile_bias);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "int8 attention: %s\n", e.what());
+        return -400;
+    }
+    return cudaGetLastError() == cudaSuccess ? 0 : -401;
+}
+
 extern "C" int gpu_int8_attn(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk,
                               int h, int hk, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs,
                               int64_t k_hs, int64_t v_bs, int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs,

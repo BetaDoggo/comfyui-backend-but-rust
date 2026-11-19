@@ -50,8 +50,10 @@ const HK: usize = 8;
 const HD: usize = 128;
 const EPS: f32 = 1e-6;
 const THETA: f32 = 5_000_000.0;
-const IMAGE_PAD: u32 = 151655;
+pub const IMAGE_PAD: u32 = 151655;
 const IM_START: u32 = 151644;
+/// `<|endoftext|>`, ComfyUI's pad token for Qwen3-VL, which SwarmUI drops from each prompt piece's tokens.
+const PAD: u32 = 151643;
 const VISION_BLOCK: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 
 pub struct TextEncoder {
@@ -102,6 +104,58 @@ pub fn qwen21_prompt(prompt: &str, count: usize) -> String {
     format!("{QWEN21_SYSTEM}<|im_start|>user\n{}{prompt}<|im_end|>\n<|im_start|>assistant\n", refs.join(" "))
 }
 
+/// Rows of Qwen Image 2.1's conditioning of `ids` with `images` prompt images: the tokens from the second
+/// `<|im_start|>` on, without the image tokens.
+pub fn qwen21_rows(ids: &[u32], images: usize) -> usize {
+    let start = ids.iter().enumerate().filter(|(_, &t)| t == IM_START).nth(1).map_or(0, |(i, _)| i);
+    let mut pads = 0;
+    let mut rows = 0;
+    for (i, &t) in ids.iter().enumerate() {
+        let image = t == IMAGE_PAD && pads < images;
+        pads += (t == IMAGE_PAD) as usize;
+        rows += (i >= start && !image) as usize;
+    }
+    rows
+}
+
+/// SwarmUI's `token_weights_from_tokens`: (row, weight) of each token whose weight isn't 1, the tokens lined up with
+/// the last of the conditioning's `rows` rows.
+pub fn qwen21_weight_rows(weights: &[f32], rows: usize) -> Vec<(usize, f32)> {
+    let offset = rows as i64 - weights.len() as i64;
+    let at = |i: usize| usize::try_from(offset + i as i64).ok().filter(|&p| p < rows);
+    weights.iter().enumerate().filter(|(_, &w)| w != 1.0).filter_map(|(i, &w)| at(i).map(|p| (p, w))).collect()
+}
+
+/// Qwen Image 2.1's tokens of one `<break>` chunk of (text, weight) segments with `images` prompt images, and each
+/// token's weight, as SwarmTextEncodeAdvanced's `combine_leaves(per_leaf=True)` builds them: each segment tokenized
+/// alone, without pad tokens, and put in the template where `wrap_in_shell` finds the text goes. The template's
+/// tokens weigh 1.
+pub fn qwen21_tokens(tok: &Tokenizer, segments: &[(String, f32)], images: usize) -> Result<(Vec<u32>, Vec<f32>)> {
+    let empty = tok.encode(&qwen21_prompt("", images))?;
+    let probe = tok.encode(&qwen21_prompt("x", images))?;
+    let at = empty.iter().zip(&probe).take_while(|(a, b)| a == b).count();
+    let (mut ids, mut weights) = (empty[..at].to_vec(), vec![1.0; at]);
+    for (text, weight) in segments {
+        if names_embedding(text) {
+            return Err(crate::lora::Unsupported("textual inversion embeddings in prompts".into()).into());
+        }
+        // the tokenizer's escape_important: `\(` and `\)` are parentheses
+        let text = text.replace("\\)", ")").replace("\\(", "(");
+        for id in tok.encode(&text)?.into_iter().filter(|&t| t != PAD) {
+            ids.push(id);
+            weights.push(*weight);
+        }
+    }
+    ids.extend_from_slice(&empty[at..]);
+    weights.resize(ids.len(), 1.0);
+    Ok((ids, weights))
+}
+
+/// True when ComfyUI's tokenizer would read `text` as naming a textual inversion embedding.
+fn names_embedding(text: &str) -> bool {
+    text.starts_with("embedding:") || text.char_indices().any(|(i, c)| c.is_whitespace() && text[i + c.len_utf8()..].starts_with("embedding:"))
+}
+
 /// The prompt SwarmTextEncodeAdvanced builds for `count` images. Its `input_image_N` replacement
 /// never reaches the tokens, because the node tokenizes each prompt leaf apart from that step, so
 /// the text stays and every image follows the prompt.
@@ -111,6 +165,70 @@ pub fn image_prompt(prompt: &str, count: usize) -> String {
         text.push_str(&format!("Picture {i}: {VISION_BLOCK}"));
     }
     text
+}
+
+/// ComfyUI's SDTokenizer takes `\(` and `\)` as escaped parentheses, even with weights disabled.
+fn unescape(text: &str) -> String {
+    text.replace("\\)", ")").replace("\\(", "(")
+}
+
+/// ComfyUI's SDTokenizer reads a word starting `embedding:` at the start or after whitespace as an embedding, and drops
+/// it when there is none.
+fn check_embedding(text: &str) -> Result<()> {
+    let mut prev: Option<char> = None;
+    for (i, c) in text.char_indices() {
+        if prev.is_none_or(char::is_whitespace) && text[i..].starts_with("embedding:") {
+            return Err(crate::lora::Unsupported("embedding: in a Krea 2 prompt (ComfyUI reads it as an embedding)".into()).into());
+        }
+        prev = Some(c);
+    }
+    Ok(())
+}
+
+/// Token ids of a Krea 2 prompt chunk of (text, weight) segments, and each token's weight. With `leaves`, as
+/// SwarmTextEncodeAdvanced builds them (`combine_leaves(per_leaf=True)`): each segment is tokenized apart and put after
+/// the template's head, and the tail after them carries the `images` prompt images. Otherwise as CLIPTextEncode: the
+/// text joined and tokenized inside the template, unless it starts with `<|im_start|>`, with the images after the text.
+pub fn krea_tokens(tok: &Tokenizer, segments: &[(String, f32)], leaves: bool, images: usize) -> Result<(Vec<u32>, Vec<f32>)> {
+    if !leaves {
+        if segments.iter().any(|(_, w)| *w != 1.0) {
+            anyhow::bail!("prompt weights on a prompt tokenized as one text");
+        }
+        let text: String = segments.iter().map(|(t, _)| t.as_str()).collect();
+        check_embedding(&text)?;
+        let text = image_prompt(&unescape(&text), images);
+        let text = if text.starts_with("<|im_start|>") { text } else { TEMPLATE.replace("{}", &text) };
+        let ids = tok.encode(&text)?;
+        let weights = vec![1.0; ids.len()];
+        return Ok((ids, weights));
+    }
+    let (head, tail) = TEMPLATE.split_once("{}").unwrap();
+    let mut ids = tok.encode(head)?;
+    let mut weights = vec![1.0; ids.len()];
+    for (text, weight) in segments {
+        check_embedding(text)?;
+        ids.extend(tok.encode(&unescape(text))?.into_iter().filter(|&t| t != PAD));
+        weights.resize(ids.len(), *weight);
+    }
+    ids.extend(tok.encode(&(image_prompt("", images) + tail))?);
+    weights.resize(ids.len(), 1.0);
+    Ok((ids, weights))
+}
+
+/// Where Krea 2's conditioning starts: after the system turn and `<|im_start|>user\n` (Krea2TEModel.encode_token_weights).
+pub fn template_end(ids: &[u32]) -> usize {
+    let mut end = 0usize;
+    let mut count = 0;
+    for (i, &t) in ids.iter().enumerate() {
+        if t == IM_START && count < 2 {
+            end = i;
+            count += 1;
+        }
+    }
+    if ids.len() > end + 3 && ids[end + 1] == 872 && ids[end + 2] == 198 {
+        end += 3;
+    }
+    end
 }
 
 /// MRoPE positions (T, H, W) of `l` tokens with images at `spans` (start, tokens, merged grid), as
@@ -187,49 +305,59 @@ impl TextEncoder {
         crate::lora::apply(crate::lora::Arch::TextEncoder { comfy }, &self.st, self.spec.pre, vec![crate::offload::Store::Set(&mut self.ws)], &mut self.lora, loras, s0)
     }
 
-    pub fn tokenize(&self, prompt: &str) -> Result<Vec<u32>> {
-        self.tok.encode(&TEMPLATE.replace("{}", prompt))
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tok
     }
 
-    pub fn encode(&mut self, prompt: &str, st: &Stream) -> Result<Cond> {
-        self.encode_with_images(prompt, &[], 1.0, st)
-    }
-
-    /// `images` go in place of the prompt's first `<|image_pad|>` tokens; add them with [`image_prompt`].
-    /// `scale` multiplies the conditioning.
-    pub fn encode_with_images(&mut self, prompt: &str, images: &[&Embeds], scale: f32, st: &Stream) -> Result<Cond> {
-        let ids = self.tokenize(prompt)?;
-        let (taps, l, _) = self.forward(&ids, images, st)?;
-        let l0 = ids.len();
-
-        // Drop the system prompt + "<|im_start|>user\n" (Krea2TEModel.encode_token_weights).
-        let mut template_end = 0usize;
-        let mut count = 0;
-        for (i, &t) in ids.iter().enumerate() {
-            if t == IM_START && count < 2 {
-                template_end = i;
-                count += 1;
-            }
-        }
-        if l0 > template_end + 3 && ids[template_end + 1] == 872 && ids[template_end + 2] == 198 {
-            template_end += 3;
-        }
+    /// Krea 2's conditioning of `ids` (from [`krea_tokens`]): `images` go in place of the first `<|image_pad|>` tokens,
+    /// and the system turn is dropped. Then its `rows` (conditioning row, factor) are multiplied by their factors and
+    /// every row by `whole`, as SwarmTextEncodeAdvanced weights it, and every row by `scale` (`ConditioningMultiply`).
+    pub fn encode_krea(&mut self, ids: &[u32], images: &[&Embeds], rows: &[(usize, f32)], whole: f32, scale: f32, st: &Stream)
+        -> Result<Cond> {
+        let (taps, l, _) = self.forward(ids, images, st)?;
+        let template_end = template_end(ids);
         let len = l - template_end;
         let width = self.spec.taps.len() * self.spec.d;
+        let times = |first: usize, count: usize, c: f32| -> Result<()> {
+            let x = off(taps.ptr(), first * width * 4);
+            let (p, c) = ([x as crate::ffi::P], [c]);
+            k!(gpu_lincomb(x, (count * width) as i64, 1, p.as_ptr(), c.as_ptr(), s(st)))
+        };
+        // runs of consecutive rows with one factor
+        let mut i = 0;
+        while i < rows.len() {
+            let (pos, f) = rows[i];
+            if pos >= len {
+                anyhow::bail!("weighted row {pos} past the conditioning's {len}");
+            }
+            let n = rows[i..].iter().enumerate().take_while(|(j, r)| r.0 == pos + j && r.1 == f && r.0 < len).count();
+            times(template_end + pos, n, f)?;
+            i += n;
+        }
+        if whole != 1.0 {
+            times(template_end, len, whole)?;
+        }
         if scale != 1.0 {
             let (p, c) = ([taps.ptr() as crate::ffi::P], [scale]);
             k!(gpu_lincomb(taps.ptr(), (l * width) as i64, 1, p.as_ptr(), c.as_ptr(), s(st)))?;
         }
         let ctx = DevBuf::alloc_async(len * width * 2, st)?;
         k!(gpu_f32_to_bf16(off(taps.ptr(), template_end * width * 4), ctx.ptr(), (len * width) as i64, s(st)))?;
-        Ok(Cond { ctx, len, width, token_ids: ids, slots: Vec::new() })
+        Ok(Cond { ctx, len, width, token_ids: ids.to_vec(), slots: Vec::new() })
     }
 
-    /// Qwen Image 2.1's conditioning of `prompt` (see [`qwen21_prompt`]): the hidden state after the last layer, without
-    /// the system turn, and, unless `keep_vision`, without the image tokens, which the DiT replaces by reference latents.
-    /// `slots` of the result say where each of them was.
-    pub fn encode_qwen21(&mut self, prompt: &str, images: &[&Embeds], keep_vision: bool, scale: f32, st: &Stream) -> Result<Cond> {
-        let ids = self.tok.encode(prompt)?;
+    /// [`qwen21_tokens`] with this encoder's tokenizer.
+    pub fn qwen21_tokens(&self, segments: &[(String, f32)], images: usize) -> Result<(Vec<u32>, Vec<f32>)> {
+        qwen21_tokens(&self.tok, segments, images)
+    }
+
+    /// Qwen Image 2.1's conditioning of `ids` (see [`TextEncoder::qwen21_tokens`]): the hidden state after the last
+    /// layer, without the system turn, and, unless `keep_vision`, without the image tokens, which the DiT replaces by
+    /// reference latents. `slots` of the result say where each of them was. Each of `row_weights` (row of the result,
+    /// factor) multiplies a row, before `scale` multiplies them all.
+    pub fn encode_qwen21(&mut self, ids: &[u32], images: &[&Embeds], keep_vision: bool, row_weights: &[(usize, f32)], scale: f32, st: &Stream)
+        -> Result<Cond> {
+        let ids = ids.to_vec();
         let (taps, l, spans) = self.forward(&ids, images, st)?;
         // positions in the sequence with the images in it
         let (mut starts, mut grown, mut next) = (Vec::new(), 0, spans.iter());
@@ -252,6 +380,14 @@ impl TextEncoder {
             }
         }
         let (width, len) = (self.spec.d, keep.iter().filter(|k| **k).count());
+        if !row_weights.is_empty() {
+            let kept: Vec<usize> = (0..l).filter(|&i| keep[i]).collect();
+            for &(row, w) in row_weights {
+                let Some(&i) = kept.get(row) else { anyhow::bail!("a weight on row {row} of a {len} row conditioning") };
+                let (p, c) = ([off(taps.ptr(), i * width * 4) as crate::ffi::P], [w]);
+                k!(gpu_lincomb(off(taps.ptr(), i * width * 4), width as i64, 1, p.as_ptr(), c.as_ptr(), s(st)))?;
+            }
+        }
         if scale != 1.0 {
             let (p, c) = ([taps.ptr() as crate::ffi::P], [scale]);
             k!(gpu_lincomb(taps.ptr(), (l * width) as i64, 1, p.as_ptr(), c.as_ptr(), s(st)))?;
@@ -394,6 +530,98 @@ mod tests {
         let block = VISION_BLOCK;
         assert_eq!(image_prompt("lake", 1), format!("lakePicture 1: {block}"));
         assert_eq!(image_prompt("a input_image_2", 2), format!("a input_image_2Picture 1: {block}Picture 2: {block}"));
+    }
+
+    /// SwarmTextEncodeAdvanced's tokens on ComfyUI's QwenImage21Tokenizer, from SwarmUI's own code: the ids after the
+    /// system turn, the conditioning's rows and the weighted ones.
+    #[test]
+    fn qwen21_tokens_match_swarm() {
+        let tok = Tokenizer::new().unwrap();
+        let system = [151644, 8948, 198, 1092, 30782, 408, 323, 23643, 279, 3897, 9934, 13, 151645, 198];
+        let images = [151644, 872, 198, 27, 1805, 16, 29, 151652, 151655, 151653, 366, 1805, 17, 29, 151652, 151655, 151653];
+        let end = [151645, 198, 151644, 77091, 198];
+        let seg = |s: &[(&str, f32)]| s.iter().map(|(t, w)| (t.to_string(), *w)).collect::<Vec<_>>();
+        type Case<'a> = (Vec<(String, f32)>, &'a [u32], &'a [(usize, f32)]);
+        let cases: [Case; 6] = [
+            (seg(&[("a ", 1.0), ("red", 1.5), (" boat", 1.0)]), &[64, 220, 1151, 15328], &[(5, 1.5)]),
+            (seg(&[("lake, ", 1.0), ("pine ", 1.3), ("bark", 2.6), (" (sky:1.2)", 1.0)]),
+                &[62110, 11, 220, 38038, 220, 65, 838, 320, 26684, 25, 16, 13, 17, 8], &[(6, 1.3), (7, 1.3), (8, 2.6), (9, 2.6)]),
+            (seg(&[("a \\(b\\) c", 1.0)]), &[64, 320, 65, 8, 272], &[]),
+            (seg(&[("a", 1.0), ("b", 2.0), ("c", 1.0)]), &[64, 65, 66], &[(4, 2.0)]),
+            // tokenized apart from the template's newline
+            (seg(&[("\n\nfog over hills", 1.0)]), &[271, 69, 538, 916, 34131], &[]),
+            (seg(&[("fog", 0.5), (" and ", 1.0), ("rain", 1.5)]), &[69, 538, 323, 220, 29093], &[(3, 0.5), (4, 0.5), (7, 1.5)]),
+        ];
+        for (segments, content, weighted) in cases {
+            for n in [0, 2] {
+                let (ids, weights) = qwen21_tokens(&tok, &segments, n).unwrap();
+                let head: &[u32] = if n == 0 { &images[..3] } else { &images };
+                let want: Vec<u32> = [&system[..], head, content, &end].concat();
+                assert_eq!(ids, want, "{segments:?} with {n} images");
+                let rows = qwen21_rows(&ids, n);
+                assert_eq!(rows, want.len() - system.len() - n);
+                // the images take no rows, and shift the text by the 12 tokens around them
+                let shift = if n == 0 { 0 } else { 12 };
+                let expect: Vec<(usize, f32)> = weighted.iter().map(|&(r, w)| (r + shift, w)).collect();
+                assert_eq!(qwen21_weight_rows(&weights, rows), expect);
+            }
+        }
+        assert!(qwen21_tokens(&tok, &seg(&[("a embedding:x", 1.0)]), 0).is_err());
+    }
+
+    /// Tokens after `<|im_start|>user\n`, and their weights.
+    fn content(segments: &[(&str, f32)], leaves: bool, images: usize) -> (Vec<u32>, Vec<f32>) {
+        let tok = Tokenizer::new().unwrap();
+        let segments: Vec<(String, f32)> = segments.iter().map(|(t, w)| (t.to_string(), *w)).collect();
+        let (ids, weights) = krea_tokens(&tok, &segments, leaves, images).unwrap();
+        let head = if ids[0] == IM_START && ids[1] == 872 { 3 } else { 34 };
+        assert_eq!(ids.len(), weights.len());
+        (ids[head..].to_vec(), weights[head..].to_vec())
+    }
+
+    const TAIL: [u32; 5] = [151645, 198, 151644, 77091, 198];
+
+    #[test]
+    fn leaves_match_swarm_text_encode_advanced() {
+        // ids and weights from SwarmTextEncodeAdvanced's combine_leaves(per_leaf=True) on ComfyUI's Krea2Tokenizer
+        let (ids, w) = content(&[("a ", 1.0), ("red", 1.5), (" boat", 1.0)], true, 0);
+        assert_eq!(ids, [&[64, 220, 1151, 15328][..], &TAIL].concat());
+        assert_eq!(w[..4], [1.0, 1.0, 1.5, 1.0]);
+        let (ids, _) = content(&[("a misty lake ", 1.0), ("<foo>", 1.0), (" at dawn", 1.0)], true, 0);
+        assert_eq!(ids, [&[64, 8600, 88, 21800, 220, 27, 7975, 29, 518, 38393][..], &TAIL].concat());
+        let (ids, _) = content(&[("\npine forest", 1.0)], true, 0);
+        assert_eq!(ids, [&[198, 38038, 13638][..], &TAIL].concat());
+        let (ids, _) = content(&[(r"a \(red\) (b:1.1) boat", 1.0)], true, 0);
+        assert_eq!(ids, [&[64, 320, 1151, 8, 320, 65, 25, 16, 13, 16, 8, 15328][..], &TAIL].concat());
+        let (ids, _) = content(&[], true, 0);
+        assert_eq!(ids, TAIL);
+        // prompt images follow every leaf
+        let (ids, w) = content(&[("a ", 1.0), ("red", 1.5), (" lake", 1.0)], true, 2);
+        let picture = |n| [24669, 220, n, 25, 220, 151652, 151655, 151653];
+        assert_eq!(ids, [&[64, 220, 1151, 21800][..], &picture(16), &picture(17), &TAIL].concat());
+        assert_eq!(w.iter().filter(|w| **w != 1.0).count(), 1);
+    }
+
+    #[test]
+    fn joined_text_matches_clip_text_encode() {
+        // Krea2Tokenizer.tokenize_with_weights: "\n" joins the template's, and a text starting <|im_start|> has no template
+        assert_eq!(content(&[("a lake at dawn", 1.0)], false, 0).0, [&[64, 21800, 518, 38393][..], &TAIL].concat());
+        let tok = Tokenizer::new().unwrap();
+        let joined = |t: &str| krea_tokens(&tok, &[(t.to_string(), 1.0)], false, 0).unwrap().0;
+        assert_eq!(joined("\nlake")[31..], [&[151644, 872, 271, 62110][..], &TAIL].concat());
+        assert_eq!(joined("  \n lake")[31..], [&[151644, 872, 13887, 21800][..], &TAIL].concat());
+        assert_eq!(joined(r"a \(red\) boat")[31..], [&[151644, 872, 198, 64, 320, 1151, 8, 15328][..], &TAIL].concat());
+        assert_eq!(joined("<|im_start|>user\nlake<|im_end|>"), [151644, 872, 198, 62110, 151645]);
+        assert_eq!(template_end(&joined("a lake at dawn")), 34);
+    }
+
+    #[test]
+    fn embedding_words_are_refused() {
+        let tok = Tokenizer::new().unwrap();
+        for (t, leaves) in [("embedding:x", true), ("a embedding:x", true), ("a\nembedding:x", false), ("embedding:x", false)] {
+            assert!(krea_tokens(&tok, &[(t.to_string(), 1.0)], leaves, 0).is_err(), "{t:?}");
+        }
+        assert!(krea_tokens(&tok, &[("a_embedding:x".to_string(), 1.0)], true, 0).is_ok());
     }
 
     #[test]

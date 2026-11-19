@@ -1,6 +1,6 @@
 //! Anima: its diffusion model, its Qwen3 text encoder and the prompts encoded through them. The VAE is the generator's.
 
-use super::{nothing_for, remember, run_batches, scale_rows, touch};
+use super::{regions, Cond, PLAIN, Side, nothing_for, remember, run_batches, scale_rows, touch};
 use super::{Dump, FamilyState, Generator, Kind, Prompt, Reference, Sampling, SharedTe, Stats, Step, CONTEXTS};
 use crate::cuda::{self, DevBuf, Stream};
 use crate::{anima, dit, lora, offload, qwen3, snapref, st, tokenizer, vae};
@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub struct AnimaRequest {
-    /// One chunk of segments, see [`tokenizer::token_weights`]
-    pub positive: Prompt,
+    /// The positive side's conditioning entries, mixed as ComfyUI's `calc_cond_batch` does. A prompt's chunks are
+    /// segments (see [`tokenizer::token_weights`]), joined as [`chunk_tokens`] says.
+    pub positive: Vec<Cond>,
     /// Only encoded when the sampling uses it.
-    pub negative: Prompt,
+    pub negative: Vec<Cond>,
     pub width: usize,
     pub height: usize,
     /// Its `images` are sampled together.
@@ -224,6 +225,21 @@ fn anima_need(width: usize, height: usize, images: usize) -> usize {
     (images * step_need(width, height)).max(vae::Vae::activation_bytes(height / 8, width / 8))
 }
 
+/// The tokens of a prompt's `<break>` chunks, as SwarmTextEncodeAdvanced joins their conditioning: each chunk's Qwen3
+/// ids, encoded apart and their hidden states concatenated along tokens, and the first chunk's T5 ids and weights,
+/// the only extras the joined conditioning keeps. The LLM adapter then reads every chunk's states (at positions that
+/// run on across chunks) with the first chunk's T5 tokens; the later chunks' T5 ids and weights are dropped.
+fn chunk_tokens(tq: &tokenizer::Tokenizer, tt: &tokenizer::T5Tokenizer, chunks: &[Vec<(String, f32)>])
+    -> Result<(Vec<Vec<u32>>, Vec<u32>, Vec<f32>)> {
+    let (first, rest) = chunks.split_first().context("a prompt without chunks")?;
+    let (q, tids, weights) = tokenizer::anima_tokens(tq, tt, first)?;
+    let mut qids = vec![q];
+    for chunk in rest {
+        qids.push(tokenizer::anima_tokens(tq, tt, chunk)?.0);
+    }
+    Ok((qids, tids, weights))
+}
+
 impl Anima {
     /// Move `prompt`'s context to the end of the cache, encoding it if needed.
     fn context(&mut self, prompt: &Prompt, st: &Stream, dump: Option<&mut Dump>) -> Result<()> {
@@ -234,8 +250,21 @@ impl Anima {
         let te = &mut self.te.as_mut().context("no text encoder loaded")?.1;
         let (tq, tt) = self.tokenizers.as_ref().context("no text encoder loaded")?;
         let t0 = Instant::now();
-        let (qids, tids, weights) = tokenizer::anima_tokens(tq, tt, prompt.segments()?)?;
-        let hidden = te.encode(&qids, st)?;
+        let (chunks, tids, weights) = chunk_tokens(tq, tt, &prompt.chunks)?;
+        let qids: Vec<u32> = chunks.concat();
+        let row = qwen3::D * 4;
+        let hidden = if let [ids] = chunks.as_slice() {
+            te.encode(ids, st)?
+        } else {
+            let joined = DevBuf::alloc_async(qids.len() * row, st)?;
+            let mut at = 0;
+            for ids in &chunks {
+                let h = te.encode(ids, st)?;
+                cuda::memcpy_d2d(joined.at(at * row), h.ptr(), ids.len() * row, st)?;
+                at += ids.len();
+            }
+            joined
+        };
         scale_rows(&hidden, qwen3::D, &vec![prompt.scale; qids.len()], st)?;
         let ctx = m.dit.encode_context(&m.st, &hidden, qids.len(), &tids, &weights, st)?;
         st.sync()?;
@@ -254,6 +283,32 @@ impl Anima {
         remember(&mut self.contexts, (prompt.clone(), ctx), CONTEXTS);
         Ok(())
     }
+
+    /// The contexts of a run's prompts, each prompt once, taken out of the cache so that none is dropped while the run
+    /// needs it; [`Self::restore`] puts them back. `dump` goes with the first prompt, if it is encoded.
+    fn take_contexts(&mut self, prompts: &[&Prompt], st: &Stream, mut dump: Option<&mut Dump>) -> Result<Vec<(Prompt, anima::Context)>> {
+        let mut out: Vec<(Prompt, anima::Context)> = Vec::new();
+        for (i, p) in prompts.iter().enumerate() {
+            if out.iter().any(|(k, _)| k == *p) {
+                continue;
+            }
+            self.context(p, st, if i == 0 { dump.take() } else { None })?;
+            out.push(self.contexts.pop().context("prompt not encoded")?);
+        }
+        Ok(out)
+    }
+
+    /// Back into the cache after a run, the first most recent.
+    fn restore(&mut self, contexts: Vec<(Prompt, anima::Context)>) {
+        for c in contexts.into_iter().rev() {
+            remember(&mut self.contexts, c, CONTEXTS);
+        }
+    }
+}
+
+/// Each entry's place in the contexts [`Anima::take_contexts`] gave.
+fn entry_contexts<C>(conds: &[Cond], contexts: &[(Prompt, C)]) -> Result<Vec<usize>> {
+    conds.iter().map(|c| contexts.iter().position(|(p, _)| *p == c.prompt).context("prompt not encoded")).collect()
 }
 
 impl Anima {
@@ -437,6 +492,13 @@ impl Generator {
         let st = &env.st;
         let mut stats = Stats::default();
         let t0 = Instant::now();
+        let guided = r.sampling.uses_negative();
+        if r.positive.is_empty() || (guided && r.negative.is_empty()) {
+            bail!("a prompt without conditioning entries");
+        }
+        if r.positive.len() > 1 && a.model.as_ref().is_some_and(|m| m.dit.recorder.is_some() || m.dit.sampler.is_some()) {
+            bail!("recording block outputs takes one positive conditioning entry");
+        }
         if let Some(sr) = &r.snapref {
             if sr.references.is_empty() || sr.references.len() != sr.biases.len() {
                 bail!("SnapRef needs one bias per reference, and at least one reference");
@@ -471,6 +533,18 @@ impl Generator {
         // shared attention: the reference's keys beside each image's; AdaIN alone keeps no keys
         let style_attention = style.as_ref().is_some_and(|s| s.attention);
         let snap_need = snap_need + if style_attention { anima::snapref_step_bytes((lh / 2) * (lw / 2), style_rows, 1) } else { 0 };
+        if style.is_some() && r.snapref.is_some() {
+            bail!("a style reference and SnapRef can't be used together");
+        }
+        // every entry's context, out of the cache for the whole run, before residency is planned around them
+        let mut prompts: Vec<&Prompt> = r.positive.iter().map(|c| &c.prompt).collect();
+        if guided {
+            prompts.extend(r.negative.iter().map(|c| &c.prompt));
+        }
+        if let Some(s) = &style {
+            prompts.push(&s.caption);
+        }
+        let contexts = a.take_contexts(&prompts, st, dump.as_deref_mut())?;
         let together = {
             let m = a.model.as_mut().context("no diffusion model loaded")?;
             let style_fixed = if style.is_some() {
@@ -482,17 +556,6 @@ impl Generator {
             env.plan(&mut m.dit.blocks, &m.st, anima_need(r.width, r.height, together) + together * snap_need + style_fixed)?;
             together
         };
-        if let Some(s) = &style {
-            if r.snapref.is_some() {
-                bail!("a style reference and SnapRef can't be used together");
-            }
-            a.context(&s.caption, st, None)?;
-        }
-        let guided = r.sampling.uses_negative();
-        if guided {
-            a.context(&r.negative, st, None)?;
-        }
-        a.context(&r.positive, st, dump.as_deref_mut())?;
         stats.text_ms = t0.elapsed().as_secs_f64() * 1e3;
 
         let m = a.model.as_mut().unwrap();
@@ -513,11 +576,11 @@ impl Generator {
             (Some(_), _, _) => bail!("SnapRef's references weren't encoded"),
             _ => (anima::Pass::Plain, anima::Pass::Plain),
         };
-        let contexts = &a.contexts;
-        let find = |p: &Prompt| contexts.iter().find(|(k, _)| k == p).map(|(_, c)| c).unwrap();
-        let pos = find(&r.positive);
-        let neg = guided.then(|| find(&r.negative));
-        let style_ctx = style.as_ref().map(|s| find(&s.caption));
+        let pos_at = entry_contexts(&r.positive, &contexts)?;
+        let neg_at = if guided { entry_contexts(&r.negative, &contexts)? } else { Vec::new() };
+        let ctx = |at: &[usize], entry: usize| at.get(entry).map(|&i| &contexts[i].1).context("no such conditioning entry");
+        let style_ctx = style.as_ref().map(|s| contexts.iter().find(|(p, _)| *p == s.caption).map(|(_, c)| c).context("caption not encoded"))
+            .transpose()?;
         let style_buf = match &style {
             Some(s) => {
                 let (rh, rw) = (s.reference.height, s.reference.width);
@@ -549,7 +612,10 @@ impl Generator {
         let rope = m.dit.rope(lh / 2, lw / 2, st)?;
         let copied0 = m.dit.blocks.copied_bytes;
         let sigmas = r.sampling.sigmas.clone();
-        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, negative: bool, eval: usize, k: usize| -> Result<()> {
+        // the sigma the style reference last ran at: it depends on nothing else, so a side's other entries reuse it
+        let mut style_at: Option<u32> = None;
+        let mut model = |x: &DevBuf, out: &DevBuf, sigma: f32, side: Side, eval: usize, k: usize| -> Result<()> {
+            let negative = side.negative;
             // the step whose sigma this is, for activation steering; a solver's intermediate sigma takes the step it is in
             m.dit.step = sigmas.windows(2).position(|w| sigma <= w[0] && sigma > w[1]);
             m.dit.negative = negative;
@@ -564,7 +630,7 @@ impl Generator {
                     }
                 };
                 let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if dump.is_some() { Some(&mut probe) } else { None };
-                m.dit.predict(x, k, lh, lw, neg.unwrap(), &rope, sigma, out, st, &neg_pass, probe_ref)?;
+                m.dit.predict(x, k, lh, lw, ctx(&neg_at, side.entry)?, &rope, sigma, out, st, &neg_pass, probe_ref)?;
                 if let (Some(dm), Some(v)) = (dump.as_deref_mut(), first) {
                     dm.insert("neg_block0".into(), ("BF16".into(), vec![v.len() / 2], v));
                 }
@@ -579,10 +645,13 @@ impl Generator {
             }
             let pos_pass = match (&style, &style_buf, m.dit.step) {
                 (Some(s), Some((kv, noise, xref, read)), Some(step)) if (s.steps.0..s.steps.1).contains(&step) => {
-                    let mix: Vec<f32> = s.reference.latent.iter().zip(noise).map(|(x0, e)| (1.0 - sigma) * x0 + sigma * e).collect();
-                    xref.upload(0, &st::f32_bytes(&mix), st)?;
-                    let (rh, rw) = (s.reference.height, s.reference.width);
-                    m.dit.encode_style_reference(xref, rh, rw, (lh, lw), sigma, s.frame, style_ctx.unwrap(), kv.as_ref(), st)?;
+                    if style_at != Some(sigma.to_bits()) {
+                        let mix: Vec<f32> = s.reference.latent.iter().zip(noise).map(|(x0, e)| (1.0 - sigma) * x0 + sigma * e).collect();
+                        xref.upload(0, &st::f32_bytes(&mix), st)?;
+                        let (rh, rw) = (s.reference.height, s.reference.width);
+                        m.dit.encode_style_reference(xref, rh, rw, (lh, lw), sigma, s.frame, style_ctx.unwrap(), kv.as_ref(), st)?;
+                        style_at = Some(sigma.to_bits());
+                    }
                     if let Some(ad) = m.dit.adain.as_mut() {
                         ad.active = true;
                     }
@@ -603,7 +672,7 @@ impl Generator {
                     }
                 };
                 let probe_ref: Option<&mut dyn FnMut(&str, &DevBuf, usize)> = if dump.is_some() { Some(&mut probe) } else { None };
-                m.dit.predict(x, k, lh, lw, pos, &rope, sigma, out, st, &pos_pass, probe_ref)?;
+                m.dit.predict(x, k, lh, lw, ctx(&pos_at, side.entry)?, &rope, sigma, out, st, &pos_pass, probe_ref)?;
             }
             if let Some(dm) = dump.as_deref_mut() {
                 for (name, v) in probes {
@@ -612,15 +681,68 @@ impl Generator {
             }
             Ok(())
         };
-        let latent = run_batches(&r.sampling, &r.noise, together, st, &mut stats, &mut model, &mut progress)?;
+        let neg_regions = if guided { regions(&r.negative) } else { PLAIN.to_vec() };
+        let latent = run_batches(&r.sampling, &r.noise, [&regions(&r.positive), &neg_regions], together, st, &mut stats, &mut model, &mut progress);
         m.dit.step = None;
         m.dit.ref_blocks = (0, usize::MAX);
         m.dit.adain = None;
+        a.restore(contexts);
+        let latent = latent?;
+        let m = a.model.as_mut().unwrap();
         stats.streamed_gb = (m.dit.blocks.copied_bytes - copied0) as f64 / 1e9;
         eprintln!("{:.2} GB streamed over PCIe", stats.streamed_gb);
         if let Some(dm) = dump {
             dm.insert("samples".into(), ("F32".into(), vec![dit::CH, lh, lw], st::f32_bytes(&latent).to_vec()));
         }
         Ok((latent, stats))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokens(chunks: &[Vec<(String, f32)>]) -> (Vec<Vec<u32>>, Vec<u32>, Vec<f32>) {
+        chunk_tokens(&tokenizer::Tokenizer::new().unwrap(), &tokenizer::T5Tokenizer::new().unwrap(), chunks).unwrap()
+    }
+
+    fn seg(text: &str, weight: f32) -> (String, f32) {
+        (text.to_string(), weight)
+    }
+
+    // ids from SwarmTextEncodeAdvanced's combine_leaves on ComfyUI's AnimaTokenizer, chunk by chunk
+    #[test]
+    fn breaks_join_qwen_chunks_and_keep_the_first_t5() {
+        // "lake<break>pine forest"
+        let (q, t, w) = tokens(&[vec![seg("lake", 1.0)], vec![seg("pine forest", 1.0)]]);
+        assert_eq!(q, [vec![62110], vec![38038, 13638]]);
+        assert_eq!((t, w), (vec![6957, 1], vec![1.0, 1.0]));
+        // "<break>b" and "a<break>": an empty chunk is one Qwen3 pad token, and only T5's end token
+        let (q, t, _) = tokens(&[vec![], vec![seg("b", 1.0)]]);
+        assert_eq!((q, t), (vec![vec![151643], vec![65]], vec![1]));
+        let (q, t, _) = tokens(&[vec![seg("a", 1.0)], vec![]]);
+        assert_eq!((q, t), (vec![vec![64], vec![151643]], vec![3, 9, 1]));
+    }
+
+    #[test]
+    fn weights_stay_on_the_first_chunks_t5_tokens() {
+        // "a <weight[1.5]:red> boat<break>sky"
+        let (q, t, w) = tokens(&[vec![seg("a ", 1.0), seg("red", 1.5), seg(" boat", 1.0)], vec![seg("sky", 1.0)]]);
+        assert_eq!(q[0], [64, 220, 1151, 15328]);
+        assert_eq!(t, [3, 9, 1131, 3432, 1]);
+        assert_eq!(w, [1.0, 1.0, 1.5, 1.0, 1.0]);
+        assert!(chunk_tokens(&tokenizer::Tokenizer::new().unwrap(), &tokenizer::T5Tokenizer::new().unwrap(), &[]).is_err());
+    }
+
+    #[test]
+    fn entries_find_their_deduplicated_contexts() {
+        let p = |t: &str| Prompt::text(t);
+        let conds = [Cond::plain(p("a")), Cond::plain(p("b")), Cond::plain(p("a"))];
+        // as take_contexts gives them: each prompt once, in first-use order
+        let contexts = [(p("a"), ()), (p("b"), ())];
+        assert_eq!(entry_contexts(&conds, &contexts).unwrap(), [0, 1, 0]);
+        // ConditioningMultiply's scale is part of the prompt's context
+        let scaled = Cond::plain(Prompt { scale: 0.5, ..p("a") });
+        assert!(entry_contexts(&[scaled], &contexts).is_err());
     }
 }

@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use diffusion::h3;
 use diffusion::h3window;
 use diffusion::pipeline::{
-    AnimaRequest, Cancelled, Generator, H3Conds, H3Request, Inpaint, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Sampling, SdRequest, SeedVrRequest,
-    SizeCond, SnapRefRequest, Step, StyleRequest,
+    AnimaRequest, Cancelled, Cond, Generator, H3Conds, H3Request, Inpaint, KreaEntry, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Region, Sampling, SdRequest,
+    SeedVrRequest, SizeCond, SnapRefRequest, Step, StyleRequest,
 };
 use diffusion::pixal3d;
 use diffusion::triposplat;
@@ -129,8 +129,8 @@ pub struct NativeEngine {
 /// really needed: at CFG 1 the negative is never read.
 struct DeferredCond {
     text_encoder: PathBuf,
-    /// `<break>` chunks of (text, weight) segments; a Krea 2 chunk is one segment of weight 1.
-    prompt: Result<Vec<Vec<(String, f32)>>, String>,
+    /// The prompt's pieces over sampling progress (one, unless it has `<alternate>` or `<fromto>`).
+    prompt: Result<Vec<Piece>, String>,
     /// Krea 2, Qwen Image 2.1 and MiniMax H3: prompt images for the vision tower.
     images: Vec<PromptImage>,
     /// `LoraLoader`'s clip half.
@@ -141,6 +141,8 @@ struct DeferredCond {
     clip_layer: Option<i32>,
     /// SDXL: the size conditioning `CLIPTextEncodeSDXL` or `SwarmTextEncodeAdvanced` set; `None` takes the latent's.
     sdxl_size: Option<SdxlSize>,
+    /// SwarmTextEncodeAdvanced's prompt, which it tokenizes leaf by leaf (`combine_leaves(per_leaf=True)`).
+    leaves: bool,
 }
 
 /// Sampled latents, `[B, 16, H/8, W/8]`, or `[B, 128, H/16, W/16]` for MOSS Image.
@@ -313,15 +315,64 @@ fn is_qwen3_600m(file: &ModelFile) -> bool {
     read_header(&file.path).is_ok_and(|h| h["model.layers.0.input_layernorm.weight"]["shape"][0] == 1024)
 }
 
-/// A prompt's `<break>` chunks of (text, weight) segments, or why it needs something the pipeline
-/// doesn't have.
-fn prompt_chunks(p: &ParsedPrompt, steps: u32, family: Family) -> Result<Vec<Vec<(String, f32)>>, String> {
-    if p.has_steps() {
-        return Err("<alternate> and <fromto> prompts".into());
+/// `<break>` chunks, each (text, weight) segments.
+type Chunks = Vec<Vec<(String, f32)>>;
+
+/// A prompt over a range of sampling progress: SwarmTextEncodeAdvanced's conditioning entries.
+#[derive(Clone, Debug, PartialEq)]
+struct Piece {
+    start_percent: f64,
+    end_percent: f64,
+    chunks: Chunks,
+}
+
+impl Piece {
+    fn whole(chunks: Chunks) -> Self {
+        Piece { start_percent: 0.0, end_percent: 1.0, chunks }
     }
-    let chunks = p.chunks(0, steps.max(1));
-    if chunks.len() != 1 && matches!(family, Family::Anima | Family::H3 | Family::H3Image | Family::Qwen21) {
-        return Err("<break> in prompts".into());
+}
+
+/// A prompt's pieces, as SwarmTextEncodeAdvanced builds them: one for the whole run, or with `<alternate>` and
+/// `<fromto>` one per run of steps whose leaves are the same, its range widened by 0.001 on each side (the first from
+/// -0.001, the last to 1). Or why it needs something the pipeline doesn't have.
+fn prompt_pieces(p: &ParsedPrompt, steps: u32, family: Family) -> Result<Vec<Piece>, String> {
+    let steps = steps.max(1);
+    if !p.has_steps() {
+        return Ok(vec![Piece::whole(prompt_chunks(&p.flatten(0, steps), family)?)]);
+    }
+    let mut pieces = Vec::new();
+    let (mut last, mut start) = (p.flatten(0, steps), 0.0);
+    for i in 1..steps {
+        let perc = i as f64 / steps as f64;
+        let leaves = p.flatten(i, steps);
+        if leaves != last {
+            pieces.push(Piece { start_percent: start - 0.001, end_percent: perc + 0.001, chunks: prompt_chunks(&last, family)? });
+            (last, start) = (leaves, perc);
+        }
+    }
+    pieces.push(Piece { start_percent: start - 0.001, end_percent: 1.0, chunks: prompt_chunks(&last, family)? });
+    Ok(pieces)
+}
+
+/// One step's leaves as `<break>` chunks of (text, weight) segments, or why the family can't take them.
+fn prompt_chunks(leaves: &[PromptLeaf], family: Family) -> Result<Chunks, String> {
+    let mut chunks = vec![Vec::new()];
+    for leaf in leaves {
+        if leaf.kind == PromptLeafKind::Break {
+            chunks.push(Vec::new());
+        } else {
+            chunks.last_mut().unwrap().push(leaf.clone());
+        }
+    }
+    // Anima's joined conditioning keeps only the first chunk's T5 tokens, which carry the weights; ComfyUI weights a
+    // later chunk's Qwen3 states instead
+    if family == Family::Anima && chunks[1..].iter().any(|c| chunk_segments(c, family).is_ok_and(|s| s.iter().any(|(_, w)| *w != 1.0))) {
+        return Err("prompt weights after a <break>".into());
+    }
+    // SwarmTextEncodeAdvanced joins the chunks' states but keeps the first chunk's token tags, and ComfyUI's model then
+    // fails reading tags past them
+    if chunks.len() != 1 && matches!(family, Family::H3 | Family::H3Image) {
+        return Err("<break> on MiniMax H3 (ComfyUI's model fails on the joined chunks: their token tags cover only the first)".into());
     }
     chunks.iter().map(|leaves| chunk_segments(leaves, family)).collect()
 }
@@ -330,11 +381,10 @@ fn chunk_segments(leaves: &[PromptLeaf], family: Family) -> Result<Vec<(String, 
     let mut text = String::new();
     let mut segments = Vec::new();
     for leaf in leaves {
-        if family.one_piece() && leaf.weight != 1.0 {
-            return Err("prompt weights (<weight>)".into());
-        }
         match &leaf.kind {
             PromptLeafKind::Text(t) if family == Family::Anima => segments.extend(token_weights(t, leaf.weight as f32)),
+            // one segment per leaf, tokenized apart and weighted by the pipeline, as SwarmTextEncodeAdvanced does for a tokenizer without weights
+            PromptLeafKind::Text(t) if matches!(family, Family::Krea2 | Family::Qwen21) => segments.push((t.clone(), leaf.weight as f32)),
             PromptLeafKind::Text(t) if family.one_piece() => text.push_str(t),
             // SwarmTextEncodeAdvanced tokenizes each piece with weights disabled: parentheses are literal, escaped ones lose
             // their backslash
@@ -345,13 +395,26 @@ fn chunk_segments(leaves: &[PromptLeaf], family: Family) -> Result<Vec<(String, 
             PromptLeafKind::Break => unreachable!("chunks() splits on breaks"),
         }
     }
-    if family.one_piece() {
+    if family.one_piece() && !matches!(family, Family::Krea2 | Family::Qwen21) {
         segments.push((text, 1.0));
     }
     Ok(segments)
 }
 
-fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<Vec<(String, f32)>>, String> {
+fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<Piece>, String> {
+    encode_chunks(req, family).map(|c| match c {
+        Encoded::Whole(chunks) => vec![Piece::whole(chunks)],
+        Encoded::Pieces(pieces) => pieces,
+    })
+}
+
+/// A text encode's prompt: plain text is one piece; SwarmTextEncodeAdvanced's can have several.
+enum Encoded {
+    Whole(Chunks),
+    Pieces(Vec<Piece>),
+}
+
+fn encode_chunks(req: &TextEncodeRequest, family: Family) -> Result<Encoded, String> {
     for p in &req.text_encoder.patches {
         match p {
             TextEncoderPatch::Lora { .. } => {}
@@ -362,20 +425,20 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<Vec<(St
     }
     match &req.mode {
         // Qwen tokenizers run with weights disabled, Anima's T5 tokens take ComfyUI's emphasis.
-        TextEncodeMode::Plain { text } if family == Family::Anima => Ok(vec![token_weights(text, 1.0)]),
+        TextEncodeMode::Plain { text } if family == Family::Anima => Ok(Encoded::Whole(vec![token_weights(text, 1.0)])),
         // MOSSImageTokenizer trims a plain prompt; SwarmTextEncodeAdvanced's leaves skip that.
-        TextEncodeMode::Plain { text } if family == Family::Moss => Ok(vec![vec![(text.trim().to_string(), 1.0)]]),
+        TextEncodeMode::Plain { text } if family == Family::Moss => Ok(Encoded::Whole(vec![vec![(text.trim().to_string(), 1.0)]])),
         // CLIPTextEncode parses ComfyUI's (word:1.2) emphasis
-        TextEncodeMode::Plain { text } if family == Family::Sd => Ok(vec![token_weights(text, 1.0)]),
+        TextEncodeMode::Plain { text } if family == Family::Sd => Ok(Encoded::Whole(vec![token_weights(text, 1.0)])),
         TextEncodeMode::Sdxl { text_g, text_l, .. } if family == Family::Sd => {
             if text_g != text_l {
                 return Err("different text_g and text_l prompts".into());
             }
-            Ok(vec![token_weights(text_g, 1.0)])
+            Ok(Encoded::Whole(vec![token_weights(text_g, 1.0)]))
         }
         TextEncodeMode::Sdxl { .. } => Err("CLIPTextEncodeSDXL on a model other than SDXL".into()),
-        TextEncodeMode::Plain { text } => Ok(vec![vec![(text.clone(), 1.0)]]),
-        TextEncodeMode::MiniMax { text, .. } if family == Family::H3 => Ok(vec![vec![(text.clone(), 1.0)]]),
+        TextEncodeMode::Plain { text } => Ok(Encoded::Whole(vec![vec![(text.clone(), 1.0)]])),
+        TextEncodeMode::MiniMax { text, .. } if family == Family::H3 => Ok(Encoded::Whole(vec![vec![(text.clone(), 1.0)]])),
         TextEncodeMode::MiniMax { .. } => Err("MiniMax H3 pictures on another text encoder".into()),
         TextEncodeMode::Swarm(s) => {
             if s.images.is_some() && !family.one_piece() && family != Family::H3 {
@@ -393,14 +456,19 @@ fn encode_request(req: &TextEncodeRequest, family: Family) -> Result<Vec<Vec<(St
             // The node only uses the template with images (SwarmUI sends `krea2` to MOSS Image too), and Krea 2's is
             // the one its encoder has. Qwen Image 2.1 builds its own.
             let template_used = s.images.is_some() && s.llama_template.is_some();
+            // without `krea2` the node neither appends the images nor uses Krea 2's template
+            if family == Family::Krea2 && s.images.is_some() && s.llama_template.as_deref() != Some("krea2") {
+                return Err("Prompt Images without the krea2 prompt template".into());
+            }
             if template_used && !(family == Family::Krea2 && s.llama_template.as_deref() == Some("krea2")) {
                 return Err(format!("prompt template {:?}", s.llama_template));
             }
-            let chunks = prompt_chunks(&s.prompt, s.steps, family)?;
-            if chunks.len() != 1 && s.images.is_some() {
+            let pieces = prompt_pieces(&s.prompt, s.steps, family)?;
+            // Qwen Image 2.1's text encoder sees the images with every chunk, and the first chunk's image slots are kept
+            if pieces.iter().any(|p| p.chunks.len() != 1) && s.images.is_some() && family != Family::Qwen21 {
                 return Err("<break> with Prompt Images".into());
             }
-            Ok(chunks)
+            Ok(Encoded::Pieces(pieces))
         }
     }
 }
@@ -511,32 +579,111 @@ fn single_prompt(c: &Conditioning, family: Family) -> EngineResult<(&DeferredCon
         return Err(unsupported("conditioning features (regions, references, ControlNet, style models, ...)"));
     }
     let cond = e.embedding.downcast_ref::<DeferredCond>().ok_or_else(|| unsupported("conditioning from another text encoder"))?;
-    let chunks = cond.prompt.clone().map_err(unsupported)?;
+    let chunks = match cond.prompt.clone().map_err(unsupported)?.as_slice() {
+        [p] if p.start_percent == 0.0 && p.end_percent == 1.0 => p.chunks.clone(),
+        _ => return Err(unsupported("<alternate> and <fromto> prompts on this model")),
+    };
     Ok((cond, Prompt { chunks, scale: if m.zeroed { 0.0 } else { m.multiplier as f32 } }))
 }
 
-/// MiniMax H3's negative prompt, which takes no pictures or keyframes.
-fn h3_negative(c: &Conditioning, family: Family) -> EngineResult<Prompt> {
-    let (cond, prompt) = single_prompt(c, family)?;
-    if cond.minimax.is_some() || !cond.images.is_empty() {
-        return Err(unsupported("pictures on the negative prompt of MiniMax H3"));
+/// A side's conditioning entries, for the families that mix several as ComfyUI's `calc_cond_batch` does: SwarmUI's
+/// `<alternate>` and `<fromto>` steps, `ConditioningSetTimestepRange` and regional prompts (`ConditioningSetMask`). Each
+/// comes with its text encoder's conditioning and its metadata; masks are resized to the `(lh, lw)` latent.
+fn conds(c: &Conditioning, family: Family, (lh, lw): (usize, usize)) -> EngineResult<Vec<(&DeferredCond, &CondMeta, Cond)>> {
+    if c.entries.is_empty() {
+        return Err(unsupported("a conditioning without entries"));
     }
-    Ok(prompt)
+    let mut out = Vec::new();
+    for e in &c.entries {
+        let m = &e.meta;
+        let plain = (family.references() || m.reference_latents.is_empty())
+            && m.gligen.is_empty()
+            && m.inpaint.is_none()
+            && m.embedding_ops.is_empty()
+            && m.unclip.is_empty()
+            && m.controls.is_empty();
+        if !plain {
+            return Err(unsupported("conditioning features (references, ControlNet, style models, GLIGEN, ...)"));
+        }
+        let cond = e.embedding.downcast_ref::<DeferredCond>().ok_or_else(|| unsupported("conditioning from another text encoder"))?;
+        let pieces = cond.prompt.clone().map_err(unsupported)?;
+        let mask = m.mask.as_ref().map(|cm| region_mask(cm, lh, lw)).transpose()?;
+        let scale = if m.zeroed { 0.0 } else { m.multiplier as f32 };
+        // ConditioningSetTimestepRange sets the range of every entry it gets, a stepped prompt's too
+        let ranged = m.start_percent != 0.0 || m.end_percent != 1.0;
+        for p in pieces {
+            let (start_percent, end_percent) = if ranged { (m.start_percent, m.end_percent) } else { (p.start_percent, p.end_percent) };
+            let region = Region { start_percent, end_percent, mask: mask.clone() };
+            out.push((cond, m, Cond { prompt: Prompt { chunks: p.chunks, scale }, region }));
+        }
+    }
+    Ok(out)
 }
 
-/// A conditioning's reference latents of `channels` channels, and whether they use `index_timestep_zero`. Krea 2's model
-/// ignores them without a method; Qwen Image 2.1's has none.
-fn reference_latents(c: &Conditioning, family: Family) -> EngineResult<(Vec<Reference>, bool)> {
-    let [e] = c.entries.as_slice() else { return Ok((Vec::new(), false)) };
-    let timestep_zero = match e.meta.reference_latents_method.as_deref() {
-        _ if family == Family::Qwen21 => false,
-        None => return Ok((Vec::new(), false)),
-        Some("index") => false,
-        Some("index_timestep_zero") => true,
-        Some(m) => return Err(unsupported(format!("reference latent method {m}"))),
-    };
-    let mut out = Vec::with_capacity(e.meta.reference_latents.len());
-    for l in &e.meta.reference_latents {
+/// `ConditioningSetMask`'s mask at the latent's size, times its strength: `resolve_areas_and_cond_masks_multidim`
+/// resizes it bilinearly (no corner alignment, no antialiasing) as sampling begins, and `get_area_and_mult` scales it.
+fn region_mask(cm: &CondMask, lh: usize, lw: usize) -> EngineResult<Vec<f32>> {
+    if cm.set_area_to_bounds {
+        return Err(unsupported("ConditioningSetMask's mask bounds area"));
+    }
+    if cm.mask.count != 1 {
+        return Err(unsupported(format!("a batch of {} region masks", cm.mask.count)));
+    }
+    let shape = [1, 1, cm.mask.height as usize, cm.mask.width as usize];
+    let mask = diffusion::latent_ops::common_upscale(&cm.mask.data, shape, lw, lh, "bilinear", false).map_err(internal)?;
+    let strength = cm.strength as f32;
+    Ok(mask.into_iter().map(|v| v * strength).collect())
+}
+
+/// The conditioning entries of a MiniMax H3 or MiniMax-H3-Image request on a `(lh, lw)` latent of shape `sh`: the
+/// positive's, each with its pictures and keyframes, and the negative's when the sampling reads them, which take
+/// neither. Returns the text encoder they share.
+fn h3_entries<'a>(req: &'a SampleRequest, family: Family, sh: &h3::Shape, (lh, lw): (usize, usize), uses_negative: bool)
+    -> EngineResult<(&'a DeferredCond, Vec<Cond>, Vec<H3Conds>, Vec<Cond>)> {
+    let positive = conds(&req.positive, family, (lh, lw))?;
+    let negative = if uses_negative { conds(&req.negative, family, (lh, lw))? } else { Vec::new() };
+    // process_conds resizes masks against the packed audio/video latent's one dimension, which fails
+    if family == Family::H3 && positive.iter().chain(&negative).any(|(_, m, _)| m.mask.is_some()) {
+        return Err(unsupported("regional prompts (ConditioningSetMask) on MiniMax H3: ComfyUI can't fit a mask to its joint audio/video latent"));
+    }
+    let first = positive[0].0;
+    for (cond, ..) in positive.iter().chain(&negative) {
+        if cond.text_encoder != first.text_encoder {
+            return Err(unsupported("MiniMax H3 conditioning entries from different text encoders"));
+        }
+        if !cond.loras.is_empty() {
+            return Err(unsupported("LoRAs on MiniMax H3's text encoder"));
+        }
+    }
+    if negative.iter().any(|(cond, ..)| cond.minimax.is_some() || !cond.images.is_empty()) {
+        return Err(unsupported("pictures on the negative prompt of MiniMax H3"));
+    }
+    let mut pictures = Vec::with_capacity(positive.len());
+    for (cond, meta, _) in &positive {
+        pictures.push(h3_conds(cond, meta, family, sh)?);
+    }
+    let positive = positive.into_iter().map(|(.., c)| c).collect();
+    Ok((first, positive, pictures, negative.into_iter().map(|(.., c)| c).collect()))
+}
+
+/// Refuses what H3's sampling can't combine with several conditioning entries or with pictures and keyframes.
+fn h3_combinations(windows: Option<&h3window::ContextWindows>, sparse: bool, sh: &h3::Shape, positive: &[Cond], pictures: &[H3Conds], negative: &[Cond])
+    -> EngineResult<()> {
+    let windowed = windows.filter(|w| w.applies(sh));
+    if windowed.is_some_and(|w| w.split_conds) && (positive.len() > 1 || negative.len() > 1) {
+        return Err(unsupported("split_conds_to_windows with several conditioning entries (<alternate>, <fromto>, timestep ranges) on MiniMax H3"));
+    }
+    let conditioned = pictures.iter().any(|c| !c.keyframes.is_empty() || c.pictures.iter().any(|p| p.latent.is_some()));
+    if conditioned && (windowed.is_some() || sparse) {
+        return Err(unsupported("MiniMax H3 keyframes and reference pictures with context windows or sparse attention"));
+    }
+    Ok(())
+}
+
+/// One conditioning entry's reference latents (`ReferenceLatent` appends to every entry), in `family`'s latent.
+fn entry_references(m: &CondMeta, family: Family) -> EngineResult<Vec<Reference>> {
+    let mut out = Vec::with_capacity(m.reference_latents.len());
+    for l in &m.reference_latents {
         let LatentSamples::Single(t) = &l.samples else {
             return Err(unsupported("audio/video reference latents"));
         };
@@ -545,11 +692,56 @@ fn reference_latents(c: &Conditioning, family: Family) -> EngineResult<(Vec<Refe
         };
         if channels != family.latent().0 {
             return Err(unsupported(format!("reference latent of shape {:?}", t.shape)));
-        };
+        }
         let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("a reference latent this engine didn't encode"))?;
         out.push(Reference { latent: latent.data.clone(), height, width });
     }
-    Ok((out, timestep_zero))
+    Ok(out)
+}
+
+/// A Qwen Image 2.1 entry's reference latents. Its model has no reference method, so the method is ignored.
+fn qwen21_references(m: &CondMeta) -> EngineResult<Vec<Reference>> {
+    entry_references(m, Family::Qwen21)
+}
+
+/// Krea 2's reference latents of one conditioning entry, and whether they take `index_timestep_zero`.
+fn krea_references(m: &CondMeta) -> EngineResult<(Vec<Reference>, bool)> {
+    let timestep_zero = match m.reference_latents_method.as_deref() {
+        // the model reads them only with a method, as ComfyUI's Krea 2 has no default one
+        None => return Ok((Vec::new(), false)),
+        Some("index") => false,
+        Some("index_timestep_zero") => true,
+        Some(method) => return Err(unsupported(format!("reference latent method {method}"))),
+    };
+    Ok((entry_references(m, Family::Krea2)?, timestep_zero))
+}
+
+/// `SwarmAttnTokenWeights` on Qwen Image 2.1: the first `<break>` chunk of its conditioning's first entry, whose weights
+/// SwarmTextEncodeAdvanced recorded, and that entry's prompt image count.
+fn qwen21_attn_token_weights(c: &Conditioning) -> EngineResult<Option<(Vec<(String, f32)>, usize)>> {
+    let Some(e) = c.entries.first() else { return Ok(None) };
+    let cond = e.embedding.downcast_ref::<DeferredCond>().ok_or_else(|| unsupported("SwarmAttnTokenWeights on conditioning from another text encoder"))?;
+    let pieces = cond.prompt.clone().map_err(unsupported)?;
+    Ok(pieces.into_iter().next().and_then(|p| p.chunks.into_iter().next()).map(|chunk| (chunk, cond.images.len())))
+}
+
+/// `SwarmAttnTokenWeights` on Krea 2: its conditioning's first entry, whose first chunk's `attn_token_weights` pairs the
+/// pipeline works out. `None` when that entry has no weights, so the node leaves the model alone.
+fn krea_attn_token_weights(c: &Conditioning, positive: &DeferredCond) -> EngineResult<Option<KreaEntry>> {
+    let e = c.entries.first().ok_or_else(|| unsupported("SwarmAttnTokenWeights with an empty conditioning"))?;
+    let cond = e.embedding.downcast_ref::<DeferredCond>().ok_or_else(|| unsupported("SwarmAttnTokenWeights on conditioning from another text encoder"))?;
+    if cond.text_encoder != positive.text_encoder {
+        return Err(unsupported("SwarmAttnTokenWeights on another text encoder's conditioning"));
+    }
+    let pieces = cond.prompt.clone().map_err(unsupported)?;
+    let piece = pieces.into_iter().next().ok_or_else(|| unsupported("SwarmAttnTokenWeights with an empty prompt"))?;
+    // only SwarmTextEncodeAdvanced records weights
+    if !cond.leaves || piece.chunks.iter().flatten().all(|(_, w)| *w == 1.0) {
+        return Ok(None);
+    }
+    let mut entry = KreaEntry::new(Prompt { chunks: piece.chunks, scale: 1.0 }, cond.images.clone());
+    entry.leaves = true;
+    Ok(Some(entry))
 }
 
 /// A picture's RGB as f32 [h][w][3]: the node takes the first three channels as they are.
@@ -564,6 +756,37 @@ fn check_text_encoder_loras(positive: &DeferredCond, negative: &DeferredCond) ->
         return Err(unsupported("different LoRAs on the positive and negative text encoders"));
     }
     Ok(())
+}
+
+/// `SwarmAttnTokenWeights` on SD 1.x and SDXL. SwarmTextEncodeAdvanced only gives a prompt attention weights when its
+/// tokenizer drops ComfyUI's `(x:2)` weights, and SD's CLIP keeps them, so a prompt from the checkpoint's CLIP has
+/// none and the patch does nothing. Another text encoder's could have some, which ComfyUI's UNet can't take (its
+/// `attn1_patch` returns three tensors, `attn1_token_weight_patch` a dict): refused.
+fn sd_attn_token_weights(patch: Option<&Conditioning>, checkpoint: &Path) -> EngineResult<()> {
+    let Some(e) = patch.and_then(|c| c.entries.first()) else {
+        return Ok(());
+    };
+    match e.embedding.downcast_ref::<DeferredCond>() {
+        Some(c) if c.text_encoder == checkpoint => Ok(()),
+        _ => Err(unsupported("SwarmAttnTokenWeights with a prompt from another text encoder than the SD checkpoint's CLIP")),
+    }
+}
+
+/// SD's entries of a side, each with the size conditioning of the prompt it came from: SDXL's `encode_adm` runs per
+/// entry, on its own pooled output and sizes, and a prompt without sizes takes the latent's (`encode_model_conds`).
+fn sd_entries(side: Vec<(&DeferredCond, &CondMeta, Cond)>, (lh, lw): (usize, usize)) -> (Vec<Cond>, Vec<SizeCond>) {
+    let size = |c: &DeferredCond| match c.sdxl_size {
+        Some(s) => SizeCond {
+            width: s.width as f32,
+            height: s.height as f32,
+            crop_w: s.crop_w as f32,
+            crop_h: s.crop_h as f32,
+            target_width: s.target_width as f32,
+            target_height: s.target_height as f32,
+        },
+        None => SizeCond::of(lw * 8, lh * 8),
+    };
+    side.into_iter().map(|(d, _, c)| (c, size(d))).unzip()
 }
 
 /// SwarmUI puts LoRAs that aren't confined to a section on every model it loads, SeedVR2's too, and ComfyUI skips the
@@ -610,6 +833,9 @@ struct ModelSettings {
     style: Option<Box<StyleRefPatch>>,
     /// SD: `ModelSamplingDiscrete`'s prediction type, in place of the checkpoint's.
     v_pred: Option<bool>,
+    /// `SwarmAttnTokenWeights`: the conditioning whose first entry's per-token weights apply inside attention, on the
+    /// models whose ComfyUI attention takes `attn1_patch`.
+    attn_token_weights: Option<Conditioning>,
 }
 
 /// MiniMax-H3-Image's `MiniMaxH3ImageModelSampling`: the sigma grid its heads were distilled on, from the file.
@@ -631,7 +857,7 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::SeedVr2 => ModelSampling::Flow { shift: 1.0 },
         Family::Sd => ModelSampling::Discrete,
     };
-    let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None, snapref: None, style: None, v_pred: None };
+    let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None, snapref: None, style: None, v_pred: None, attn_token_weights: None };
     let mut sparse = None;
     for p in &model.patches {
         match p {
@@ -655,14 +881,15 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
                 s.model_sampling = ModelSampling::Flow { shift: *shift_video };
                 s.audio_shift = *shift_audio;
             }
-            ModelPatch::MiniMaxH3ContextWindows { context_length, context_overlap, fuse_method, freenoise, split_conds_to_windows: _ } => {
+            ModelPatch::MiniMaxH3ContextWindows { context_length, context_overlap, fuse_method, freenoise, split_conds_to_windows } => {
                 if family != Family::H3 {
                     return Err(unsupported("context windows on this model (only MiniMax H3 takes them)"));
                 }
-                // split_conds_to_windows only picks among several conditionings, and H3 takes one prompt
+                // split_conds_to_windows only picks among several conditioning entries, refused in sample_h3
                 let fuse = h3window::Fuse::parse(fuse_method).ok_or_else(|| EngineError::InvalidInput(format!("fuse_method {fuse_method}")))?;
-                let w = h3window::ContextWindows::from_frames(*context_length as usize, *context_overlap as usize, fuse, *freenoise)
+                let mut w = h3window::ContextWindows::from_frames(*context_length as usize, *context_overlap as usize, fuse, *freenoise)
                     .map_err(|e| EngineError::InvalidInput(e.to_string()))?;
+                w.split_conds = *split_conds_to_windows;
                 s.windows = Some(w);
             }
             ModelPatch::BlockSparseAttention(sp) => {
@@ -696,7 +923,8 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
             // only read with a noise mask, which H3 refuses
             ModelPatch::DifferentialDiffusion { strength } => s.differential = Some(*strength as f32),
             // Weighted prompts are refused in encode_text; with none this patch has no effect.
-            ModelPatch::AttnTokenWeights { .. } | ModelPatch::Compile { .. } => {}
+            ModelPatch::AttnTokenWeights { conditioning } => s.attn_token_weights = Some((**conditioning).clone()),
+            ModelPatch::Compile { .. } => {}
             ModelPatch::Lora { file, strength } => s.loras.push(Lora { path: file.path.clone(), strength: *strength }),
             ModelPatch::SnapRef(p) => {
                 if family != Family::Anima {
@@ -1056,19 +1284,24 @@ impl NativeEngine {
         let (batch, lh, lw) = shape;
         let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
-        let (cond, prompt) = single_prompt(&req.positive, Family::Krea2)?;
-        let (references, timestep_zero) = reference_latents(&req.positive, Family::Krea2)?;
         let sampling = sampling(req, settings, plan, batch)?;
-        let (negative, negative_images) = if sampling.uses_negative() {
-            let (c, p) = single_prompt(&req.negative, Family::Krea2)?;
-            check_text_encoder_loras(cond, c)?;
-            if !reference_latents(&req.negative, Family::Krea2)?.0.is_empty() {
-                return Err(unsupported("reference latents on the negative prompt"));
+        let positive = conds(&req.positive, Family::Krea2, (lh, lw))?;
+        let negative = if sampling.uses_negative() { conds(&req.negative, Family::Krea2, (lh, lw))? } else { Vec::new() };
+        // one text encoder, with one set of LoRAs, encodes every entry
+        let cond = positive[0].0;
+        for (c, _, _) in positive.iter().chain(&negative) {
+            if c.text_encoder != cond.text_encoder {
+                return Err(unsupported("prompts from different text encoders"));
             }
-            (p, c.images.clone())
-        } else {
-            (Prompt::text(""), Vec::new())
+            check_text_encoder_loras(cond, c)?;
+        }
+        let entry = |(c, m, cond): (&DeferredCond, &CondMeta, Cond)| -> EngineResult<KreaEntry> {
+            let (references, timestep_zero) = krea_references(m)?;
+            Ok(KreaEntry { cond, leaves: c.leaves, images: c.images.clone(), references, timestep_zero })
         };
+        let positive = positive.into_iter().map(entry).collect::<EngineResult<Vec<_>>>()?;
+        let negative = negative.into_iter().map(entry).collect::<EngineResult<Vec<_>>>()?;
+        let attn_token_weights = settings.attn_token_weights.as_ref().map(|c| krea_attn_token_weights(c, cond)).transpose()?.flatten();
         let steps = sampling.sigmas.len().saturating_sub(1);
         let style = settings.style.as_deref().map(|p| self.style_request(p, cond, steps, Family::Krea2)).transpose()?;
         let mut gen = self.gen();
@@ -1078,17 +1311,14 @@ impl NativeEngine {
         gen.set_loras(&settings.loras).map_err(internal)?;
         gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
         let r = KreaRequest {
-            prompt,
+            positive,
             negative,
             seed: req.noise_seed,
             width: lw * 8,
             height: lh * 8,
             sampling,
             noise: Some(plan.noise(req, batch, (16, lh, lw))),
-            images: cond.images.clone(),
-            negative_images,
-            references,
-            timestep_zero,
+            attn_token_weights,
             style,
         };
         let (latent, stats) = gen
@@ -1103,15 +1333,25 @@ impl NativeEngine {
         let (batch, lh, lw) = shape;
         let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
-        let (cond, positive) = single_prompt(&req.positive, Family::Anima)?;
-        let text_encoder = &cond.text_encoder;
         let sampling = sampling(req, settings, plan, batch)?;
-        let negative = if sampling.uses_negative() {
-            let (c, p) = single_prompt(&req.negative, Family::Anima)?;
+        // every entry of both sides, as calc_cond_batch mixes them; SnapRef and the style reference act on each of the
+        // side's evaluations as their wrappers do on each model call
+        let positive = conds(&req.positive, Family::Anima, (lh, lw))?;
+        let cond = positive[0].0;
+        let text_encoder = &cond.text_encoder;
+        let negative = if sampling.uses_negative() { conds(&req.negative, Family::Anima, (lh, lw))? } else { Vec::new() };
+        for (c, _, _) in positive.iter().chain(&negative) {
+            if c.text_encoder != *text_encoder {
+                return Err(unsupported("conditioning entries from different text encoders"));
+            }
             check_text_encoder_loras(cond, c)?;
-            p
+        }
+        let positive: Vec<Cond> = positive.into_iter().map(|(_, _, c)| c).collect();
+        // unread at CFG 1
+        let negative: Vec<Cond> = if negative.is_empty() {
+            vec![Cond::plain(Prompt::new(Vec::new()))]
         } else {
-            Prompt::new(Vec::new())
+            negative.into_iter().map(|(_, _, c)| c).collect()
         };
         let snapref = settings.snapref.as_deref().map(|p| self.snapref_request(p, cond)).transpose()?;
         if snapref.is_some() && settings.style.is_some() {
@@ -1275,43 +1515,47 @@ impl NativeEngine {
     }
 
     /// Qwen Image 2.1: text to image and edits. Prompt images go through the vision tower and, as the reference latents
-    /// of the prompts, into the sequence.
+    /// of the prompts, into the sequence. Each conditioning entry is evaluated with its own prompt, prompt images and
+    /// reference latents.
     fn sample_qwen21(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, plan: &Plan, progress: &mut dyn ProgressSink)
         -> EngineResult<Vec<f32>> {
         let (batch, lh, lw) = shape;
         let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
-        let (cond, positive) = single_prompt(&req.positive, Family::Qwen21)?;
-        let references = reference_latents(&req.positive, Family::Qwen21)?.0;
         let sampling = sampling(req, settings, plan, batch)?;
-        let (negative, negative_images) = if sampling.uses_negative() {
-            let (c, p) = single_prompt(&req.negative, Family::Qwen21)?;
-            check_text_encoder_loras(cond, c)?;
-            let theirs = reference_latents(&req.negative, Family::Qwen21)?.0;
-            if theirs.len() != references.len() || theirs.iter().zip(&references).any(|(a, b)| a.latent != b.latent) {
-                return Err(unsupported("different reference latents on the positive and negative prompts"));
+        let positive = conds(&req.positive, Family::Qwen21, (lh, lw))?;
+        let negative = if sampling.uses_negative() { conds(&req.negative, Family::Qwen21, (lh, lw))? } else { Vec::new() };
+        let first = positive[0].0;
+        for (c, ..) in positive.iter().chain(&negative) {
+            if c.text_encoder != first.text_encoder {
+                return Err(unsupported("conditioning entries from different text encoders"));
             }
-            (p, c.images.clone())
-        } else {
-            (Prompt::text(""), Vec::new())
+            check_text_encoder_loras(first, c)?;
+        }
+        let inputs = |side: &[(&DeferredCond, &CondMeta, Cond)]| -> EngineResult<(Vec<Vec<PromptImage>>, Vec<Vec<Reference>>)> {
+            let images = side.iter().map(|(c, ..)| c.images.clone()).collect();
+            let references = side.iter().map(|(_, m, _)| qwen21_references(m)).collect::<EngineResult<_>>()?;
+            Ok((images, references))
         };
+        let ((pos_images, pos_refs), (neg_images, neg_refs)) = (inputs(&positive)?, inputs(&negative)?);
+        let attn_token_weights = settings.attn_token_weights.as_ref().map(qwen21_attn_token_weights).transpose()?.flatten();
         let mut gen = self.gen();
         gen.ensure_qwen21(&file.path).map_err(internal)?;
-        gen.ensure_te(&cond.text_encoder).map_err(internal)?;
+        gen.ensure_te(&first.text_encoder).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
-        gen.set_text_encoder_loras(&cond.loras).map_err(internal)?;
+        gen.set_text_encoder_loras(&first.loras).map_err(internal)?;
         let (width, height) = (lw * diffusion::vae21::SCALE, lh * diffusion::vae21::SCALE);
         let r = Qwen21Request {
-            positive,
-            negative,
+            positive: positive.into_iter().map(|(.., c)| c).collect(),
+            negative: negative.into_iter().map(|(.., c)| c).collect(),
             width,
             height,
             sampling,
             noise: plan.noise(req, batch, (diffusion::qwen21::CH, lh, lw)),
-            images: cond.images.clone(),
-            negative_images,
-            references,
+            images: [pos_images, neg_images],
+            references: [pos_refs, neg_refs],
+            attn_token_weights,
         };
         let (latent, stats) = gen
             .sample_qwen21(&r, |step| report(mode, progress, batch, step, |x0| (preview::qwen21(x0, lh, lw), lh, lw)), None)
@@ -1348,13 +1592,12 @@ impl NativeEngine {
                 return Err(unsupported("LoRAs on HyperFlow H3 Flash (its layers are pruned and factorized)"));
             }
         }
-        let (cond, prompt) = single_prompt(&req.positive, Family::H3)?;
         let shape = h3::Shape { t, h: lh, w: lw, audio_t };
-        let conds = h3_conds(cond, &req.positive.entries[0].meta, Family::H3, &shape)?;
         let sigmas = schedule(req, settings, (lh, lw))?.ok_or_else(|| EngineError::InvalidInput("no steps to sample".into()))?;
         let plan = Plan { sigmas, latent: None, mask: None, differential: None };
         let sampling = sampling(req, settings, &plan, 1)?;
-        let negative = if sampling.uses_negative() { h3_negative(&req.negative, Family::H3)? } else { Prompt::new(Vec::new()) };
+        let (cond, positive, conds, negative) = h3_entries(req, Family::H3, &shape, (lh, lw), sampling.uses_negative())?;
+        h3_combinations(settings.windows.as_ref(), settings.sparse.is_some(), &shape, &positive, &conds, &negative)?;
         let ModelSampling::Flow { shift } = settings.model_sampling else { unreachable!("H3 is a flow model") };
         let mut gen = self.gen();
         gen.ensure_h3(&file.path).map_err(internal)?;
@@ -1367,7 +1610,7 @@ impl NativeEngine {
             w.freenoise(&mut noise, &shape, req.noise_seed);
         }
         let r = H3Request {
-            prompt,
+            positive,
             negative,
             shape,
             sampling,
@@ -1413,20 +1656,19 @@ impl NativeEngine {
         if !settings.loras.is_empty() {
             return Err(unsupported("LoRAs on MiniMax-H3-Image (not supported yet)"));
         }
-        let (cond, prompt) = single_prompt(&req.positive, Family::H3Image)?;
         let shape = h3::Shape::image(lw * 16, lh * 16);
-        let conds = h3_conds(cond, &req.positive.entries[0].meta, Family::H3Image, &shape)?;
         let sigmas = schedule(req, settings, (lh, lw))?.ok_or_else(|| EngineError::InvalidInput("no steps to sample".into()))?;
         let plan = Plan { sigmas, latent: None, mask: None, differential: None };
         let sampling = sampling(req, settings, &plan, 1)?;
-        let negative = if sampling.uses_negative() { h3_negative(&req.negative, Family::H3Image)? } else { Prompt::new(Vec::new()) };
+        // regional masks resize to the [1, 24, 1, h, w] latent and cover every channel, as the core's mix takes them
+        let (cond, positive, conds, negative) = h3_entries(req, Family::H3Image, &shape, (lh, lw), sampling.uses_negative())?;
         let mut gen = self.gen();
         gen.ensure_h3(&file.path).map_err(internal)?;
         gen.ensure_h3_te(&cond.text_encoder).map_err(internal)?;
         gen.set_int8_attention(settings.int8_attention);
         gen.set_loras(&settings.loras).map_err(internal)?;
         let noise = plan.noise(req, 1, (24, lh, lw));
-        let r = H3Request { prompt, negative, shape, sampling, shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO), noise, sparse: None, windows: None, conds, seed: req.noise_seed };
+        let r = H3Request { positive, negative, shape, sampling, shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO), noise, sparse: None, windows: None, conds, seed: req.noise_seed };
         let (out, stats) = gen
             .sample_h3(&r, |step| report(mode, progress, 1, step, |x0| (preview::h3(x0, 1, lh, lw), lh, lw)), None)
             .map_err(internal)?;
@@ -1492,15 +1734,21 @@ impl NativeEngine {
         let (batch, lh, lw) = shape;
         let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
-        let (cond, positive) = single_prompt(&req.positive, Family::Moss)?;
+        // SwarmAttnTokenWeights needs nothing here: ComfyUI's MOSS Image attention never runs attn1_patch, so <weight>
+        // is the hidden states' scaling alone
+        let positive = conds(&req.positive, Family::Moss, (lh, lw))?;
+        let cond = positive[0].0;
         let sampling = sampling(req, settings, plan, batch)?;
-        let negative = if sampling.uses_negative() {
-            let (c, p) = single_prompt(&req.negative, Family::Moss)?;
+        let negative = if sampling.uses_negative() { conds(&req.negative, Family::Moss, (lh, lw))? } else { Vec::new() };
+        for (c, _, _) in positive.iter().chain(&negative) {
+            if c.text_encoder != cond.text_encoder {
+                return Err(unsupported("prompts from different text encoders"));
+            }
             check_text_encoder_loras(cond, c)?;
-            p
-        } else {
-            Prompt::text("")
-        };
+        }
+        let entries = |side: Vec<(&DeferredCond, &CondMeta, Cond)>| side.into_iter().map(|(_, _, c)| c).collect::<Vec<_>>();
+        let (positive, negative) = (entries(positive), entries(negative));
+        let negative = if negative.is_empty() { vec![Cond::plain(Prompt::text(""))] } else { negative };
         let mut gen = self.gen();
         gen.ensure_moss(&file.path).map_err(internal)?;
         gen.ensure_qwen35(&cond.text_encoder).map_err(internal)?;
@@ -1529,46 +1777,34 @@ impl NativeEngine {
         let mode = self.preview_mode(req);
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let xl = sd_file_is_xl(file)?;
-        let (cond, positive) = single_prompt(&req.positive, Family::Sd)?;
+        let positive = conds(&req.positive, Family::Sd, (lh, lw))?;
+        let cond = positive[0].0;
         let mut sampling = sampling(req, settings, plan, batch)?;
-        let (negative_cond, negative) = if sampling.uses_negative() {
-            let (c, p) = single_prompt(&req.negative, Family::Sd)?;
-            check_text_encoder_loras(cond, c)?;
-            (Some(c), p)
-        } else {
-            (None, Prompt::new(Vec::new()))
-        };
-        for c in std::iter::once(cond).chain(negative_cond) {
+        let negative = if sampling.uses_negative() { conds(&req.negative, Family::Sd, (lh, lw))? } else { Vec::new() };
+        for (c, _, _) in positive.iter().chain(&negative) {
             if c.text_encoder != file.path {
                 return Err(unsupported("a CLIP from another checkpoint than the model's"));
             }
             if c.clip_layer != cond.clip_layer {
-                return Err(unsupported("different CLIP Stop At Layer on the positive and negative prompts"));
+                return Err(unsupported("different CLIP Stop At Layer on the prompts"));
             }
+            check_text_encoder_loras(cond, c)?;
         }
-        let size = |c: &DeferredCond| match c.sdxl_size {
-            Some(s) => SizeCond {
-                width: s.width as f32,
-                height: s.height as f32,
-                crop_w: s.crop_w as f32,
-                crop_h: s.crop_h as f32,
-                target_width: s.target_width as f32,
-                target_height: s.target_height as f32,
-            },
-            None => SizeCond::of(lw * 8, lh * 8),
-        };
+        sd_attn_token_weights(settings.attn_token_weights.as_ref(), &file.path)?;
         let scale = if xl { diffusion::sdvae::SDXL_SCALE } else { diffusion::sdvae::SD1_SCALE };
         // process_latent_in
         if let Some(l) = &mut sampling.latent {
             l.iter_mut().for_each(|v| *v *= scale);
         }
+        let (positive, positive_size) = sd_entries(positive, (lh, lw));
+        let (negative, negative_size) = sd_entries(negative, (lh, lw));
         let r = SdRequest {
             positive,
             negative,
             width: lw * 8,
             height: lh * 8,
-            positive_size: size(cond),
-            negative_size: size(negative_cond.unwrap_or(cond)),
+            positive_size,
+            negative_size,
             clip_layer: cond.clip_layer,
             v_pred: settings.v_pred,
             sampling,
@@ -1854,7 +2090,8 @@ impl Engine for NativeEngine {
             TextEncodeMode::Swarm(s) => Some(SdxlSize { width: s.width, height: s.height, crop_w: 0, crop_h: 0, target_width: s.target_width, target_height: s.target_height }),
             _ => None,
         };
-        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), images, loras, minimax, clip_layer, sdxl_size };
+        let leaves = matches!(req.mode, TextEncodeMode::Swarm(_));
+        let cond = DeferredCond { text_encoder: file.path.clone(), prompt: encode_request(req, family), images, loras, minimax, clip_layer, sdxl_size, leaves };
         Ok(Conditioning::single(Opaque::new(cond), CondMeta::default()))
     }
 
@@ -2268,22 +2505,84 @@ mod tests {
     fn plain_prompts_keep_comfy_literal_parentheses() {
         // Qwen3-VL tokenizes with weights disabled, so `(x:1.2)` stays in the text.
         let p = ParsedPrompt::parse("a (red:1.2) fox");
-        assert_eq!(prompt_chunks(&p, 8, Family::Krea2).unwrap(), [[("a (red:1.2) fox".to_string(), 1.0)]]);
+        assert_eq!(whole_chunks(&p, Family::Krea2).unwrap(), [[("a (red:1.2) fox".to_string(), 1.0)]]);
+    }
+
+    /// The chunks of a prompt without steps.
+    fn whole_chunks(p: &ParsedPrompt, family: Family) -> Result<Chunks, String> {
+        let pieces = prompt_pieces(p, 8, family)?;
+        assert_eq!(pieces.len(), 1);
+        assert_eq!((pieces[0].start_percent, pieces[0].end_percent), (0.0, 1.0));
+        Ok(pieces[0].chunks.clone())
+    }
+
+    #[test]
+    fn stepped_prompts_split_like_swarm_text_encode_advanced() {
+        let ranges = |p: &str, steps| -> Vec<(f64, f64, String)> {
+            prompt_pieces(&ParsedPrompt::parse(p), steps, Family::Moss).unwrap().into_iter()
+                .map(|p| ((p.start_percent * 1e6).round() / 1e6, (p.end_percent * 1e6).round() / 1e6, p.chunks[0].iter().map(|(t, _)| t.as_str()).collect())).collect()
+        };
+        // a new entry wherever the step's leaves change, widened by 0.001 on each side
+        assert_eq!(ranges("x <alternate:a, b>", 4), [
+            (-0.001, 0.251, "x a".into()), (0.249, 0.501, "x b".into()), (0.499, 0.751, "x a".into()), (0.749, 1.0, "x b".into())
+        ]);
+        assert_eq!(ranges("<fromto[0.5]:a, b>", 10), [(-0.001, 0.501, "a".into()), (0.499, 1.0, "b".into())]);
+        // fromto at a step count
+        assert_eq!(ranges("<fromto[3]:a, b>", 10), [(-0.001, 0.301, "a".into()), (0.299, 1.0, "b".into())]);
     }
 
     #[test]
     fn prompt_syntax_the_pipeline_cant_honor_is_refused() {
-        for p in ["a <weight[1.3]:fox>", "<alternate:a, b>", "<fromto[0.5]:a, b>", "<embed:x>"] {
-            assert!(prompt_chunks(&ParsedPrompt::parse(p), 8, Family::Krea2).is_err(), "{p}");
-        }
-        for family in [Family::Anima, Family::H3] {
-            assert!(prompt_chunks(&ParsedPrompt::parse("a<break>b"), 8, family).is_err());
+        assert!(whole_chunks(&ParsedPrompt::parse("<embed:x>"), Family::Krea2).is_err());
+        for family in [Family::H3] {
+            assert!(whole_chunks(&ParsedPrompt::parse("a<break>b"), family).is_err());
         }
     }
 
     #[test]
+    fn anima_breaks_are_chunks_with_weights_only_before_the_first() {
+        let chunks = whole_chunks(&ParsedPrompt::parse("lake, <weight[1.3]:pine><break>sky"), Family::Anima).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert!((chunks[0].iter().find(|(s, _)| s == "pine").unwrap().1 - 1.3).abs() < 1e-6);
+        assert_eq!(chunks[1], [("sky".to_string(), 1.0)]);
+        for p in ["lake<break><weight[1.3]:pine>", "lake<break>(sky:1.2)"] {
+            assert!(whole_chunks(&ParsedPrompt::parse(p), Family::Anima).is_err(), "{p}");
+        }
+        // each stepped piece keeps its own chunks
+        let pieces = prompt_pieces(&ParsedPrompt::parse("<alternate:lake, sea><break>pine"), 4, Family::Anima).unwrap();
+        assert_eq!(pieces.len(), 4);
+        assert!(pieces.iter().all(|p| p.chunks.len() == 2 && p.chunks[1] == [("pine".to_string(), 1.0)]));
+    }
+
+    #[test]
+    fn h3_takes_stepped_prompts_and_refuses_what_it_cant_combine() {
+        let pieces = prompt_pieces(&ParsedPrompt::parse("a lake <alternate:at dawn, at dusk>"), 4, Family::H3).unwrap();
+        assert_eq!(pieces.len(), 4);
+        assert!(prompt_pieces(&ParsedPrompt::parse("a lake<break>pines"), 4, Family::H3).unwrap_err().contains("token tags"));
+        let shape = h3::Shape { t: 32, h: 4, w: 4, audio_t: 40 };
+        let mut w = h3window::ContextWindows::from_frames(56, 22, h3window::Fuse::Pyramid, true).unwrap();
+        assert!(w.applies(&shape));
+        let one = vec![Cond::plain(Prompt::text("a lake"))];
+        let two = vec![one[0].clone(), Cond { region: Region { start_percent: 0.5, end_percent: 1.0, mask: None }, ..one[0].clone() }];
+        let (plain, plain2) = (vec![H3Conds::default()], vec![H3Conds::default(); 2]);
+        // windows run every entry, as ComfyUI's handler mixes them per window
+        assert!(h3_combinations(Some(&w), false, &shape, &two, &plain2, &one).is_ok());
+        // split_conds_to_windows picks an entry per window, which only matters with several
+        w.split_conds = true;
+        assert!(h3_combinations(Some(&w), false, &shape, &two, &plain2, &one).is_err());
+        assert!(h3_combinations(Some(&w), false, &shape, &one, &plain, &two).is_err());
+        assert!(h3_combinations(Some(&w), false, &shape, &one, &plain, &one).is_ok());
+        // short clips sample without windows
+        assert!(h3_combinations(Some(&w), false, &h3::Shape { t: 7, ..shape }, &two, &plain2, &one).is_ok());
+        let keyframe = vec![H3Conds { keyframes: vec![(0, vec![0.0; 24 * 16])], ..H3Conds::default() }];
+        assert!(h3_combinations(Some(&w), false, &shape, &one, &keyframe, &one).is_err());
+        assert!(h3_combinations(None, true, &shape, &one, &keyframe, &one).is_err());
+        assert!(h3_combinations(None, false, &shape, &one, &keyframe, &one).is_ok());
+    }
+
+    #[test]
     fn anima_takes_weights_from_both_syntaxes() {
-        let chunks = prompt_chunks(&ParsedPrompt::parse("lake, <weight[1.3]:pine> (sky:1.2)"), 8, Family::Anima).unwrap();
+        let chunks = whole_chunks(&ParsedPrompt::parse("lake, <weight[1.3]:pine> (sky:1.2)"), Family::Anima).unwrap();
         let weight = |t: &str| chunks[0].iter().find(|(s, _)| s.contains(t)).unwrap().1;
         assert!((weight("pine") - 1.3).abs() < 1e-6);
         assert!((weight("sky") - 1.2).abs() < 1e-6);
@@ -2293,7 +2592,7 @@ mod tests {
     #[test]
     fn moss_and_h3_weight_segments_and_keep_emphasis_literal() {
         for family in [Family::Moss, Family::H3] {
-            let chunks = prompt_chunks(&ParsedPrompt::parse("a (red:1.2) <weight[1.5]:lake>"), 8, family).unwrap();
+            let chunks = whole_chunks(&ParsedPrompt::parse("a (red:1.2) <weight[1.5]:lake>"), family).unwrap();
             assert_eq!(chunks, [[("a (red:1.2) ".to_string(), 1.0), ("lake".to_string(), 1.5)]]);
         }
     }
@@ -2301,24 +2600,40 @@ mod tests {
     #[test]
     fn sd_swarm_pieces_are_literal_with_breaks() {
         // SwarmTextEncodeAdvanced tokenizes each piece with weights off: parentheses stay, escapes lose their backslash
-        let chunks = prompt_chunks(&ParsedPrompt::parse(r"a (red:1.2) \(b\) <weight[1.5]:lake><break>c"), 8, Family::Sd).unwrap();
+        let chunks = whole_chunks(&ParsedPrompt::parse(r"a (red:1.2) \(b\) <weight[1.5]:lake><break>c"), Family::Sd).unwrap();
         assert_eq!(chunks, vec![vec![("a (red:1.2) (b) ".to_string(), 1.0), ("lake".to_string(), 1.5)], vec![("c".to_string(), 1.0)]]);
+    }
+
+    #[test]
+    fn krea2_takes_a_segment_per_leaf_with_its_weight() {
+        // SwarmTextEncodeAdvanced tokenizes each leaf apart; the pipeline weights them
+        let chunks = whole_chunks(&ParsedPrompt::parse("a <weight[1.5]:red> boat"), Family::Krea2).unwrap();
+        assert_eq!(chunks, [[("a ".to_string(), 1.0), ("red".to_string(), 1.5), (" boat".to_string(), 1.0)]]);
+        let pieces = prompt_pieces(&ParsedPrompt::parse("lake <alternate:pine, oak>"), 4, Family::Krea2).unwrap();
+        assert_eq!(pieces.len(), 4);
+        assert_eq!(pieces[1].chunks, [[("lake ".to_string(), 1.0), ("oak".to_string(), 1.0)]]);
     }
 
     #[test]
     fn breaks_become_chunks_on_krea2_and_moss() {
         for family in [Family::Krea2, Family::Moss] {
-            let chunks = prompt_chunks(&ParsedPrompt::parse("a<break>b"), 8, family).unwrap();
+            let chunks = whole_chunks(&ParsedPrompt::parse("a<break>b"), family).unwrap();
             assert_eq!(chunks, [[("a".to_string(), 1.0)], [("b".to_string(), 1.0)]]);
         }
     }
 
     #[test]
-    fn qwen21_prompts_are_one_piece_without_breaks_or_weights() {
-        let chunks = prompt_chunks(&ParsedPrompt::parse("a, b"), 8, Family::Qwen21).unwrap();
-        assert_eq!(chunks, [[("a, b".to_string(), 1.0)]]);
-        assert!(prompt_chunks(&ParsedPrompt::parse("a<break>b"), 8, Family::Qwen21).is_err());
-        assert!(prompt_chunks(&ParsedPrompt::parse("a <weight[1.2]:b>"), 8, Family::Qwen21).is_err());
+    fn qwen21_prompts_keep_each_piece_and_its_weight() {
+        let s = |t: &str, w: f32| (t.to_string(), w);
+        let chunks = whole_chunks(&ParsedPrompt::parse("a, b"), Family::Qwen21).unwrap();
+        assert_eq!(chunks, [[s("a, b", 1.0)]]);
+        // SwarmUI's leaves, from its own parser on these prompts
+        let chunks = whole_chunks(&ParsedPrompt::parse("lake, <weight[1.3]:pine <weight[2]:bark>> (sky:1.2)"), Family::Qwen21).unwrap();
+        assert_eq!(chunks, [[s("lake, ", 1.0), s("pine ", 1.3), s("bark", 2.6), s(" (sky:1.2)", 1.0)]]);
+        let chunks = whole_chunks(&ParsedPrompt::parse("hills<break><weight[0.5]:fog> and <weight[1.5]:rain>"), Family::Qwen21).unwrap();
+        assert_eq!(chunks, vec![vec![s("hills", 1.0)], vec![s("fog", 0.5), s(" and ", 1.0), s("rain", 1.5)]]);
+        // the tokenizer drops the backslashes, not the parser
+        assert_eq!(whole_chunks(&ParsedPrompt::parse(r"a \(b\) c"), Family::Qwen21).unwrap(), [[s(r"a \(b\) c", 1.0)]]);
         assert_eq!(Family::Qwen21.latent(), (64, 16));
     }
 
@@ -2358,5 +2673,44 @@ mod tests {
         // 2560 and 256 patches are the points ModelSamplingFlux interpolates between.
         assert!((flux_shift(1.15, 0.5, 16 * 256, 16) - 0.5).abs() < 1e-12);
         assert!((flux_shift(1.15, 0.5, 16 * 2560, 16) - 1.15).abs() < 1e-12);
+    }
+
+    /// SwarmTextEncodeAdvanced's conditioning of `prompt` at 10 steps from `text_encoder`, as `encode_text` gives it.
+    fn swarm_cond(prompt: &str, text_encoder: &str, family: Family, sdxl_size: Option<SdxlSize>) -> Conditioning {
+        let prompt = prompt_pieces(&ParsedPrompt::parse(prompt), 10, family);
+        let cond = DeferredCond { text_encoder: text_encoder.into(), prompt, images: Vec::new(), loras: Vec::new(), minimax: None, clip_layer: None, sdxl_size, leaves: true };
+        Conditioning::single(Opaque::new(cond), CondMeta::default())
+    }
+
+    #[test]
+    fn sd_entries_carry_their_own_size_conditioning() {
+        let size = |width, height| SdxlSize { width, height, crop_w: 0, crop_h: 0, target_width: width, target_height: height };
+        // a stepped prompt at 1024 and a region of another at 512x768, joined as ConditioningCombine does
+        let stepped = swarm_cond("<fromto[0.5]:lake, pines>", "sdxl.safetensors", Family::Sd, Some(size(1024, 1024)));
+        let mut region = swarm_cond("a stone bridge", "sdxl.safetensors", Family::Sd, Some(size(512, 768)));
+        let mask = Mask { count: 1, height: 2, width: 2, data: Arc::new(vec![1.0, 0.0, 1.0, 0.0]) };
+        region.entries[0].meta.mask = Some(CondMask { mask, strength: 0.5, set_area_to_bounds: false });
+        // CLIPTextEncode sets no size: the latent's
+        let plain = swarm_cond("fog", "sdxl.safetensors", Family::Sd, None);
+        let all = Conditioning { entries: [stepped.entries, region.entries, plain.entries].concat() };
+        let (entries, sizes) = sd_entries(conds(&all, Family::Sd, (4, 6)).unwrap(), (4, 6));
+        let text = |c: &Cond| c.prompt.chunks[0][0].0.clone();
+        assert_eq!(entries.iter().map(text).collect::<Vec<_>>(), ["lake", "pines", "a stone bridge", "fog"]);
+        assert_eq!((entries[0].region.start_percent, entries[1].region.end_percent), (-0.001, 1.0));
+        assert!(entries[2].region.mask.as_ref().is_some_and(|m| m.len() == 4 * 6) && entries[3].region.mask.is_none());
+        let wh = |s: &SizeCond| (s.width, s.height, s.target_width, s.target_height);
+        assert_eq!(sizes.iter().map(wh).collect::<Vec<_>>(),
+            [(1024.0, 1024.0, 1024.0, 1024.0), (1024.0, 1024.0, 1024.0, 1024.0), (512.0, 768.0, 512.0, 768.0), (48.0, 32.0, 48.0, 32.0)]);
+    }
+
+    #[test]
+    fn sd_takes_attention_weights_only_from_its_own_clip() {
+        let checkpoint = Path::new("sdxl.safetensors");
+        assert!(sd_attn_token_weights(None, checkpoint).is_ok());
+        // SD's CLIP keeps (x:2) weights, so SwarmTextEncodeAdvanced gives its prompts no attention weights
+        let own = swarm_cond("lake, <weight[1.5]:pines>", "sdxl.safetensors", Family::Sd, None);
+        assert!(sd_attn_token_weights(Some(&own), checkpoint).is_ok());
+        let other = swarm_cond("lake, <weight[1.5]:pines>", "qwen35.safetensors", Family::Moss, None);
+        assert!(matches!(sd_attn_token_weights(Some(&other), checkpoint), Err(EngineError::Unsupported(_))));
     }
 }

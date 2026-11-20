@@ -26,6 +26,7 @@ pub mod prof;
 pub mod qwen21;
 pub mod qwen3;
 pub mod qwen35;
+pub mod relayvsr;
 pub mod samplers;
 pub mod sampling;
 pub mod seedvr;

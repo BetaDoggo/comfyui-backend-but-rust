@@ -480,3 +480,25 @@ were written from that code, not captured from a live SwarmUI.
 A prompt without size conditioning (`CLIPTextEncode` on SDXL) takes the latent's size, as ComfyUI's `encode_model_conds`
 does. The engine refuses LoRAs, embeddings, the SDXL refiner and SD 2.x, CLIP from a file other than the model's
 checkpoint, and RescaleCFG. Sides can be any multiple of 8, as in ComfyUI.
+
+## 13. RelayVSR (the extension's stage)
+
+The [RelayVSR extension](../relayvsr-extension/README.md) upscales the current picture or video after SeedVR. Its
+SwarmUI parameters are RelayVSR Model, RelayVSR Decoder and RelayVSR Detail. It sends Comfy-Org's example workflow,
+and it works in SwarmUI with the native engine:
+
+| Node | Inputs | Engine |
+|---|---|---|
+| `UNETLoader` | the RelayVSR model, `weight_dtype` `default` | `load_diffusion_model`: `Family::RelayVsr` from the `lq_proj_in` keys, `ensure_relayvsr` |
+| `RelayVSRConditioning` | `model`, `images` (the decoded frames) | server: `Engine::relayvsr_latent_stride` (16 over the factor, from the model's projection), then a positive entry with `CondMeta::relayvsr` (every 15th frame and the last, and the frame count) and an empty `LatentFormat::RelayVsr` latent `[1, 48, keyframes, lh, lw]` |
+| `KSampler` | steps 1, CFG 1, `euler`, `simple`, the same entry as positive and negative; seed = Seed + 10 | `Engine::sample`: the keyframes through the model, shift 8 |
+| `VAELoader` | the Flash decoder | `load_vae`: `ensure_relayvsr_vae` |
+| `VSRDecode` | `vae`, `samples`, `images` (the same frames), `detail` | `Engine::vsr_decode`: every frame at the factor's size, RGB |
+
+The server checks that the latent has as many keyframes as the frames given to `VSRDecode` imply. The engine refuses:
+
+* LoRAs on the model
+* CFG other than 1
+* Variation Seed, a noise mask, and conditioning changes on the entry
+* `VAEDecode` of a RelayVSR latent
+* `VAEEncode` with the Flash decoder

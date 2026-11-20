@@ -26,6 +26,9 @@ pub enum LatentFormat {
     /// SeedVR2's VAE: `[B, 16, H/8, W/8]` for one frame, `[B, 16, T, H/8, W/8]` for a clip (ComfyUI's is always 5D). Made by
     /// `VAEEncode` with the SeedVR2 VAE, sampled by the SeedVR2 model with `SeedVR2Conditioning`.
     SeedVr2,
+    /// RelayVSR's keyframe latent: `[1, 48, keyframes, lh, lw]`, made by `RelayVSRConditioning` (every 15th frame of the
+    /// low-quality clip and its last), sampled by the RelayVSR model and decoded by `VSRDecode`.
+    RelayVsr,
     /// Produced by an engine operation whose format the server doesn't track (e.g. `VAEEncode`).
     EngineDefined,
 }

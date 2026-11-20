@@ -66,6 +66,8 @@ enum Family {
     Qwen21,
     /// SeedVR2 3B, the restoration model SwarmUI's SeedVR stage runs
     SeedVr2,
+    /// RelayVSR's keyframe model (Wan 2.2 TI2V 5B), the video upscaler of the RelayVSR extension's stage
+    RelayVsr,
     /// SD 1.x and SDXL base checkpoints, with their own CLIP and VAE
     Sd,
 }
@@ -217,6 +219,12 @@ fn check_dit(file: &ModelFile) -> EngineResult<Family> {
             return Err(unsupported(format!("{}: this backend only runs the int8 ConvRot SeedVR2 3B release", file.name)));
         }
         return Ok(Family::SeedVr2);
+    }
+    if let Some(p) = diffusion::relayvsr::key_prefix(|k| h.get(k).is_some()) {
+        if h.get(format!("{p}blocks.0.self_attn.q.weight_scale")).is_none() || h[format!("{p}blocks.0.self_attn.q.weight")]["dtype"] != "I8" {
+            return Err(unsupported(format!("{}: this backend only runs the int8 ConvRot RelayVSR releases", file.name)));
+        }
+        return Ok(Family::RelayVsr);
     }
     if let Some(p) = diffusion::qwen21::key_prefix(|k| h.get(k).is_some()) {
         if h.get(format!("{p}transformer_blocks.0.img_mlp.gate_up.weight_scale")).is_none() {
@@ -857,6 +865,8 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         Family::H3 => ModelSampling::Flow { shift: h3::SHIFT_VIDEO },
         // ComfyUI's SeedVR2 sampling_settings
         Family::SeedVr2 => ModelSampling::Flow { shift: 1.0 },
+        // WAN22_RelayVSR keeps WAN21_T2V's sampling_settings
+        Family::RelayVsr => ModelSampling::Flow { shift: 8.0 },
         Family::Sd => ModelSampling::Discrete,
     };
     let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None, snapref: None, style: None, v_pred: None, attn_token_weights: None };
@@ -1240,6 +1250,78 @@ impl NativeEngine {
         Ok(Latent::single(tensor, info))
     }
 
+    /// RelayVSR's keyframe latent from the keyframes `RelayVSRConditioning` carries: one evaluation of the model over
+    /// every keyframe, as in ComfyUI.
+    fn sample_relayvsr(&self, req: &SampleRequest, settings: &ModelSettings, progress: &mut dyn ProgressSink) -> EngineResult<Latent> {
+        let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
+        if !settings.loras.is_empty() {
+            return Err(unsupported("LoRAs on RelayVSR"));
+        }
+        let LatentSamples::Single(tensor) = &req.latent.samples else {
+            return Err(unsupported("RelayVSR on an audio/video latent"));
+        };
+        let &[1, ch, keys, lh, lw] = tensor.shape.as_slice() else {
+            return Err(unsupported(format!("RelayVSR on a latent of shape {:?} (it upscales one clip from RelayVSRConditioning)", tensor.shape)));
+        };
+        if ch != diffusion::relayvsr::CH || tensor.format != LatentFormat::RelayVsr {
+            return Err(unsupported("RelayVSR on a latent RelayVSRConditioning didn't make"));
+        }
+        if req.latent.noise_mask.is_some() {
+            return Err(unsupported("a noise mask on RelayVSR"));
+        }
+        if req.variation.is_some() {
+            return Err(unsupported("Variation Seed on RelayVSR"));
+        }
+        let cond = relayvsr_condition(&req.positive)?;
+        let k = &cond.keyframes;
+        if k.count as usize != keys {
+            return Err(unsupported(format!("{} RelayVSR keyframes for a latent of {keys}", k.count)));
+        }
+        let finish = |data| {
+            let t = LatentTensor { format: LatentFormat::RelayVsr, shape: tensor.shape.clone(), data: Opaque::new(HostLatent { data }) };
+            Ok(req.latent.with_samples(LatentSamples::Single(t)))
+        };
+        // [48, keys, lh, lw] in the order of a [48, keys * lh, lw] picture, which is how the sampler sees it
+        let flat = LatentTensor { format: tensor.format, shape: vec![1, ch, keys * lh, lw], data: tensor.data.clone() };
+        let Some(sigmas) = schedule(req, settings, (lh, lw))? else {
+            let plan = Plan::new(Vec::new(), &req.latent, &flat, settings)?;
+            return finish(plan.latent.unwrap_or_else(|| vec![0.0; ch * keys * lh * lw]));
+        };
+        let plan = Plan::new(sigmas, &req.latent, &flat, settings)?;
+        let sampling = sampling(req, settings, &plan, 1)?;
+        // the model reads no prompt but the one stored in it, so CFG would need a negative that differs
+        if sampling.uses_negative() {
+            return Err(unsupported("CFG other than 1 on RelayVSR"));
+        }
+        let noise = plan.noise(req, 1, (ch, keys * lh, lw));
+        let data = frames_f32(k);
+        let r = diffusion::pipeline::RelayVsrRequest {
+            keyframes: diffusion::pipeline::RelayVsrFrames { data: &data, count: keys, height: k.height as usize, width: k.width as usize, channels: k.channels as usize },
+            lh,
+            lw,
+            sampling,
+            noise,
+        };
+        let mut gen = self.gen();
+        gen.ensure_relayvsr(&file.path).map_err(internal)?;
+        gen.set_int8_attention(settings.int8_attention);
+        // one step: the bar follows the blocks; RelayVSR's latents have no preview colours in ComfyUI
+        let progress = std::cell::RefCell::new(progress);
+        let (latent, stats) = gen
+            .sample_relayvsr(
+                &r,
+                |_| !progress.borrow().interrupted(),
+                |done, total| {
+                    let mut p = progress.borrow_mut();
+                    p.progress(done as u32, total as u32);
+                    if p.interrupted() { Err(Cancelled.into()) } else { Ok(()) }
+                },
+            )
+            .map_err(internal)?;
+        tracing::info!("relayvsr: {keys} keyframes of {}x{}: sampling {:.0} ms", k.width, k.height, stats.sample_ms);
+        finish(latent)
+    }
+
     fn decode_seedvr(&self, vae: &VaeHandle, t: &LatentTensor, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
         let (frames, lh, lw) = match *t.shape.as_slice() {
             [1, 16, lh, lw] => (1, lh, lw),
@@ -1275,6 +1357,7 @@ impl NativeEngine {
             Family::H3Image => (self.gen().ensure_h3(&file.path), "minimax-h3-image"),
             Family::Qwen21 => (self.gen().ensure_qwen21(&file.path), "qwen-image-2.1"),
             Family::SeedVr2 => (self.gen().ensure_seedvr(&file.path), "seedvr2"),
+            Family::RelayVsr => (self.gen().ensure_relayvsr(&file.path), "relayvsr"),
             Family::Sd if sd_file_is_xl(file)? => (self.gen().ensure_sd(&file.path), "stable-diffusion-xl-v1-base"),
             Family::Sd => (self.gen().ensure_sd(&file.path), "stable-diffusion-v1"),
         };
@@ -1957,6 +2040,33 @@ fn seedvr_condition<'a>(c: &'a Conditioning, shape: &[usize]) -> EngineResult<&'
     Ok(&h.data)
 }
 
+/// True for RelayVSR's Flash decoder.
+fn is_relayvsr_vae(file: &ModelFile) -> bool {
+    read_header(&file.path).is_ok_and(|h| diffusion::relayvsr::is_flash(|k| h.get(k).is_some()))
+}
+
+/// The `RelayVSRConditioning` an entry list carries.
+fn relayvsr_condition(c: &Conditioning) -> EngineResult<&RelayVsrCondition> {
+    let [entry] = c.entries.as_slice() else {
+        return Err(unsupported("RelayVSR with other conditioning than one RelayVSRConditioning"));
+    };
+    let Some(cond) = &entry.meta.relayvsr else {
+        return Err(unsupported("RelayVSR without RelayVSRConditioning (it upscales a video and takes no prompt)"));
+    };
+    let m = &entry.meta;
+    if m.multiplier != 1.0 || m.zeroed || m.mask.is_some() || !m.reference_latents.is_empty() || m.inpaint.is_some() || !m.controls.is_empty()
+        || !m.embedding_ops.is_empty() || !m.gligen.is_empty() || !m.unclip.is_empty() || m.start_percent != 0.0 || m.end_percent != 1.0
+        || m.seedvr2.is_some() || !m.minimax_keyframes.is_empty() {
+        return Err(unsupported("conditioning changes on RelayVSR's conditioning"));
+    }
+    Ok(cond)
+}
+
+/// A batch's pixels, f32 [count][height][width][channels].
+fn frames_f32(b: &ImageBatch) -> Vec<f32> {
+    (0..b.count).flat_map(|f| b.frame_f32(f).into_owned()).collect()
+}
+
 /// True for the Flux 2 VAE, which MOSS Image uses.
 fn is_flux2_vae(file: &ModelFile) -> bool {
     read_header(&file.path).is_ok_and(|h| h.get("bn.running_mean").is_some())
@@ -2037,6 +2147,10 @@ impl Engine for NativeEngine {
     }
 
     fn load_vae(&self, req: &LoadVae) -> EngineResult<VaeHandle> {
+        if is_relayvsr_vae(&req.file) {
+            self.gen().ensure_relayvsr_vae(&req.file.path).map_err(internal)?;
+            return Ok(VaeHandle::new(Some(req.file.clone()), Opaque::none()));
+        }
         if is_seedvr2_vae(&req.file) {
             self.gen().ensure_seedvr_vae(&req.file.path).map_err(internal)?;
             return Ok(VaeHandle::new(Some(req.file.clone()), Opaque::none()));
@@ -2123,6 +2237,14 @@ impl Engine for NativeEngine {
                 PixelInfo::image(width, height, req.batch_size),
             ));
         }
+        // RelayVSRConditioning's zeros: one latent frame per keyframe, sampled as they are
+        if let EmptyLatentKind::RelayVsr { keyframes, latent_height, latent_width, width, height, frames } = req.kind {
+            let shape = vec![1, diffusion::relayvsr::CH, keyframes as usize, latent_height as usize, latent_width as usize];
+            return Ok(Latent::single(
+                LatentTensor { format: LatentFormat::RelayVsr, shape, data: Opaque::none() },
+                PixelInfo { frames, ..PixelInfo::image(width, height, 1) },
+            ));
+        }
         // Qwen Image 2.1's placeholder, which `sample` widens to its 64 channels
         if let EmptyLatentKind::Image4Ch { width, height } = req.kind {
             let (b, h, w) = (req.batch_size as usize, height as usize / 8, width as usize / 8);
@@ -2158,6 +2280,9 @@ impl Engine for NativeEngine {
         if family == Family::SeedVr2 {
             return self.sample_seedvr(req, &settings, progress);
         }
+        if family == Family::RelayVsr {
+            return self.sample_relayvsr(req, &settings, progress);
+        }
         // SwarmUI sends Qwen Image 2.1 a half-size 4-channel placeholder, as ComfyUI widens it
         let widened = if family == Family::Qwen21 { req.latent.conform_empty(LatentFormat::QwenImage21, family.latent().0, family.latent().1 as u32) } else { None };
         let latent = widened.as_ref().unwrap_or(&req.latent);
@@ -2190,7 +2315,7 @@ impl Engine for NativeEngine {
             Family::Moss => self.sample_moss(req, shape, &settings, &plan, progress)?,
             Family::Qwen21 => self.sample_qwen21(req, shape, &settings, &plan, progress)?,
             Family::Sd => self.sample_sd(req, shape, &settings, &plan, progress)?,
-            Family::H3 | Family::H3Image | Family::SeedVr2 => unreachable!("H3 and SeedVR2 sample above"),
+            Family::H3 | Family::H3Image | Family::SeedVr2 | Family::RelayVsr => unreachable!("H3, SeedVR2 and RelayVSR sample above"),
         })
     }
 
@@ -2199,6 +2324,12 @@ impl Engine for NativeEngine {
             LatentSamples::AudioVideo { video, .. } => return self.decode_h3(req, video),
             LatentSamples::Single(t) if t.format == LatentFormat::MiniMaxH3Video => return self.decode_h3(req, t),
             _ => {}
+        }
+        if req.vae.source.as_ref().is_some_and(is_relayvsr_vae) {
+            return Err(unsupported("VAE Decode with RelayVSR's Flash decoder (it decodes with VSR Decode, which reads the low-quality video too)"));
+        }
+        if matches!(&req.latent.samples, LatentSamples::Single(t) if t.format == LatentFormat::RelayVsr) {
+            return Err(unsupported("VAE Decode of a RelayVSR latent (it decodes with VSR Decode and the RelayVSR Flash decoder)"));
         }
         let seedvr_vae = req.vae.source.as_ref().is_some_and(is_seedvr2_vae);
         if let LatentSamples::Single(t) = &req.latent.samples {
@@ -2258,6 +2389,9 @@ impl Engine for NativeEngine {
             return Err(unsupported("VAE tiling"));
         }
         let file = req.vae.source.as_ref().ok_or_else(|| unsupported("the pixel-space VAE"))?;
+        if is_relayvsr_vae(file) {
+            return Err(unsupported("VAE Encode with RelayVSR's Flash decoder, which only decodes"));
+        }
         if is_seedvr2_vae(file) {
             return self.encode_seedvr(file, &req.pixels);
         }
@@ -2289,6 +2423,57 @@ impl Engine for NativeEngine {
 
     fn latent_op(&self, op: &LatentOp) -> EngineResult<Latent> {
         latent::latent_op(op)
+    }
+
+    fn relayvsr_latent_stride(&self, model: &ModelHandle) -> EngineResult<u32> {
+        let file = model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
+        if check_dit(file)? != Family::RelayVsr {
+            return Err(unsupported(format!("RelayVSRConditioning on {}, which isn't a RelayVSR model", file.name)));
+        }
+        let h = read_header(&file.path).map_err(internal)?;
+        let p = diffusion::relayvsr::key_prefix(|k| h.get(k).is_some()).ok_or_else(|| unsupported("not a RelayVSR model"))?;
+        let cin = h[format!("{p}lq_proj_in.conv1.weight")]["shape"][1].as_u64().ok_or_else(|| unsupported("RelayVSR without lq_proj_in.conv1"))?;
+        let factor = diffusion::relayvsr::factor_of(cin as usize).map_err(|e| unsupported(e.to_string()))?;
+        Ok((16 / factor) as u32)
+    }
+
+    fn vsr_decode(&self, req: &VsrDecodeRequest, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        let file = req.vae.source.as_ref().ok_or_else(|| unsupported("VSR Decode without a VAE file"))?;
+        if !is_relayvsr_vae(file) {
+            return Err(unsupported(format!("VSR Decode with {}, which isn't RelayVSR's Flash decoder", file.name)));
+        }
+        let LatentSamples::Single(t) = &req.latent.samples else {
+            return Err(unsupported("VSR Decode of an audio/video latent"));
+        };
+        let &[1, ch, keys, lh, lw] = t.shape.as_slice() else {
+            return Err(unsupported(format!("VSR Decode of a latent of shape {:?}", t.shape)));
+        };
+        if ch != diffusion::relayvsr::CH || t.format != LatentFormat::RelayVsr {
+            return Err(unsupported("VSR Decode of a latent RelayVSR didn't sample"));
+        }
+        let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("decoding a latent this engine didn't sample"))?;
+        let img = &req.images;
+        if img.count == 0 {
+            return Err(EngineError::InvalidInput("VSR Decode without frames".into()));
+        }
+        let data = frames_f32(img);
+        let frames = diffusion::pipeline::RelayVsrFrames {
+            data: &data,
+            count: img.count as usize,
+            height: img.height as usize,
+            width: img.width as usize,
+            channels: img.channels as usize,
+        };
+        let mut gen = self.gen();
+        gen.ensure_relayvsr_vae(&file.path).map_err(internal)?;
+        let factor = gen.relayvsr_vae_factor().unwrap_or(1);
+        let rgb = gen
+            .decode_relayvsr(&latent.data, keys, lh, lw, &frames, req.detail as f32, |done, total| {
+                progress.progress(done as u32, total as u32);
+                if progress.interrupted() { Err(Cancelled.into()) } else { Ok(()) }
+            })
+            .map_err(internal)?;
+        Ok(ImageBatch::from_f32(img.count, img.height * factor as u32, img.width * factor as u32, 3, rgb))
     }
 
     /// SeedVR2 clips: the most latent frames one evaluation fits, from this engine's own estimate.
@@ -2338,7 +2523,9 @@ impl Engine for NativeEngine {
             .map_err(internal)?;
         }
         if let Some(f) = req.vae.source.as_ref().filter(|f| !is_h3_vae(f)) {
-            if is_seedvr2_vae(f) {
+            if is_relayvsr_vae(f) {
+                gen.ensure_relayvsr_vae(&f.path)
+            } else if is_seedvr2_vae(f) {
                 gen.ensure_seedvr_vae(&f.path)
             } else if is_qwen21_vae(f) {
                 gen.ensure_vae21(&f.path)

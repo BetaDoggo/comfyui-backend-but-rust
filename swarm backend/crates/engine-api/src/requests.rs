@@ -265,6 +265,29 @@ pub enum EmptyLatentKind {
     MiniMaxH3AudioVideo { width: u32, height: u32, length: u32 },
     /// `MiniMaxH3ImageConditioning`'s latent for MiniMax-H3-Image: one frame, `[1, 24, 1, H/16, W/16]`.
     MiniMaxH3Image { width: u32, height: u32 },
+    /// `RelayVSRConditioning`'s latent: `[1, 48, keyframes, latent_height, latent_width]`, zeros. `width`, `height` and
+    /// `frames` are the upscaled clip it decodes to.
+    RelayVsr { keyframes: u32, latent_height: u32, latent_width: u32, width: u32, height: u32, frames: u32 },
+}
+
+/// RelayVSR's frame layout (`comfy.ldm.wan.model_vsr`).
+pub mod relayvsr {
+    /// Frames between keyframes.
+    pub const KEYFRAME_INTERVAL: u32 = 15;
+
+    /// `relay_keyframes`: every 15th frame of a clip of `frames`, and its last.
+    pub fn keyframes(frames: u32) -> Vec<u32> {
+        let mut k: Vec<u32> = (0..frames.saturating_sub(1)).step_by(KEYFRAME_INTERVAL as usize).collect();
+        k.push(frames.saturating_sub(1));
+        k
+    }
+
+    /// `relay_latent_size`: the latent of a `height` x `width` frame, whole 2x2 patches of `latent_stride` pixels per
+    /// latent pixel.
+    pub fn latent_size(height: u32, width: u32, latent_stride: u32) -> (u32, u32) {
+        let s = latent_stride * 2;
+        (height.div_ceil(s) * 2, width.div_ceil(s) * 2)
+    }
 }
 
 /// MiniMax H3 temporal layout helpers, matching `SwarmModels.py::temporal_shape`.
@@ -397,6 +420,18 @@ pub struct VaeDecodeRequest {
     pub vae: VaeHandle,
     pub latent: Latent,
     pub tiling: Option<VaeTiling>,
+}
+
+/// `VSRDecode`: RelayVSR's keyframe latent through its Flash decoder (the `vae`), which reads the whole low-quality
+/// clip beside it and returns it upscaled by the decoder's factor. `detail` scales what the decoder adds to the bicubic
+/// upscale of each frame, 1 being the model's full output.
+#[derive(Clone, Debug)]
+pub struct VsrDecodeRequest {
+    pub vae: VaeHandle,
+    pub latent: Latent,
+    /// The same clip `RelayVSRConditioning` was given, every frame.
+    pub images: ImageBatch,
+    pub detail: f64,
 }
 
 /// `VAEEncode` / `VAEEncodeTiled` (init images, reference latents, H3 keyframes).

@@ -16,6 +16,7 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | Pixal3D | A 3D mesh from one image | the example workflow's four `euler` samplers | int8 ConvRot (`pixal3d_int8_convrot`) only |
 | Idol (TripoSplat) | A 3D gaussian splat from one image | `dpmpp_2m`, `simple`, 20 steps, CFG 3 | Comfy-Org's fp16 files |
 | SeedVR2 3B | A restored copy of a picture (SwarmUI's SeedVR stage) | `euler`, `simple`, 1 step, CFG 1 | int8 ConvRot (`seedvr2_3b_int8_convrot`) only |
+| RelayVSR | A video upscaled x2 or x4 (the RelayVSR extension's stage); works in SwarmUI, compared with ComfyUI through the CLI | `euler`, `simple`, 1 step, CFG 1 | int8 ConvRot keyframe models, fp32 Flash decoders |
 
 ## Support matrix
 
@@ -46,7 +47,7 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | VAE tiling, Seamless Tileable | Refused | Refused | Refused | Refused | Refused | Only the 256 / 64 tile | - |
 | Background removal | - | - | - | - | - | - | Yes (BiRefNet) |
 
-HyperFlow H3 Flash, MiniMax-H3-Image, Idol and SeedVR2 aren't in this matrix; their own sections below say what they
+HyperFlow H3 Flash, MiniMax-H3-Image, Idol, SeedVR2 and RelayVSR aren't in this matrix; their own sections below say what they
 take. ControlNet, regions, IP-Adapter, style models, GLIGEN, LoRA hooks and embeddings are refused on every family. Anima
 takes both `(word:1.2)` and `<weight>`; Qwen Image 2.1's encoder reads `(word:1.2)` as plain text. SD 1.x and SDXL take
 `(word:1.2)` in a plain prompt and `<weight>` through SwarmUI's text node, which reads parentheses literally, as
@@ -897,3 +898,105 @@ Each of these is refused with an error SwarmUI shows, unless marked untested:
 The `pixel-*` upscale methods resize with the Rust `image` crate's filters, not PIL's, so SeedVR's input differs a
 little from ComfyUI's when SwarmUI upscales before it. The encoder's stride 2 convolutions run as stride 1 convolutions
 whose odd samples are kept, which wastes about a tenth of the encode.
+
+## RelayVSR
+
+Comfy-Org's video super-resolution, x2 or x4, run as its example workflow does. The
+[RelayVSR extension](../swarm%20backend/relayvsr-extension/README.md) adds it to SwarmUI as a stage after the
+generation. It sends five nodes:
+
+1. `UNETLoader` loads the keyframe model.
+2. `RelayVSRConditioning` takes the finished frames.
+3. `KSampler` runs one `euler` step at CFG 1 with the `simple` scheduler.
+4. `VAELoader` loads the Flash decoder.
+5. `VSRDecode` decodes with it.
+
+**Status:** compared with ComfyUI through the CLI on the real x2 and x4 files (see [Against ComfyUI](#against-comfyui)).
+Run through `comfy-server` over HTTP with the extension's nodes. A single frame (832x1216 x2) took 354 ms to sample and
+266 ms to decode. 17 frames at 640x360 took 371 and 425 ms. Tested through SwarmUI by the maintainer.
+
+The model runs in two networks, both in [`src/relayvsr.rs`](../src/relayvsr.rs).
+
+**The keyframe model** is Wan 2.2 TI2V 5B, int8 ConvRot, with the low-quality frames projected in beside its patch
+embedding.
+
+* It samples every 15th frame and the last, each keyframe one latent frame. The latent is 1/16 of the upscaled size.
+* Self-attention is local: a 22x40 window of the keyframe's own tokens and of the three keyframes before it.
+* Keyframes go through in chunks of about 32768 tokens, with each block's keys and values of the last three kept as
+  int8 for the next chunk.
+* Cross-attention reads a prompt stored in the checkpoint, so its keys and values are computed once at load.
+* It is held beside the loaded family, as SeedVR2 is.
+
+**The Flash decoder** (`VSRDecode`) runs in fp16 and rebuilds every frame.
+
+* It reads the two keyframe latents around the frame, the previous frame and the low-quality frame itself.
+* Its output is added to a bicubic upscale of the frame. `detail` scales the part it adds.
+
+Files, from [Comfy-Org/RelayVSR](https://huggingface.co/Comfy-Org/RelayVSR):
+
+* `diffusion_models/relayvsr_x2_lightx2v_int8_convrot.safetensors` or `relayvsr_x4_int8_convrot.safetensors`
+* `VAE/relayvsr_flash_vae_x2_fp32.safetensors` or `relayvsr_flash_vae_x4_fp32.safetensors`
+
+The factor comes from the files: the model's low-quality projection, and the decoder's `config` metadata.
+
+### Against ComfyUI
+
+To compare:
+
+1. Run `tools/relayvsr_ref.py` on a scenery picture. It dumps ComfyUI's stages.
+2. Run `diffusion --relayvsr-check <dump> --dit <model> --vae <decoder>`. It runs the keyframe model and the decoder on
+   ComfyUI's own inputs, reports the differences, and saves our last frame as `ours_last.png` beside the dump.
+
+On this card, ComfyUI runs the int8 keyframe model in **fp16**. With a quantized file it computes in the model's first
+supported dtype, whatever the flags say. This engine runs it in bf16. `relayvsr_ref.py --dtype bf16` makes ComfyUI
+compute in bf16, which measures that difference on its own.
+
+Measured on an RTX 5070 with a scenery pan, a snowy forest. Each clip is 17 frames, so 3 keyframes in one chunk:
+
+| | x2, 632x360 to 1264x720 | x4, 316x180 to 1264x720 |
+|---|---|---|
+| Flash decoder on ComfyUI's latent, frames from ComfyUI's | 69.6 dB, worst frame 62.2 dB | 72.4 dB, worst frame 64.5 dB |
+| `lq_proj_in` output | 0.24% relative (vs ComfyUI bf16) | 0.44% (vs fp16) |
+| After block 0 | 0.40% (vs bf16) | 0.41% (vs fp16) |
+| Denoised latent | 3.5% vs fp16 (cos 0.99938); 3.2% vs bf16 | 3.6% vs fp16 (cos 0.99935) |
+| End to end, final frames | 50.2 dB vs fp16; 51.2 dB vs bf16 | 48.1 dB vs fp16 |
+| **ComfyUI fp16 vs ComfyUI bf16** | block 0 0.35%, latent 3.2%, frames 50.5 dB | not measured |
+
+Our port sits as far from ComfyUI as ComfyUI's own fp16 and bf16 runs sit from each other. The error grows smoothly
+through the blocks, with no step at any one of them, and our frames look the same as ComfyUI's. With flash
+cross-attention (`RELAYVSR_FLASH=1`), the latent is 2.8% from ComfyUI bf16 and the frames are 52.2 dB. ComfyUI is
+deterministic from run to run.
+
+**The int8 key cache:** a 632-frame x4 clip at 316x180 has 44 keyframes, which go through in chunks of 35 and 9. The
+first chunk's keyframes are 3.0% to 4.1% from ComfyUI fp16. The second chunk reads the cache and is 3.5% to 4.2%, with
+no jump where it starts. The whole latent is 3.3% from ComfyUI.
+
+Times, warm, from the check, against ComfyUI's warm `KSampler` and `VSRDecode` calls:
+
+| | This engine | ComfyUI |
+|---|---|---|
+| x2, 3 keyframes at 632x360 | keyframes 231 to 264 ms | 289 ms |
+| x2, decode of 17 frames at 1264x720 | 429 to 475 ms | 451 to 735 ms |
+| x4, 3 keyframes at 316x180 | 296 ms | 248 ms |
+| x4, decode of 17 frames | 418 ms | 445 ms |
+| x4, 44 keyframes (632 frames) | 4.46 s | not measured warm |
+
+These are single runs, not averages, so read them as rough. Other checks:
+
+* The window attention kernel matches an eager CPU reference: `cargo test --release -- --ignored window_attention`.
+* Keyframe choice, latent sizes and chunk sizes match ComfyUI's formulas in unit tests.
+* The server's node chain runs on the mock engine.
+
+### What RelayVSR refuses here
+
+Each of these is refused with an error SwarmUI shows:
+
+| Setting | Why |
+|---|---|
+| LoRAs on the keyframe model | Not ported |
+| CFG other than 1 | The model takes no prompt, so a negative has nothing to differ by |
+| Variation Seed, a noise mask, other conditioning on the entry | Not part of the workflow |
+| Files other than the int8 ConvRot keyframe models | Not ported |
+| `VAEDecode` of a RelayVSR latent, or `VAEEncode` with the Flash decoder | The decoder needs the low-quality frames, so only `VSRDecode` decodes |
+
+The key cache stays in VRAM. At 1080p to 4K x2 it is about 4.5 GB (estimated, not measured).

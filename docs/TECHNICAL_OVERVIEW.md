@@ -90,6 +90,7 @@ the baked weights match ComfyUI's bit for bit. Sampling then runs the normal int
 | MiniMax H3 | `src/h3.rs`, w6a8 | Qwen3-VL 32B, `src/h3te.rs` | Video and audio, `src/h3vae.rs` |
 | Pixal3D | `src/trellis.rs`, int8 ConvRot | DINOv3 ViT-L and NAF, `src/dino3.rs` | Sparse convolution shape and texture decoders, `src/trellis_vae.rs` |
 | SeedVR2 3B | `src/seedvr.rs`, int8 ConvRot | none: a fixed prompt stored in the checkpoint | Causal video VAE, a frame at a time, `src/seedvr_vae.rs` |
+| RelayVSR | `src/relayvsr.rs`, int8 ConvRot Wan 2.2 TI2V 5B over keyframes | none: a fixed prompt stored in the checkpoint | The Flash decoder, fp16, which also reads the low-quality frames, `src/relayvsr.rs` |
 | TripoSplat / Idol | `src/triposplat.rs`, fp16 | DINOv3 ViT-H, `src/dino3.rs`, and the Flux 2 VAE's encoder | Octree gaussian decoder, `src/triposplat.rs` |
 | SD 1.x and SDXL | `src/unet.rs`, fp16, transformer linears int8 by default | CLIP-L, and OpenCLIP bigG on SDXL, `src/clip.rs` | The 4-channel KL VAE, `src/sdvae.rs` |
 
@@ -103,6 +104,8 @@ drops those caches when a LoRA or a text encoder changes. Loading any part of an
 parts outlive a switch: the Qwen3-VL text encoder, shared by Krea 2 and Qwen Image 2.1, and the Wan 2.1 VAE, shared by
 Krea 2 and Anima. SeedVR2 isn't a family: it restores any family's picture in the same job, so it is held beside the
 loaded one ([`src/pipeline/seedvr.rs`](../src/pipeline/seedvr.rs)), and the memory management moves weights between them.
+RelayVSR's keyframe model and Flash decoder are held beside it the same way
+([`src/pipeline/relayvsr.rs`](../src/pipeline/relayvsr.rs)).
 
 ## Why it is faster than ComfyUI
 
@@ -327,6 +330,7 @@ csrc/attn_int8.cu   INT8 attention wrapper, the default
 csrc/h3.cu          MiniMax H3 kernels
 csrc/qwen21.cu      Qwen Image 2.1: VAE shortcuts, prefix attention for text and reference tokens
 csrc/seedvr.cu      SeedVR2: patch embedding input, window attention reordering, VAE pixel shuffle and temporal taps
+csrc/relayvsr.cu    RelayVSR: tensor-core sliding-window attention over several planes, int8 key cache, LQ projection, Flash output
 csrc/trellis.cu     Pixal3D: per-head QK norm, voxel hashing and sparse-conv gathers, NAF attention, feature sampling
 csrc/triposplat.cu  TripoSplat: fp16 gated adds, RePo rotary + q/k RMS norm, SiLU gating
 csrc/birefnet.cu    BiRefNet: im2col, deformable-conv columns, Swin window gather and attention, bilinear resize

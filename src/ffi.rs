@@ -204,6 +204,24 @@ extern "C" {
     pub fn gpu_seedvr_stack3(a: P, b: P, c: P, out: PM, px: i64, ch: i32, s: PM) -> i32;
     pub fn gpu_pixel_shuffle2_bf16(x: P, out: PM, h: i32, w: i32, c: i32, s: PM) -> i32;
 
+    // RelayVSR (csrc/relayvsr.cu)
+    /// Sliding-window attention, see [`WinArgs`]; `dtype` bf16 or f16, heads `hd` 64 or 128 wide.
+    pub fn gpu_win_attn(dtype: i32, hd: i32, args: *const WinArgs, scale: f32, s: PM) -> i32;
+    pub fn gpu_relay_rms(dtype: i32, x: P, x_rs: i64, out: PM, out_rs: i64, w: P, add: P, eps: f32, rows: i64, k: i32, groups: i32, s: PM) -> i32;
+    pub fn gpu_relay_rope(dtype: i32, x: P, x_rs: i64, out: PM, out_rs: i64, heads: i32, hd: i32, rows: i64, h: i32, w: i32, tt: P, th: P, tw: P,
+        pt: i32, ph: i32, s: PM) -> i32;
+    pub fn gpu_relay_kv_quant(src: P, src_rs: i64, q: PM, sc: PM, rows: i64, heads: i32, s: PM) -> i32;
+    pub fn gpu_relay_kv_dequant(q: P, sc: P, dst: PM, dst_rs: i64, rows: i64, heads: i32, s: PM) -> i32;
+    pub fn gpu_relay_lq_unshuffle(src: P, h: i32, w: i32, c: i32, hp: i32, wp: i32, up: i32, r: i32, out: PM, s: PM) -> i32;
+    pub fn gpu_relay_im2col3(dtype: i32, inp: P, h: i32, w: i32, c: i32, stride: i32, out: PM, ld: i32, s: PM) -> i32;
+    pub fn gpu_relay_silu(dtype: i32, x: PM, n: i64, s: PM) -> i32;
+    pub fn gpu_relay_patchify(lat: P, c: i32, f: i32, f0: i32, nf: i32, lh: i32, lw: i32, out: PM, s: PM) -> i32;
+    pub fn gpu_relay_embed_add(pe: P, lq: P, out: PM, n: i64, s: PM) -> i32;
+    pub fn gpu_relay_unpatch_denoise(tok: P, ld: i32, x: P, den: PM, c: i32, f: i32, f0: i32, nf: i32, lh: i32, lw: i32, sigma: f32, s: PM) -> i32;
+    pub fn gpu_relay_plane_rows(dtype: i32, lat: P, c: i32, f: i32, plane: i32, h: i32, w: i32, out: PM, s: PM) -> i32;
+    pub fn gpu_relay_lr_frame(dtype: i32, src: P, h: i32, w: i32, c: i32, hp: i32, wp: i32, out_f: PM, out_t: PM, s: PM) -> i32;
+    pub fn gpu_relay_flash_out(dtype: i32, res: P, lr: P, hp: i32, wp: i32, up: i32, detail: f32, out: PM, oh: i32, ow: i32, lw: i32, s: PM) -> i32;
+
     // SD 1.x and SDXL (csrc/sd.cu): fp16 UNet, float32 CLIP
     pub fn gpu_conv2d_f16(x: P, w: P, bias: P, out: PM, n: i32, h: i32, w_: i32, c: i32, cout: i32, r: i32, stride: i32, s: PM) -> i32;
     /// `gpu_conv2d_f16` at stride 1 with `resid` added as `gpu_sd_add` adds it; `out` aliases neither input.
@@ -233,6 +251,73 @@ extern "C" {
     pub fn gpu_sd_unpad_quant_rows(src: P, q: PM, scales: PM, m: i32, h: i32, d: i32, dp: i32, rotate: i32, s: PM) -> i32;
     pub fn gpu_sd_group_norm_quant_rows(x: P, w: P, b: P, sums: PM, n: i32, p: i64, c: i32, g: i32, eps: f32, q: PM, scales: PM, rotate: i32,
         s: PM) -> i32;
+}
+
+/// Key planes one query plane of [`gpu_win_attn`] attends, at most.
+pub const WIN_PLANES: usize = 4;
+
+/// [`gpu_win_attn`]'s arguments (`WinArgs` in csrc/relayvsr.cu). Query plane `t` attends key plane `t + tk - tq` and the
+/// `tw - 1` before it, each at `kb + p * k_ps` with one window (`n == 0`), or the `n` planes given, each with its own
+/// window and strides, for one query plane. Strides are in elements; `scale_log2` is filled in by the launcher.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WinArgs {
+    pub q: P,
+    pub o: PM,
+    pub q_rs: i64,
+    pub q_ps: i64,
+    pub o_rs: i64,
+    pub o_ps: i64,
+    pub k: [P; WIN_PLANES],
+    pub v: [P; WIN_PLANES],
+    pub krs: [i64; WIN_PLANES],
+    pub vrs: [i64; WIN_PLANES],
+    pub wh: [i32; WIN_PLANES],
+    pub ww: [i32; WIN_PLANES],
+    pub n: i32,
+    pub kb: P,
+    pub vb: P,
+    pub k_ps: i64,
+    pub v_ps: i64,
+    pub uwh: i32,
+    pub uww: i32,
+    pub tk: i32,
+    pub tq: i32,
+    pub tw: i32,
+    pub k_rs: i64,
+    pub v_rs: i64,
+    pub h: i32,
+    pub w: i32,
+    pub heads: i32,
+    pub kv_heads: i32,
+    pub clamp: i32,
+    pub scale_log2: f32,
+}
+
+impl WinArgs {
+    /// No planes yet, for a `h` x `w` grid.
+    pub fn new(q: P, q_rs: i64, o: PM, o_rs: i64, h: usize, w: usize, heads: usize, kv_heads: usize, clamp: bool) -> Self {
+        WinArgs {
+            q, o, q_rs, q_ps: 0, o_rs, o_ps: 0,
+            k: [null(); WIN_PLANES], v: [null(); WIN_PLANES], krs: [0; WIN_PLANES], vrs: [0; WIN_PLANES], wh: [0; WIN_PLANES], ww: [0; WIN_PLANES], n: 0,
+            kb: null(), vb: null(), k_ps: 0, v_ps: 0, uwh: 0, uww: 0, tk: 0, tq: 1, tw: 1, k_rs: 0, v_rs: 0,
+            h: h as i32, w: w as i32, heads: heads as i32, kv_heads: kv_heads as i32, clamp: clamp as i32, scale_log2: 0.0,
+        }
+    }
+
+    /// One more explicit key plane.
+    pub fn plane(mut self, k: P, krs: i64, v: P, vrs: i64, window: (usize, usize)) -> Self {
+        let i = self.n as usize;
+        assert!(i < WIN_PLANES, "at most {WIN_PLANES} key planes");
+        self.k[i] = k;
+        self.v[i] = v;
+        self.krs[i] = krs;
+        self.vrs[i] = vrs;
+        self.wh[i] = window.0 as i32;
+        self.ww[i] = window.1 as i32;
+        self.n += 1;
+        self
+    }
 }
 
 /// Most key groups [`gpu_attn_merge`] takes.

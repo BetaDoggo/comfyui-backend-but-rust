@@ -168,6 +168,17 @@ pub trait Engine: Send + Sync + 'static {
         Err(EngineError::Unsupported("model upscaling (ImageUpscaleWithModel)".into()))
     }
 
+    /// `RelayVSRConditioning`: low-quality pixels per latent pixel of `model`, a RelayVSR keyframe model (16 over its
+    /// upscale factor), which sizes the latent. Default: unsupported.
+    fn relayvsr_latent_stride(&self, _model: &ModelHandle) -> EngineResult<u32> {
+        Err(EngineError::Unsupported("RelayVSR video upscaling (RelayVSRConditioning)".into()))
+    }
+
+    /// See [`VsrDecodeRequest`]: the upscaled clip. Default: unsupported.
+    fn vsr_decode(&self, _req: &VsrDecodeRequest, _progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        Err(EngineError::Unsupported("RelayVSR video upscaling (VSRDecode)".into()))
+    }
+
     /// The generic hook (see [`crate::custom`]): any node class without a dedicated request,
     /// such as other model families' nodes and third-party node packs. Default: unsupported.
     fn custom_node(&self, req: &CustomNodeRequest, _progress: &mut dyn ProgressSink) -> EngineResult<Vec<NodeValue>> {

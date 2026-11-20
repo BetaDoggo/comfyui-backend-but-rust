@@ -16,6 +16,7 @@ mod masks;
 mod media;
 mod output;
 mod sampling;
+mod relayvsr;
 mod seedvr;
 mod segment;
 mod snapref;
@@ -157,6 +158,7 @@ impl NodeRegistry {
         snapref::register(&mut r, env);
         broke_style_ref::register(&mut r, env);
         seedvr::register(&mut r, env);
+        relayvsr::register(&mut r, env);
         r
     }
 

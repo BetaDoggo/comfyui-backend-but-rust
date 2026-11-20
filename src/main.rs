@@ -347,6 +347,10 @@ struct Args {
     /// SeedVR2: compare each stage with a dump of tools/seedvr_ref.py (with --dit and --vae) instead of generating
     #[arg(long)]
     seedvr_check: Option<PathBuf>,
+    /// RelayVSR: compare the keyframe model and the Flash decoder with a dump of tools/relayvsr_ref.py (with --dit and
+    /// --vae) instead of generating
+    #[arg(long)]
+    relayvsr_check: Option<PathBuf>,
 }
 
 /// RGB f32 [height, width, 3], 0 to 1.
@@ -409,6 +413,8 @@ const SDXL_DIT: &str = "Stable-diffusion/sd_xl_base_1.0.safetensors";
 const MOSS_VAE: &str = "VAE/flux2-vae.safetensors";
 const SEEDVR_DIT: &str = "diffusion_models/SeedVR2/seedvr2_3b_int8_convrot.safetensors";
 const SEEDVR_VAE: &str = "VAE/SeedVR2/seedvr2_ema_vae_fp16.safetensors";
+const RELAYVSR_DIT: &str = "diffusion_models/relayvsr_x2_lightx2v_int8_convrot.safetensors";
+const RELAYVSR_VAE: &str = "VAE/relayvsr_flash_vae_x2_fp32.safetensors";
 const QWEN21_DIT: &str = "Stable-diffusion/rayQwen21_v1Int8Convrot.safetensors";
 const QWEN21_TE: &str = "clip/qwen3vl_8b_int8_convrot.safetensors";
 const QWEN21_VAE: &str = "VAE/QwenImage/qwen_image_2.1_vae_bf16.safetensors";
@@ -1220,6 +1226,9 @@ fn main() -> Result<()> {
     }
     if let Some(reference) = &args.seedvr_check {
         return diffusion::seedvr::check(&args.model(&args.dit, SEEDVR_DIT), &args.model(&args.vae, SEEDVR_VAE), reference);
+    }
+    if let Some(reference) = &args.relayvsr_check {
+        return diffusion::relayvsr::check(&args.model(&args.dit, RELAYVSR_DIT), &args.model(&args.vae, RELAYVSR_VAE), reference);
     }
     if let Some(reference) = &args.flux2_vae_check {
         return diffusion::flux2vae::check(&args.model(&args.vae, MOSS_VAE), reference);

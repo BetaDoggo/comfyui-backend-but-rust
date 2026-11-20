@@ -66,6 +66,8 @@ const MODEL_FILES: &[&str] = &[
     "VAE/idol_decoder_fp16.safetensors",
     "diffusion_models/SeedVR2/seedvr2_3b_int8_convrot.safetensors",
     "VAE/SeedVR2/seedvr2_ema_vae_fp16.safetensors",
+    "diffusion_models/RelayVSR/relayvsr_x2_lightx2v_int8_convrot.safetensors",
+    "VAE/RelayVSR/relayvsr_flash_vae_x2_fp32.safetensors",
 ];
 
 struct TestServer {
@@ -579,6 +581,12 @@ impl Engine for RecordingEngine {
     fn vae_decode(&self, r: &VaeDecodeRequest, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
         self.seen.lock().unwrap().vae_patches = r.vae.patches.iter().map(|p| format!("{p:?}")).collect();
         self.inner.vae_decode(r, progress)
+    }
+    fn relayvsr_latent_stride(&self, model: &ModelHandle) -> EngineResult<u32> {
+        self.inner.relayvsr_latent_stride(model)
+    }
+    fn vsr_decode(&self, r: &VsrDecodeRequest, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        self.inner.vsr_decode(r, progress)
     }
     fn vae_encode(&self, r: &VaeEncodeRequest) -> EngineResult<Latent> {
         self.inner.vae_encode(r)
@@ -1437,6 +1445,53 @@ async fn upload_load_save_view_roundtrip() {
     assert_eq!(png_dims(&bytes), (60, 40));
     let traversal = s.http.get(s.url("view?filename=../../Cargo.toml&type=output")).send().await.unwrap();
     assert_ne!(traversal.status(), 200);
+}
+
+/// The RelayVSR stage relayvsr-extension emits, on a 17-frame 40x72 clip: keyframes 0, 15 and 16 reach the sampler as a
+/// [1, 48, 3, lh, lw] latent sized by the x2 model's latent stride of 8, and VSR Decode returns every frame at twice the
+/// size.
+#[tokio::test(flavor = "multi_thread")]
+async fn relayvsr_samples_keyframes_and_decodes_every_frame() {
+    let engine = RecordingEngine::new();
+    let s = TestServer::start_engine(engine.clone(), 0, false).await;
+    let img = ImageBatch::from_u8(1, 40, 72, 3, (0..40 * 72 * 3).map(|i| (i % 211) as u8).collect());
+    let b64 = base64::engine::general_purpose::STANDARD.encode(encode::png8(&img, 0).unwrap());
+    let mut wf = json!({
+        "1": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": b64 } },
+        "3":{ "class_type": "UNETLoader", "inputs": { "unet_name": "RelayVSR/relayvsr_x2_lightx2v_int8_convrot.safetensors", "weight_dtype": "default" } },
+        "4": { "class_type": "RelayVSRConditioning", "inputs": { "model": ["3", 0], "images": ["2", 0] } },
+        "5": { "class_type": "KSampler", "inputs": { "model": ["3", 0], "seed": 7, "steps": 1, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple",
+            "positive": ["4", 0], "negative": ["4", 0], "latent_image": ["4", 1], "denoise": 1.0 } },
+        "6": { "class_type": "VAELoader", "inputs": { "vae_name": "RelayVSR/relayvsr_flash_vae_x2_fp32.safetensors" } },
+        "7": { "class_type": "VSRDecode", "inputs": { "vae": ["6", 0], "samples": ["5", 0], "images": ["2", 0], "detail": 0.5 } },
+        "8": { "class_type": "SaveImage", "inputs": { "images": ["7", 0], "filename_prefix": "tests/relayvsr" } }
+    });
+    // seventeen frames joined into one batch, as a video's frames reach the stage; node 2 is the clip
+    let mut prev = json!(["1", 0]);
+    for i in 0..16 {
+        let id = if i == 15 { "2".to_string() } else { format!("{}", 10 + i) };
+        wf[&id] = json!({ "class_type": "ImageBatch", "inputs": { "image1": prev, "image2": ["1", 0] } });
+        prev = json!([id, 0]);
+    }
+    let r = run_like_swarm(&s, wf.clone(), |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    {
+        let seen = engine.seen.lock().unwrap();
+        // 40 / 16 -> 3 patches of 2, 72 / 16 -> 5 patches of 2
+        assert_eq!(seen.sample_shapes, [vec![1, 48, 3, 6, 10]]);
+        let relay = seen.positive[0].relayvsr.as_ref().expect("the keyframes ride on the conditioning");
+        assert_eq!((relay.keyframes.count, relay.frames), (3, 17));
+    }
+    let images = r.history_entry()["outputs"]["8"]["images"].as_array().unwrap().clone();
+    assert_eq!(images.len(), 17, "{:#}", r.history);
+    let url = format!("view?filename={}&type=output&subfolder={}", images[0]["filename"].as_str().unwrap(), images[0]["subfolder"].as_str().unwrap());
+    let bytes = s.http.get(s.url(&url)).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(png_dims(&bytes), (144, 80));
+
+    // images that aren't the clip the latent was made from are refused
+    wf["7"]["inputs"]["images"] = json!(["1", 0]);
+    let r = run_like_swarm(&s, wf, |_| {}).await;
+    assert_eq!(r.status(), "error", "{:#}", r.history);
 }
 
 /// SwarmUI's SeedVR stage on a 9-frame clip with SeedVR Split Latent: `SeedVR2TemporalChunk` makes a list, the

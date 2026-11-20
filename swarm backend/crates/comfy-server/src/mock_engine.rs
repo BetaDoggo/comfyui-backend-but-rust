@@ -288,7 +288,32 @@ impl Engine for MockEngine {
                     empty: false,
                 }
             }
+            EmptyLatentKind::RelayVsr { keyframes, latent_height, latent_width, width, height, frames } => {
+                let shape = vec![1, 48, keyframes as usize, latent_height as usize, latent_width as usize];
+                let mut info = PixelInfo::image(width, height, 1);
+                info.frames = frames;
+                Latent::single(LatentTensor { format: LatentFormat::RelayVsr, shape, data }, info)
+            }
         })
+    }
+
+    /// RelayVSR files name their factor (`relayvsr_x2_...`, `relayvsr_x4_...`); 4 when they don't.
+    fn relayvsr_latent_stride(&self, model: &ModelHandle) -> EngineResult<u32> {
+        let name = model.source.as_ref().map_or("", |f| f.name.as_str());
+        Ok(if name.contains("x2") { 8 } else { 4 })
+    }
+
+    fn vsr_decode(&self, req: &VsrDecodeRequest, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        let px = &req.latent.pixel;
+        tracing::info!("[mock] vsr_decode {}x{} x{} frame(s) detail={} vae_patches={:?}", px.width, px.height, req.images.count, req.detail,
+            req.vae.patches);
+        if progress.interrupted() {
+            return Err(EngineError::Interrupted);
+        }
+        if req.latent.pixel.frames != req.images.count {
+            return Err(EngineError::InvalidInput(format!("a RelayVSR latent of {} frames for {} frames", px.frames, req.images.count)));
+        }
+        Ok(render(px.width, px.height, req.images.count, latent_key(&req.latent), req.images.count > 1))
     }
 
     fn sample(&self, req: &SampleRequest, progress: &mut dyn ProgressSink) -> EngineResult<Latent> {

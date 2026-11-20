@@ -13,6 +13,7 @@ mod h3;
 mod krea;
 mod moss;
 mod qwen21;
+mod relayvsr;
 mod sd;
 mod seedvr;
 
@@ -21,6 +22,7 @@ pub use h3::{h3_presentation, h3_tokens, image_pictures, ref2va_pictures, ref2va
 pub use krea::{KreaEntry, KreaRequest};
 pub use moss::{moss_tokens, MossRequest};
 pub use qwen21::Qwen21Request;
+pub use relayvsr::{Frames as RelayVsrFrames, RelayVsrRequest};
 pub use sd::{is_sd, SdRequest, SizeCond};
 pub use seedvr::SeedVrRequest;
 pub use crate::samplers::Inpaint;
@@ -777,6 +779,9 @@ pub struct Generator {
     /// SeedVR2, which restores any family's pictures: kept beside the family (see [`seedvr`]).
     seedvr: Option<seedvr::Model>,
     seedvr_vae: Option<(PathBuf, crate::seedvr_vae::Vae)>,
+    /// RelayVSR, which upscales any family's video, kept beside it the same way (see [`relayvsr`]).
+    relayvsr: Option<relayvsr::Model>,
+    relayvsr_vae: Option<(PathBuf, crate::relayvsr::Flash)>,
 }
 
 impl Generator {
@@ -809,7 +814,7 @@ impl Generator {
             dynamic: o.resident_blocks.is_none() && o.comfy_memory.is_none(),
             comfy: o.comfy_memory.is_some(),
         };
-        Ok(Generator { env, te: None, vae: None, family: Family::None, seedvr: None, seedvr_vae: None })
+        Ok(Generator { env, te: None, vae: None, family: Family::None, seedvr: None, seedvr_vae: None, relayvsr: None, relayvsr_vae: None })
     }
 
     /// The stream the models run on.
@@ -886,6 +891,7 @@ impl Generator {
             f.set_int8_attention(on);
         }
         self.seedvr_int8_attention(on);
+        self.relayvsr_int8_attention(on);
     }
 
     /// Drop every model and give their VRAM and pinned RAM back. `ensure_*` loads them again.
@@ -896,6 +902,8 @@ impl Generator {
         self.vae = None;
         self.seedvr = None;
         self.seedvr_vae = None;
+        self.relayvsr = None;
+        self.relayvsr_vae = None;
         cuda::trim_pool()
     }
 
@@ -910,6 +918,7 @@ impl Generator {
                 f.idle()?;
             }
             self.seedvr_idle()?;
+            self.relayvsr_idle()?;
         }
         if self.env.comfy {
             crate::comfy_memory::node_done()?;
@@ -932,6 +941,7 @@ impl Generator {
             }
             if !self.env.comfy {
                 self.seedvr_idle()?;
+                self.relayvsr_idle()?;
             }
         }
         if self.env.comfy {

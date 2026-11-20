@@ -5391,6 +5391,60 @@
   "essentials_category": null,
   "has_intermediate_output": false
  },
+ "RelayVSRConditioning": {
+  "input": {
+   "required": {
+    "model": [
+     "MODEL",
+     {}
+    ],
+    "images": [
+     "IMAGE",
+     {
+      "tooltip": "The low-quality video at its native resolution, the model decides the upscale factor."
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "images"
+   ]
+  },
+  "is_input_list": false,
+  "output": [
+   "CONDITIONING",
+   "LATENT"
+  ],
+  "output_is_list": [
+   false,
+   false
+  ],
+  "output_name": [
+   "positive",
+   "latent"
+  ],
+  "output_tooltips": [
+   null,
+   null
+  ],
+  "output_matchtypes": null,
+  "name": "RelayVSRConditioning",
+  "display_name": null,
+  "description": "Conditioning and empty latent for RelayVSR video upscaling, sample with 1 step at cfg 1. Only every 15th frame goes through the model, VSR Decode restores all of them.",
+  "python_module": "comfy_extras.nodes_wan",
+  "category": "model/conditioning/wan",
+  "output_node": false,
+  "deprecated": false,
+  "experimental": false,
+  "dev_only": false,
+  "api_node": false,
+  "price_badge": null,
+  "search_aliases": null,
+  "essentials_category": null,
+  "has_intermediate_output": false
+ },
  "RenormCFG": {
   "input": {
    "required": {
@@ -10298,6 +10352,72 @@
   "output_node": false,
   "has_intermediate_output": false,
   "search_aliases": []
+ },
+ "VSRDecode": {
+  "input": {
+   "required": {
+    "vae": [
+     "VAE",
+     {}
+    ],
+    "samples": [
+     "LATENT",
+     {}
+    ],
+    "images": [
+     "IMAGE",
+     {
+      "tooltip": "The same low-quality video given to the conditioning node."
+     }
+    ],
+    "detail": [
+     "FLOAT",
+     {
+      "tooltip": "How much of the detail the decoder adds to the bicubic upscale of each frame is kept, 1 is the full model output.",
+      "default": 1.0,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.01
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "vae",
+    "samples",
+    "images",
+    "detail"
+   ]
+  },
+  "is_input_list": false,
+  "output": [
+   "IMAGE"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "IMAGE"
+  ],
+  "output_tooltips": [
+   null
+  ],
+  "output_matchtypes": null,
+  "name": "VSRDecode",
+  "display_name": "VSR Decode",
+  "description": "Decode RelayVSR latents with the RelayVSR Flash decoder, which also reads the low-quality frames.",
+  "python_module": "comfy_extras.nodes_wan",
+  "category": "latent",
+  "output_node": false,
+  "deprecated": false,
+  "experimental": false,
+  "dev_only": false,
+  "api_node": false,
+  "price_badge": null,
+  "search_aliases": null,
+  "essentials_category": null,
+  "has_intermediate_output": false
  },
  "VideoLinearCFGGuidance": {
   "input": {

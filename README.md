@@ -78,6 +78,12 @@ In SwarmUI it runs from its own tab, the [Pixal3D extension](swarm%20backend/pix
 SeedVR2, SwarmUI's restoration stage (SeedVR Model), uses `diffusion_models/SeedVR2/seedvr2_3b_int8_convrot.safetensors` and
 `VAE/SeedVR2/seedvr2_ema_vae_fp16.safetensors`, from [Comfy-Org/SeedVR2](https://huggingface.co/Comfy-Org/SeedVR2).
 
+RelayVSR, video upscaling x2 or x4, uses `diffusion_models/relayvsr_x2_lightx2v_int8_convrot.safetensors` or
+`relayvsr_x4_int8_convrot.safetensors`. Its decoder is `VAE/relayvsr_flash_vae_x2_fp32.safetensors` or
+`relayvsr_flash_vae_x4_fp32.safetensors`. All four are from [Comfy-Org/RelayVSR](https://huggingface.co/Comfy-Org/RelayVSR).
+In SwarmUI it is a stage added by the [RelayVSR extension](swarm%20backend/relayvsr-extension/README.md). It works in
+SwarmUI, and it has been compared with ComfyUI through the CLI.
+
 Idol uses `diffusion_models/idol_fp16.safetensors`, `clip_vision/dino_v3_vit_h_bf16.safetensors`, and
 `VAE/idol_decoder_fp16.safetensors` with the Flux 2 VAE (`flux2-vae.safetensors`, anywhere in `VAE/`), all from
 [Comfy-Org/Idol](https://huggingface.co/Comfy-Org/Idol). It runs from the same tab, as its second model.

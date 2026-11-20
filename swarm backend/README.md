@@ -12,6 +12,7 @@ crates/
   native-engine/    the real engine (optional, `--features native`)
 swarm-extension/    comfy-rust backend: SwarmUI extension that starts the server
 pixal3d-extension/  the Pixal3D tab: SwarmUI extension and its ComfyUI node
+relayvsr-extension/ the RelayVSR stage: SwarmUI extension that upscales video with RelayVSR's stock nodes
 docs/
   INPUT_MAPPING.md   what SwarmUI sends for each native family, and what the engine receives
   COMPATIBILITY.md   every Swarm parameter probed live, and the node classes served through the generic custom_node route

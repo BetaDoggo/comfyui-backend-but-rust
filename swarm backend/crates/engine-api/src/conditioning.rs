@@ -58,6 +58,18 @@ pub struct CondMeta {
     /// two stored prompts this entry carries. The engine takes the prompt from the model, so the entry's embedding is
     /// empty.
     pub seedvr2: Option<SeedVr2Condition>,
+    /// `RelayVSRConditioning`: the low-quality keyframes the RelayVSR model reads beside the prompt stored in it, so
+    /// the entry's embedding is empty.
+    pub relayvsr: Option<RelayVsrCondition>,
+}
+
+/// See [`CondMeta::relayvsr`].
+#[derive(Clone, Debug)]
+pub struct RelayVsrCondition {
+    /// The clip's keyframes (`images[keyframes]`): every 15th frame and the last, at the clip's own size.
+    pub keyframes: ImageBatch,
+    /// Frames in the whole clip.
+    pub frames: u32,
 }
 
 /// See [`CondMeta::seedvr2`].
@@ -177,6 +189,7 @@ impl Default for CondMeta {
             unclip: Vec::new(),
             controls: Vec::new(),
             seedvr2: None,
+            relayvsr: None,
         }
     }
 }

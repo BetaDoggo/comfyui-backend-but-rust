@@ -41,6 +41,7 @@ models folder instead of downloading checkpoints.
 | `swarm backend/crates/native-engine` | `Engine` on top of the `diffusion` library |
 | `swarm backend/swarm-extension` | comfy-rust backend: SwarmUI extension that starts the server |
 | `swarm backend/pixal3d-extension` | Pixal3D tab: SwarmUI extension, meant to become its own repository |
+| `swarm backend/relayvsr-extension` | RelayVSR stage: SwarmUI extension that adds video upscaling |
 | `swarm backend/docs/` | Server documentation: input mapping, compatibility, adding models |
 | `swarm backend/tools/` | Node catalog and COMPATIBILITY.md generators |
 | `ref/`, `refout/`, `prof/`, `data/`, `swarm backend/reference/`, `swarm backend/scratch/`, `swarm backend/data/` | Local and gitignored; may not exist |
@@ -142,6 +143,7 @@ dotnet src/bin/live_release/SwarmUI.dll --data_dir <tmp> --settings_file <tmp>/S
 | [ADDING_MODELS.md](swarm%20backend/docs/ADDING_MODELS.md) | How to add a model family | The steps for adding one change |
 | [COMPATIBILITY.md](swarm%20backend/docs/COMPATIBILITY.md) | Generated, don't edit | Edit `swarm backend/tools/gen_compat_doc.py` and run it |
 | [Pixal3D extension](swarm%20backend/pixal3d-extension/README.md) | The Pixal3D tab | The tab or its node changes |
+| [RelayVSR extension](swarm%20backend/relayvsr-extension/README.md) | The RelayVSR stage | The stage or its nodes change |
 | [assets/README.md](assets/README.md) | Tokenizer provenance and licenses | A tokenizer is added |
 
 * In STATUS, **Working** needs real output, tested end to end. Server plus mock is **Plumbing**.

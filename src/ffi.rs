@@ -197,7 +197,11 @@ extern "C" {
 
     // SD 1.x and SDXL (csrc/sd.cu): fp16 UNet, float32 CLIP
     pub fn gpu_conv2d_f16(x: P, w: P, bias: P, out: PM, n: i32, h: i32, w_: i32, c: i32, cout: i32, r: i32, stride: i32, s: PM) -> i32;
-    pub fn gpu_sd_group_norm(x: P, out: PM, w: P, b: P, sums: PM, n: i32, p: i64, c: i32, g: i32, eps: f32, silu: i32, s: PM) -> i32;
+    /// `gpu_conv2d_f16` at stride 1 with `resid` added as `gpu_sd_add` adds it; `out` aliases neither input.
+    pub fn gpu_conv2d_f16_residual(x: P, w: P, bias: P, resid: P, out: PM, n: i32, h: i32, w_: i32, c: i32, cout: i32, r: i32, s: PM) -> i32;
+    /// `add` (nullable, [n, c]) is added to `x` first, rounded to fp16; `sums` holds 16 * n * g + 16 bytes.
+    pub fn gpu_sd_group_norm(x: P, add: P, out: PM, w: P, b: P, sums: PM, n: i32, p: i64, c: i32, g: i32, eps: f32, silu: i32, s: PM)
+        -> i32;
     pub fn gpu_sd_layer_norm(dtype: i32, x: P, x_stride: i64, out: PM, out_stride: i64, w: P, b: P, m: i32, k: i32, eps: f32, s: PM) -> i32;
     pub fn gpu_sd_geglu(inp: P, out: PM, m: i64, i: i32, s: PM) -> i32;
     pub fn gpu_sd_add(x: PM, y: P, n: i64, s: PM) -> i32;
@@ -213,6 +217,13 @@ extern "C" {
     pub fn gpu_sd_softmax(scores: P, p: PM, rows: i32, n: i32, scale: f32, s: PM) -> i32;
     pub fn gpu_sd_vae_in(lat: P, out: PM, c: i32, hw: i64, cs: i32, scale: f32, s: PM) -> i32;
     pub fn gpu_sd_quant_rows(x: P, x_stride: i64, q: PM, scales: PM, m: i32, k: i32, rotate: i32, s: PM) -> i32;
+    /// `gpu_sd_quant_rows` of what `gpu_sd_layer_norm`, `gpu_sd_geglu`, `gpu_sd_unpad_heads` or `gpu_sd_group_norm` (without SiLU)
+    /// would write, without writing it
+    pub fn gpu_sd_ln_quant_rows(x: P, x_stride: i64, w: P, b: P, eps: f32, q: PM, scales: PM, m: i32, k: i32, rotate: i32, s: PM) -> i32;
+    pub fn gpu_sd_geglu_quant_rows(inp: P, q: PM, scales: PM, m: i32, i: i32, rotate: i32, s: PM) -> i32;
+    pub fn gpu_sd_unpad_quant_rows(src: P, q: PM, scales: PM, m: i32, h: i32, d: i32, dp: i32, rotate: i32, s: PM) -> i32;
+    pub fn gpu_sd_group_norm_quant_rows(x: P, w: P, b: P, sums: PM, n: i32, p: i64, c: i32, g: i32, eps: f32, q: PM, scales: PM, rotate: i32,
+        s: PM) -> i32;
 }
 
 /// Most key groups [`gpu_attn_merge`] takes.

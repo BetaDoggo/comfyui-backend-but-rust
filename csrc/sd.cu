@@ -6,6 +6,7 @@
 #include "cutlass/conv/kernel/default_conv2d_fprop.h"
 #include "cutlass/conv/device/implicit_gemm_convolution.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/conv/kernel/default_conv2d_fprop_with_broadcast.h"
 
 // ---------------------------------------------------------------------------------------------
 // conv2d NHWC fp16, 'same' padding (R / 2), stride 1 or 2, fp32 accumulate, bias broadcast via zero-stride C.
@@ -50,7 +51,111 @@ struct ConvF16 {
     }
 };
 
+// The epilogue of a conv whose output joins a residual: half(half(acc + bias) + residual), the conv's output rounded as
+// ConvF16's epilogue rounds it, then the residual added as gpu_sd_add adds it.
+template <int Count>
+class ConvF16BiasResidual {
+public:
+    static bool const kIsSingleSource = true;
+    using ElementOutput = cutlass::half_t;
+    using ElementC = ElementOutput;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementVector = ElementOutput;
+    static int const kElementsPerAccess = Count;
+    static int const kCount = Count;
+    using FragmentAccumulator = cutlass::Array<float, Count>;
+    using FragmentCompute = cutlass::Array<float, Count>;
+    using FragmentC = cutlass::Array<ElementOutput, Count>;
+    using FragmentOutput = FragmentC;
+    using ElementZ = ElementOutput;
+    using ElementT = ElementOutput;
+    using FragmentZ = FragmentC;
+    using FragmentT = FragmentC;
+    static bool const kIsHeavy = false;
+    static bool const kStoreZ = true;
+    static bool const kStoreT = false;
+    struct Params {
+        CUTLASS_HOST_DEVICE Params() {}
+    };
+    CUTLASS_HOST_DEVICE ConvF16BiasResidual(Params const&) {}
+    CUTLASS_HOST_DEVICE bool is_source_needed() const { return true; }
+    CUTLASS_HOST_DEVICE void set_k_partition(int, int) {}
+    CUTLASS_HOST_DEVICE void operator()(FragmentOutput& z, FragmentOutput&, FragmentAccumulator const& ab, FragmentC const& resid,
+                                        FragmentCompute const& bias) const {
+        cutlass::NumericConverter<ElementOutput, float, cutlass::FloatRoundStyle::round_to_nearest> to_half;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < Count; ++i) {
+            const float conv = float(to_half(ab[i] + bias[i]));
+            z[i] = to_half(conv + float(resid[i]));
+        }
+    }
+    CUTLASS_HOST_DEVICE void operator()(FragmentOutput&, FragmentOutput&, FragmentAccumulator const&, FragmentCompute const&) const {}
+};
+
+// ConvF16 at stride 1 with the residual epilogue: the same mainloop, so the same sums
+template <int TBM, int TBN, int TBK, int WM, int WN, int Stages>
+struct ConvF16Residual {
+    using Element = cutlass::half_t;
+    using Layout = cutlass::layout::TensorNHWC;
+    using Kernel = typename cutlass::conv::kernel::DefaultConv2dFpropWithBroadcast<
+        Element, Layout, Element, Layout, Element, Layout, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<TBM, TBN, TBK>, cutlass::gemm::GemmShape<WM, WN, TBK>, cutlass::gemm::GemmShape<16, 8, 16>,
+        ConvF16BiasResidual<8>, cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, Stages, cutlass::arch::OpMultiplyAdd,
+        cutlass::conv::IteratorAlgorithm::kOptimized, cutlass::conv::StrideSupport::kUnity>::Kernel;
+    using Conv = cutlass::conv::device::ImplicitGemmConvolution<Kernel>;
+
+    static int run(const void* x, const void* w, const void* bias, const void* resid, void* out, int N, int H, int W, int C, int Cout,
+                   int R, cudaStream_t stream) {
+        const int pad = R / 2;
+        cutlass::conv::Conv2dProblemSize problem(cutlass::Tensor4DCoord(N, H, W, C), cutlass::Tensor4DCoord(Cout, R, R, C),
+                                                 cutlass::Tensor4DCoord(pad, pad, pad, pad), cutlass::MatrixCoord(1, 1),
+                                                 cutlass::MatrixCoord(1, 1), cutlass::Tensor4DCoord(N, H, W, Cout),
+                                                 cutlass::conv::Mode::kCrossCorrelation, 1);
+        using TensorRef = cutlass::TensorRef<Element, Layout>;
+        TensorRef a((Element*)x, Layout::packed({N, H, W, C}));
+        TensorRef b((Element*)w, Layout::packed({Cout, R, R, C}));
+        TensorRef c((Element*)resid, Layout::packed({N, H, W, Cout}));
+        TensorRef d((Element*)out, Layout::packed({N, H, W, Cout}));
+        typename Conv::Arguments args(problem, a, b, c, d, {}, cutlass::conv::SplitKMode::kSerial, const_cast<void*>(bias), nullptr, 0, Cout);
+        Conv op;
+        if (op.can_implement(args) != cutlass::Status::kSuccess) return -300;
+        const size_t ws = op.get_workspace_size(args);
+        void* wsp = nullptr;
+        if (ws && cudaMallocAsync(&wsp, ws, stream) != cudaSuccess) return -301;
+        cutlass::Status s = op.initialize(args, wsp, stream);
+        if (s == cutlass::Status::kSuccess) s = op(stream);
+        if (wsp) cudaFreeAsync(wsp, stream);
+        return s == cutlass::Status::kSuccess ? 0 : -302;
+    }
+};
+
 }  // namespace
+
+// gpu_conv2d_f16 at stride 1, then gpu_sd_add of `resid`, in one pass, rounded as those two round. bias is required; out
+// must not alias resid or x.
+GPU_API int gpu_conv2d_f16_residual(const void* x, const void* w, const void* bias, const void* resid, void* out, int N, int H, int W,
+                                    int C, int Cout, int R, void* stream) {
+    if (C % 8 || Cout % 8) return -310;
+    if (!bias) return -311;
+    cudaStream_t st = (cudaStream_t)stream;
+    static int sms = 0;
+    if (!sms) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    }
+    // gpu_conv2d_f16's tiles
+    const int64_t m = (int64_t)N * H * W;
+    const bool small = (m + 127) / 128 * ((Cout + 127) / 128) < 2 * sms;
+    int r;
+    if (small) r = ConvF16Residual<64, 64, 32, 32, 32, 4>::run(x, w, bias, resid, out, N, H, W, C, Cout, R, st);
+    else if (Cout >= 128) r = ConvF16Residual<128, 128, 32, 64, 64, 4>::run(x, w, bias, resid, out, N, H, W, C, Cout, R, st);
+    else r = ConvF16Residual<128, 64, 32, 64, 32, 4>::run(x, w, bias, resid, out, N, H, W, C, Cout, R, st);
+    if (r) return r;
+    KCHECK();
+    return 0;
+}
 
 // x [N,H,W,C], w [Cout,R,R,C], bias [Cout] (nullable), out [N,H/stride,W/stride,Cout]; C and Cout multiples of 8.
 GPU_API int gpu_conv2d_f16(const void* x, const void* w, const void* bias, void* out, int N, int H, int W, int C, int Cout, int R,
@@ -87,63 +192,116 @@ GPU_API int gpu_conv2d_f16(const void* x, const void* w, const void* bias, void*
 // GroupNorm of fp16 x [N, P, C] per image, then optional SiLU, as torch computes it for half tensors: float statistics,
 // the affine result rounded to half, SiLU of that rounded again.
 // ---------------------------------------------------------------------------------------------
-__global__ void sd_group_sums_kernel(const half* x, double* sums, int64_t P, int C, int G, int splits) {
+// x, or half(x + add[n, c]) when add [N, C] is given: a residual block's first conv output with its timestep embedding
+__device__ __forceinline__ float sd_gn_in(const half* x, const half* add, int64_t i, int n, int c, int C) {
+    const float v = __half2float(x[i]);
+    return add ? rnd<half>(v + __half2float(add[(int64_t)n * C + c])) : v;
+}
+
+// A group's (mean, rstd) in float from its sums s and ss, written over the first half of its pair of sums.
+__device__ __forceinline__ void sd_group_stat(double* sums, int ng, double s, double ss, double cnt, float eps) {
+    const double mean = s / cnt;
+    const double var = fmax(ss / cnt - mean * mean, 0.0);
+    ((float2*)sums)[ng * 2] = make_float2((float)mean, (float)(1.0 / sqrt(var + (double)eps)));
+}
+
+// The last block to finish turns every group's sums into statistics; `done` counts the finished blocks.
+__global__ void sd_group_sums_kernel(const half* x, const half* add, double* sums, unsigned* done, int64_t P, int C, int G, int splits,
+                                     double cnt, float eps) {
     const int ng = blockIdx.x, split = blockIdx.y;
     const int n = ng / G, g = ng % G, per = C / G;
-    const half* base = x + (int64_t)n * P * C + g * per;
+    const int64_t base = (int64_t)n * P * C + g * per;
     const int64_t p0 = P * split / splits, p1 = P * (split + 1) / splits;
     float s = 0.f, ss = 0.f;
     const int64_t count = (p1 - p0) * per;
     for (int64_t i = threadIdx.x; i < count; i += blockDim.x) {
         const int64_t p = p0 + i / per;
-        const float v = __half2float(base[p * C + i % per]);
+        const int c = (int)(i % per);
+        const float v = sd_gn_in(x, add, base + p * C + c, n, g * per + c, C);
         s += v;
         ss += v * v;
     }
     __shared__ float red[33];
+    __shared__ bool last;
     s = block_sum(s, red);
     ss = block_sum(ss, red);
     if (threadIdx.x == 0) {
         atomicAdd(&sums[ng * 2], (double)s);
         atomicAdd(&sums[ng * 2 + 1], (double)ss);
+        __threadfence();
+        last = atomicAdd(done, 1u) == gridDim.x * gridDim.y - 1;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    for (int i = threadIdx.x; i < (int)gridDim.x; i += blockDim.x) {
+        // the other blocks' atomics are in L2; read past L1
+        const volatile double* vs = sums;
+        sd_group_stat(sums, i, vs[i * 2], vs[i * 2 + 1], cnt, eps);
     }
 }
 
-// Each group's (mean, rstd) in float, written over the first half of its pair of sums.
-__global__ void sd_group_stats_kernel(double* sums, double cnt, float eps, int groups) {
-    const int ng = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ng >= groups) return;
-    const double mean = sums[ng * 2] / cnt;
-    const double var = fmax(sums[ng * 2 + 1] / cnt - mean * mean, 0.0);
-    ((float2*)sums)[ng * 2] = make_float2((float)mean, (float)(1.0 / sqrt(var + (double)eps)));
-}
-
-__global__ void sd_group_apply_kernel(const half* x, half* out, const float* w, const float* b, const double* sums, int64_t P, int C,
-                                      int G, int silu, int64_t total) {
+__global__ void sd_group_apply_kernel(const half* x, const half* add, half* out, const float* w, const float* b, const double* sums,
+                                      int64_t P, int C, int G, int silu, int64_t total) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     const int c = (int)(i % C);
     const int n = (int)(i / (P * C));
     const int ng = n * G + c / (C / G);
     const float2 st = ((const float2*)sums)[ng * 2];
-    float y = rnd<half>((__half2float(x[i]) - st.x) * st.y * w[c] + b[c]);
+    float y = rnd<half>((sd_gn_in(x, add, i, n, c, C) - st.x) * st.y * w[c] + b[c]);
     if (silu) y = silu_f(y);
     out[i] = __float2half_rn(y);
 }
 
-// sums: 16 * N * G bytes of scratch.
-GPU_API int gpu_sd_group_norm(const void* x, void* out, const float* w, const float* b, void* sums, int N, int64_t P, int C, int G,
-                              float eps, int silu, void* stream) {
+// sd_group_apply_kernel over 8 channels of a pixel per thread, for C a multiple of 8 and 16-byte aligned x, add and out
+__global__ void sd_group_apply_v8_kernel(const half* x, const half* add, half* out, const float* w, const float* b, const double* sums,
+                                         int64_t P, int C, int G, int silu, int64_t total8) {
+    const int64_t i8 = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i8 >= total8) return;
+    const int64_t i0 = i8 * 8;
+    const int c0 = (int)(i0 % C);
+    const int n = (int)(i0 / (P * C));
+    uint4 raw = *(const uint4*)(x + i0);
+    const half* xv = (const half*)&raw;
+    uint4 araw = make_uint4(0u, 0u, 0u, 0u);
+    if (add) araw = *(const uint4*)(add + (int64_t)n * C + c0);
+    const half* av = (const half*)&araw;
+    uint4 oraw;
+    half* ov = (half*)&oraw;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int c = c0 + j;
+        const int ng = n * G + c / (C / G);
+        const float2 st = ((const float2*)sums)[ng * 2];
+        const float v = __half2float(xv[j]);
+        const float in = add ? rnd<half>(v + __half2float(av[j])) : v;
+        float y = rnd<half>((in - st.x) * st.y * w[c] + b[c]);
+        if (silu) y = silu_f(y);
+        ov[j] = __float2half_rn(y);
+    }
+    *(uint4*)(out + i0) = oraw;
+}
+
+// sums: 16 * N * G + 16 bytes of scratch. add (nullable) [N, C] is added to x first, rounded to half.
+GPU_API int gpu_sd_group_norm(const void* x, const void* add, void* out, const float* w, const float* b, void* sums, int N, int64_t P,
+                              int C, int G, float eps, int silu, void* stream) {
     if (C % G) return -1;
     cudaStream_t st = (cudaStream_t)stream;
-    cudaMemsetAsync(sums, 0, (size_t)N * G * 2 * sizeof(double), st);
+    cudaMemsetAsync(sums, 0, (size_t)N * G * 2 * sizeof(double) + 16, st);
     const int64_t want = P * (C / G) / 4096;
     const int splits = want < 1 ? 1 : want > 64 ? 64 : (int)want;
-    sd_group_sums_kernel<<<dim3(N * G, splits), 256, 0, st>>>((const half*)x, (double*)sums, P, C, G, splits);
-    sd_group_stats_kernel<<<(N * G + 255) / 256, 256, 0, st>>>((double*)sums, (double)P * (C / G), eps, N * G);
+    unsigned* done = (unsigned*)((double*)sums + (size_t)N * G * 2);
+    sd_group_sums_kernel<<<dim3(N * G, splits), 256, 0, st>>>((const half*)x, (const half*)add, (double*)sums, done, P, C, G, splits,
+                                                             (double)P * (C / G), eps);
     const int64_t total = (int64_t)N * P * C;
-    sd_group_apply_kernel<<<(unsigned)((total + 255) / 256), 256, 0, st>>>((const half*)x, (half*)out, w, b, (const double*)sums, P, C, G,
-                                                                          silu, total);
+    if (C % 8 == 0 && (uintptr_t)x % 16 == 0 && (uintptr_t)out % 16 == 0 && (uintptr_t)add % 16 == 0) {
+        sd_group_apply_v8_kernel<<<(unsigned)((total / 8 + 255) / 256), 256, 0, st>>>((const half*)x, (const half*)add, (half*)out, w, b,
+                                                                                     (const double*)sums, P, C, G, silu, total / 8);
+    } else {
+        sd_group_apply_kernel<<<(unsigned)((total + 255) / 256), 256, 0, st>>>((const half*)x, (const half*)add, (half*)out, w, b,
+                                                                              (const double*)sums, P, C, G, silu, total);
+    }
     KCHECK();
     return 0;
 }
@@ -333,7 +491,24 @@ __global__ void sd_pad_heads_kernel(const half* src, int64_t stride, half* dst, 
     const int64_t l = lh / H;
     dst[i] = j < d ? src[l * stride + (int64_t)h * d + j] : __float2half_rn(0.f);
 }
+// The same copy 16 bytes at a time, for d, dp and the stride multiples of 8 and 16-byte aligned rows
+__global__ void sd_pad_heads_v8_kernel(const uint4* src, int64_t stride8, uint4* dst, int H, int d8, int dp8, int64_t total) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int j = (int)(i % dp8);
+    const int64_t lh = i / dp8;
+    const int h = (int)(lh % H);
+    const int64_t l = lh / H;
+    dst[i] = j < d8 ? src[l * stride8 + (int64_t)h * d8 + j] : make_uint4(0u, 0u, 0u, 0u);
+}
 GPU_API int gpu_sd_pad_heads(const void* src, int64_t stride, void* dst, int64_t L, int H, int d, int dp, void* stream) {
+    if (d % 8 == 0 && dp % 8 == 0 && stride % 8 == 0 && (uintptr_t)src % 16 == 0 && (uintptr_t)dst % 16 == 0) {
+        const int64_t total = L * H * (dp / 8);
+        sd_pad_heads_v8_kernel<<<(unsigned)((total + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const uint4*)src, stride / 8, (uint4*)dst,
+                                                                                                  H, d / 8, dp / 8, total);
+        KCHECK();
+        return 0;
+    }
     const int64_t total = L * H * dp;
     sd_pad_heads_kernel<<<(unsigned)((total + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const half*)src, stride, (half*)dst, H, d, dp, total);
     KCHECK();
@@ -428,6 +603,124 @@ GPU_API int gpu_sd_quant_rows(const void* x, int64_t x_stride, int8_t* q, float*
     sd_quant_rows_kernel<<<M, 256, smem, (cudaStream_t)stream>>>((const half*)x, x_stride, q, scales, K, rotate);
     KCHECK();
     return 0;
+}
+
+// sd_quant_rows of a row that another kernel would have written in half first: the row is computed as that kernel
+// computes it, rounded to half, then quantized as sd_quant_rows quantizes it. Blocks of 256 threads, as both kernels use,
+// so every sum runs in their order.
+enum { SDQ_LN = 1, SDQ_GEGLU = 2, SDQ_UNPAD = 3, SDQ_GN = 4 };
+struct SdQuantSrc {
+    const half* x;
+    int64_t x_stride;    // LN: the row stride
+    const float* w;      // LN, GN: weight and bias
+    const float* b;
+    float eps;           // LN
+    int heads, d, dp;    // UNPAD: heads of d values, each stored dp wide
+    const double* sums;  // GN: the statistics gpu_sd_group_norm's sums pass leaves
+    int groups;          // GN
+    int64_t P;           // GN: pixels per image
+};
+
+template <int MODE>
+__global__ void sd_quant_src_kernel(SdQuantSrc p, int8_t* q, float* scales, int K, int rotate) {
+    extern __shared__ float row[];
+    __shared__ float red[33];
+    const int64_t m = blockIdx.x;
+    if (MODE == SDQ_LN) {
+        // sd_layer_norm_kernel
+        const half* r = p.x + m * p.x_stride;
+        float s = 0.f;
+        for (int k = threadIdx.x; k < K; k += blockDim.x) s += ldf(r, k);
+        const float mean = block_sum(s, red) / K;
+        float ss = 0.f;
+        for (int k = threadIdx.x; k < K; k += blockDim.x) {
+            const float d = ldf(r, k) - mean;
+            ss += d * d;
+        }
+        const float rstd = rsqrtf(block_sum(ss, red) / K + p.eps);
+        for (int k = threadIdx.x; k < K; k += blockDim.x) row[k] = __half2float(__float2half_rn((ldf(r, k) - mean) * rstd * p.w[k] + p.b[k]));
+    } else if (MODE == SDQ_GEGLU) {
+        // sd_geglu_kernel: [M, 2K] value then gate
+        const half* r = p.x + m * 2 * K;
+        for (int k = threadIdx.x; k < K; k += blockDim.x) {
+            const float a = __half2float(r[k]);
+            const float g = rnd<half>(gelu_f(__half2float(r[K + k])));
+            row[k] = __half2float(__float2half_rn(a * g));
+        }
+    } else if (MODE == SDQ_UNPAD) {
+        const half* r = p.x + m * p.heads * p.dp;
+        for (int k = threadIdx.x; k < K; k += blockDim.x) row[k] = __half2float(r[(k / p.d) * p.dp + k % p.d]);
+    } else {
+        // sd_group_apply_kernel without SiLU: row m is a pixel of image m / P
+        const half* r = p.x + m * K;
+        const int n = (int)(m / p.P);
+        for (int c = threadIdx.x; c < K; c += blockDim.x) {
+            const int ng = n * p.groups + c / (K / p.groups);
+            const float2 st = ((const float2*)p.sums)[ng * 2];
+            const float y = rnd<half>((__half2float(r[c]) - st.x) * st.y * p.w[c] + p.b[c]);
+            row[c] = __half2float(__float2half_rn(y));
+        }
+    }
+    __syncthreads();
+    // sd_quant_rows_kernel from here
+    if (rotate == 256) fht256_rows_smem(row, K);
+    else if (rotate == 64) fht64_rows_smem(row, K);
+    float mx = 0.f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) mx = fmaxf(mx, fabsf(rnd<half>(row[k])));
+    mx = block_max(mx, red);
+    const float scale = fmaxf(mx, 1e-30f) / 127.f;
+    if (threadIdx.x == 0) scales[m] = scale;
+    const float scale_t = rnd<half>(scale) > 0.f ? rnd<half>(scale) : scale;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        const float t = rnd<half>(rnd<half>(row[k]) / scale_t);
+        q[m * K + k] = (int8_t)fminf(127.f, fmaxf(-128.f, nearbyintf(t)));
+    }
+}
+
+template <int MODE>
+static int sd_quant_src(const SdQuantSrc& src, int8_t* q, float* scales, int M, int K, int rotate, cudaStream_t st) {
+    if ((rotate != 0 && rotate != 64 && rotate != 256) || (rotate && K % rotate)) return -1;
+    const size_t smem = (size_t)K * sizeof(float);
+    if (smem > 48 * 1024) cudaFuncSetAttribute(sd_quant_src_kernel<MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    sd_quant_src_kernel<MODE><<<M, 256, smem, st>>>(src, q, scales, K, rotate);
+    KCHECK();
+    return 0;
+}
+
+// gpu_sd_layer_norm (half) then gpu_sd_quant_rows
+GPU_API int gpu_sd_ln_quant_rows(const void* x, int64_t x_stride, const float* w, const float* b, float eps, int8_t* q, float* scales,
+                                 int M, int K, int rotate, void* stream) {
+    SdQuantSrc p{};
+    p.x = (const half*)x, p.x_stride = x_stride, p.w = w, p.b = b, p.eps = eps;
+    return sd_quant_src<SDQ_LN>(p, q, scales, M, K, rotate, (cudaStream_t)stream);
+}
+// gpu_sd_geglu of in [M, 2I] then gpu_sd_quant_rows of the [M, I] result
+GPU_API int gpu_sd_geglu_quant_rows(const void* in, int8_t* q, float* scales, int M, int I, int rotate, void* stream) {
+    SdQuantSrc p{};
+    p.x = (const half*)in;
+    return sd_quant_src<SDQ_GEGLU>(p, q, scales, M, I, rotate, (cudaStream_t)stream);
+}
+// gpu_sd_unpad_heads of src [M, H, dp] then gpu_sd_quant_rows of the [M, H * d] result
+GPU_API int gpu_sd_unpad_quant_rows(const void* src, int8_t* q, float* scales, int M, int H, int d, int dp, int rotate, void* stream) {
+    SdQuantSrc p{};
+    p.x = (const half*)src, p.heads = H, p.d = d, p.dp = dp;
+    return sd_quant_src<SDQ_UNPAD>(p, q, scales, M, H * d, rotate, (cudaStream_t)stream);
+}
+
+// gpu_sd_group_norm without SiLU, then gpu_sd_quant_rows of the [N * P, C] result. sums: as gpu_sd_group_norm's.
+GPU_API int gpu_sd_group_norm_quant_rows(const void* x, const float* w, const float* b, void* sums, int N, int64_t P, int C, int G,
+                                         float eps, int8_t* q, float* scales, int rotate, void* stream) {
+    if (C % G) return -1;
+    cudaStream_t st = (cudaStream_t)stream;
+    cudaMemsetAsync(sums, 0, (size_t)N * G * 2 * sizeof(double) + 16, st);
+    const int64_t want = P * (C / G) / 4096;
+    const int splits = want < 1 ? 1 : want > 64 ? 64 : (int)want;
+    unsigned* done = (unsigned*)((double*)sums + (size_t)N * G * 2);
+    sd_group_sums_kernel<<<dim3(N * G, splits), 256, 0, st>>>((const half*)x, nullptr, (double*)sums, done, P, C, G, splits,
+                                                             (double)P * (C / G), eps);
+    SdQuantSrc p{};
+    p.x = (const half*)x, p.w = w, p.b = b, p.sums = (const double*)sums, p.groups = G, p.P = P;
+    return sd_quant_src<SDQ_GN>(p, q, scales, (int)(N * P), C, rotate, st);
 }
 
 // The VAE decoder's input: the sampler's latent f32 [C, HW] / scale, as bf16 NHWC [HW, cs] with channels past C zero.

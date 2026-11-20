@@ -77,13 +77,35 @@ pub struct Unet {
     pub downsamplings: usize,
     pub int8_attn: bool,
     pub int8: bool,
+    /// fp16 ones, as wide as the widest transformer: the residual scale of the int8 linears that add into their input
+    ones: DevBuf,
 }
 
 /// The prompt as every cross-attention reads it.
 pub struct Context {
     /// fp16 [len, 2 * inner] keys then values, by transformer block
     kv: HashMap<String, DevBuf>,
+    /// The same with every head zero padded to the int8 attention's width, for blocks whose heads are narrower
+    kv_pad: HashMap<String, DevBuf>,
     pub len: usize,
+}
+
+/// What a linear reads: fp16 rows, or rows another kernel computes from these.
+enum Src<'a> {
+    Rows(PM),
+    /// LayerNorm `name` of fp16 rows
+    Ln(PM, &'a str),
+    /// GEGLU of [m, 2i] rows, value then gate
+    Geglu(PM),
+    /// [m, heads, dp] rows of heads (heads, d, dp) `d` wide, zero padded to `dp`
+    Unpad(PM, usize, usize, usize),
+    /// GroupNorm `name`, without SiLU, of (images, pixels) images
+    Gn(PM, &'a str, usize, usize),
+}
+
+/// The int8 attention's head width for heads `hd` wide.
+fn int8_head(hd: usize) -> Option<usize> {
+    [64, 128, 256].into_iter().find(|&d| d >= hd)
 }
 
 /// Conv weight [Cout, Cin, R, R] -> fp16 [cout_pad, R, R, cin_pad], zero padded.
@@ -370,8 +392,11 @@ impl Unet {
             }
             parts.push(Part { main, lay: b.main, lin });
         }
+        let widest = linears.values().map(|l| l.n).max().unwrap_or(0).max(1);
+        let ones = DevBuf::alloc(widest * 2)?;
+        ones.upload(0, &f16_bytes(&vec![1.0; widest]), s0)?;
         s0.sync()?;
-        Ok(Unet { parts, linears, where_, input, middle, output, model_channels, adm, context_dim, downsamplings, int8_attn: true, int8 })
+        Ok(Unet { parts, linears, where_, input, middle, output, model_channels, adm, context_dim, downsamplings, int8_attn: true, int8, ones })
     }
 
     fn w(&self, key: &str) -> PM {
@@ -399,6 +424,67 @@ impl Unet {
         }
     }
 
+    /// `out = src @ W.T + b`, or with `add`, `out += src @ W.T + b` with the product rounded to fp16 first, as `gpu_sd_add`
+    /// adds it. The int8 linears quantize `src` straight from what it's computed from, and add in their epilogue.
+    fn qlinear(&self, key: &str, src: Src, m: usize, out: PM, add: bool, st: &Stream) -> Result<()> {
+        let info = &self.linears[key];
+        let (n, kk) = (info.n, info.k);
+        if let Lin::I8(buf, offs) = &self.parts[info.part].lin {
+            let bias_key = format!("{key}.b");
+            let bias: P = if self.where_.contains_key(&bias_key) { self.w(&bias_key) } else { null() };
+            let (w, sc, rotate) = offs[key];
+            let q = DevBuf::alloc_async(m * kk, st)?;
+            let xs = DevBuf::alloc_async(m * 4, st)?;
+            let (qp, xp, mi, ki) = (q.ptr(), xs.ptr(), m as i32, kk as i32);
+            match src {
+                Src::Rows(x) => k!(gpu_sd_quant_rows(x, kk as i64, qp, xp, mi, ki, rotate, s(st)))?,
+                Src::Ln(x, name) => k!(gpu_sd_ln_quant_rows(x, kk as i64, self.w(&format!("{name}.w")), self.w(&format!("{name}.b")), LN_EPS, qp, xp,
+                    mi, ki, rotate, s(st)))?,
+                Src::Geglu(x) => k!(gpu_sd_geglu_quant_rows(x, qp, xp, mi, ki, rotate, s(st)))?,
+                Src::Unpad(x, heads, d, dp) => k!(gpu_sd_unpad_quant_rows(x, qp, xp, mi, heads as i32, d as i32, dp as i32, rotate, s(st)))?,
+                Src::Gn(x, name, imgs, p) => {
+                    let sums = DevBuf::alloc_async(imgs * GROUPS * 16 + 16, st)?;
+                    k!(gpu_sd_group_norm_quant_rows(x, self.w(&format!("{name}.w")), self.w(&format!("{name}.b")), sums.ptr(), imgs as i32, p as i64,
+                        ki, GROUPS as i32, ST_EPS, qp, xp, rotate, s(st)))?
+                }
+            }
+            return if add {
+                k!(gpu_int8_gemm_residual(qp, buf.at(w), xp, buf.at(sc), bias, self.ones.ptr(), out, out, m as i64, n as i64, kk as i64, DT_F16,
+                    s(st)))
+            } else {
+                k!(gpu_int8_gemm(qp, buf.at(w), xp, buf.at(sc), bias, out, m as i64, n as i64, kk as i64, DT_F16, s(st)))
+            };
+        }
+        // fp16 linears read their input from memory
+        let rows = DevBuf::alloc_async(m * kk * 2, st)?;
+        let x = match src {
+            Src::Rows(x) => x,
+            Src::Ln(x, name) => {
+                k!(gpu_sd_layer_norm(DT_F16, x, kk as i64, rows.ptr(), kk as i64, self.w(&format!("{name}.w")), self.w(&format!("{name}.b")), m as i32,
+                    kk as i32, LN_EPS, s(st)))?;
+                rows.ptr()
+            }
+            Src::Geglu(x) => {
+                k!(gpu_sd_geglu(x, rows.ptr(), m as i64, kk as i32, s(st)))?;
+                rows.ptr()
+            }
+            Src::Unpad(x, heads, d, dp) => {
+                k!(gpu_sd_unpad_heads(x, rows.ptr(), m as i64, heads as i32, d as i32, dp as i32, s(st)))?;
+                rows.ptr()
+            }
+            Src::Gn(x, name, imgs, p) => {
+                self.group_norm(name, x, rows.ptr(), imgs, p, kk, ST_EPS, false, st)?;
+                rows.ptr()
+            }
+        };
+        if !add {
+            return self.linear(key, x, m, out, st);
+        }
+        let y = DevBuf::alloc_async(m * n * 2, st)?;
+        self.linear(key, x, m, y.ptr(), st)?;
+        k!(gpu_sd_add(out, y.ptr(), (m * n) as i64, s(st)))
+    }
+
     /// An fp16 linear held in `main`: rows [m, k] -> [m, n].
     fn dense(&self, key: &str, x: PM, m: usize, n: usize, kk: usize, bias: bool, out: PM, st: &Stream) -> Result<()> {
         let b: P = if bias { self.w(&format!("{key}.b")) } else { null() };
@@ -413,8 +499,15 @@ impl Unet {
     }
 
     fn group_norm(&self, key: &str, x: PM, out: PM, n: usize, p: usize, c: usize, eps: f32, silu: bool, st: &Stream) -> Result<()> {
-        let sums = DevBuf::alloc_async(n * GROUPS * 16, st)?;
-        k!(gpu_sd_group_norm(x, out, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), sums.ptr(), n as i32, p as i64, c as i32,
+        self.group_norm_add(key, x, null(), out, n, p, c, eps, silu, st)
+    }
+
+    /// GroupNorm of `x + add`, `add` [n, c] broadcast over the pixels and the sum rounded to fp16.
+    #[allow(clippy::too_many_arguments)]
+    fn group_norm_add(&self, key: &str, x: PM, add: P, out: PM, n: usize, p: usize, c: usize, eps: f32, silu: bool, st: &Stream)
+        -> Result<()> {
+        let sums = DevBuf::alloc_async(n * GROUPS * 16 + 16, st)?;
+        k!(gpu_sd_group_norm(x, add, out, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), sums.ptr(), n as i32, p as i64, c as i32,
             GROUPS as i32, eps, silu as i32, s(st)))
     }
 
@@ -426,52 +519,68 @@ impl Unet {
         }
         let c16 = DevBuf::alloc_async(ctx.len() * 2, st)?;
         c16.upload(0, &f16_bytes(ctx), st)?;
-        let mut kv = HashMap::new();
+        let (mut kv, mut kv_pad) = (HashMap::new(), HashMap::new());
         for op in self.input.iter().flatten().chain(&self.middle).chain(self.output.iter().flatten()) {
-            if let Op::Transformer { key, c, depth, .. } = op {
+            if let Op::Transformer { key, c, depth, heads, hd } = op {
                 for t in 0..*depth {
                     let tk = format!("{key}.transformer_blocks.{t}");
                     let buf = DevBuf::alloc_async(len * 2 * c * 2, st)?;
                     self.dense(&format!("{tk}.kv2"), c16.ptr(), len, 2 * c, self.context_dim, false, buf.ptr(), st)?;
+                    if let Some(dp) = int8_head(*hd).filter(|&dp| dp != *hd) {
+                        let p = DevBuf::alloc_async(len * 2 * heads * dp * 2, st)?;
+                        k!(gpu_sd_pad_heads(buf.ptr(), (2 * c) as i64, p.ptr(), len as i64, (2 * heads) as i32, *hd as i32, dp as i32, s(st)))?;
+                        kv_pad.insert(tk.clone(), p);
+                    }
                     kv.insert(tk, buf);
                 }
             }
         }
-        Ok(Context { kv, len })
+        Ok(Context { kv, kv_pad, len })
     }
 
     /// Attention over heads `hd` wide: `q` rows of `n * lq` queries (`n` images), `k` and `v` rows of `n * lk` keys, or of
     /// `lk` keys shared by every image when `shared`. Writes [n * lq, heads * hd] to `out`.
     #[allow(clippy::too_many_arguments)]
+    /// `padded` says which of q and k, v are already in the int8 attention's head width (`int8_head`), with the strides given.
+    /// With `keep_pad`, output that the int8 attention leaves padded comes back as [n * lq, heads, dp] with its `dp`, and `out`
+    /// isn't written.
     fn attention(&self, q: PM, q_rs: usize, k_: PM, v: PM, kv_rs: usize, n: usize, lq: usize, lk: usize, shared: bool, heads: usize, hd: usize,
-        out: PM, st: &Stream) -> Result<()> {
+        padded: (bool, bool), keep_pad: bool, out: PM, st: &Stream) -> Result<Option<(DevBuf, usize)>> {
         let inner = heads * hd;
         let scale = 1.0 / (hd as f32).sqrt();
         if self.int8_attn {
-            let dp = [64, 128, 256].into_iter().find(|&d| d >= hd).context("head too wide for the int8 attention")?;
+            let dp = int8_head(hd).context("head too wide for the int8 attention")?;
             let (b, lq_b) = if shared { (1, n * lq) } else { (n, lq) };
             let kv_rows = if shared { lk } else { n * lk };
             let ws = DevBuf::alloc_async(unsafe { crate::ffi::gpu_int8_attn_workspace_d(b as i32, heads as i32, heads as i32, lq_b as i32, lk as i32,
                 dp as i32) } as usize, st)?;
             if dp == hd {
                 let (q_bs, k_bs) = ((lq_b * q_rs) as i64, if shared { 0 } else { (lk * kv_rs) as i64 });
-                return k!(gpu_int8_attn_f16(q, k_, v, out, ws.ptr(), b as i32, lq_b as i32, lk as i32, heads as i32, heads as i32, dp as i32, q_bs,
+                k!(gpu_int8_attn_f16(q, k_, v, out, ws.ptr(), b as i32, lq_b as i32, lk as i32, heads as i32, heads as i32, dp as i32, q_bs,
                     q_rs as i64, hd as i64, k_bs, kv_rs as i64, hd as i64, k_bs, kv_rs as i64, hd as i64, (lq_b * inner) as i64, inner as i64,
-                    hd as i64, scale, s(st)));
+                    hd as i64, scale, s(st)))?;
+                return Ok(None);
             }
             let pad = |src: PM, rs: usize, rows: usize| -> Result<DevBuf> {
                 let d = DevBuf::alloc_async(rows * heads * dp * 2, st)?;
                 k!(gpu_sd_pad_heads(src, rs as i64, d.ptr(), rows as i64, heads as i32, hd as i32, dp as i32, s(st)))?;
                 Ok(d)
             };
-            let (qp, kp, vp) = (pad(q, q_rs, n * lq)?, pad(k_, kv_rs, kv_rows)?, pad(v, kv_rs, kv_rows)?);
-            let op = DevBuf::alloc_async(n * lq * heads * dp * 2, st)?;
             let rs = (heads * dp) as i64;
-            let k_bs = if shared { 0 } else { lk as i64 * rs };
-            k!(gpu_int8_attn_f16(qp.ptr(), kp.ptr(), vp.ptr(), op.ptr(), ws.ptr(), b as i32, lq_b as i32, lk as i32, heads as i32, heads as i32,
-                dp as i32, lq_b as i64 * rs, rs, dp as i64, k_bs, rs, dp as i64, k_bs, rs, dp as i64, lq_b as i64 * rs, rs, dp as i64, scale,
+            let qp = if padded.0 { None } else { Some(pad(q, q_rs, n * lq)?) };
+            let (q, q_rs) = qp.as_ref().map_or((q as P, q_rs as i64), |b| (b.ptr() as P, rs));
+            let kvp = if padded.1 { None } else { Some((pad(k_, kv_rs, kv_rows)?, pad(v, kv_rs, kv_rows)?)) };
+            let (k_, v, kv_rs) = kvp.as_ref().map_or((k_ as P, v as P, kv_rs as i64), |(k, v)| (k.ptr() as P, v.ptr() as P, rs));
+            let op = DevBuf::alloc_async(n * lq * heads * dp * 2, st)?;
+            let k_bs = if shared { 0 } else { lk as i64 * kv_rs };
+            k!(gpu_int8_attn_f16(q, k_, v, op.ptr(), ws.ptr(), b as i32, lq_b as i32, lk as i32, heads as i32, heads as i32, dp as i32,
+                lq_b as i64 * q_rs, q_rs, dp as i64, k_bs, kv_rs, dp as i64, k_bs, kv_rs, dp as i64, lq_b as i64 * rs, rs, dp as i64, scale,
                 s(st)))?;
-            return k!(gpu_sd_unpad_heads(op.ptr(), out, (n * lq) as i64, heads as i32, hd as i32, dp as i32, s(st)));
+            if keep_pad {
+                return Ok(Some((op, dp)));
+            }
+            k!(gpu_sd_unpad_heads(op.ptr(), out, (n * lq) as i64, heads as i32, hd as i32, dp as i32, s(st)))?;
+            return Ok(None);
         }
         // exact fp16 attention: scores in float32, probabilities in fp16, a block of queries at a time
         let chunk = ((256usize << 20) / (lk * 6)).clamp(64, 4096).min(lq);
@@ -491,7 +600,7 @@ impl Unet {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -505,11 +614,9 @@ impl Unet {
         drop(t);
         let e = DevBuf::alloc_async(n * cout * 2, st)?;
         self.dense(&format!("{key}.emb"), emb.ptr(), n, cout, self.time_dim(), true, e.ptr(), st)?;
-        k!(gpu_sd_add_emb(u.ptr(), e.ptr(), n as i32, p as i64, cout as i32, s(st)))?;
+        // the timestep embedding is added as the norm reads u
         let t2 = alloc(cout)?;
-        self.group_norm(&format!("{key}.n2"), u.ptr(), t2.ptr(), n, p, cout, RES_EPS, true, st)?;
-        self.conv(&format!("{key}.c2"), t2.ptr(), u.ptr(), n, h, w, cout, cout, 3, 1, st)?;
-        drop(t2);
+        self.group_norm_add(&format!("{key}.n2"), u.ptr(), e.ptr(), t2.ptr(), n, p, cout, RES_EPS, true, st)?;
         let residual = if skip {
             let r = alloc(cout)?;
             self.conv(&format!("{key}.skip"), x.ptr(), r.ptr(), n, h, w, cin, cout, 1, 1, st)?;
@@ -517,8 +624,10 @@ impl Unet {
         } else {
             x
         };
-        // skip_connection(x) + h
-        k!(gpu_sd_add(u.ptr(), residual.ptr(), (n * p * cout) as i64, s(st)))?;
+        // skip_connection(x) + h, in the conv's epilogue
+        let c2 = format!("{key}.c2");
+        k!(gpu_conv2d_f16_residual(t2.ptr(), self.w(&format!("{c2}.w")), self.w(&format!("{c2}.b")), residual.ptr(), u.ptr(), n as i32, h as i32,
+            w as i32, cout as i32, cout as i32, 3, s(st)))?;
         Ok(u)
     }
 
@@ -531,49 +640,55 @@ impl Unet {
         -> Result<()> {
         let m = n * p;
         let alloc = |cols: usize| DevBuf::alloc_async(m * cols * 2, st);
-        let nrm = alloc(c)?;
-        self.group_norm(&format!("{key}.norm"), x.ptr(), nrm.ptr(), n, p, c, ST_EPS, false, st)?;
         let t = alloc(c)?;
-        self.linear(&format!("{key}.pin"), nrm.ptr(), m, t.ptr(), st)?;
-        let ln = |name: &str, out: &DevBuf| -> Result<()> {
-            k!(gpu_sd_layer_norm(DT_F16, t.ptr(), c as i64, out.ptr(), c as i64, self.w(&format!("{name}.w")), self.w(&format!("{name}.b")), m as i32,
-                c as i32, LN_EPS, s(st)))
-        };
+        self.qlinear(&format!("{key}.pin"), Src::Gn(x.ptr(), &format!("{key}.norm"), n, p), m, t.ptr(), false, st)?;
         for b in 0..depth {
             let tk = format!("{key}.transformer_blocks.{b}");
+            let (n1, n2, n3) = (format!("{tk}.norm1"), format!("{tk}.norm2"), format!("{tk}.norm3"));
             // self-attention
-            ln(&format!("{tk}.norm1"), &nrm)?;
             let qkv = alloc(3 * c)?;
-            self.linear(&format!("{tk}.qkv"), nrm.ptr(), m, qkv.ptr(), st)?;
+            self.qlinear(&format!("{tk}.qkv"), Src::Ln(t.ptr(), &n1), m, qkv.ptr(), false, st)?;
             let att = alloc(c)?;
-            self.attention(qkv.ptr(), 3 * c, off(qkv.ptr(), c * 2), off(qkv.ptr(), 2 * c * 2), 3 * c, n, p, p, false, heads, hd, att.ptr(), st)?;
+            let o = match int8_head(hd).filter(|&dp| self.int8_attn && dp != hd) {
+                // q, k and v padded in one pass
+                Some(dp) => {
+                    let qkv_p = DevBuf::alloc_async(m * 3 * heads * dp * 2, st)?;
+                    k!(gpu_sd_pad_heads(qkv.ptr(), (3 * c) as i64, qkv_p.ptr(), m as i64, (3 * heads) as i32, hd as i32, dp as i32, s(st)))?;
+                    let (rs, w) = (3 * heads * dp, heads * dp * 2);
+                    self.attention(qkv_p.ptr(), rs, off(qkv_p.ptr(), w), off(qkv_p.ptr(), 2 * w), rs, n, p, p, false, heads, hd, (true, true),
+                        true, att.ptr(), st)?
+                }
+                None => self.attention(qkv.ptr(), 3 * c, off(qkv.ptr(), c * 2), off(qkv.ptr(), 2 * c * 2), 3 * c, n, p, p, false, heads, hd,
+                    (false, false), true, att.ptr(), st)?,
+            };
             drop(qkv);
-            self.linear(&format!("{tk}.o1"), att.ptr(), m, nrm.ptr(), st)?;
-            k!(gpu_sd_add(t.ptr(), nrm.ptr(), (m * c) as i64, s(st)))?;
+            let att_src = |o: &Option<(DevBuf, usize)>| o.as_ref().map_or(Src::Rows(att.ptr()), |(b, dp)| Src::Unpad(b.ptr(), heads, hd, *dp));
+            self.qlinear(&format!("{tk}.o1"), att_src(&o), m, t.ptr(), true, st)?;
+            drop(o);
             // cross-attention
-            ln(&format!("{tk}.norm2"), &nrm)?;
             let q = alloc(c)?;
-            self.linear(&format!("{tk}.q2"), nrm.ptr(), m, q.ptr(), st)?;
+            self.qlinear(&format!("{tk}.q2"), Src::Ln(t.ptr(), &n2), m, q.ptr(), false, st)?;
             let kv = ctx.kv.get(&tk).context("context of another model")?;
-            self.attention(q.ptr(), c, kv.ptr(), off(kv.ptr(), c * 2), 2 * c, n, p, ctx.len, true, heads, hd, att.ptr(), st)?;
+            let o = match ctx.kv_pad.get(&tk).filter(|_| self.int8_attn) {
+                Some(kp) => {
+                    let w = heads * int8_head(hd).context("head too wide for the int8 attention")?;
+                    self.attention(q.ptr(), c, kp.ptr(), off(kp.ptr(), w * 2), 2 * w, n, p, ctx.len, true, heads, hd, (false, true), true,
+                        att.ptr(), st)?
+                }
+                None => self.attention(q.ptr(), c, kv.ptr(), off(kv.ptr(), c * 2), 2 * c, n, p, ctx.len, true, heads, hd, (false, false), true,
+                    att.ptr(), st)?,
+            };
             drop(q);
-            self.linear(&format!("{tk}.o2"), att.ptr(), m, nrm.ptr(), st)?;
-            k!(gpu_sd_add(t.ptr(), nrm.ptr(), (m * c) as i64, s(st)))?;
+            self.qlinear(&format!("{tk}.o2"), att_src(&o), m, t.ptr(), true, st)?;
+            drop(o);
             drop(att);
-            // GEGLU feed-forward
-            ln(&format!("{tk}.norm3"), &nrm)?;
+            // GEGLU feed-forward, ff(norm3(x)) + x
             let inner2 = self.linears[&format!("{tk}.ff1")].n;
             let f = alloc(inner2)?;
-            self.linear(&format!("{tk}.ff1"), nrm.ptr(), m, f.ptr(), st)?;
-            let g = alloc(inner2 / 2)?;
-            k!(gpu_sd_geglu(f.ptr(), g.ptr(), m as i64, (inner2 / 2) as i32, s(st)))?;
-            drop(f);
-            self.linear(&format!("{tk}.ff2"), g.ptr(), m, nrm.ptr(), st)?;
-            // ff(norm3(x)) + x
-            k!(gpu_sd_add(t.ptr(), nrm.ptr(), (m * c) as i64, s(st)))?;
+            self.qlinear(&format!("{tk}.ff1"), Src::Ln(t.ptr(), &n3), m, f.ptr(), false, st)?;
+            self.qlinear(&format!("{tk}.ff2"), Src::Geglu(f.ptr()), m, t.ptr(), true, st)?;
         }
-        self.linear(&format!("{key}.pout"), t.ptr(), m, nrm.ptr(), st)?;
-        k!(gpu_sd_add(x.ptr(), nrm.ptr(), (m * c) as i64, s(st)))
+        self.qlinear(&format!("{key}.pout"), Src::Rows(t.ptr()), m, x.ptr(), true, st)
     }
 
     /// `up_to` is the size an upsample in these ops makes: the next skip connection's, as ComfyUI's `output_shape`.

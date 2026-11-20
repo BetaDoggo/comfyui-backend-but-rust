@@ -16,6 +16,8 @@ extern "C" void launch_quant_qk_norm_rope_int8(const void* q, void* q_int8, void
     const float* qw, const float* kw, const float* rope, float eps, int rope_mode, cudaStream_t stream);
 extern "C" void launch_quant_v_int8_kernel(const void* v, void* out, void* scale, int B, int H, int N, int D,
     int padded_N, int64_t sb, int64_t sh, int64_t sn, int input_dtype_code, cudaStream_t stream);
+extern "C" void launch_quant_v128_int8(const void* v, void* out, void* scale, void* absmax, int B, int H, int N,
+    int padded_N, int64_t sb, int64_t sh, int64_t sn, int input_dtype_code, cudaStream_t stream);
 extern "C" void launch_sage_attn_kernel(const void* q, const void* k, const void* v, void* o, const void* q_scale,
     const void* k_scale, const void* v_scale, const void* mask, int64_t mask_stride_b, int64_t mask_stride_h,
     int64_t mask_stride_q, int64_t mask_stride_k, int mask_dtype_code, int cta_k, int batch_size, int qo_len,
@@ -23,6 +25,15 @@ extern "C" void launch_sage_attn_kernel(const void* q, const void* k, const void
     int64_t stride_h_q, int64_t stride_bz_k, int stride_seq_k, int64_t stride_h_k, int64_t stride_bz_v,
     int64_t stride_h_v, int stride_d_v, int64_t stride_bz_o, int stride_seq_o, int64_t stride_h_o, float sm_scale,
     int output_dtype_code, cudaStream_t stream, const float* mask_tile_bias);
+
+// sage's V quantizer, or its two-pass coalesced form at head dim 128
+static void quant_v(const void* v, int8_t* vi, float* vs, void* vmax, int b, int hk, int lk, int D, int plk, int64_t v_bs,
+                    int64_t v_hs, int64_t v_rs, int dt, cudaStream_t st) {
+    if (D == 128 && dt != 0)
+        launch_quant_v128_int8(v, vi, vs, vmax, b, hk, lk, plk, v_bs, v_hs, v_rs, dt, st);
+    else
+        launch_quant_v_int8_kernel(v, vi, vs, b, hk, lk, D, plk, v_bs, v_hs, v_rs, dt, st);
+}
 
 static int cta_k_for(int lk, int d) { return lk > 1024 && d != 64 ? 128 : 64; }
 // The quantizer's query warp: 16 rows at head dim 256, 32 otherwise; each warp keeps 8 scales.
@@ -43,6 +54,7 @@ extern "C" int64_t gpu_int8_attn_workspace_d(int b, int h, int hk, int lq, int l
     add((int64_t)b * hk * d * plk);                                // v int8 (transposed, padded)
     add((int64_t)b * hk * d * 4);                                  // v scale
     add((int64_t)b * hk * 4);                                      // anchor indices
+    add((int64_t)b * hk * d * 4);                                  // v abs-max
     return n;
 }
 
@@ -100,6 +112,7 @@ static int int8_attn(const void* q, const void* k, const void* v, void* o, void*
         int8_t* vi = (int8_t*)take((int64_t)b * hk * D * plk);
         float* vs = (float*)take((int64_t)b * hk * D * 4);
         void* anchors = take((int64_t)b * hk * 4);
+        void* vmax = take((int64_t)b * hk * D * 4);
         // inputs are [B, H, L, D] views: (batch, head, seq) strides
         if (norm) {
             if (D != 128 || dt != 2) throw std::runtime_error("fused q/k norm needs bf16 head dim 128");
@@ -109,7 +122,7 @@ static int int8_attn(const void* q, const void* k, const void* v, void* o, void*
             launch_quant_qk_per_thread_int8(q, qi, qs, k, ki, ks, b, h, lq, hk, lk, D, 128, warp_q(D), ck, ck, q_bs, q_hs,
                                             q_rs, k_bs, k_hs, k_rs, dt, anchors, st);
         }
-        launch_quant_v_int8_kernel(v, vi, vs, b, hk, lk, D, plk, v_bs, v_hs, v_rs, dt, st);
+        quant_v(v, vi, vs, vmax, b, hk, lk, D, plk, v_bs, v_hs, v_rs, dt, st);
         const int64_t qh = (int64_t)lq * D, kh = (int64_t)lk * D, vh = (int64_t)D * plk;
         launch_sage_attn_kernel(qi, ki, vi, o, qs, ks, vs, nullptr, 0, 0, 0, 0, 0, ck, b, lq, lk, h, hk, D, h * qh, D,
                                 qh, hk * kh, D, kh, hk * vh, vh, plk, o_bs, (int)o_rs, o_hs, scale, dt, st, nullptr);
@@ -166,10 +179,11 @@ extern "C" int gpu_int8_attn_key_bias(const void* q, const void* k, const void* 
         int8_t* vi = (int8_t*)take((int64_t)b * hk * D * plk);
         float* vs = (float*)take((int64_t)b * hk * D * 4);
         void* anchors = take((int64_t)b * hk * 4);
+        void* vmax = take((int64_t)b * hk * D * 4);
         float* packed = (float*)take(key_mask_width(lk) * 4);
         launch_quant_qk_per_thread_int8(q, qi, qs, k, ki, ks, b, h, lq, hk, lk, D, 128, warp_q(D), ck, ck, q_bs, q_hs, q_rs,
                                         k_bs, k_hs, k_rs, dt, anchors, st);
-        launch_quant_v_int8_kernel(v, vi, vs, b, hk, lk, D, plk, v_bs, v_hs, v_rs, dt, st);
+        quant_v(v, vi, vs, vmax, b, hk, lk, D, plk, v_bs, v_hs, v_rs, dt, st);
         const int64_t qh = (int64_t)lq * D, kh = (int64_t)lk * D, vh = (int64_t)D * plk;
         // the mask's (batch, head, query, key) strides: one row for everything
         const void* mask = bias;

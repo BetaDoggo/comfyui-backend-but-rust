@@ -999,8 +999,8 @@ __global__ __launch_bounds__(128, 3) void quant_qk_fused(
   }
 }
 
-// Head dim 128: Q in quant_q128_kernel, K in quant_k128_kernel.
-template <typename T, int NL, int BK, int ROT, int NM>
+// Head dim 128: Q in quant_q128_kernel, K in quant_k128_kernel. NMK: K's own mode (0 when K is normalized already).
+template <typename T, int NL, int BK, int ROT, int NM, int NMK = NM>
 void launch_qk128(const void *q, void *q_int8, void *q_scale, const void *k,
                   void *k_int8, void *k_scale, int *anchors, int B, int H_q,
                   int Lq, int H_kv, int Lk, int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
@@ -1011,7 +1011,7 @@ void launch_qk128(const void *q, void *q_int8, void *q_scale, const void *k,
   quant_q128_kernel<T, ROT, NM><<<dim3(q_oblk, H_q, B), 256, 0, stream>>>(
       (const T *)q, (int8_t *)q_int8, (float *)q_scale, Lq, H_q, q_oblk * 8,
       q_stride_b, q_stride_h, q_stride_n, norm);
-  quant_k128_kernel<T, NL, BK, ROT, NM>
+  quant_k128_kernel<T, NL, BK, ROT, NMK>
       <<<dim3(k_oblk, H_kv, B), 512, 0, stream>>>(
           (const T *)k, (int8_t *)k_int8, (float *)k_scale, anchors, Lk, H_kv,
           k_oblk * 4, k_stride_b, k_stride_h, k_stride_n, norm);
@@ -1204,10 +1204,29 @@ extern "C" void launch_quant_qk_per_thread_int8(
 #undef DO
 }
 
+// launch_quant_qk_norm_rope_int8's kernels: Q in mode NM, K in mode NMK.
+template <int NM, int NMK>
+static void launch_norm128(const void *q, void *q_int8, void *q_scale, const void *k, void *k_int8, void *k_scale, int *anchors,
+                           int B, int H_q, int Lq, int H_kv, int Lk, int BLKK, int64_t q_stride_b, int64_t q_stride_h,
+                           int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
+                           const QkNormRope &norm, cudaStream_t stream) {
+  using T = nv_bfloat16;
+  detect_k_anchor<T, NMK><<<dim3(H_kv, B), CENTER_DETECT_THREADS, 0, stream>>>(
+      (const T *)k, anchors, Lk, 128, H_kv, k_stride_b, k_stride_h, k_stride_n, norm);
+#define NORM128(NL, BK, ROT) launch_qk128<T, NL, BK, ROT, NM, NMK>(q, q_int8, q_scale, k, k_int8, k_scale, anchors, B, H_q, Lq, H_kv, Lk, q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h, k_stride_n, norm, stream)
+  if (BLKK == 128) {
+    if (Lk <= 256) NORM128(16, 128, 4); else NORM128(16, 128, 128);
+  } else {
+    if (Lk <= 256) NORM128(8, 64, 4); else NORM128(8, 64, 128);
+  }
+#undef NORM128
+}
+
 // launch_quant_qk_per_thread_int8 for bf16 head dim 128, with Q and K first
 // taken through gpu_qk_norm_rope's per-head RMSNorm, weight and RoPE
 // (rope_mode 1 or 2; a null table for none). Q and K in memory are left as
-// they are.
+// they are. A null kw takes K as it is (normalized already), as the plain
+// quantizer does.
 extern "C" void launch_quant_qk_norm_rope_int8(
     const void *q, void *q_int8, void *q_scale, const void *k, void *k_int8,
     void *k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int BLKK,
@@ -1236,16 +1255,12 @@ extern "C" void launch_quant_qk_norm_rope_int8(
   auto *anchors = static_cast<int *>(anchor_indices);
   const auto go = [&](auto nm_tag) {
     constexpr int NM = decltype(nm_tag)::value;
-    detect_k_anchor<T, NM><<<dim3(H_kv, B), CENTER_DETECT_THREADS, 0, stream>>>(
-        (const T *)k, anchors, Lk, 128, H_kv, k_stride_b, k_stride_h,
-        k_stride_n, norm);
-#define NORM128(NL, BK, ROT) launch_qk128<T, NL, BK, ROT, NM>(q, q_int8, q_scale, k, k_int8, k_scale, anchors, B, H_q, Lq, H_kv, Lk, q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h, k_stride_n, norm, stream)
-    if (BLKK == 128) {
-      if (Lk <= 256) NORM128(16, 128, 4); else NORM128(16, 128, 128);
-    } else {
-      if (Lk <= 256) NORM128(8, 64, 4); else NORM128(8, 64, 128);
-    }
-#undef NORM128
+    if (kw)
+      launch_norm128<NM, NM>(q, q_int8, q_scale, k, k_int8, k_scale, anchors, B, H_q, Lq, H_kv, Lk, BLKK, q_stride_b, q_stride_h,
+                             q_stride_n, k_stride_b, k_stride_h, k_stride_n, norm, stream);
+    else
+      launch_norm128<NM, 0>(q, q_int8, q_scale, k, k_int8, k_scale, anchors, B, H_q, Lq, H_kv, Lk, BLKK, q_stride_b, q_stride_h,
+                            q_stride_n, k_stride_b, k_stride_h, k_stride_n, norm, stream);
   };
   switch (nm) {
   case 1: go(std::integral_constant<int, 1>{}); break;

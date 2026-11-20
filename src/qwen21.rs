@@ -8,7 +8,7 @@
 
 use crate::cuda::{memcpy_2d_d2d, memcpy_d2d, DevBuf, Stream};
 use crate::dit::Dit as KreaDit;
-use crate::ffi::{k, null, off, s, DT_BF16, PM, PRO_LN_MOD, PRO_PLAIN, PRO_RMS, PRO_SILU, PRO_SWIGLU};
+use crate::ffi::{k, null, off, s, DT_BF16, P, PM, PRO_LN_MOD, PRO_PLAIN, PRO_RMS, PRO_SILU, PRO_SWIGLU};
 use crate::offload::{plan, Layout, Store, WeightSet};
 use crate::st::{bf16_bytes, SafeTensors};
 use anyhow::{bail, Result};
@@ -335,15 +335,21 @@ impl Dit {
     }
 
     /// Attention of `batch` images, each of `lq` rows of `q` (rows `qrow` apart, images `q_item` rows apart) over its `lk`
-    /// rows of keys and values (`krow` apart).
+    /// rows of keys and values (`krow` apart). `q_norm` (int8 only), the q norm's weight and RoPE table: q in memory isn't
+    /// normalized yet, and the quantizer does it as `gpu_qk_norm_rope` would.
     #[allow(clippy::too_many_arguments)]
     fn attention(&self, q: PM, kp: PM, vp: PM, out: PM, batch: usize, lq: usize, lk: usize, qrow: usize, krow: usize, q_item: usize,
-        st: &Stream) -> Result<()> {
+        q_norm: Option<(P, P)>, st: &Stream) -> Result<()> {
         let (hs, b) = (HD as i64, batch as i32);
         if self.int8_attn {
             let ws = DevBuf::alloc_async(unsafe { crate::ffi::gpu_int8_attn_workspace(b, H as i32, H as i32, lq as i32, lk as i32) } as usize, st)?;
-            k!(gpu_int8_attn(q, kp, vp, out, ws.ptr(), b, lq as i32, lk as i32, H as i32, H as i32, (q_item * qrow) as i64, qrow as i64, hs,
-                (lk * krow) as i64, krow as i64, hs, (lk * krow) as i64, krow as i64, hs, (lq * F) as i64, F as i64, hs, 1.0 / (HD as f32).sqrt(), s(st)))
+            let (q_bs, k_bs, o_bs, scale) = ((q_item * qrow) as i64, (lk * krow) as i64, (lq * F) as i64, 1.0 / (HD as f32).sqrt());
+            if let Some((qn, rope)) = q_norm {
+                return k!(gpu_int8_attn_norm_rope(q, kp, vp, out, ws.ptr(), b, lq as i32, lk as i32, H as i32, H as i32, q_bs, qrow as i64, hs,
+                    k_bs, krow as i64, hs, k_bs, krow as i64, hs, o_bs, F as i64, hs, scale, qn, null(), EPS, rope, 1, s(st)));
+            }
+            k!(gpu_int8_attn(q, kp, vp, out, ws.ptr(), b, lq as i32, lk as i32, H as i32, H as i32, q_bs, qrow as i64, hs,
+                k_bs, krow as i64, hs, k_bs, krow as i64, hs, o_bs, F as i64, hs, scale, s(st)))
         } else {
             let lse = DevBuf::alloc_async(H * batch * lq * 4, st)?;
             self.flash(q, kp, vp, out, lse.ptr(), batch, lq, lk, qrow, krow, q_item, st)
@@ -353,10 +359,11 @@ impl Dit {
     /// One block over `rows` rows of `x` that `scale`, `gate` etc. modulate alike: `batch` sequences one after another, each
     /// taking `rope`. `attend` is called with the first row of q, k and v (after the norm and RoPE) and writes the attention
     /// output for them. The rows of q, k and v go to `dest` (the first row, and the rows between sequences) when given,
-    /// else to a buffer of their own.
+    /// else to a buffer of their own. With `dest` and int8 attention q is left unnormalized, and `attend` gets the q norm's
+    /// weight to do it in the attention's quantizer.
     #[allow(clippy::too_many_arguments)]
     fn block(&self, tag: &str, base: PM, lay: &Layout, x: &DevBuf, batch: usize, rows: usize, m: &Mod, rope: PM, dest: Option<(PM, usize)>,
-        st: &Stream, attend: &mut dyn FnMut(PM, &DevBuf, &Stream) -> Result<()>) -> Result<()> {
+        st: &Stream, attend: &mut dyn FnMut(PM, Option<P>, &DevBuf, &Stream) -> Result<()>) -> Result<()> {
         let wp = |key: &str| off(base, lay.off(key));
         let (fi, mi) = (F as i64, rows as i32);
         let vec = |j: usize| off(m.vecs.ptr(), j * F * 2);
@@ -379,14 +386,15 @@ impl Dit {
             }
         }
         mark("qkv gemm")?;
+        let fuse_q = dest.is_some() && self.int8_attn;
         for i in 0..batch {
-            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(qkv, i * item * QKV * 2), QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn"), wp("kn"),
-                EPS, rope, 1, each as i32, s(st)))?;
+            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(qkv, i * item * QKV * 2), QKV as i64, 0, F as i32, if fuse_q { 0 } else { H as i32 },
+                H as i32, wp("qn"), wp("kn"), EPS, rope, 1, each as i32, s(st)))?;
         }
         mark("norm rope")?;
         let attn = DevBuf::alloc_async(rows * F * 2, st)?;
         trace(tag, "x_in", x, rows * F * 2, st)?;
-        attend(qkv, &attn, st)?;
+        attend(qkv, fuse_q.then(|| wp("qn") as P), &attn, st)?;
         mark("attention")?;
         trace(tag, "attn", &attn, rows * F * 2, st)?;
         drop(own);
@@ -416,7 +424,7 @@ impl Dit {
     fn prefix_block(&self, tag: &str, base: PM, lay: &Layout, x: &DevBuf, pf: &Prefix, m0: &Mod, kout: PM, vout: PM, out_row: usize,
         st: &Stream) -> Result<()> {
         let p = pf.rows;
-        self.block(&format!("p{tag}"), base, lay, x, 1, p, m0, pf.rope.ptr(), None, st, &mut |q, attn, st| {
+        self.block(&format!("p{tag}"), base, lay, x, 1, p, m0, pf.rope.ptr(), None, st, &mut |q, _, attn, st| {
             let (kp, vp) = (off(q, F * 2), off(q, 2 * F * 2));
             for &(row, w) in pf.v_scale.iter().filter(|&&(row, _)| row < p) {
                 k!(gpu_scale_bf16(off(vp, row * QKV * 2), F as i64, w, s(st)))?;
@@ -517,13 +525,13 @@ impl Dit {
                 memcpy_d2d(off(cat.ptr(), i * kl * QKV * 2), cat.ptr(), p * QKV * 2, st)?;
             }
             let own = off(cat.ptr(), p * QKV * 2);
-            self.block(&format!("t{b}"), base, &lay, &x, batch, rows, &m, rope_t, Some((own, kl)), st, &mut |q, attn, st| {
+            self.block(&format!("t{b}"), base, &lay, &x, batch, rows, &m, rope_t, Some((own, kl)), st, &mut |q, q_norm, attn, st| {
                 for i in 0..batch {
                     for &(row, w) in pf.v_scale.iter().filter(|&&(row, _)| (p..kl).contains(&row)) {
                         k!(gpu_scale_bf16(off(vc, (i * kl + row) * QKV * 2), F as i64, w, s(st)))?;
                     }
                 }
-                self.attention(q, kc, vc, attn.ptr(), batch, lt, kl, QKV, QKV, kl, st)
+                self.attention(q, kc, vc, attn.ptr(), batch, lt, kl, QKV, QKV, kl, q_norm.map(|qn| (qn, rope_t as P)), st)
             })?;
             self.blocks.release(b, st)?;
             if let Some(pr) = probe.as_mut() {

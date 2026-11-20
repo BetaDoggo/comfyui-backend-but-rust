@@ -824,9 +824,25 @@ impl Dit {
                 lora_delta(a, mm, xn, F, rows, lt, dl, F, st)?;
                 k!(gpu_add_gated_bf16(q, fi, dl, fi, null(), m, F as i32, s(st)))?;
             }
-            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, q, fi, 0, 0, H as i32, 0, wp("qn_cross"), null(), EPS, null(), 0, m, s(st)))?;
-            self.prof.mark("rope", st)?;
-            self.attention(q, kv, off(kv, F * 2), attn.ptr(), ws.ptr(), batch, l, lc, F, KV, true, st)?;
+            // concept steering reads the normalized q again; otherwise int8 attention normalizes it in its quantizer
+            let steer = match (&self.concept, self.step, sigma, matches!(pass, Pass::Reference { .. })) {
+                (Some(cc), Some(step), Some(_), false) => (cc.steps.0..cc.steps.1).contains(&step) && (cc.blocks.0..cc.blocks.1).contains(&b),
+                _ => false,
+            };
+            if self.int8_attn && !steer {
+                self.prof.mark("rope", st)?;
+                // one image at a time, as `attention` takes the shared keys
+                for i in 0..batch {
+                    let (hs, at) = (HD as i64, i * l * F * 2);
+                    k!(gpu_int8_attn_norm_rope(off(q, at), kv, off(kv, F * 2), off(attn.ptr(), at), ws.ptr(), 1, l as i32, lc as i32, H as i32,
+                        H as i32, (l * F) as i64, fi, hs, 0, KV as i64, hs, 0, KV as i64, hs, (l * F) as i64, fi, hs, 1.0 / (HD as f32).sqrt(),
+                        wp("qn_cross"), null(), EPS, null(), 0, s(st)))?;
+                }
+            } else {
+                k!(gpu_qk_norm_rope(DT_BF16, HD as i32, q, fi, 0, 0, H as i32, 0, wp("qn_cross"), null(), EPS, null(), 0, m, s(st)))?;
+                self.prof.mark("rope", st)?;
+                self.attention(q, kv, off(kv, F * 2), attn.ptr(), ws.ptr(), batch, l, lc, F, KV, true, st)?;
+            }
             if let (Some(cc), Some(step), Some(_), false) = (&self.concept, self.step, sigma, matches!(pass, Pass::Reference { .. })) {
                 if (cc.steps.0..cc.steps.1).contains(&step) && (cc.blocks.0..cc.blocks.1).contains(&b) {
                     // the concept's keys and values against the null prompt's, read by the same queries

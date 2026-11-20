@@ -76,6 +76,8 @@ extern "C" {
     pub fn gpu_gelu_tanh_bf16(x: PM, n: i64, s: PM) -> i32;
     pub fn gpu_add_gated_bf16(x: PM, x_stride: i64, y: P, y_stride: i64, gate: P, rows: i32, cols: i32, s: PM) -> i32;
     pub fn gpu_add_vec_bf16(out: PM, a: P, b: P, b_is_f32: i32, n: i32, s: PM) -> i32;
+    /// `gpu_add_vec_bf16` with bf16 `b` over `rows` rows of `a` into rows of `out`, strides in elements
+    pub fn gpu_add_vec_rows_bf16(out: PM, out_stride: i64, a: P, a_stride: i64, b: P, rows: i32, n: i32, s: PM) -> i32;
     pub fn gpu_steer_record(x: P, rows: i32, cols: i32, sum: PM, norm: PM, s: PM) -> i32;
     pub fn gpu_steer_add(x: PM, rows: i32, cols: i32, dir: P, amount: f32, preserve: i32, s: PM) -> i32;
     pub fn gpu_zero_f32(x: PM, n: i64, s: PM) -> i32;

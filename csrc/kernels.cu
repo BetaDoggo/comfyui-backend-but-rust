@@ -682,6 +682,20 @@ GPU_API int gpu_add_vec_bf16(void* out, const void* a, const void* b, int b_is_f
     return 0;
 }
 
+// out[r * out_stride + i] = rnd(a[r * a_stride + i] + b[i]): add_vec_kernel with bf16 b over `rows` rows
+__global__ void add_vec_rows_kernel(bf16* out, int64_t out_stride, const bf16* a, int64_t a_stride, const bf16* b, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (i >= n) return;
+    out[r * out_stride + i] = __float2bfloat16_rn(__bfloat162float(a[r * a_stride + i]) + __bfloat162float(b[i]));
+}
+GPU_API int gpu_add_vec_rows_bf16(void* out, int64_t out_stride, const void* a, int64_t a_stride, const void* b, int rows, int n,
+                                  void* stream) {
+    add_vec_rows_kernel<<<dim3((n + 255) / 256, rows), 256, 0, (cudaStream_t)stream>>>((bf16*)out, out_stride, (const bf16*)a, a_stride,
+                                                                                       (const bf16*)b, n);
+    KCHECK();
+    return 0;
+}
+
 __global__ void f32_to_bf16_kernel(const float* in, bf16* out, int64_t n) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2bfloat16_rn(in[i]);

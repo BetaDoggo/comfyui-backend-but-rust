@@ -171,11 +171,11 @@ pub fn block_layout(st: &SafeTensors, i: usize) -> Result<Layout> {
         l.f32(st, &format!("qn_{key}"), &n(&format!("{a}.q_norm.weight")), 0.0)?;
         l.f32(st, &format!("kn_{key}"), &n(&format!("{a}.k_norm.weight")), 0.0)?;
     }
-    for (j, a) in ["self_attn", "cross_attn", "mlp"].iter().enumerate() {
-        for layer in 1..=2 {
-            l.raw(st, &format!("w_mod{j}_{layer}"), &[n(&format!("adaln_modulation_{a}.{layer}.weight"))])?;
-            l.raw(st, &format!("s_mod{j}_{layer}"), &[n(&format!("adaln_modulation_{a}.{layer}.weight_scale"))])?;
-        }
+    // the three modulations (self attention, cross attention, MLP) one after another, so each layer is one GEMM
+    for layer in 1..=2 {
+        let names = |what: &str| ["self_attn", "cross_attn", "mlp"].map(|a| n(&format!("adaln_modulation_{a}.{layer}.{what}")));
+        l.raw(st, &format!("w_mod_{layer}"), &names("weight"))?;
+        l.raw(st, &format!("s_mod_{layer}"), &names("weight_scale"))?;
     }
     l.raw(st, "w_l1", &[n("mlp.layer1.weight")])?;
     l.raw(st, "s_l1", &[n("mlp.layer1.weight_scale")])?;
@@ -627,9 +627,10 @@ impl Dit {
         let qkv = DevBuf::alloc_async(rows * QKV * 2, st)?;
         let attn = DevBuf::alloc_async(rows * F * 2, st)?;
         let hid = DevBuf::alloc_async(rows * MLP * 2, st)?;
-        let a8y = DevBuf::alloc_async(ADALN, st)?;
-        let asy = DevBuf::alloc_async(4, st)?;
-        let y256 = DevBuf::alloc_async(ADALN * 2, st)?;
+        let a8y = DevBuf::alloc_async(3 * ADALN, st)?;
+        let asy = DevBuf::alloc_async(3 * 4, st)?;
+        let y256 = DevBuf::alloc_async(3 * ADALN * 2, st)?;
+        let y3 = DevBuf::alloc_async(3 * 3 * MOD * 2, st)?;
         let cached = sigma.and_then(|sg| self.mods.remove(&sg.to_bits()));
         let hit = cached.is_some();
         if sigma.is_some() && !hit && self.mods.len() >= MOD_CACHE {
@@ -696,14 +697,17 @@ impl Dit {
             let lay = self.blocks.layouts[b].clone();
             let wp = |key: &str| off(base, lay.off(key));
             let bm = off(modv.ptr(), b * 3 * MOD * 2);
-            for j in (0..3).filter(|_| !hit) {
-                k!(gpu_int8_gemm(t.a8t.ptr(), wp(&format!("w_mod{j}_1")), t.ast.ptr(), wp(&format!("s_mod{j}_1")), null(), y256.ptr(), 1,
-                    ADALN as i64, fi, DT_BF16, s(st)))?;
-                k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, y256.ptr(), ADALN as i64, null(), 0, 0, null(), 0.0, null(), null(),
-                    a8y.ptr(), asy.ptr(), 1, ADALN as i32, 1, s(st)))?;
-                k!(gpu_int8_gemm(a8y.ptr(), wp(&format!("w_mod{j}_2")), asy.ptr(), wp(&format!("s_mod{j}_2")), null(),
-                    off(bm, j * MOD * 2), 1, MOD as i64, ADALN as i64, DT_BF16, s(st)))?;
-                k!(gpu_add_vec_bf16(off(bm, j * MOD * 2), off(bm, j * MOD * 2), t.lora.ptr(), 0, MOD as i32, s(st)))?;
+            if !hit {
+                // The three modulations at once: their first layers as one GEMM, its output quantized as three rows, the
+                // second layers as one GEMM of those rows, of which row j keeps its own third, then the LoRA term. Each
+                // value is computed as three separate chains compute it.
+                k!(gpu_int8_gemm(t.a8t.ptr(), wp("w_mod_1"), t.ast.ptr(), wp("s_mod_1"), null(), y256.ptr(), 1, (3 * ADALN) as i64, fi,
+                    DT_BF16, s(st)))?;
+                k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, y256.ptr(), ADALN as i64, null(), 0, 0, null(), 0.0, null(), null(), a8y.ptr(),
+                    asy.ptr(), 3, ADALN as i32, 1, s(st)))?;
+                k!(gpu_int8_gemm(a8y.ptr(), wp("w_mod_2"), asy.ptr(), wp("s_mod_2"), null(), y3.ptr(), 3, (3 * MOD) as i64, ADALN as i64,
+                    DT_BF16, s(st)))?;
+                k!(gpu_add_vec_rows_bf16(bm, MOD as i64, y3.ptr(), (4 * MOD) as i64, t.lora.ptr(), 3, MOD as i32, s(st)))?;
             }
             let shift = |j: usize| off(bm, j * MOD * 2);
             let scale = |j: usize| off(bm, (j * MOD + F) * 2);

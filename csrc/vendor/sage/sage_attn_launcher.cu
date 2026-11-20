@@ -231,6 +231,22 @@ extern "C" void launch_sage_attn_kernel(
     return;
   }
 
+  // Blackwell GeForce (sm_12x): 64-row query tiles for unmasked self-attention
+  // at any length. On an RTX 5070 the kernel is 5-17% faster at 512x512 to
+  // 1536x1536 images with 16, 24 and 48 heads (Anima, MOSS Image, Krea 2), and
+  // Krea 2 at 1536x1536 stays 0.8% faster per step over a sustained run. 30-32
+  // heads keep the narrower rule below.
+  if (mask == nullptr && head_dim == 128 && cta_k == 128 && qo_len == kv_len &&
+      (num_qo_heads < 30 || num_qo_heads > 32) &&
+      current_device_sm() / 10 == 12) {
+    if (output_dtype_code == 1) {
+      LAUNCH_Q(128, 128, MaskMode::kNone, half, true, 64);
+    } else {
+      LAUNCH_Q(128, 128, MaskMode::kNone, nv_bfloat16, true, 64);
+    }
+    return;
+  }
+
   // Keep smaller unmasked query tiles limited to Blackwell image shapes.
   // Ada retains 128-query tiles: warmed ComfyUI workloads regress with the
   // smaller tiles under stock-clock thermal throttling.

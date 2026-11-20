@@ -158,6 +158,8 @@ Measured at 1024x1024 with 8 steps, CFG 1 and `er_sde`, after warm-up:
 A whole warm image takes about 1.01 s from the command line, decode included. Through SwarmUI it took 1.14 s before
 the quantizer's rotation and the VAE decode were sped up, and hasn't been timed there since. The int8 column is the
 average of warm steps over four runs alternated with the previous build, which averaged 116.5 ms/step on the same runs.
+Batching the modulation GEMMs and normalizing the cross-attention queries inside the int8 quantizer later took steps from
+110 to 108 ms at 1024x1024 and from 32 to 30 ms at 512x512, with bit-identical images.
 Steps vary from 111 to 119 ms between runs as the GPU warms. The faster rotation gives bit-identical images and was
 tested through SwarmUI.
 
@@ -300,6 +302,9 @@ Measured here (RTX 5070, 12 GB), 8 steps, after warm-up:
 | VAE decode, 1024x1024 | not timed | 0.31 s |
 | Text encoder, a short prompt | not timed | 0.3 s |
 
+Writing the q, k and v projections in place for attention, and normalizing the queries inside the int8 quantizer, later
+took a 1024x1024 evaluation from 344 to 333 ms, with bit-identical images; the table wasn't timed again.
+
 The VAE decode, timed on its own with a synthetic latent, took 387 ms before its convs took tiles that fit
 its 144, 288 and 576 channels and its residual adds moved into the convs, 311 to 325 ms after, with the same bytes. Not
 tested through SwarmUI.
@@ -365,6 +370,12 @@ together took 1.51 s. The VAE decodes 1024x1024 in about 190 ms, against 242 ms 
 with the same bytes (timed on its own with a synthetic latent, not tested through SwarmUI); 512x512 took about 170 ms
 before and wasn't timed again. Before GroupNorm stopped
 dividing in double precision and the small levels' convolutions took smaller tiles, SD 1.5 took 1.37 s.
+
+Fewer launches per evaluation since then (residual adds in the GEMM and conv epilogues, GroupNorm and LayerNorm fused
+with the int8 quantizer, the prompt's keys and values padded once per prompt) gave bit-identical images and, on SD 1.5
+in alternated runs of the two builds: 0.875 to 0.76 s at 512x512, 1.16 to 1.02 s at 512x768, 1.40 to 1.23 s for two
+images together, 0.88 to 0.82 s with `--no-quant` and 1.93 to 1.45 s with `--attention flash`. SDXL wasn't timed again:
+no SDXL checkpoint was at hand.
 
 **Against ComfyUI** (same seed and noise, its own code on the same files, `tools/sd_ref.py`):
 

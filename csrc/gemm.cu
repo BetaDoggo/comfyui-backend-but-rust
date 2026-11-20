@@ -9,6 +9,7 @@
 #include "cutlass/conv/kernel/default_conv2d_fprop.h"
 #include "cutlass/conv/device/implicit_gemm_convolution.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/conv/kernel/default_conv2d_fprop_with_broadcast.h"
 
 // ---------------------------------------------------------------------------------------------
 // cuBLASLt
@@ -183,6 +184,86 @@ struct ConvFprop {
     }
 };
 
+// The epilogue of a conv whose output joins a residual: bf16(bf16(acc + bias) + residual), the conv's output rounded
+// as the plain epilogue rounds it, then the residual added and rounded as gpu_add_gated_bf16 does.
+template <int Count>
+class ConvBiasResidual {
+public:
+    static bool const kIsSingleSource = true;
+    using ElementOutput = cutlass::bfloat16_t;
+    using ElementC = ElementOutput;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementVector = ElementOutput;
+    static int const kElementsPerAccess = Count;
+    static int const kCount = Count;
+    using FragmentAccumulator = cutlass::Array<float, Count>;
+    using FragmentCompute = cutlass::Array<float, Count>;
+    using FragmentC = cutlass::Array<ElementOutput, Count>;
+    using FragmentOutput = FragmentC;
+    using ElementZ = ElementOutput;
+    using ElementT = ElementOutput;
+    using FragmentZ = FragmentC;
+    using FragmentT = FragmentC;
+    static bool const kIsHeavy = false;
+    static bool const kStoreZ = true;
+    static bool const kStoreT = false;
+    struct Params {
+        CUTLASS_HOST_DEVICE Params() {}
+    };
+    CUTLASS_HOST_DEVICE ConvBiasResidual(Params const&) {}
+    CUTLASS_HOST_DEVICE bool is_source_needed() const { return true; }
+    CUTLASS_HOST_DEVICE void set_k_partition(int, int) {}
+    CUTLASS_HOST_DEVICE void operator()(FragmentOutput& z, FragmentOutput&, FragmentAccumulator const& ab, FragmentC const& resid,
+                                        FragmentCompute const& bias) const {
+        cutlass::NumericConverter<ElementOutput, float, cutlass::FloatRoundStyle::round_to_nearest> to_bf16;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < Count; ++i) {
+            const float conv = float(to_bf16(ab[i] + bias[i]));
+            z[i] = to_bf16(conv + float(resid[i]));
+        }
+    }
+    CUTLASS_HOST_DEVICE void operator()(FragmentOutput&, FragmentOutput&, FragmentAccumulator const&, FragmentCompute const&) const {}
+};
+
+template <int TBM, int TBN, int TBK, int WM, int WN, int Stages>
+struct ConvFpropResidual {
+    using ElementA = cutlass::bfloat16_t;
+    using Layout = cutlass::layout::TensorNHWC;
+    using Kernel = typename cutlass::conv::kernel::DefaultConv2dFpropWithBroadcast<
+        ElementA, Layout, ElementA, Layout, ElementA, Layout, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<TBM, TBN, TBK>, cutlass::gemm::GemmShape<WM, WN, TBK>, cutlass::gemm::GemmShape<16, 8, 16>,
+        ConvBiasResidual<8>, cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, Stages, cutlass::arch::OpMultiplyAdd,
+        cutlass::conv::IteratorAlgorithm::kOptimized, cutlass::conv::StrideSupport::kUnity>::Kernel;
+    using Conv = cutlass::conv::device::ImplicitGemmConvolution<Kernel>;
+
+    static int run(const void* x, const void* w, const void* bias, const void* resid, void* out, int N, int H, int W, int C,
+                   int Cout, int R, cudaStream_t stream) {
+        const int pad = R / 2;
+        cutlass::conv::Conv2dProblemSize problem(cutlass::Tensor4DCoord(N, H, W, C),
+                                                 cutlass::Tensor4DCoord(Cout, R, R, C),
+                                                 cutlass::Tensor4DCoord(pad, pad, pad, pad), cutlass::MatrixCoord(1, 1),
+                                                 cutlass::MatrixCoord(1, 1), cutlass::Tensor4DCoord(N, H, W, Cout),
+                                                 cutlass::conv::Mode::kCrossCorrelation, 1);
+        using TensorRef = cutlass::TensorRef<cutlass::bfloat16_t, Layout>;
+        TensorRef a((cutlass::bfloat16_t*)x, Layout::packed({N, H, W, C}));
+        TensorRef b((cutlass::bfloat16_t*)w, Layout::packed({Cout, R, R, C}));
+        TensorRef c((cutlass::bfloat16_t*)resid, Layout::packed({N, H, W, Cout}));
+        TensorRef d((cutlass::bfloat16_t*)out, Layout::packed({N, H, W, Cout}));
+        typename Conv::Arguments args(problem, a, b, c, d, {}, cutlass::conv::SplitKMode::kSerial, const_cast<void*>(bias), nullptr, 0,
+                                      Cout);
+        Conv op;
+        if (op.can_implement(args) != cutlass::Status::kSuccess) return -300;
+        const size_t ws = op.get_workspace_size(args);
+        void* wsp = nullptr;
+        if (ws && cudaMallocAsync(&wsp, ws, stream) != cudaSuccess) return -301;
+        cutlass::Status s = op.initialize(args, wsp, stream);
+        if (s == cutlass::Status::kSuccess) s = op(stream);
+        if (wsp) cudaFreeAsync(wsp, stream);
+        return s == cutlass::Status::kSuccess ? 0 : -302;
+    }
+};
+
 }  // namespace
 
 // x [N,H,W,C], w [Cout,R,R,C], bias [Cout] (nullable), out [N,H,W,Cout]; C and Cout multiples of 8.
@@ -190,9 +271,28 @@ GPU_API int gpu_conv2d(const void* x, const void* w, const void* bias, void* out
                          int Cout, int R, void* stream) {
     if (C % 8 || Cout % 8) return -310;
     cudaStream_t st = (cudaStream_t)stream;
+    // The widest tile that divides Cout: a partial tile costs a whole one (a 128-wide tile on 192 channels did a
+    // third more work). Every shape here reduces over K in the same order, so the output is the same bytes.
     int r;
-    if (Cout >= 128) r = ConvFprop<128, 128, 32, 64, 64, 4>::run(x, w, bias, out, N, H, W, C, Cout, R, st);
-    else r = ConvFprop<128, 64, 32, 64, 32, 4>::run(x, w, bias, out, N, H, W, C, Cout, R, st);
+    if (Cout % 128 == 0) r = ConvFprop<128, 128, 32, 64, 64, 4>::run(x, w, bias, out, N, H, W, C, Cout, R, st);
+    else if (Cout % 64 == 0) r = ConvFprop<128, 64, 32, 64, 32, 4>::run(x, w, bias, out, N, H, W, C, Cout, R, st);
+    else r = ConvFprop<64, 32, 32, 32, 32, 4>::run(x, w, bias, out, N, H, W, C, Cout, R, st);
+    if (r) return r;
+    KCHECK();
+    return 0;
+}
+
+// gpu_conv2d then gpu_add_gated_bf16 of `resid` (no gate) in one pass: out = conv(x) + resid, rounded as those two
+// round. bias is required; out must not alias resid or x.
+GPU_API int gpu_conv2d_residual(const void* x, const void* w, const void* bias, const void* resid, void* out, int N, int H, int W,
+                                  int C, int Cout, int R, void* stream) {
+    if (C % 8 || Cout % 8) return -310;
+    if (!bias) return -311;
+    cudaStream_t st = (cudaStream_t)stream;
+    int r;
+    if (Cout % 128 == 0) r = ConvFpropResidual<128, 128, 32, 64, 64, 4>::run(x, w, bias, resid, out, N, H, W, C, Cout, R, st);
+    else if (Cout % 64 == 0) r = ConvFpropResidual<128, 64, 32, 64, 32, 4>::run(x, w, bias, resid, out, N, H, W, C, Cout, R, st);
+    else r = ConvFpropResidual<64, 32, 32, 32, 32, 4>::run(x, w, bias, resid, out, N, H, W, C, Cout, R, st);
     if (r) return r;
     KCHECK();
     return 0;

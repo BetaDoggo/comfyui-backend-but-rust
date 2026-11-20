@@ -155,10 +155,17 @@ Measured at 1024x1024 with 8 steps, CFG 1 and `er_sde`, after warm-up:
 |---|---|---|---|
 | Sampling | 1.59 s (199 ms/step) | 1.31 s (164 ms/step) | 0.90 s (113 ms/step) |
 
-A whole image took about 1.04 s from the command line and 1.14 s through SwarmUI, decode included, before the
-quantizer's rotation was sped up; not measured again since. The int8 column is the average of warm steps over four
-runs alternated with the previous build, which averaged 116.5 ms/step on the same runs. Steps vary from 111 to 119 ms
-between runs as the GPU warms. The faster rotation gives bit-identical images and was tested through SwarmUI.
+A whole warm image takes about 1.01 s from the command line, decode included. Through SwarmUI it took 1.14 s before
+the quantizer's rotation and the VAE decode were sped up, and hasn't been timed there since. The int8 column is the
+average of warm steps over four runs alternated with the previous build, which averaged 116.5 ms/step on the same runs.
+Steps vary from 111 to 119 ms between runs as the GPU warms. The faster rotation gives bit-identical images and was
+tested through SwarmUI.
+
+The VAE decode of a 1024x1024 image takes about 88 ms of GPU time, down from about 115 ms, with bit-identical output at
+768x1280, 1280x768, 1024x1024 and 2048x2048. Convs now use the widest tile that divides their output channels, the
+residual add runs in the epilogue of each block's last conv, and the upsample and the mid-block softmax read their
+input once. Its 3x3 convs run at 60 to 80 TFLOPS, about this GPU's bf16 rate with float32 accumulation, which ComfyUI
+also uses. This VAE also serves Krea 2, whose decode wasn't timed. Tested through SwarmUI, where the maintainer found it faster.
 
 Where the time goes per step: int8 GEMMs about 60 ms, at or near this GPU's int8 peak, self-attention about 19 ms plus
 7 ms quantizing and rotating its inputs, row quantization about 13 ms, and cross-attention about 5 ms, most of it

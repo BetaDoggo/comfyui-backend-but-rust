@@ -948,9 +948,29 @@ __global__ void upsample2x_kernel(const bf16* x, bf16* out, int H, int W, int C)
     const int ox = (int)(p % (2 * W)), oy = (int)(p / (2 * W));
     out[i] = x[((int64_t)(oy >> 1) * W + (ox >> 1)) * C + c];
 }
+// One thread per input pixel and 8 channels: one 16-byte read, written to all four output pixels.
+__global__ void upsample2x_v8_kernel(const uint4* x, uint4* out, int W, int C8, int64_t n) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int c = (int)(i % C8);
+    const int64_t p = i / C8;
+    const int64_t px = p % W, py = p / W;
+    const int64_t row = (int64_t)2 * W * C8;
+    const int64_t o = (2 * py * 2 * W + 2 * px) * C8 + c;
+    const uint4 v = x[i];
+    out[o] = v;
+    out[o + C8] = v;
+    out[o + row] = v;
+    out[o + row + C8] = v;
+}
 GPU_API int gpu_upsample2x(const void* x, void* out, int H, int W, int C, void* stream) {
-    const int64_t n = (int64_t)4 * H * W * C;
-    upsample2x_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const bf16*)x, (bf16*)out, H, W, C);
+    if (C % 8 == 0 && ((uintptr_t)x & 15) == 0 && ((uintptr_t)out & 15) == 0) {
+        const int64_t n = (int64_t)H * W * (C / 8);
+        upsample2x_v8_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const uint4*)x, (uint4*)out, W, C / 8, n);
+    } else {
+        const int64_t n = (int64_t)4 * H * W * C;
+        upsample2x_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const bf16*)x, (bf16*)out, H, W, C);
+    }
     KCHECK();
     return 0;
 }
@@ -970,8 +990,44 @@ __global__ void softmax_rows_kernel(const float* s, bf16* p, int n, float scale)
     const float inv = 1.f / sum;
     for (int j = threadIdx.x; j < n; j += blockDim.x) pr[j] = __float2bfloat16_rn(expf(sr[j] * scale - mx) * inv);
 }
+// The same, for rows of at most 1024 * PER: each thread keeps its elements in registers, so the row is read once and
+// each exponential computed once, in the same order as above.
+template <int PER>
+__global__ void __launch_bounds__(1024) softmax_rows_reg_kernel(const float* s, bf16* p, int n, float scale) {
+    __shared__ float red[33];
+    const int64_t r = blockIdx.x;
+    const float* sr = s + r * n;
+    bf16* pr = p + r * n;
+    float v[PER];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int j = threadIdx.x + k * blockDim.x;
+        v[k] = j < n ? sr[j] : 0.f;
+        if (j < n) mx = fmaxf(mx, v[k] * scale);
+    }
+    mx = block_max(mx, red);
+    float sum = 0.f;
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        if (threadIdx.x + k * blockDim.x < n) {
+            v[k] = expf(fmaf(v[k], scale, -mx));  // as nvcc contracts sr[j] * scale - mx above
+            sum += v[k];
+        }
+    }
+    sum = block_sum(sum, red);
+    const float inv = 1.f / sum;
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int j = threadIdx.x + k * blockDim.x;
+        if (j < n) pr[j] = __float2bfloat16_rn(v[k] * inv);
+    }
+}
 GPU_API int gpu_softmax_rows(const float* s, void* p, int rows, int n, float scale, void* stream) {
-    softmax_rows_kernel<<<rows, 1024, 0, (cudaStream_t)stream>>>(s, (bf16*)p, n, scale);
+    cudaStream_t st = (cudaStream_t)stream;
+    if (n <= 1024 * 16) softmax_rows_reg_kernel<16><<<rows, 1024, 0, st>>>(s, (bf16*)p, n, scale);
+    else if (n <= 1024 * 32) softmax_rows_reg_kernel<32><<<rows, 1024, 0, st>>>(s, (bf16*)p, n, scale);
+    else softmax_rows_kernel<<<rows, 1024, 0, st>>>(s, (bf16*)p, n, scale);
     KCHECK();
     return 0;
 }

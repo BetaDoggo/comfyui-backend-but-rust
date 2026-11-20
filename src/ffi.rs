@@ -37,6 +37,8 @@ extern "C" {
     pub fn gpu_int8_gemm_residual(a: P, w: P, xs: P, ws: P, bias: P, rscale: P, resid: P, d: PM, m: i64, n: i64,
         k: i64, out_dt: i32, s: PM) -> i32;
     pub fn gpu_conv2d(x: P, w: P, bias: P, out: PM, n: i32, h: i32, w_: i32, c: i32, cout: i32, r: i32, s: PM) -> i32;
+    /// `gpu_conv2d` with `resid` added to its output (rounded as `gpu_add_gated_bf16` rounds); `out` aliases neither input.
+    pub fn gpu_conv2d_residual(x: P, w: P, bias: P, resid: P, out: PM, n: i32, h: i32, w_: i32, c: i32, cout: i32, r: i32, s: PM) -> i32;
     pub fn gpu_flash_attn(q: P, k: P, v: P, o: PM, lse: PM, b: i32, sq: i32, sk: i32, h: i32, hk: i32, q_bs: i64,
         q_rs: i64, q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64, v_hs: i64, o_bs: i64, o_rs: i64,
         o_hs: i64, scale: f32, variant: i32, s: PM) -> i32;

@@ -98,6 +98,28 @@ pub(crate) fn conv2d(x: PM, wk: PM, bk: PM, out: PM, h: usize, w: usize, cin: us
     Ok(())
 }
 
+/// [`conv2d`] with `resid` (NHWC [h, w, cout]) added to its output in the conv's epilogue; `out` aliases neither input.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv2d_residual(x: PM, wk: PM, bk: PM, resid: PM, out: PM, h: usize, w: usize, cin: usize, cout: usize, r: usize,
+    st: &Stream) -> Result<()> {
+    let run = |x: PM, resid: PM, out: PM, rows: usize| -> Result<()> {
+        k!(gpu_conv2d_residual(x, wk, bk, resid, out, 1, rows as i32, w as i32, cin as i32, cout as i32, r as i32, s(st)))
+    };
+    let halo = r / 2;
+    let band = (CONV_ELEMENTS / (w * cin.max(cout))).saturating_sub(2 * halo).max(1);
+    if band >= h {
+        return run(x, resid, out, h);
+    }
+    let tmp = DevBuf::alloc_async((band + 2 * halo) * w * cout * 2, st)?;
+    for y0 in (0..h).step_by(band) {
+        let y1 = (y0 + band).min(h);
+        let (a, b) = (y0.saturating_sub(halo), (y1 + halo).min(h));
+        run(off(x, a * w * cin * 2), off(resid, a * w * cout * 2), tmp.ptr(), b - a)?;
+        crate::cuda::memcpy_d2d(off(out, y0 * w * cout * 2), off(tmp.ptr(), (y0 - a) * w * cout * 2), (y1 - y0) * w * cout * 2, st)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn bias_pad(st: &SafeTensors, name: &str, pad: usize) -> Result<Vec<u8>> {
     let mut v = st.f32_vec(name, false)?;
     v.resize(pad.max(v.len()), 0.0);
@@ -214,6 +236,13 @@ impl Vae {
         conv2d(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), out, h, w, cin, cout, r, st)
     }
 
+    /// [`Self::conv`] plus `resid`, into `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_residual(&self, key: &str, x: PM, resid: PM, out: PM, h: usize, w: usize, cin: usize, cout: usize, r: usize, st: &Stream)
+        -> Result<()> {
+        conv2d_residual(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), resid, out, h, w, cin, cout, r, st)
+    }
+
     /// Peak activation memory (bytes) for decoding an h x w latent.
     pub fn activation_bytes(h: usize, w: usize) -> usize {
         let full = h * 8 * w * 8;
@@ -231,16 +260,19 @@ impl Vae {
         drop(t);
         let t2 = alloc(cout)?;
         k!(gpu_l2norm_silu(u.ptr(), t2.ptr(), self.w(&format!("{pre}.g3")), p, cout as i32, 1, s(st)))?;
-        self.conv(&format!("{pre}.c6"), t2.ptr(), u.ptr(), h, w, cout, cout, 3, st)?;
-        drop(t2);
+        // the residual joins in the epilogue of the block's last conv
         if shortcut {
-            let sc = alloc(cout)?;
-            self.conv(&format!("{pre}.sc"), x.ptr(), sc.ptr(), h, w, cin, cout, 1, st)?;
-            k!(gpu_add_gated_bf16(u.ptr(), cout as i64, sc.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
+            self.conv(&format!("{pre}.c6"), t2.ptr(), u.ptr(), h, w, cout, cout, 3, st)?;
+            drop(t2);
+            let y = alloc(cout)?;
+            self.conv_residual(&format!("{pre}.sc"), x.ptr(), u.ptr(), y.ptr(), h, w, cin, cout, 1, st)?;
+            Ok(y)
         } else {
-            k!(gpu_add_gated_bf16(u.ptr(), cout as i64, x.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
+            drop(u);
+            let y = alloc(cout)?;
+            self.conv_residual(&format!("{pre}.c6"), t2.ptr(), x.ptr(), y.ptr(), h, w, cout, cout, 3, st)?;
+            Ok(y)
         }
-        Ok(u)
     }
 
     /// RGB f32 [h, w, 3] (0 to 1, both sides multiples of 8) -> model latent f32 [16, h/8, w/8]:

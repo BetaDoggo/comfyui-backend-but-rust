@@ -256,7 +256,10 @@ Measured at 1024x1024, 20 steps, CFG 4 (two model evaluations per step), after w
 |---|---|---|---|
 | Sampling | 12.0 s (601 ms/step) | 15.2 s (760 ms/step) | 11.0 to 11.5 s (550 to 573 ms/step) |
 | Text, one prompt | 437 ms | 248 ms | 248 ms |
-| VAE decode | 530 to 780 ms | 268 ms | 268 ms |
+| VAE decode | 530 to 780 ms | 190 ms | 190 ms |
+
+The VAE decode, timed on its own with a synthetic 1024x1024 latent, took 230 ms before its GroupNorm,
+upsample and attention softmax kernels were sped up, 188 to 194 ms after, with the same bytes. Not tested through SwarmUI.
 
 Where the time goes in one evaluation (about 275 ms): the int8 GEMMs take 173 ms and attention 58 ms. Those are the
 same kernels ComfyUI uses, so sampling gains little. The text encoder is streamed from pinned RAM here and timed with
@@ -294,8 +297,12 @@ Measured here (RTX 5070, 12 GB), 8 steps, after warm-up:
 | 1024x1024 text to image, sampling | 0.46 s/step (3.68 s) | 0.36 s/step (2.90 s) |
 | 768x768 edit, one reference, sampling | not timed | 0.22 s/step cached, 0.48 s/step without the cache |
 | 1024x1024 edit, one 1024x1024 reference | not timed | 0.44 s/step, part of the blocks streaming to make room for the cache |
-| VAE decode, 1024x1024 | not timed | 0.42 s |
+| VAE decode, 1024x1024 | not timed | 0.31 s |
 | Text encoder, a short prompt | not timed | 0.3 s |
+
+The VAE decode, timed on its own with a synthetic latent, took 387 ms before its convs took tiles that fit
+its 144, 288 and 576 channels and its residual adds moved into the convs, 311 to 325 ms after, with the same bytes. Not
+tested through SwarmUI.
 
 In one step at 1024x1024 the int8 GEMMs take 241 ms (gate and up 110, down 57, qkv 54, o 20) and attention 68 ms.
 
@@ -354,7 +361,9 @@ same files with its PyTorch attention:
 | SDXL, 1024x1024 | 5.72 s | 3.79 s | 5.29 s | 9.25 s |
 
 Int8 linears with exact attention (`--attention flash` alone) took 1.61 s and 8.16 s. Two SD 1.5 images sampled
-together took 1.51 s. The VAE decodes 512x512 in about 170 ms and 1024x1024 in about 340 ms. Before GroupNorm stopped
+together took 1.51 s. The VAE decodes 1024x1024 in about 190 ms, against 242 ms before its GroupNorm statistics spread over the whole GPU,
+with the same bytes (timed on its own with a synthetic latent, not tested through SwarmUI); 512x512 took about 170 ms
+before and wasn't timed again. Before GroupNorm stopped
 dividing in double precision and the small levels' convolutions took smaller tiles, SD 1.5 took 1.37 s.
 
 **Against ComfyUI** (same seed and noise, its own code on the same files, `tools/sd_ref.py`):
@@ -762,8 +771,11 @@ Warm, on this machine, a 512 picture upscaled to the size shown, against ComfyUI
 
 | Size | VAE encode | DiT (one evaluation) | VAE decode | ComfyUI sampling | ComfyUI decode |
 |---|---|---|---|---|---|
-| 1024x1024 | 134 ms | 145 ms | 234 ms | 235 ms | 276 ms |
+| 1024x1024 | 134 ms | 145 ms | 203 ms | 235 ms | 276 ms |
 | 2048x2048 | 705 ms | 568 ms | 1119 ms | 855 ms | 2631 ms (tiled) |
+
+The 1024 decode was timed on its own with a synthetic latent, after GroupNorm was sped up: 235 ms before on the
+same benchmark, with the same bytes. The other cells, and the whole job below, weren't timed again.
 
 The whole 1024 job through `comfy-server` over HTTP, image loading and two PNG saves included, took 0.79 s warm; the
 colour correction is 136 ms of it, on the CPU. ComfyUI's encode wasn't timed.

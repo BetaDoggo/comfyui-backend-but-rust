@@ -209,6 +209,13 @@ impl Vae {
         crate::vae::conv2d(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), out, h, w, cin, cout, r, st)
     }
 
+    /// [`Self::conv`] plus `resid`, into `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_residual(&self, key: &str, x: PM, resid: PM, out: PM, h: usize, w: usize, cin: usize, cout: usize, r: usize, st: &Stream)
+        -> Result<()> {
+        crate::vae::conv2d_residual(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), resid, out, h, w, cin, cout, r, st)
+    }
+
     /// Peak activation memory (bytes) for decoding an h x w latent, or encoding the image it stands for.
     pub fn activation_bytes(h: usize, w: usize) -> usize {
         let full = h * SCALE * w * SCALE;
@@ -227,16 +234,19 @@ impl Vae {
         drop(t);
         let t2 = alloc(cout)?;
         k!(gpu_l2norm_silu(u.ptr(), t2.ptr(), self.w(&format!("{pre}.g3")), p, cout as i32, 1, s(st)))?;
-        self.conv(&format!("{pre}.c6"), t2.ptr(), u.ptr(), h, w, cout, cout, 3, st)?;
-        drop(t2);
+        // the residual joins in the epilogue of the block's last conv
         if shortcut {
-            let sc = alloc(cout)?;
-            self.conv(&format!("{pre}.sc"), x.ptr(), sc.ptr(), h, w, cin, cout, 1, st)?;
-            k!(gpu_add_gated_bf16(u.ptr(), cout as i64, sc.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
+            self.conv(&format!("{pre}.c6"), t2.ptr(), u.ptr(), h, w, cout, cout, 3, st)?;
+            drop(t2);
+            let y = alloc(cout)?;
+            self.conv_residual(&format!("{pre}.sc"), x.ptr(), u.ptr(), y.ptr(), h, w, cin, cout, 1, st)?;
+            Ok(y)
         } else {
-            k!(gpu_add_gated_bf16(u.ptr(), cout as i64, x.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
+            drop(u);
+            let y = alloc(cout)?;
+            self.conv_residual(&format!("{pre}.c6"), t2.ptr(), x.ptr(), y.ptr(), h, w, cout, cout, 3, st)?;
+            Ok(y)
         }
-        Ok(u)
     }
 
     fn attention(&self, pre: &str, x: &DevBuf, p: usize, c: usize, st: &Stream) -> Result<()> {
@@ -294,14 +304,12 @@ impl Vae {
             let big = alloc(c, 2 * hh, 2 * ww)?;
             k!(gpu_upsample2x(main.ptr(), big.ptr(), hh as i32, ww as i32, c as i32, s(st)))?;
             drop(main);
-            let y = alloc(c, 2 * hh, 2 * ww)?;
-            self.conv(&format!("{}.conv", stage.pre), big.ptr(), y.ptr(), 2 * hh, 2 * ww, c, c, 3, st)?;
-            drop(big);
-            // the shortcut: the stage's input, regrouped onto the doubled grid
+            // the shortcut: the stage's input, regrouped onto the doubled grid, added in the conv's epilogue
             let sc = alloc(c, 2 * hh, 2 * ww)?;
             k!(gpu_dup_up(input.ptr(), sc.ptr(), hh as i32, ww as i32, stage.cin as i32, c as i32, rs.ft as i32, s(st)))?;
             drop(input);
-            k!(gpu_add_gated_bf16(y.ptr(), c as i64, sc.ptr(), c as i64, null(), (4 * hh * ww) as i32, c as i32, s(st)))?;
+            let y = alloc(c, 2 * hh, 2 * ww)?;
+            self.conv_residual(&format!("{}.conv", stage.pre), big.ptr(), sc.ptr(), y.ptr(), 2 * hh, 2 * ww, c, c, 3, st)?;
             x = y;
             hh *= 2;
             ww *= 2;

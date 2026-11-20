@@ -1238,14 +1238,78 @@ __global__ void group_apply_kernel(const bf16* x, bf16* out, const bf16* w, cons
     out[i] = __float2bfloat16_rn(silu ? silu_f(y) : y);
 }
 
+// group_stats_kernel's per-thread sums, each in the same order (pixels t, t + 1024, ..., channels in order), but spread
+// over the whole GPU instead of one block per group: thread i takes group i % groups of chain i / groups, so a warp reads
+// whole pixels. part[g * 1024 + t] = (sum, sum of squares).
+__global__ void group_partials_kernel(const bf16* x, float2* part, int64_t P, int C, int groups) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)1024 * groups) return;
+    const int g = (int)(i % groups), t = (int)(i / groups), per = C / groups;
+    float sum = 0.f, ss = 0.f;
+    for (int64_t p = t; p < P; p += 1024) {
+        const bf16* r = x + p * C + g * per;
+#pragma unroll 4
+        for (int c = 0; c < per; ++c) {
+            const float v = __bfloat162float(r[c]);
+            sum += v;
+            ss += v * v;
+        }
+    }
+    part[(int64_t)g * 1024 + t] = make_float2(sum, ss);
+}
+// group_stats_kernel's block reduction of those sums, one 1024-thread block per group.
+__global__ void group_finish_kernel(const float2* part, float2* stats, int64_t P, int per, float eps) {
+    __shared__ float red[33];
+    const int g = blockIdx.x;
+    const float2 v = part[(int64_t)g * 1024 + threadIdx.x];
+    const float nv = 1.f / ((float)P * per);
+    const float mean = block_sum(v.x, red) * nv;
+    const float var = block_sum(v.y, red) * nv - mean * mean;
+    if (threadIdx.x == 0) stats[g] = make_float2(mean, rsqrtf(fmaxf(var, 0.f) + eps));
+}
+// group_apply_kernel for 8 channels per thread.
+__global__ void group_apply_v8_kernel(const uint4* x, uint4* out, const bf16* w, const bf16* b, const float2* stats, int64_t n8, int C8,
+                                      int per, int silu) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n8) return;
+    const int c0 = (int)(i % C8) * 8;
+    const uint4 u = x[i];
+    const bf16* xv = reinterpret_cast<const bf16*>(&u);
+    uint4 o;
+    bf16* ov = reinterpret_cast<bf16*>(&o);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int c = c0 + j;
+        const float2 st = stats[c / per];
+        const float y = (__bfloat162float(xv[j]) - st.x) * st.y * __bfloat162float(w[c]) + __bfloat162float(b[c]);
+        ov[j] = __float2bfloat16_rn(silu ? silu_f(y) : y);
+    }
+    out[i] = o;
+}
+
 // GroupNorm, then optional SiLU. x, out [P, C]; stats is 8 * groups bytes of scratch.
 GPU_API int gpu_group_norm(const void* x, void* out, const void* w, const void* b, void* stats, int64_t P, int C, int groups,
                              float eps, int silu, void* stream) {
     cudaStream_t st = (cudaStream_t)stream;
-    group_stats_kernel<<<groups, 1024, 0, st>>>((const bf16*)x, (float2*)stats, P, C, groups, eps);
+    float2* part = nullptr;
+    if (cudaMallocAsync((void**)&part, (size_t)1024 * groups * sizeof(float2), st) == cudaSuccess) {
+        const int64_t chains = (int64_t)1024 * groups;
+        group_partials_kernel<<<(unsigned)((chains + 255) / 256), 256, 0, st>>>((const bf16*)x, part, P, C, groups);
+        group_finish_kernel<<<groups, 1024, 0, st>>>(part, (float2*)stats, P, C / groups, eps);
+        cudaFreeAsync(part, st);
+    } else {
+        cudaGetLastError();
+        group_stats_kernel<<<groups, 1024, 0, st>>>((const bf16*)x, (float2*)stats, P, C, groups, eps);
+    }
     const int64_t n = P * C;
-    group_apply_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>((const bf16*)x, (bf16*)out, (const bf16*)w, (const bf16*)b,
-                                                                     (const float2*)stats, n, C, C / groups, silu);
+    if (C % 8 == 0 && ((uintptr_t)x & 15) == 0 && ((uintptr_t)out & 15) == 0) {
+        const int64_t n8 = n / 8;
+        group_apply_v8_kernel<<<(unsigned)((n8 + 255) / 256), 256, 0, st>>>((const uint4*)x, (uint4*)out, (const bf16*)w, (const bf16*)b,
+                                                                            (const float2*)stats, n8, C / 8, C / groups, silu);
+    } else {
+        group_apply_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>((const bf16*)x, (bf16*)out, (const bf16*)w, (const bf16*)b,
+                                                                         (const float2*)stats, n, C, C / groups, silu);
+    }
     KCHECK();
     return 0;
 }

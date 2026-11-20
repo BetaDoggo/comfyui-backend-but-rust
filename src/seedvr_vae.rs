@@ -248,6 +248,13 @@ impl Vae {
         crate::vae::conv2d(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), out, h, w, cin, cout, r, st)
     }
 
+    /// [`Self::conv`] plus `resid`, into `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_residual(&self, key: &str, x: PM, resid: PM, out: PM, h: usize, w: usize, cin: usize, cout: usize, r: usize, st: &Stream)
+        -> Result<()> {
+        crate::vae::conv2d_residual(x, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), resid, out, h, w, cin, cout, r, st)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn norm(&self, key: &str, x: PM, out: PM, stats: PM, p: usize, c: usize, silu: bool, st: &Stream) -> Result<()> {
         k!(gpu_group_norm(x, out, self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), stats, p as i64, c as i32, GROUPS as i32, EPS,
@@ -265,17 +272,20 @@ impl Vae {
         drop(t);
         let t2 = alloc(cout)?;
         self.norm(&format!("{key}.n2"), u.ptr(), t2.ptr(), stats, p, cout, true, st)?;
-        self.conv(&format!("{key}.c2"), t2.ptr(), u.ptr(), h, w, cout, cout, 3, st)?;
-        drop(t2);
-        let residual = if cin != cout {
-            let sc = alloc(cout)?;
-            self.conv(&format!("{key}.sc"), x.ptr(), sc.ptr(), h, w, cin, cout, 1, st)?;
-            sc
+        // the residual joins in the epilogue of the block's last conv
+        let y = if cin != cout {
+            self.conv(&format!("{key}.c2"), t2.ptr(), u.ptr(), h, w, cout, cout, 3, st)?;
+            drop(t2);
+            let y = alloc(cout)?;
+            self.conv_residual(&format!("{key}.sc"), x.ptr(), u.ptr(), y.ptr(), h, w, cin, cout, 1, st)?;
+            y
         } else {
-            x
+            drop(u);
+            let y = alloc(cout)?;
+            self.conv_residual(&format!("{key}.c2"), t2.ptr(), x.ptr(), y.ptr(), h, w, cout, cout, 3, st)?;
+            y
         };
-        k!(gpu_add_gated_bf16(u.ptr(), cout as i64, residual.ptr(), cout as i64, null(), p as i32, cout as i32, s(st)))?;
-        Ok(u)
+        Ok(y)
     }
 
     fn mid(&self, pre: &str, x: DevBuf, h: usize, w: usize, c: usize, stats: PM, st: &Stream) -> Result<DevBuf> {

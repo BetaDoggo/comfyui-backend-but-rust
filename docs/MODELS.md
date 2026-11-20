@@ -163,6 +163,16 @@ Batching the modulation GEMMs and normalizing the cross-attention queries inside
 Steps vary from 111 to 119 ms between runs as the GPU warms. The faster rotation gives bit-identical images and was
 tested through SwarmUI.
 
+**`--lossy`** (Lossy in the SwarmUI backend's settings). The prompt is padded to 512 rows of zeros, as in ComfyUI, and
+those rows take part in the cross-attention softmax. Their keys and values are exactly zero, so each only adds
+`exp(0 - max)` to the denominator. With `--lossy`, int8 cross-attention reads only the prompt's own rows and adds the
+padding to the denominator itself, with the key anchor off so a zero key scores zero. That is exact in the math, but the
+padding's probabilities are no longer rounded to int8, so the image changes. Measured at 1024x1024 with 8 steps, seed
+42, in alternated runs with the profiler: cross-attention 6 to 2 ms per step, steps about 110 to 107 ms. The image is
+23.5 dB PSNR from the default one and 22.4 dB from `--attention flash`, against the default's 21.0 dB from flash, so
+it moves no further from exact attention. It changes nothing with `--attention flash` or with prompts of 512 tokens or more. Not
+tested: SwarmUI, concept steering (its reads take the same path); a batch of two only ran, without a comparison.
+
 The VAE decode of a 1024x1024 image takes about 88 ms of GPU time, down from about 115 ms, with bit-identical output at
 768x1280, 1280x768, 1024x1024 and 2048x2048. Convs now use the widest tile that divides their output channels, the
 residual add runs in the epilogue of each block's last conv, and the upsample and the mid-block softmax read their
@@ -268,6 +278,14 @@ same kernels ComfyUI uses, so sampling gains little. The text encoder is streame
 ComfyUI's held in VRAM.
 
 The prompt's text embedder runs once, and the modulation is cached per sigma across images.
+
+**`--lossy`** (Lossy in the SwarmUI backend's settings) computes the int8 blocks' SiTU activation,
+`4 tanh(g / 4) sigmoid(g) * 25 tanh(h / 25)`, with the GPU's approximate tanh, fast exponential and fast division. Its
+kernel is compute-bound, and the result is rounded to int8 right after. Measured on the int8 ConvRot base checkpoint at
+1024x1024, 8 evaluations, seed 42, three alternated runs each: 279 to 271 ms per evaluation on average. The image is 36.0 dB
+PSNR from the default one; the default is 37.8 dB from `--attention flash` on the same seed, so it moves about as far as
+the attention choice does. bf16 blocks under `--no-quant` keep the exact activation. Not tested: SwarmUI, comparison
+with ComfyUI's hidden states.
 
 The output is not pixel-identical to ComfyUI. Token ids match, Qwen3.5 hidden states match to 3e-6 (the GatedDeltaNet
 layers run as the plain delta-rule recursion on the GPU), and the image embedder matches exactly. The text embedder

@@ -4,7 +4,7 @@
 
 use crate::cuda::{DevBuf, Stream};
 use crate::dit::Dit as KreaDit;
-use crate::ffi::{k, null, off, s, DT_BF16, DT_F32, P, PM, PRO_ADALN, PRO_PLAIN, PRO_RMS, PRO_SITU};
+use crate::ffi::{k, null, off, s, DT_BF16, DT_F32, P, PM, PRO_ADALN, PRO_PLAIN, PRO_RMS, PRO_SITU, PRO_SITU_FAST};
 use crate::st::Dt;
 use crate::offload::{plan, Layout, Store, WeightSet};
 use crate::st::{bf16_bytes, SafeTensors};
@@ -107,6 +107,9 @@ pub struct Dit {
     int8: bool,
     pub attn_variant: i32,
     pub int8_attn: bool,
+    /// `--lossy`: the int8 blocks' SiTU activation with hardware tanh and fast exponentials; the image isn't
+    /// byte-identical.
+    pub lossy: bool,
     mods: HashMap<u32, Mods>,
 }
 
@@ -216,7 +219,7 @@ impl Dit {
         let layouts = (0..n_blocks(st)).map(|i| block_layout(st, i)).collect::<Result<Vec<_>>>()?;
         let p = plan(&layouts, block_budget, slots);
         let blocks = WeightSet::load("moss blocks", st, layouts, p, threads)?;
-        Ok(Dit { globals, gl, blocks, int8: is_int8(st), attn_variant: 0, int8_attn: true, mods: HashMap::new() })
+        Ok(Dit { globals, gl, blocks, int8: is_int8(st), attn_variant: 0, int8_attn: true, lossy: false, mods: HashMap::new() })
     }
 
     fn g(&self, key: &str) -> PM {
@@ -420,7 +423,8 @@ impl Dit {
                     1, s(st)))?;
                 k!(gpu_int8_gemm(a8.ptr(), wp("w_ug"), asc.ptr(), wp("s_ug"), null(), hid.ptr(), rows as i64, (2 * MLP) as i64, fi, DT_BF16,
                     s(st)))?;
-                k!(gpu_quant_rows(DT_BF16, PRO_SITU, hid.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0, null(), null(), a8.ptr(),
+                let situ = if self.lossy { PRO_SITU_FAST } else { PRO_SITU };
+                k!(gpu_quant_rows(DT_BF16, situ, hid.ptr(), (2 * MLP) as i64, null(), 0, MLP as i64, null(), 0.0, null(), null(), a8.ptr(),
                     asc.ptr(), m, MLP as i32, 1, s(st)))?;
                 k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_d"), asc.ptr(), wp("s_d"), null(), shared(5), xp, xp, rows as i64, fi, MLP as i64,
                     DT_BF16, s(st)))?;

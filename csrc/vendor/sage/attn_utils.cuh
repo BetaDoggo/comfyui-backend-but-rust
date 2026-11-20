@@ -1105,7 +1105,8 @@ template <uint32_t num_tiles_q, uint32_t num_tiles_v,
           ComputeUnit compute_unit =
               ComputeUnit::kTensorCore> // compute unit for accumulate_d
 __device__ __forceinline__ void normalize_d(float RO[][num_tiles_v][8],
-                                            float m[][2], float d[][2]) {
+                                            float m[][2], float d[][2],
+                                            const float sink = 0.f) {
   if constexpr (compute_unit == ComputeUnit::kCudaCore) {
     // accumulate_d performs partial accumulation with cuda core
     // aggregate d
@@ -1118,6 +1119,17 @@ __device__ __forceinline__ void normalize_d(float RO[][num_tiles_v][8],
         d[fq][k] += __shfl_xor_sync(
             0xffffffff, d[fq][k], 0x2); // sum 0 and 2, 1 and 3
       }
+    }
+  }
+
+  // `sink` keys of score zero and value zero: each adds exp2(0 - m) to the
+  // denominator and nothing to O, exactly, without being quantized
+  if (sink != 0.f) {
+#pragma unroll
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+      for (uint32_t k = 0; k < 2; k++)
+        d[fq][k] = fmaf(sink, math::ptx_exp2(-m[fq][k]), d[fq][k]);
     }
   }
 

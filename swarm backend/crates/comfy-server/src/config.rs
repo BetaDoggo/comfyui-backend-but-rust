@@ -67,6 +67,12 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub no_quant: bool,
 
+    /// native engine: faster paths whose images aren't byte-identical to the default ones. Anima's int8
+    /// cross-attention skips the prompt's zero padding (exact in the math), and MOSS Image's int8 blocks use a fast
+    /// SiTU activation.
+    #[arg(long, default_value_t = false)]
+    pub lossy: bool,
+
     /// Mock engine only: artificial delay per sampling step, so progress/previews are visible.
     #[arg(long, default_value_t = 40)]
     pub mock_step_ms: u64,
@@ -106,6 +112,7 @@ impl Config {
             max_side: 2048,
             live_previews: false,
             no_quant: false,
+            lossy: false,
             mock_step_ms: 0,
             mock_native_only: false,
             max_history: 100,

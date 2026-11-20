@@ -56,6 +56,9 @@ pub struct LoadOptions {
     /// Quantize bf16 MOSS Image blocks to int8 ConvRot as they load, for speed (the default on the CLI and server);
     /// otherwise they run in bf16.
     pub int8_weights: bool,
+    /// Faster paths whose images aren't byte-identical to the default ones (`--lossy`): Anima's int8 cross-attention
+    /// skips the prompt's zero padding, and MOSS Image's int8 blocks take a fast SiTU activation.
+    pub lossy: bool,
     /// `Some(headroom MB)`: ComfyUI's DynamicVRAM memory management ([`crate::comfy_memory`]), the default, keeping
     /// that much VRAM free (ComfyUI's `--reserve-vram`, 256 MB by default). `slots` is then its cast buffer count, and
     /// `resident_blocks` is refused. `None` is the legacy planner (`--legacy-offload`).
@@ -512,6 +515,7 @@ struct Env {
     attn_variant: i32,
     int8_attn: bool,
     int8_weights: bool,
+    lossy: bool,
     /// Re-plan DiT block residency from live free VRAM (--legacy-offload, unless --resident-blocks is forced).
     dynamic: bool,
     /// ComfyUI's memory management decides residency as it runs (the default; off with `--legacy-offload`).
@@ -801,6 +805,7 @@ impl Generator {
             attn_variant: o.attn_variant,
             int8_attn: o.int8_attn,
             int8_weights: o.int8_weights,
+            lossy: o.lossy,
             dynamic: o.resident_blocks.is_none() && o.comfy_memory.is_none(),
             comfy: o.comfy_memory.is_some(),
         };

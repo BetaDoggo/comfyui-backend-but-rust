@@ -21,6 +21,7 @@ fn make_engine(cfg: &Config) -> anyhow::Result<Arc<dyn Engine>> {
                 max_side: cfg.max_side,
                 live_previews: cfg.live_previews,
                 int8_weights: !cfg.no_quant,
+                lossy: cfg.lossy,
                 ..Default::default()
             };
             Ok(Arc::new(native_engine::NativeEngine::new(&options)?))

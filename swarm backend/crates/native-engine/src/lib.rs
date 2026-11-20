@@ -111,11 +111,13 @@ pub struct NativeOptions {
     pub live_previews: bool,
     /// Quantize bf16 MOSS Image blocks to int8 ConvRot as they load (the default); false runs them in bf16.
     pub int8_weights: bool,
+    /// Faster paths whose images aren't byte-identical to the default ones (`--lossy`, see `LoadOptions::lossy`).
+    pub lossy: bool,
 }
 
 impl Default for NativeOptions {
     fn default() -> Self {
-        Self { reserve_vram_mb: 512, comfy_memory: Some(COMFY_HEADROOM_MB), max_side: 2048, threads: 6, live_previews: false, int8_weights: true }
+        Self { reserve_vram_mb: 512, comfy_memory: Some(COMFY_HEADROOM_MB), max_side: 2048, threads: 6, live_previews: false, int8_weights: true, lossy: false }
     }
 }
 
@@ -1159,6 +1161,7 @@ impl NativeEngine {
             attn_variant: 0,
             int8_attn: true,
             int8_weights: o.int8_weights,
+            lossy: o.lossy,
             comfy_memory: o.comfy_memory,
         };
         Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads })

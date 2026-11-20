@@ -45,6 +45,9 @@ pub struct Dit {
     pub blocks: WeightSet,
     pub attn_variant: i32,
     pub int8_attn: bool,
+    /// `--lossy`: int8 cross-attention reads only the prompt's own rows and counts the zero padding in the softmax
+    /// denominator. Exact in the math, but the image isn't byte-identical to attending over the padding.
+    pub lossy: bool,
     pub prof: crate::prof::Prof,
     /// bf16 [blocks][3][shift | scale | gate] by sigma bits: it depends on nothing else, and
     /// repeated schedules skip 250 small kernels per step.
@@ -104,6 +107,8 @@ pub struct Context {
     /// cross-attention projections run once per prompt instead of once per step
     kv: DevBuf,
     pub len: usize,
+    /// rows before the zero padding
+    real: usize,
 }
 
 /// What a model evaluation runs besides the plain model: SnapRef's streams (see [`crate::snapref`]).
@@ -299,7 +304,7 @@ impl Dit {
         let layouts = (0..n_blocks(st)?).map(|i| block_layout(st, i)).collect::<Result<Vec<_>>>()?;
         let p = plan(&layouts, block_budget, slots);
         let blocks = WeightSet::load("anima blocks", st, layouts, p, threads)?;
-        Ok(Dit { prefix: prefix(st)?.to_string(), globals, gl, blocks, attn_variant: 0, int8_attn: true, mods: HashMap::new(), prof: crate::prof::Prof::new(),
+        Ok(Dit { prefix: prefix(st)?.to_string(), globals, gl, blocks, attn_variant: 0, int8_attn: true, lossy: false, mods: HashMap::new(), prof: crate::prof::Prof::new(),
             step: None, negative: false, recorder: None, sampler: None, steer: Vec::new(), concept: None, ref_blocks: (0, usize::MAX), adain: None })
     }
 
@@ -429,7 +434,7 @@ impl Dit {
                 EPS, null(), 0, len as i32, s(st)))?;
             self.blocks.release(b, st)?;
         }
-        Ok(Context { ctx, kv, len })
+        Ok(Context { ctx, kv, len, real: ids.len().min(len) })
     }
 
     pub fn rope(&self, ht: usize, wt: usize, st: &Stream) -> Result<DevBuf> {
@@ -437,6 +442,31 @@ impl Dit {
         let d = DevBuf::alloc_async(rope.len() * 4, st)?;
         d.upload(0, &crate::st::f32_bytes(&rope), st)?;
         Ok(d)
+    }
+
+    /// Cross-attention of `batch` images of `lq` rows each over block `b`'s keys and values of `c`. A non-null `qn`
+    /// normalizes q inside int8 attention (q in memory is left as it is); null takes q as normalized already.
+    #[allow(clippy::too_many_arguments)]
+    fn cross_attention(&self, q: PM, c: &Context, b: usize, out: PM, ws: PM, batch: usize, lq: usize, qn: P, st: &Stream)
+        -> Result<()> {
+        let kv = off(c.kv.ptr(), b * c.len * KV * 2);
+        let sink = self.lossy && self.int8_attn && c.real > 0 && c.real < c.len;
+        if !sink && qn.is_null() {
+            return self.attention(q, kv, off(kv, F * 2), out, ws, batch, lq, c.len, F, KV, true, st);
+        }
+        let (hi, hs, sc, ib, fi) = (H as i32, HD as i64, 1.0 / (HD as f32).sqrt(), (lq * F) as i64, F as i64);
+        // one image at a time, as `attention` takes the shared keys
+        for i in 0..batch {
+            let at = i * lq * F * 2;
+            if sink {
+                k!(gpu_int8_attn_sink(off(q, at), kv, off(kv, F * 2), off(out, at), ws, 1, lq as i32, c.real as i32, hi, hi, ib, fi, hs,
+                    0, KV as i64, hs, 0, KV as i64, hs, ib, fi, hs, sc, (c.len - c.real) as f32, qn, EPS, s(st)))?;
+            } else {
+                k!(gpu_int8_attn_norm_rope(off(q, at), kv, off(kv, F * 2), off(out, at), ws, 1, lq as i32, c.len as i32, hi, hi, ib, fi,
+                    hs, 0, KV as i64, hs, 0, KV as i64, hs, ib, fi, hs, sc, qn, null(), EPS, null(), 0, s(st)))?;
+            }
+        }
+        Ok(())
     }
 
     /// Attention of `batch` images of `lq` rows each. `shared_kv`: every image reads the same keys and values.
@@ -688,7 +718,6 @@ impl Dit {
         let (cpt, nul) = (DevBuf::alloc_async(concept_rows * F * 2, st)?, DevBuf::alloc_async(concept_rows * F * 2, st)?);
         let xp = x.ptr();
         let q = qkv.ptr();
-        let lc = c.len;
         let nb = self.blocks.len();
 
         for b in 0..nb {
@@ -813,7 +842,6 @@ impl Dit {
             self.prof.mark("out proj", st)?;
 
             // cross attention, k and v come from the per-prompt cache
-            let kv = off(c.kv.ptr(), b * lc * KV * 2);
             k!(gpu_quant_rows(DT_BF16, PRO_LAYERNORM, xp, fi, null(), 0, 0, null(), EPS, scale(1), shift(1), a8.ptr(), asc.ptr(), m,
                 F as i32, 1, s(st)))?;
             self.prof.mark("quant", st)?;
@@ -831,25 +859,16 @@ impl Dit {
             };
             if self.int8_attn && !steer {
                 self.prof.mark("rope", st)?;
-                // one image at a time, as `attention` takes the shared keys
-                for i in 0..batch {
-                    let (hs, at) = (HD as i64, i * l * F * 2);
-                    k!(gpu_int8_attn_norm_rope(off(q, at), kv, off(kv, F * 2), off(attn.ptr(), at), ws.ptr(), 1, l as i32, lc as i32, H as i32,
-                        H as i32, (l * F) as i64, fi, hs, 0, KV as i64, hs, 0, KV as i64, hs, (l * F) as i64, fi, hs, 1.0 / (HD as f32).sqrt(),
-                        wp("qn_cross"), null(), EPS, null(), 0, s(st)))?;
-                }
+                self.cross_attention(q, c, b, attn.ptr(), ws.ptr(), batch, l, wp("qn_cross"), st)?;
             } else {
                 k!(gpu_qk_norm_rope(DT_BF16, HD as i32, q, fi, 0, 0, H as i32, 0, wp("qn_cross"), null(), EPS, null(), 0, m, s(st)))?;
                 self.prof.mark("rope", st)?;
-                self.attention(q, kv, off(kv, F * 2), attn.ptr(), ws.ptr(), batch, l, lc, F, KV, true, st)?;
+                self.cross_attention(q, c, b, attn.ptr(), ws.ptr(), batch, l, null(), st)?;
             }
             if let (Some(cc), Some(step), Some(_), false) = (&self.concept, self.step, sigma, matches!(pass, Pass::Reference { .. })) {
                 if (cc.steps.0..cc.steps.1).contains(&step) && (cc.blocks.0..cc.blocks.1).contains(&b) {
                     // the concept's keys and values against the null prompt's, read by the same queries
-                    let read = |ctx: &Context, out: PM| -> Result<()> {
-                        let kvc = off(ctx.kv.ptr(), b * ctx.len * KV * 2);
-                        self.attention(q, kvc, off(kvc, F * 2), out, ws.ptr(), batch, l, ctx.len, F, KV, true, st)
-                    };
+                    let read = |ctx: &Context, out: PM| -> Result<()> { self.cross_attention(q, ctx, b, out, ws.ptr(), batch, l, null(), st) };
                     read(&cc.concept, cpt.ptr())?;
                     read(&cc.null, nul.ptr())?;
                     k!(gpu_steer_axpy(attn.ptr(), fi, cpt.ptr(), nul.ptr(), fi, m, F as i32, cc.alpha, s(st)))?;

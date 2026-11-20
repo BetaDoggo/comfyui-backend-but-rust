@@ -382,6 +382,7 @@ impl Generator {
         let mut dit = anima::Dit::load(&dst, budget, env.slots, env.threads, &env.st)?;
         dit.attn_variant = env.attn_variant;
         dit.int8_attn = env.int8_attn;
+        dit.lossy = env.lossy;
         eprintln!("Anima ready in {:.1}s", t0.elapsed().as_secs_f64());
         a.model = Some(Model { path: path.to_path_buf(), dit, st: dst, lora: lora::State::default() });
         Ok(())

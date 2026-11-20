@@ -25,6 +25,8 @@ pub const PRO_LN_MOD: i32 = 9;
 pub const PRO_LN_AFFINE: i32 = 10;
 pub const PRO_GELU_TANH: i32 = 11;
 pub const PRO_LN_AFFINE_SILU: i32 = 12;
+/// `PRO_SITU` with hardware tanh and fast exponentials, `gpu_quant_rows` only (`--lossy`)
+pub const PRO_SITU_FAST: i32 = 13;
 
 extern "C" {
     pub fn gpu_blas_init(workspace: usize) -> i32;
@@ -64,6 +66,11 @@ extern "C" {
     pub fn gpu_int8_attn_norm_rope(q: P, k: P, v: P, o: PM, ws: PM, b: i32, lq: i32, lk: i32, h: i32, hk: i32, q_bs: i64,
         q_rs: i64, q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64, v_hs: i64, o_bs: i64, o_rs: i64,
         o_hs: i64, scale: f32, qw: P, kw: P, eps: f32, rope: P, rope_mode: i32, s: PM) -> i32;
+    /// `gpu_int8_attn` over `lk` keys plus `sink` more whose keys and values are zero, counted in the denominator only
+    /// (`--lossy`). A non-null `qw` normalizes q first, as `gpu_int8_attn_norm_rope` with a null `kw`.
+    pub fn gpu_int8_attn_sink(q: P, k: P, v: P, o: PM, ws: PM, b: i32, lq: i32, lk: i32, h: i32, hk: i32, q_bs: i64,
+        q_rs: i64, q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64, v_hs: i64, o_bs: i64, o_rs: i64,
+        o_hs: i64, scale: f32, sink: f32, qw: P, eps: f32, s: PM) -> i32;
     pub fn gpu_quant_rows(dtype: i32, prologue: i32, x: P, x_stride: i64, g: P, g_stride: i64, up_offset: i64,
         norm_w: P, eps: f32, mod_scale: P, mod_shift: P, q: PM, scales: PM, m: i32, k: i32, rotate: i32, s: PM) -> i32;
     pub fn gpu_prologue_rows(dtype: i32, prologue: i32, x: P, x_stride: i64, g: P, g_stride: i64, up_offset: i64,

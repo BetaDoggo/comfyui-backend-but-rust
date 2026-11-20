@@ -28,7 +28,8 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
                  int stride_seq_k, Offset stride_h_k, Offset stride_bz_v,
                  Offset stride_h_v, int stride_d_v, Offset stride_bz_o,
                  int stride_seq_o, Offset stride_h_o, float sm_scale,
-                 int batch_size, cudaStream_t stream, const float *mask_tile_bias) {
+                 int batch_size, cudaStream_t stream, const float *mask_tile_bias,
+                 float sink) {
   // Tiling constants — must match sage_attention.py and dlpack_bindings.cpp.
   // D>=128 otherwise needs too many live FP32 output accumulators per thread.
   // A 16-row warp tile halves that accumulator set.
@@ -65,7 +66,7 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
       mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q,
       stride_seq_q, stride_h_q, stride_bz_k, stride_seq_k, stride_h_k,
       stride_bz_v, stride_h_v, stride_d_v, stride_bz_o, stride_seq_o,
-      stride_h_o, sm_scale, mask_tile_bias);
+      stride_h_o, sm_scale, mask_tile_bias, sink);
 
   error = cudaGetLastError();
   if (error != cudaSuccess) {
@@ -108,7 +109,11 @@ extern "C" void launch_sage_attn_kernel(
     int stride_seq_k, int64_t stride_h_k, int64_t stride_bz_v, int64_t stride_h_v,
     int stride_d_v, int64_t stride_bz_o, int stride_seq_o, int64_t stride_h_o,
     float sm_scale, int output_dtype_code, cudaStream_t stream,
-    const float *mask_tile_bias) {
+    const float *mask_tile_bias, float sink) {
+  // sink: keys of score zero and value zero left out of K and V and counted
+  // in the softmax denominator. Only the unmasked path takes it.
+  if (sink != 0.f && mask != nullptr)
+    throw std::runtime_error("sage_attn: a sink needs an unmasked launch");
   if (cta_k != 64 && cta_k != 128) {
     throw std::runtime_error("sage_attn: cta_k must be 64 or 128");
   }
@@ -154,7 +159,7 @@ extern "C" void launch_sage_attn_kernel(
                           stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,  \
                           stride_seq_k, stride_h_k, stride_bz_v, stride_h_v,   \
                           stride_d_v, stride_bz_o, stride_seq_o, stride_h_o,   \
-                          sm_scale, batch_size, stream, mask_tile_bias)
+                          sm_scale, batch_size, stream, mask_tile_bias, sink)
 
 // Keep the ordinary launch's argument packing and call path unchanged.
 #define LAUNCH_Q(HD, CK, MM, DT, FUSE_FP32, CQ)                         \

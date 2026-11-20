@@ -79,6 +79,15 @@ __device__ __forceinline__ float stable_tanh(float x) {
 __device__ __forceinline__ float situ_f(float hidden, float gate) {
     return 4.f * stable_tanh(gate / 4.f) / (1.f + expf(-gate)) * (25.f * stable_tanh(hidden / 25.f));
 }
+__device__ __forceinline__ float tanh_approx(float x) {
+    float y;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+// situ_f with hardware tanh and fast exponential and division (`--lossy`): about 2^-11 relative error, before int8
+__device__ __forceinline__ float situ_fast_f(float hidden, float gate) {
+    return __fdividef(4.f * tanh_approx(gate * 0.25f), 1.f + __expf(-gate)) * (25.f * tanh_approx(hidden * 0.04f));
+}
 __device__ __forceinline__ float gelu_f(float x) { return 0.5f * x * (1.f + erff(x * 0.70710678118654752f)); }
 __device__ __forceinline__ float gelu_tanh_f(float x) {
     const float k0 = 0.7978845608028654f, k1 = 0.044715f;

@@ -13,7 +13,7 @@ extern "C" void launch_quant_qk_per_thread_int8(const void* q, void* q_int8, voi
 extern "C" void launch_quant_qk_norm_rope_int8(const void* q, void* q_int8, void* q_scale, const void* k, void* k_int8,
     void* k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int BLKK, int64_t q_stride_b, int64_t q_stride_h,
     int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n, void* anchor_indices,
-    const float* qw, const float* kw, const float* rope, float eps, int rope_mode, cudaStream_t stream);
+    const float* qw, const float* kw, const float* rope, float eps, int rope_mode, int no_anchor, cudaStream_t stream);
 extern "C" void launch_quant_v_int8_kernel(const void* v, void* out, void* scale, int B, int H, int N, int D,
     int padded_N, int64_t sb, int64_t sh, int64_t sn, int input_dtype_code, cudaStream_t stream);
 extern "C" void launch_quant_v128_int8(const void* v, void* out, void* scale, void* absmax, int B, int H, int N,
@@ -24,7 +24,11 @@ extern "C" void launch_sage_attn_kernel(const void* q, const void* k, const void
     int kv_len, int num_qo_heads, int num_kv_heads, int head_dim, int64_t stride_bz_q, int stride_seq_q,
     int64_t stride_h_q, int64_t stride_bz_k, int stride_seq_k, int64_t stride_h_k, int64_t stride_bz_v,
     int64_t stride_h_v, int stride_d_v, int64_t stride_bz_o, int stride_seq_o, int64_t stride_h_o, float sm_scale,
-    int output_dtype_code, cudaStream_t stream, const float* mask_tile_bias);
+    int output_dtype_code, cudaStream_t stream, const float* mask_tile_bias, float sink);
+extern "C" void launch_quant_qk_per_thread_int8_no_anchor(const void* q, void* q_int8, void* q_scale, const void* k,
+    void* k_int8, void* k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int C, int BLKQ, int WARPQ, int BLKK,
+    int WARPK, int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h,
+    int64_t k_stride_n, int input_dtype_code, void* anchor_indices, cudaStream_t stream);
 
 // sage's V quantizer, or its two-pass coalesced form at head dim 128
 static void quant_v(const void* v, int8_t* vi, float* vs, void* vmax, int b, int hk, int lk, int D, int plk, int64_t v_bs,
@@ -74,7 +78,7 @@ struct QkNorm {
 static int int8_attn(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk, int h, int hk,
                      int D, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs, int64_t k_hs, int64_t v_bs,
                      int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs, int64_t o_hs, float scale, int dt, void* stream,
-                     const QkNorm* norm = nullptr);
+                     const QkNorm* norm = nullptr, float sink = 0.f);
 
 // q/k/v: bf16 [b, seq, heads, D] with element strides; o: bf16, same convention.
 extern "C" int gpu_int8_attn_d(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk,
@@ -98,7 +102,7 @@ extern "C" int gpu_int8_attn_f16(const void* q, const void* k, const void* v, vo
 static int int8_attn(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk, int h, int hk,
                      int D, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs, int64_t k_hs, int64_t v_bs,
                      int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs, int64_t o_hs, float scale, int dt, void* stream,
-                     const QkNorm* norm) {
+                     const QkNorm* norm, float sink) {
     try {
         cudaStream_t st = (cudaStream_t)stream;
         const int ck = cta_k_for(lk, D);
@@ -114,10 +118,14 @@ static int int8_attn(const void* q, const void* k, const void* v, void* o, void*
         void* anchors = take((int64_t)b * hk * 4);
         void* vmax = take((int64_t)b * hk * D * 4);
         // inputs are [B, H, L, D] views: (batch, head, seq) strides
+        // with a sink, the sink's keys are zero only without the anchor's shift
         if (norm) {
             if (D != 128 || dt != 2) throw std::runtime_error("fused q/k norm needs bf16 head dim 128");
             launch_quant_qk_norm_rope_int8(q, qi, qs, k, ki, ks, b, h, lq, hk, lk, ck, q_bs, q_hs, q_rs, k_bs, k_hs, k_rs,
-                                           anchors, norm->qw, norm->kw, norm->rope, norm->eps, norm->rope_mode, st);
+                                           anchors, norm->qw, norm->kw, norm->rope, norm->eps, norm->rope_mode, sink != 0.f, st);
+        } else if (sink != 0.f) {
+            launch_quant_qk_per_thread_int8_no_anchor(q, qi, qs, k, ki, ks, b, h, lq, hk, lk, D, 128, warp_q(D), ck, ck, q_bs,
+                                                      q_hs, q_rs, k_bs, k_hs, k_rs, dt, anchors, st);
         } else {
             launch_quant_qk_per_thread_int8(q, qi, qs, k, ki, ks, b, h, lq, hk, lk, D, 128, warp_q(D), ck, ck, q_bs, q_hs,
                                             q_rs, k_bs, k_hs, k_rs, dt, anchors, st);
@@ -125,7 +133,7 @@ static int int8_attn(const void* q, const void* k, const void* v, void* o, void*
         quant_v(v, vi, vs, vmax, b, hk, lk, D, plk, v_bs, v_hs, v_rs, dt, st);
         const int64_t qh = (int64_t)lq * D, kh = (int64_t)lk * D, vh = (int64_t)D * plk;
         launch_sage_attn_kernel(qi, ki, vi, o, qs, ks, vs, nullptr, 0, 0, 0, 0, 0, ck, b, lq, lk, h, hk, D, h * qh, D,
-                                qh, hk * kh, D, kh, hk * vh, vh, plk, o_bs, (int)o_rs, o_hs, scale, dt, st, nullptr);
+                                qh, hk * kh, D, kh, hk * vh, vh, plk, o_bs, (int)o_rs, o_hs, scale, dt, st, nullptr, sink);
     } catch (const std::exception& e) {
         fprintf(stderr, "int8 attention: %s\n", e.what());
         return -400;
@@ -144,6 +152,19 @@ extern "C" int gpu_int8_attn_norm_rope(const void* q, const void* k, const void*
     const QkNorm norm{qw, kw, rope, eps, rope_mode};
     return int8_attn(q, k, v, o, ws, b, lq, lk, h, hk, 128, q_bs, q_rs, q_hs, k_bs, k_rs, k_hs, v_bs, v_rs, v_hs, o_bs, o_rs,
                      o_hs, scale, 2, stream, &norm);
+}
+
+// gpu_int8_attn over lk keys plus `sink` more whose keys and values are zero (padding), without storing them: they
+// count in the softmax denominator only, and the K anchor is off so a zero key's score stays zero. Exact in the math,
+// but not byte-identical to attending over the padding (`--lossy`). A non-null qw first normalizes q as
+// gpu_int8_attn_norm_rope does, with k taken as it is. Head dim 128, bf16.
+extern "C" int gpu_int8_attn_sink(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk,
+                                 int h, int hk, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs,
+                                 int64_t k_hs, int64_t v_bs, int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs,
+                                 int64_t o_hs, float scale, float sink, const float* qw, float eps, void* stream) {
+    const QkNorm norm{qw, nullptr, nullptr, eps, 0};
+    return int8_attn(q, k, v, o, ws, b, lq, lk, h, hk, 128, q_bs, q_rs, q_hs, k_bs, k_rs, k_hs, v_bs, v_rs, v_hs, o_bs, o_rs,
+                     o_hs, scale, 2, stream, qw ? &norm : nullptr, sink);
 }
 
 extern "C" void launch_sage_prepare_key_mask(const void* mask, float* packed, int batch, int heads, int length, int64_t stride_b,
@@ -194,7 +215,7 @@ extern "C" int gpu_int8_attn_key_bias(const void* q, const void* k, const void* 
             tile_bias = packed + (lk + 127) / 128 * 128;
         }
         launch_sage_attn_kernel(qi, ki, vi, o, qs, ks, vs, mask, 0, 0, 0, 1, 0, ck, b, lq, lk, h, hk, D, h * qh, D,
-                                qh, hk * kh, D, kh, hk * vh, vh, plk, o_bs, (int)o_rs, o_hs, scale, dt, st, tile_bias);
+                                qh, hk * kh, D, kh, hk * vh, vh, plk, o_bs, (int)o_rs, o_hs, scale, dt, st, tile_bias, 0.f);
     } catch (const std::exception& e) {
         fprintf(stderr, "int8 attention: %s\n", e.what());
         return -400;

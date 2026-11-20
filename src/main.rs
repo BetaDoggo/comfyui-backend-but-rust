@@ -193,6 +193,10 @@ struct Args {
     /// speed (in RAM; the file is only read)
     #[arg(long)]
     no_quant: bool,
+    /// Faster paths whose images aren't byte-identical to the default: Anima's int8 cross-attention skips the prompt's
+    /// zero padding (exact in the math), and MOSS Image's int8 blocks use a fast SiTU activation
+    #[arg(long)]
+    lossy: bool,
     /// Run MiniMax H3 (text to video with audio); --dit and --te then default to its files
     #[arg(long)]
     h3: bool,
@@ -1240,6 +1244,7 @@ fn main() -> Result<()> {
         attn_variant: args.attn_variant,
         int8_attn,
         int8_weights: !args.no_quant,
+        lossy: args.lossy,
         comfy_memory: (!args.legacy_offload).then(|| args.reserve_vram.unwrap_or(diffusion::comfy_memory::DEFAULT_HEADROOM_MB)),
     };
     if args.h3 || args.h3_image {

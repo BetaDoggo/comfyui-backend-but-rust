@@ -1023,13 +1023,13 @@ void launch_qk128(const void *q, void *q_int8, void *q_scale, const void *k,
 
 } // namespace
 
-extern "C" void launch_quant_qk_per_thread_int8(
+static void quant_qk_per_thread_int8(
     const void *q, void *q_int8, void *q_scale, const void *k, void *k_int8,
     void *k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int C, int BLKQ,
     int WARPQ, int BLKK, int WARPK, int64_t q_stride_b, int64_t q_stride_h,
     int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h,
     int64_t k_stride_n, int input_dtype_code, void *anchor_indices,
-    cudaStream_t stream) {
+    bool detect_anchor, cudaStream_t stream) {
   if (C != 64 && C != 128 && C != 256) {
     throw std::runtime_error(
         "quant_qk_per_thread_int8: padded head_dim must be 64, 128, or 256");
@@ -1074,11 +1074,16 @@ extern "C" void launch_quant_qk_per_thread_int8(
   const int k_sc_per_h = k_oblk * 4;
   auto *anchor_ptr = static_cast<int *>(anchor_indices);
   dim3 gd(H_kv, B);
-  DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
-    detect_k_anchor<T><<<gd, CENTER_DETECT_THREADS, 0, stream>>>(
-        (const T *)k, anchor_ptr, Lk, C, H_kv, k_stride_b, k_stride_h,
-        k_stride_n);
-  });
+  if (detect_anchor) {
+    DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
+      detect_k_anchor<T><<<gd, CENTER_DETECT_THREADS, 0, stream>>>(
+          (const T *)k, anchor_ptr, Lk, C, H_kv, k_stride_b, k_stride_h,
+          k_stride_n);
+    });
+  } else {
+    // -1 everywhere: no key is subtracted
+    cudaMemsetAsync(anchor_ptr, 0xff, sizeof(int) * B * H_kv, stream);
+  }
   cudaError_t anchor_error = cudaGetLastError();
   if (anchor_error != cudaSuccess) {
     throw std::runtime_error(std::string("detect_k_anchor kernel launch failed: ") +
@@ -1204,15 +1209,48 @@ extern "C" void launch_quant_qk_per_thread_int8(
 #undef DO
 }
 
+extern "C" void launch_quant_qk_per_thread_int8(
+    const void *q, void *q_int8, void *q_scale, const void *k, void *k_int8,
+    void *k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int C, int BLKQ,
+    int WARPQ, int BLKK, int WARPK, int64_t q_stride_b, int64_t q_stride_h,
+    int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h,
+    int64_t k_stride_n, int input_dtype_code, void *anchor_indices,
+    cudaStream_t stream) {
+  quant_qk_per_thread_int8(q, q_int8, q_scale, k, k_int8, k_scale, B, H_q, Lq,
+                           H_kv, Lk, C, BLKQ, WARPQ, BLKK, WARPK, q_stride_b,
+                           q_stride_h, q_stride_n, k_stride_b, k_stride_h,
+                           k_stride_n, input_dtype_code, anchor_indices, true,
+                           stream);
+}
+
+// launch_quant_qk_per_thread_int8 without the K anchor: keys are quantized as
+// they are, so a key that is zero keeps a score of exactly zero.
+extern "C" void launch_quant_qk_per_thread_int8_no_anchor(
+    const void *q, void *q_int8, void *q_scale, const void *k, void *k_int8,
+    void *k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int C, int BLKQ,
+    int WARPQ, int BLKK, int WARPK, int64_t q_stride_b, int64_t q_stride_h,
+    int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h,
+    int64_t k_stride_n, int input_dtype_code, void *anchor_indices,
+    cudaStream_t stream) {
+  quant_qk_per_thread_int8(q, q_int8, q_scale, k, k_int8, k_scale, B, H_q, Lq,
+                           H_kv, Lk, C, BLKQ, WARPQ, BLKK, WARPK, q_stride_b,
+                           q_stride_h, q_stride_n, k_stride_b, k_stride_h,
+                           k_stride_n, input_dtype_code, anchor_indices, false,
+                           stream);
+}
+
 // launch_quant_qk_norm_rope_int8's kernels: Q in mode NM, K in mode NMK.
 template <int NM, int NMK>
 static void launch_norm128(const void *q, void *q_int8, void *q_scale, const void *k, void *k_int8, void *k_scale, int *anchors,
                            int B, int H_q, int Lq, int H_kv, int Lk, int BLKK, int64_t q_stride_b, int64_t q_stride_h,
                            int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
-                           const QkNormRope &norm, cudaStream_t stream) {
+                           const QkNormRope &norm, bool detect_anchor, cudaStream_t stream) {
   using T = nv_bfloat16;
-  detect_k_anchor<T, NMK><<<dim3(H_kv, B), CENTER_DETECT_THREADS, 0, stream>>>(
-      (const T *)k, anchors, Lk, 128, H_kv, k_stride_b, k_stride_h, k_stride_n, norm);
+  if (detect_anchor)
+    detect_k_anchor<T, NMK><<<dim3(H_kv, B), CENTER_DETECT_THREADS, 0, stream>>>(
+        (const T *)k, anchors, Lk, 128, H_kv, k_stride_b, k_stride_h, k_stride_n, norm);
+  else
+    cudaMemsetAsync(anchors, 0xff, sizeof(int) * B * H_kv, stream);
 #define NORM128(NL, BK, ROT) launch_qk128<T, NL, BK, ROT, NM, NMK>(q, q_int8, q_scale, k, k_int8, k_scale, anchors, B, H_q, Lq, H_kv, Lk, q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h, k_stride_n, norm, stream)
   if (BLKK == 128) {
     if (Lk <= 256) NORM128(16, 128, 4); else NORM128(16, 128, 128);
@@ -1226,14 +1264,15 @@ static void launch_norm128(const void *q, void *q_int8, void *q_scale, const voi
 // taken through gpu_qk_norm_rope's per-head RMSNorm, weight and RoPE
 // (rope_mode 1 or 2; a null table for none). Q and K in memory are left as
 // they are. A null kw takes K as it is (normalized already), as the plain
-// quantizer does.
+// quantizer does. no_anchor: no key is subtracted (see
+// launch_quant_qk_per_thread_int8_no_anchor).
 extern "C" void launch_quant_qk_norm_rope_int8(
     const void *q, void *q_int8, void *q_scale, const void *k, void *k_int8,
     void *k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int BLKK,
     int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
     int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
     void *anchor_indices, const float *qw, const float *kw, const float *rope,
-    float eps, int rope_mode, cudaStream_t stream) {
+    float eps, int rope_mode, int no_anchor, cudaStream_t stream) {
   using T = nv_bfloat16;
   if (BLKK != 64 && BLKK != 128)
     throw std::runtime_error("quant_qk_norm_rope_int8: unsupported key block");
@@ -1257,10 +1296,10 @@ extern "C" void launch_quant_qk_norm_rope_int8(
     constexpr int NM = decltype(nm_tag)::value;
     if (kw)
       launch_norm128<NM, NM>(q, q_int8, q_scale, k, k_int8, k_scale, anchors, B, H_q, Lq, H_kv, Lk, BLKK, q_stride_b, q_stride_h,
-                             q_stride_n, k_stride_b, k_stride_h, k_stride_n, norm, stream);
+                             q_stride_n, k_stride_b, k_stride_h, k_stride_n, norm, !no_anchor, stream);
     else
       launch_norm128<NM, 0>(q, q_int8, q_scale, k, k_int8, k_scale, anchors, B, H_q, Lq, H_kv, Lk, BLKK, q_stride_b, q_stride_h,
-                            q_stride_n, k_stride_b, k_stride_h, k_stride_n, norm, stream);
+                            q_stride_n, k_stride_b, k_stride_h, k_stride_n, norm, !no_anchor, stream);
   };
   switch (nm) {
   case 1: go(std::integral_constant<int, 1>{}); break;

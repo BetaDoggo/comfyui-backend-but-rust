@@ -87,7 +87,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
     const Offset stride_bz_v, const Offset stride_h_v,
     const uint32_t stride_d_v, const Offset stride_bz_o,
     const uint32_t stride_seq_o, const Offset stride_h_o, float sm_scale,
-    const float *__restrict__ MaskTileBias) {
+    const float *__restrict__ MaskTileBias, const float sink) {
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4,
                 "DTypeQK must be int8 or int4");
@@ -1026,7 +1026,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
   // TODO: thread block sync mdo state for num_warps_k > 0. Then only one thread
   // block needs to do the final saving.
 
-  normalize_d<num_tiles_q, num_tiles_v, ComputeUnit::kCudaCore>(RO, m, d);
+  normalize_d<num_tiles_q, num_tiles_v, ComputeUnit::kCudaCore>(RO, m, d, sink);
 
   if constexpr (custom_mask && mask_mode != MaskMode::kPreparedKey) {
 #pragma unroll
@@ -1213,7 +1213,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
     const Offset stride_bz_v, const Offset stride_h_v,
     const uint32_t stride_d_v, const Offset stride_bz_o,
     const uint32_t stride_seq_o, const Offset stride_h_o, float sm_scale,
-    const float *__restrict__ MaskTileBias) {
+    const float *__restrict__ MaskTileBias, const float sink = 0.f) {
   if constexpr (mask_mode == MaskMode::kPreparedKey && head_dim == 128) {
     const uint32_t tiles = (kv_len + 127) / 128;
     const float *tile_bias = MaskTileBias + blockIdx.z * mask_stride_b +
@@ -1234,7 +1234,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
           stride_h_q, stride_bz_k, stride_seq_k, stride_h_k, stride_bz_v, stride_h_v,
-          stride_d_v, stride_bz_o, stride_seq_o, stride_h_o, sm_scale, MaskTileBias);
+          stride_d_v, stride_bz_o, stride_seq_o, stride_h_o, sm_scale, MaskTileBias, sink);
     } else if (excluded) {
       qk_int_sv_i8_attn_body<true, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
@@ -1244,7 +1244,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
           stride_h_q, stride_bz_k, stride_seq_k, stride_h_k, stride_bz_v, stride_h_v,
-          stride_d_v, stride_bz_o, stride_seq_o, stride_h_o, sm_scale, MaskTileBias);
+          stride_d_v, stride_bz_o, stride_seq_o, stride_h_o, sm_scale, MaskTileBias, sink);
     } else {
       qk_int_sv_i8_attn_body<false, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
@@ -1254,7 +1254,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
           stride_h_q, stride_bz_k, stride_seq_k, stride_h_k, stride_bz_v, stride_h_v,
-          stride_d_v, stride_bz_o, stride_seq_o, stride_h_o, sm_scale, MaskTileBias);
+          stride_d_v, stride_bz_o, stride_seq_o, stride_h_o, sm_scale, MaskTileBias, sink);
     }
   } else {
     qk_int_sv_i8_attn_body<false, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
@@ -1265,6 +1265,6 @@ __global__ void qk_int_sv_i8_attn_kernel(
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
           stride_h_q, stride_bz_k, stride_seq_k, stride_h_k, stride_bz_v, stride_h_v,
-          stride_d_v, stride_bz_o, stride_seq_o, stride_h_o, sm_scale, MaskTileBias);
+          stride_d_v, stride_bz_o, stride_seq_o, stride_h_o, sm_scale, MaskTileBias, sink);
   }
 }

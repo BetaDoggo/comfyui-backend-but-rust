@@ -11,7 +11,8 @@
 // LN_MOD: LayerNorm then addcmul(shift, n, 1 + scale) (Trellis 2), one rounding after the norm and one after the
 // addcmul. LN_AFFINE: LayerNorm with weight and bias, rounded once; LN_AFFINE_SILU then rounds silu of that.
 enum { PRO_PLAIN = 0, PRO_RMS = 1, PRO_GATE = 2, PRO_SWIGLU = 3, PRO_LAYERNORM = 4, PRO_SILU = 5, PRO_GELU = 6, PRO_ADALN = 7,
-       PRO_SITU = 8, PRO_LN_MOD = 9, PRO_LN_AFFINE = 10, PRO_GELU_TANH = 11, PRO_LN_AFFINE_SILU = 12 };
+       PRO_SITU = 8, PRO_LN_MOD = 9, PRO_LN_AFFINE = 10, PRO_GELU_TANH = 11, PRO_LN_AFFINE_SILU = 12,
+       PRO_SITU_FAST = 13 };
 
 template <int PRO> __device__ __forceinline__ constexpr bool is_ln() {
     return PRO == PRO_LAYERNORM || PRO == PRO_LN_MOD || PRO == PRO_LN_AFFINE || PRO == PRO_LN_AFFINE_SILU;
@@ -103,12 +104,12 @@ __global__ void __launch_bounds__(1024) quant_rows_kernel(QuantParams p) {
             load8(x + p.up_offset + c, u);
 #pragma unroll
             for (int j = 0; j < 8; ++j) v[gi][j] = rnd<T>(rnd<T>(silu_f(a[j])) * u[j]);
-        } else if (PRO == PRO_SITU) {
+        } else if (PRO == PRO_SITU || PRO == PRO_SITU_FAST) {
             float a[8], u[8];
             load8(x + c, a);
             load8(x + p.up_offset + c, u);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) v[gi][j] = situ_f(a[j], u[j]);
+            for (int j = 0; j < 8; ++j) v[gi][j] = PRO == PRO_SITU ? situ_f(a[j], u[j]) : situ_fast_f(a[j], u[j]);
         } else {
             load8(x + c, v[gi]);
             if (PRO == PRO_RMS || PRO == PRO_ADALN) {
@@ -284,7 +285,7 @@ GPU_API int gpu_quant_rows(int dtype, int prologue, const void* x, int64_t x_str
         case PRO_SILU: return launch_quant<T, PRO_SILU>(p, M, st);     \
         case PRO_GELU: return launch_quant<T, PRO_GELU>(p, M, st);     \
         case PRO_ADALN: return launch_quant<T, PRO_ADALN>(p, M, st);   \
-        case PRO_SITU: return launch_quant<T, PRO_SITU>(p, M, st);     \
+        case PRO_SITU: return launch_quant<T, PRO_SITU>(p, M, st);             case PRO_SITU_FAST: return launch_quant<T, PRO_SITU_FAST>(p, M, st); \
         case PRO_LN_MOD: return launch_quant<T, PRO_LN_MOD>(p, M, st); \
         case PRO_LN_AFFINE: return launch_quant<T, PRO_LN_AFFINE>(p, M, st); \
         case PRO_GELU_TANH: return launch_quant<T, PRO_GELU_TANH>(p, M, st); \

@@ -4,7 +4,7 @@
 
 use crate::cuda::{DevBuf, Stream};
 use crate::dit::Dit as KreaDit;
-use crate::ffi::{k, null, off, s, DT_BF16, DT_F32, PM, PRO_ADALN, PRO_PLAIN, PRO_RMS, PRO_SITU};
+use crate::ffi::{k, null, off, s, DT_BF16, DT_F32, P, PM, PRO_ADALN, PRO_PLAIN, PRO_RMS, PRO_SITU};
 use crate::st::Dt;
 use crate::offload::{plan, Layout, Store, WeightSet};
 use crate::st::{bf16_bytes, SafeTensors};
@@ -271,9 +271,7 @@ impl Dit {
             k!(gpu_prologue_rows(DT_BF16, PRO_RMS, xp, fi, null(), 0, 0, g("norm1"), EPS, null(), null(), h.ptr(), fi, m, F as i32, s(st)))?;
             self.gemm(h.ptr(), g("qkv_w"), g("qkv_b"), qkv.ptr(), l, QKV, F, QKV, st)?;
             let q = qkv.ptr();
-            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, q, QKV as i64, 0, F as i32, H as i32, H as i32, g("q_norm"), g("k_norm"), EPS,
-                rope_d.ptr(), 2, m, s(st)))?;
-            self.attention(q, off(q, F * 2), off(q, 2 * F * 2), attn.ptr(), ws.ptr(), 1, l, st)?;
+            self.attention(q, attn.ptr(), ws.ptr(), 1, l, (g("q_norm"), g("k_norm"), rope_d.ptr()), st)?;
             self.gemm(attn.ptr(), g("proj_w"), g("proj_b"), y.ptr(), l, F, F, F, st)?;
             k!(gpu_add_gated_bf16(xp, fi, y.ptr(), fi, null(), m, F as i32, s(st)))?;
             k!(gpu_prologue_rows(DT_BF16, PRO_RMS, xp, fi, null(), 0, 0, g("norm2"), EPS, null(), null(), h.ptr(), fi, m, F as i32, s(st)))?;
@@ -325,11 +323,22 @@ impl Dit {
         }
     }
 
-    /// Self attention of `batch` sequences of `l` rows each.
+    /// Self attention of `batch` sequences of `l` rows each, packed q, k, v from `q`, after per-head RMSNorm (q and k
+    /// weights) and RoPE (one image's table) of q and k. Plain int8 attention does those in its quantizer; otherwise
+    /// they're applied in place first.
     #[allow(clippy::too_many_arguments)]
-    fn attention(&self, q: PM, kp: PM, vp: PM, out: PM, ws: PM, batch: usize, l: usize, st: &Stream) -> Result<()> {
+    fn attention(&self, q: PM, out: PM, ws: PM, batch: usize, l: usize, (qn, kn, rope): (P, P, P), st: &Stream) -> Result<()> {
+        let (kp, vp) = (off(q, F * 2), off(q, 2 * F * 2));
         let (hi, hs, sc, b) = (H as i32, HD as i64, 1.0 / (HD as f32).sqrt(), batch as i32);
         let (bs, rs, ob, or) = ((l * QKV) as i64, QKV as i64, (l * F) as i64, F as i64);
+        if self.int8_attn {
+            return k!(gpu_int8_attn_norm_rope(q, kp, vp, out, ws, b, l as i32, l as i32, hi, hi, bs, rs, hs, bs, rs, hs, bs, rs, hs, ob, or,
+                hs, sc, qn, kn, EPS, rope, 2, s(st)));
+        }
+        for i in 0..batch {
+            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(q, i * l * QKV * 2), QKV as i64, 0, F as i32, hi, hi, qn, kn, EPS, rope, 2, l as i32,
+                s(st)))?;
+        }
         if self.int8_attn {
             k!(gpu_int8_attn(q, kp, vp, out, ws, b, l as i32, l as i32, hi, hi, bs, rs, hs, bs, rs, hs, bs, rs, hs, ob, or, hs, sc, s(st)))
         } else {
@@ -401,12 +410,7 @@ impl Dit {
                     s(st)))?;
                 self.gemm(a8.ptr(), wp("w_qkv"), nil, q, rows, QKV, F, QKV, st)?;
             }
-            // the RoPE table is one image's
-            for i in 0..batch {
-                k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(q, i * l * QKV * 2), QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn"), wp("kn"),
-                    EPS, rope.ptr(), 2, l as i32, s(st)))?;
-            }
-            self.attention(q, off(q, F * 2), off(q, 2 * F * 2), attn.ptr(), ws.ptr(), batch, l, st)?;
+            self.attention(q, attn.ptr(), ws.ptr(), batch, l, (wp("qn"), wp("kn"), rope.ptr()), st)?;
             if self.int8 {
                 k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m, F as i32,
                     1, s(st)))?;

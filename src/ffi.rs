@@ -59,6 +59,11 @@ extern "C" {
     pub fn gpu_int8_attn(q: P, k: P, v: P, o: PM, ws: PM, b: i32, lq: i32, lk: i32, h: i32, hk: i32, q_bs: i64,
         q_rs: i64, q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64, v_hs: i64, o_bs: i64, o_rs: i64,
         o_hs: i64, scale: f32, s: PM) -> i32;
+    /// `gpu_int8_attn` with q and k taken through `gpu_qk_norm_rope` inside the quantizer, bit-identical to running it
+    /// first. q and k in memory are left as they are. bf16, head dim 128.
+    pub fn gpu_int8_attn_norm_rope(q: P, k: P, v: P, o: PM, ws: PM, b: i32, lq: i32, lk: i32, h: i32, hk: i32, q_bs: i64,
+        q_rs: i64, q_hs: i64, k_bs: i64, k_rs: i64, k_hs: i64, v_bs: i64, v_rs: i64, v_hs: i64, o_bs: i64, o_rs: i64,
+        o_hs: i64, scale: f32, qw: P, kw: P, eps: f32, rope: P, rope_mode: i32, s: PM) -> i32;
     pub fn gpu_quant_rows(dtype: i32, prologue: i32, x: P, x_stride: i64, g: P, g_stride: i64, up_offset: i64,
         norm_w: P, eps: f32, mod_scale: P, mod_shift: P, q: PM, scales: PM, m: i32, k: i32, rotate: i32, s: PM) -> i32;
     pub fn gpu_prologue_rows(dtype: i32, prologue: i32, x: P, x_stride: i64, g: P, g_stride: i64, up_offset: i64,

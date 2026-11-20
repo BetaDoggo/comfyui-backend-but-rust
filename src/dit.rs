@@ -554,8 +554,10 @@ impl Dit {
             k!(gpu_int8_gemm(a8.ptr(), wp("wqkvg"), asc.ptr(), wp("sqkvg"), null(), qkvg.ptr(), rows as i64,
                 QKVG as i64, fi, DT_BF16, s(st)))?;
             self.prof.mark("gemm qkvg", st)?;
+            // plain int8 attention normalizes q and k in its quantizer
+            let fused = int8_ws.is_some() && tw.bias.is_none();
             // the RoPE table is one image's
-            for i in 0..batch {
+            for i in 0..if fused { 0 } else { batch } {
                 k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(qkvg.ptr(), i * l * QKVG * 2), QKVG as i64, 0, (HQ * HD) as i32, HQ as i32,
                     HK as i32, wp("qn"), wp("kn"), EPS, rope.ptr(), 1, l as i32, s(st)))?;
             }
@@ -570,6 +572,9 @@ impl Dit {
                 match &tw.bias {
                     Some(bias) => k!(gpu_int8_attn_key_bias(q, kp, vp, attn.ptr(), ws.ptr(), batch as i32, l as i32, l as i32, HQ as i32,
                         HK as i32, bs, rs, hs, bs, rs, hs, bs, rs, hs, (l * F) as i64, fi, hs, 1.0 / (HD as f32).sqrt(), bias.ptr(), s(st)))?,
+                    None if fused => k!(gpu_int8_attn_norm_rope(q, kp, vp, attn.ptr(), ws.ptr(), batch as i32, l as i32, l as i32, HQ as i32,
+                        HK as i32, bs, rs, hs, bs, rs, hs, bs, rs, hs, (l * F) as i64, fi, hs, 1.0 / (HD as f32).sqrt(), wp("qn"), wp("kn"), EPS,
+                        rope.ptr(), 1, s(st)))?,
                     None => k!(gpu_int8_attn(q, kp, vp, attn.ptr(), ws.ptr(), batch as i32, l as i32, l as i32, HQ as i32, HK as i32, bs, rs,
                         hs, bs, rs, hs, bs, rs, hs, (l * F) as i64, fi, hs, 1.0 / (HD as f32).sqrt(), s(st)))?,
                 }

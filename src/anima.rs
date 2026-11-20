@@ -743,8 +743,11 @@ impl Dit {
                 k!(gpu_add_gated_bf16(q, QKV as i64, dl, QKV as i64, null(), m, QKV as i32, s(st)))?;
             }
             self.prof.mark("gemm qkv", st)?;
+            let read_here = read.filter(|_| (self.ref_blocks.0..self.ref_blocks.1).contains(&b));
+            // plain int8 attention normalizes q and k in its quantizer; recording and reading references need them in memory
+            let fused = self.int8_attn && read_here.is_none() && !matches!(pass, Pass::Reference { out: Some(_), .. });
             // the RoPE table is one image's
-            for i in 0..batch {
+            for i in 0..if fused { 0 } else { batch } {
                 k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(q, i * l * QKV * 2), QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn_self"),
                     wp("kn_self"), EPS, rope, 2, l as i32, s(st)))?;
             }
@@ -758,7 +761,6 @@ impl Dit {
                     break;
                 }
             }
-            let read_here = read.filter(|_| (self.ref_blocks.0..self.ref_blocks.1).contains(&b));
             match (read_here, &cat, &merge, &groups) {
                 (Some((kv, _)), Some(cat), _, _) => {
                     let lk = kv.rows + l;
@@ -788,6 +790,12 @@ impl Dit {
                         (mg.o[g + 1], mg.lse[g + 1], mg.bias[g + 1]) = (o(g + 1) as P, lse(g + 1) as P, bias);
                     }
                     k!(gpu_attn_merge(&mg, (groups.len() + 1) as i32, attn.ptr(), bi, l as i32, hi, HD as i32, s(st)))?;
+                }
+                _ if fused => {
+                    let (hi, hs, sc, bi) = (H as i32, HD as i64, 1.0 / (HD as f32).sqrt(), batch as i32);
+                    let (qb, qr, ob, or) = ((l * QKV) as i64, QKV as i64, (l * F) as i64, F as i64);
+                    k!(gpu_int8_attn_norm_rope(q, off(q, F * 2), off(q, KV * 2), attn.ptr(), ws.ptr(), bi, l as i32, l as i32, hi, hi, qb, qr, hs,
+                        qb, qr, hs, qb, qr, hs, ob, or, hs, sc, wp("qn_self"), wp("kn_self"), EPS, rope, 2, s(st)))?;
                 }
                 _ => self.attention(q, off(q, F * 2), off(q, KV * 2), attn.ptr(), ws.ptr(), batch, l, l, QKV, QKV, false, st)?,
             }

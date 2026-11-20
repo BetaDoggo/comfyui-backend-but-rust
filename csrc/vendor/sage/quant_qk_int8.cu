@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 using comfy::quant_int8_rcp;
 using comfy::store4_i8;
@@ -153,6 +154,137 @@ __forceinline__ __device__ void convrot128_plain(float *values) {
 __forceinline__ __device__ void convrot128(float *values) {
   apply_convrot_sign128(values, threadIdx.x & 31);
   convrot128_plain(values);
+}
+
+// ---------------------------------------------------------------------------
+// Optional per-head RMSNorm, weight and RoPE ahead of quantization, for head
+// dim 128 in bf16. It reproduces gpu_qk_norm_rope (csrc/kernels.cu) bit for
+// bit, so the quantizer sees exactly the bf16 values that pass would have
+// written: the same per-lane sums in the same order, the same butterfly, the
+// same roundings.
+//
+// NM picks the variant: 0 none, 1 interleaved-pair RoPE (rope_mode 1), 2
+// split-half RoPE (rope_mode 2), 3 no RoPE, 4 no RoPE with rope_mode 2's
+// lane order for the sum of squares.
+// ---------------------------------------------------------------------------
+struct QkNormRope {
+  const float *qw;   // [128] or null
+  const float *kw;   // [128] or null
+  const float *rope; // [L][64] x (cos, sin), 16-byte aligned; null for NM 3, 4
+  float eps;
+};
+
+template <int NM> constexpr bool kHasRope = NM == 1 || NM == 2;
+template <int NM> constexpr bool kSplitHalves = NM == 2 || NM == 4;
+
+__forceinline__ __device__ float round_bf16(float v) {
+  return __bfloat162float(__float2bfloat16_rn(v));
+}
+
+// This lane's four weights (channels 4 * lane ..), or ones without a weight:
+// multiplying by one is exact.
+__forceinline__ __device__ float4 norm_weights(const float *w) {
+  if (!w)
+    return make_float4(1.f, 1.f, 1.f, 1.f);
+  const int ch = (threadIdx.x & 31) << 2;
+  return make_float4(__ldg(&w[ch]), __ldg(&w[ch + 1]), __ldg(&w[ch + 2]),
+                     __ldg(&w[ch + 3]));
+}
+
+// The rope table entries (cos, sin pairs) this lane needs for `row`.
+template <int NM>
+__forceinline__ __device__ void rope_entries(const QkNormRope &p, const int row,
+                                             float4 &r0, float4 &r1) {
+  const int lane = threadIdx.x & 31;
+  const float4 *r = reinterpret_cast<const float4 *>(p.rope + (int64_t)row * 128);
+  if constexpr (NM == 1) {
+    r0 = __ldg(&r[lane]);
+  } else if constexpr (NM == 2) {
+    r0 = __ldg(&r[2 * (lane & 15)]);
+    r1 = __ldg(&r[2 * (lane & 15) + 1]);
+  }
+}
+
+// values: channels 4 * lane .. 4 * lane + 3 of one row; w from norm_weights,
+// r0 and r1 from rope_entries. Every lane of the warp must take part, so call
+// it outside divergent branches: a row of zeros comes out as zeros.
+template <int NM>
+__forceinline__ __device__ void norm_rope128(float *values, const float4 w,
+                                             const float eps, const float4 r0,
+                                             const float4 r1) {
+  const int lane = threadIdx.x & 31;
+  float x[4];
+  if constexpr (kSplitHalves<NM>) {
+    // gpu_qk_norm_rope's lane L holds channels 2L, 2L + 1, 64 + 2L, 65 + 2L
+    const int src = lane >> 1;
+    const bool hi = lane & 1;
+    float a[4], b[4];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      a[c] = __shfl_sync(0xffffffffu, values[c], src);
+      b[c] = __shfl_sync(0xffffffffu, values[c], src + 16);
+    }
+    x[0] = hi ? a[2] : a[0];
+    x[1] = hi ? a[3] : a[1];
+    x[2] = hi ? b[2] : b[0];
+    x[3] = hi ? b[3] : b[1];
+  } else {
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+      x[c] = values[c];
+  }
+  float ss = 0.f;
+#pragma unroll
+  for (int c = 0; c < 4; ++c)
+    ss += x[c] * x[c];
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  const float rstd = rsqrtf(ss / 128.f + eps);
+  values[0] = round_bf16(values[0] * rstd * w.x);
+  values[1] = round_bf16(values[1] * rstd * w.y);
+  values[2] = round_bf16(values[2] * rstd * w.z);
+  values[3] = round_bf16(values[3] * rstd * w.w);
+  if constexpr (NM == 1) {
+    const float cs[2][2] = {{r0.x, r0.y}, {r0.z, r0.w}};
+#pragma unroll
+    for (int pi = 0; pi < 2; ++pi) {
+      const float c = cs[pi][0], s = cs[pi][1];
+      const float a = values[2 * pi], b = values[2 * pi + 1];
+      values[2 * pi] = c * a - s * b;
+      values[2 * pi + 1] = s * a + c * b;
+    }
+  } else if constexpr (NM == 2) {
+    const float cs[4][2] = {{r0.x, r0.y}, {r0.z, r0.w}, {r1.x, r1.y}, {r1.z, r1.w}};
+    const bool first = lane < 16;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float other = __shfl_xor_sync(0xffffffffu, values[k], 16);
+      const float c = cs[k][0], s = cs[k][1];
+      if (first) {
+        const float a = values[k], b = other;
+        values[k] = a * c - b * s;
+      } else {
+        const float a = other, b = values[k];
+        values[k] = b * c + a * s;
+      }
+    }
+  }
+  if constexpr (kHasRope<NM>) {
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+      values[c] = round_bf16(values[c]);
+  }
+}
+
+template <int NM>
+__forceinline__ __device__ void norm_rope128(float *values, const float4 w,
+                                             const QkNormRope &p,
+                                             const int row) {
+  float4 r0 = make_float4(0.f, 0.f, 0.f, 0.f), r1 = r0;
+  if constexpr (kHasRope<NM>)
+    rope_entries<NM>(p, row, r0, r1);
+  norm_rope128<NM>(values, w, p.eps, r0, r1);
 }
 
 // ---------------------------------------------------------------------------
@@ -456,11 +588,12 @@ constexpr int CENTER_DETECT_THREADS = 128;
 constexpr int CENTER_SAMPLES = 9;
 constexpr int CENTER_MAX_CHANNELS = 256;
 
-template <typename T>
+template <typename T, int NM = 0>
 __global__ __launch_bounds__(CENTER_DETECT_THREADS) void detect_k_anchor(
     const T *__restrict__ k_in, int *__restrict__ anchor_indices, const int Lk,
     const int C, const int H_kv, const int64_t stride_b,
-    const int64_t stride_h, const int64_t stride_n) {
+    const int64_t stride_h, const int64_t stride_n,
+    const QkNormRope norm = QkNormRope{}) {
   const int h = blockIdx.x;
   const int b = blockIdx.y;
   const int tid = threadIdx.x;
@@ -486,6 +619,24 @@ __global__ __launch_bounds__(CENTER_DETECT_THREADS) void detect_k_anchor(
         __ldg(&k_in[bh_offset + (int64_t)row * stride_n + channel]));
   }
   __syncthreads();
+  if constexpr (NM != 0) {
+    // C is 128: warp w normalizes sampled rows w, w + 4, w + 8
+    const float4 w = norm_weights(norm.kw);
+#pragma unroll
+    for (int pass = 0; pass < 3; ++pass) {
+      const int sample = min(warp + pass * 4, CENTER_SAMPLES - 1);
+      float *row_values = &samples[sample * C + (lane << 2)];
+      float v[4] = {row_values[0], row_values[1], row_values[2], row_values[3]};
+      norm_rope128<NM>(v, w, norm, sample * (Lk - 1) / (CENTER_SAMPLES - 1));
+      __syncwarp();
+      if (warp + pass * 4 < CENTER_SAMPLES) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+          row_values[c] = v[c];
+      }
+    }
+    __syncthreads();
+  }
 
   float original_energy = 0.f;
   float original_max = 0.f;
@@ -646,6 +797,168 @@ __global__ __launch_bounds__(128, 4) void quant_k_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Q for head dim 128 with one row group per warp (8 warps per block): the same
+// output as process_q with its two groups per warp, with more warps in flight.
+// ---------------------------------------------------------------------------
+template <typename T, int ROTATION, int NM>
+__global__ __launch_bounds__(256) void quant_q128_kernel(
+    const T *__restrict__ q_in, int8_t *__restrict__ q_out,
+    float *__restrict__ q_sb, const int Lq, const int H_q,
+    const int q_sc_per_h, const int64_t stride_b, const int64_t stride_h,
+    const int64_t stride_n, const QkNormRope norm) {
+  constexpr int NR = 4;
+  const int oblk = blockIdx.x;
+  const int h = blockIdx.y, b = blockIdx.z;
+  const int lane = threadIdx.x & 31;
+  const int otld = threadIdx.x >> 5;
+  const int ch = lane << 2;
+  const int base = (oblk >> 2) * 128 + (oblk & 3) * 32 + otld;
+  const T *in = q_in + (int64_t)b * stride_b + (int64_t)h * stride_h;
+  int8_t *out = q_out + ((int64_t)b * H_q + h) * Lq * 128;
+  float *sc_buf = q_sb + ((int64_t)b * H_q + h) * q_sc_per_h;
+  float4 wq;
+  if constexpr (NM != 0)
+    wq = norm_weights(norm.qw);
+  float v[NR * 4];
+#pragma unroll
+  for (int i = 0; i < NR * 4; ++i)
+    v[i] = 0.f;
+#pragma unroll
+  for (int j = 0; j < NR; ++j) {
+    const int n = base + j * 8;
+    if (n < Lq)
+      VectorLoader4<T>::load(&in[(int64_t)n * stride_n + ch], &v[j * 4]);
+    if constexpr (NM != 0)
+      norm_rope128<NM>(&v[j * 4], wq, norm, min(n, Lq - 1));
+  }
+#pragma unroll
+  for (int j = 0; j < NR; ++j) {
+    if constexpr (ROTATION == 128)
+      convrot128(&v[j * 4]);
+    else if constexpr (ROTATION == 129)
+      convrot128_plain(&v[j * 4]);
+    else if constexpr (ROTATION == 64)
+      convrot64(&v[j * 4]);
+    else
+      convrot4(&v[j * 4]);
+  }
+  float mx = 0.f;
+#pragma unroll
+  for (int i = 0; i < NR * 4; ++i)
+    mx = fmaxf(mx, fabsf(v[i]));
+  mx = warp_reduce_fmax(mx);
+  const float sc = mx / 127.f + 1e-7f;
+  const float inv_sc = 1.f / sc;
+  if (lane == 0)
+    sc_buf[oblk * 8 + otld] = sc;
+#pragma unroll
+  for (int j = 0; j < NR; ++j) {
+    const int n = base + j * 8;
+    if (n < Lq)
+      store4_i8(&out[(int64_t)n * 128 + ch], quant_int8_rcp(v[j * 4], inv_sc),
+                quant_int8_rcp(v[j * 4 + 1], inv_sc),
+                quant_int8_rcp(v[j * 4 + 2], inv_sc),
+                quant_int8_rcp(v[j * 4 + 3], inv_sc));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// K for head dim 128 with four warps per row group (16 warps per block): each
+// warp holds a quarter of process_k's rows, so nothing spills, and the group's
+// abs-max is combined through shared memory. The same output as process_k.
+// ---------------------------------------------------------------------------
+template <typename T, int NL, int WARPK, int ROTATION, int NM>
+__global__ __launch_bounds__(512) void quant_k128_kernel(
+    const T *__restrict__ k_in, int8_t *__restrict__ k_out,
+    float *__restrict__ k_sb, const int *__restrict__ anchor_indices,
+    const int L, const int H_kv, const int k_sc_per_h,
+    const int64_t stride_b, const int64_t stride_h, const int64_t stride_n,
+    const QkNormRope norm) {
+  constexpr int C = 128, SPLIT = 4, NJ = NL / SPLIT;
+  static_assert(NL % SPLIT == 0, "rows must split evenly");
+  const int oblk = blockIdx.x;
+  const int h = blockIdx.y, b = blockIdx.z;
+  const int lane = threadIdx.x & 31;
+  const int wid = threadIdx.x >> 5;
+  const int otld = wid / SPLIT, part = wid % SPLIT;
+  const T *in = k_in + (int64_t)b * stride_b + (int64_t)h * stride_h;
+  int8_t *out = k_out + ((int64_t)b * H_kv + h) * L * C;
+  float *sc_buf = k_sb + ((int64_t)b * H_kv + h) * k_sc_per_h;
+  const int anchor_index = __ldg(&anchor_indices[b * H_kv + h]);
+  const int ch = lane << 2;
+  float4 wk;
+  if constexpr (NM != 0)
+    wk = norm_weights(norm.kw);
+
+  float bias[4] = {0.f, 0.f, 0.f, 0.f};
+  if (anchor_index >= 0)
+    VectorLoader4<T>::load(&in[(int64_t)anchor_index * stride_n + ch], bias);
+  if constexpr (NM != 0)
+    norm_rope128<NM>(bias, wk, norm, max(anchor_index, 0));
+
+  float v[NJ * 2 * 4];
+#pragma unroll
+  for (int i = 0; i < NJ * 2 * 4; ++i)
+    v[i] = 0.f;
+#pragma unroll
+  for (int jj = 0; jj < NJ; ++jj) {
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+      const int n = oblk * WARPK + (part + jj * SPLIT) * 8 + otld * 2 + p;
+      const int vi = (jj * 2 + p) * 4;
+      if (n < L)
+        VectorLoader4<T>::load(&in[(int64_t)n * stride_n + ch], &v[vi]);
+      if constexpr (NM != 0)
+        norm_rope128<NM>(&v[vi], wk, norm, min(n, L - 1));
+      if (n < L) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+          v[vi + c] -= bias[c];
+      }
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < NJ * 2; ++j) {
+    if constexpr (ROTATION == 128)
+      convrot128(&v[j * 4]);
+    else if constexpr (ROTATION == 129)
+      convrot128_plain(&v[j * 4]);
+    else if constexpr (ROTATION == 64)
+      convrot64(&v[j * 4]);
+    else
+      convrot4(&v[j * 4]);
+  }
+  float mx = 0.f;
+#pragma unroll
+  for (int j = 0; j < NJ * 2 * 4; ++j)
+    mx = fmaxf(mx, fabsf(v[j]));
+  mx = warp_reduce_fmax(mx);
+  __shared__ float part_max[16];
+  if (lane == 0)
+    part_max[wid] = mx;
+  __syncthreads();
+  mx = fmaxf(fmaxf(part_max[otld * SPLIT], part_max[otld * SPLIT + 1]),
+             fmaxf(part_max[otld * SPLIT + 2], part_max[otld * SPLIT + 3]));
+  const float sc = mx / 127.f + 1e-7f;
+  const float inv_sc = 1.f / sc;
+  if (part == 0 && lane == 0)
+    sc_buf[oblk * 4 + otld] = sc;
+#pragma unroll
+  for (int jj = 0; jj < NJ; ++jj) {
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+      const int n = oblk * WARPK + (part + jj * SPLIT) * 8 + otld * 2 + p;
+      const int vi = (jj * 2 + p) * 4;
+      if (n < L)
+        store4_i8(&out[(int64_t)n * C + ch], quant_int8_rcp(v[vi], inv_sc),
+                  quant_int8_rcp(v[vi + 1], inv_sc),
+                  quant_int8_rcp(v[vi + 2], inv_sc),
+                  quant_int8_rcp(v[vi + 3], inv_sc));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Fused Q+K kernel – fallback for non-standard tile configs.
 // blockIdx.x < q_oblk_count  →  Q path
 // blockIdx.x >= q_oblk_count →  K path
@@ -684,6 +997,28 @@ __global__ __launch_bounds__(128, 3) void quant_qk_fused(
         k_in + in_bh, k_out + out_bh, k_sb + sbh,
         (int)blockIdx.x - q_oblk_count, Lk, C, anchor_index, k_stride_n);
   }
+}
+
+// Head dim 128: Q in quant_q128_kernel, K in quant_k128_kernel.
+template <typename T, int NL, int BK, int ROT, int NM>
+void launch_qk128(const void *q, void *q_int8, void *q_scale, const void *k,
+                  void *k_int8, void *k_scale, int *anchors, int B, int H_q,
+                  int Lq, int H_kv, int Lk, int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
+                  int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
+                  const QkNormRope &norm, cudaStream_t stream) {
+  const int q_oblk = (Lq + 127) / 128 * 4;
+  const int k_oblk = (Lk + BK - 1) / BK;
+  quant_q128_kernel<T, ROT, NM><<<dim3(q_oblk, H_q, B), 256, 0, stream>>>(
+      (const T *)q, (int8_t *)q_int8, (float *)q_scale, Lq, H_q, q_oblk * 8,
+      q_stride_b, q_stride_h, q_stride_n, norm);
+  quant_k128_kernel<T, NL, BK, ROT, NM>
+      <<<dim3(k_oblk, H_kv, B), 512, 0, stream>>>(
+          (const T *)k, (int8_t *)k_int8, (float *)k_scale, anchors, Lk, H_kv,
+          k_oblk * 4, k_stride_b, k_stride_h, k_stride_n, norm);
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess)
+    throw std::runtime_error(std::string("quant_qk kernel launch failed: ") +
+                             cudaGetErrorString(error));
 }
 
 } // namespace
@@ -792,11 +1127,12 @@ extern "C" void launch_quant_qk_per_thread_int8(
 #define LAUNCH_C64(T, ROT)                                                      \
   LAUNCH_FUSED(T, 4, 8, 128, 32, 64, 64, 1, ROT, false)
 
-#define LAUNCH_C128_CTA64(T, ROT)                                              \
-  LAUNCH_FUSED(T, 4, 8, 128, 32, 64, 64, 1, ROT, true)
+// Head dim 128 takes separate Q and K kernels with more warps per row group.
+#define LAUNCH_C128(T, NL, BK, ROT) launch_qk128<T, NL, BK, ROT, 0>(q, q_int8, q_scale, k, k_int8, k_scale, anchor_ptr, B, H_q, Lq, H_kv, Lk, q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h, k_stride_n, QkNormRope{}, stream)
 
-#define LAUNCH_C128_CTA128(T, ROT)                                             \
-  LAUNCH_FUSED(T, 4, 16, 128, 32, 128, 128, 1, ROT, true)
+#define LAUNCH_C128_CTA64(T, ROT) LAUNCH_C128(T, 8, 64, ROT)
+
+#define LAUNCH_C128_CTA128(T, ROT) LAUNCH_C128(T, 16, 128, ROT)
 
 #define LAUNCH_C256_CTA64(T, ROT)                                              \
   LAUNCH_SPLIT(T, 2, 8, 128, 16, 64, 64, 2, ROT, true)
@@ -859,12 +1195,64 @@ extern "C" void launch_quant_qk_per_thread_int8(
 #undef LAUNCH_C64
 #undef LAUNCH_C128_CTA64
 #undef LAUNCH_C128_CTA128
+#undef LAUNCH_C128
 #undef LAUNCH_C256_CTA64
 #undef LAUNCH_C256_CTA128
 #undef DISPATCH_C64
 #undef DISPATCH_C128
 #undef DISPATCH_C256
 #undef DO
+}
+
+// launch_quant_qk_per_thread_int8 for bf16 head dim 128, with Q and K first
+// taken through gpu_qk_norm_rope's per-head RMSNorm, weight and RoPE
+// (rope_mode 1 or 2; a null table for none). Q and K in memory are left as
+// they are.
+extern "C" void launch_quant_qk_norm_rope_int8(
+    const void *q, void *q_int8, void *q_scale, const void *k, void *k_int8,
+    void *k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int BLKK,
+    int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
+    int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
+    void *anchor_indices, const float *qw, const float *kw, const float *rope,
+    float eps, int rope_mode, cudaStream_t stream) {
+  using T = nv_bfloat16;
+  if (BLKK != 64 && BLKK != 128)
+    throw std::runtime_error("quant_qk_norm_rope_int8: unsupported key block");
+  if (rope_mode < 0 || rope_mode > 2)
+    throw std::runtime_error("quant_qk_norm_rope_int8: rope_mode must be 0, 1 or 2");
+  if (reinterpret_cast<uintptr_t>(rope) % 16 != 0)
+    throw std::runtime_error("quant_qk_norm_rope_int8: the rope table must be 16-byte aligned");
+  const auto ok = [](const void *ptr, int64_t sb, int64_t sh, int64_t sn) {
+    return reinterpret_cast<uintptr_t>(ptr) % 8 == 0 && sb % 4 == 0 &&
+           sh % 4 == 0 && sn % 4 == 0;
+  };
+  if (!ok(q, q_stride_b, q_stride_h, q_stride_n) ||
+      !ok(k, k_stride_b, k_stride_h, k_stride_n))
+    throw std::runtime_error(
+        "quant_qk_norm_rope_int8: Q/K must keep 4-element alignment");
+  const QkNormRope norm{qw, kw, rope, eps};
+  // gpu_qk_norm_rope's lane order follows rope_mode even without a table
+  const int nm = rope && rope_mode != 0 ? rope_mode : (rope_mode == 2 ? 4 : 3);
+  auto *anchors = static_cast<int *>(anchor_indices);
+  const auto go = [&](auto nm_tag) {
+    constexpr int NM = decltype(nm_tag)::value;
+    detect_k_anchor<T, NM><<<dim3(H_kv, B), CENTER_DETECT_THREADS, 0, stream>>>(
+        (const T *)k, anchors, Lk, 128, H_kv, k_stride_b, k_stride_h,
+        k_stride_n, norm);
+#define NORM128(NL, BK, ROT) launch_qk128<T, NL, BK, ROT, NM>(q, q_int8, q_scale, k, k_int8, k_scale, anchors, B, H_q, Lq, H_kv, Lk, q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h, k_stride_n, norm, stream)
+    if (BLKK == 128) {
+      if (Lk <= 256) NORM128(16, 128, 4); else NORM128(16, 128, 128);
+    } else {
+      if (Lk <= 256) NORM128(8, 64, 4); else NORM128(8, 64, 128);
+    }
+#undef NORM128
+  };
+  switch (nm) {
+  case 1: go(std::integral_constant<int, 1>{}); break;
+  case 2: go(std::integral_constant<int, 2>{}); break;
+  case 3: go(std::integral_constant<int, 3>{}); break;
+  default: go(std::integral_constant<int, 4>{}); break;
+  }
 }
 
 namespace {

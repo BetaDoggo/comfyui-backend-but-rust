@@ -10,6 +10,10 @@ extern "C" void launch_quant_qk_per_thread_int8(const void* q, void* q_int8, voi
     void* k_int8, void* k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int C, int BLKQ, int WARPQ, int BLKK,
     int WARPK, int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h,
     int64_t k_stride_n, int input_dtype_code, void* anchor_indices, cudaStream_t stream);
+extern "C" void launch_quant_qk_norm_rope_int8(const void* q, void* q_int8, void* q_scale, const void* k, void* k_int8,
+    void* k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int BLKK, int64_t q_stride_b, int64_t q_stride_h,
+    int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n, void* anchor_indices,
+    const float* qw, const float* kw, const float* rope, float eps, int rope_mode, cudaStream_t stream);
 extern "C" void launch_quant_v_int8_kernel(const void* v, void* out, void* scale, int B, int H, int N, int D,
     int padded_N, int64_t sb, int64_t sh, int64_t sn, int input_dtype_code, cudaStream_t stream);
 extern "C" void launch_sage_attn_kernel(const void* q, const void* k, const void* v, void* o, const void* q_scale,
@@ -46,9 +50,19 @@ extern "C" int64_t gpu_int8_attn_workspace(int b, int h, int hk, int lq, int lk)
     return gpu_int8_attn_workspace_d(b, h, hk, lq, lk, 128);
 }
 
+// Per-head RMSNorm and RoPE for q and k, applied on the way into the quantizer (gpu_qk_norm_rope's arguments).
+struct QkNorm {
+    const float* qw;
+    const float* kw;
+    const float* rope;
+    float eps;
+    int rope_mode;
+};
+
 static int int8_attn(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk, int h, int hk,
                      int D, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs, int64_t k_hs, int64_t v_bs,
-                     int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs, int64_t o_hs, float scale, int dt, void* stream);
+                     int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs, int64_t o_hs, float scale, int dt, void* stream,
+                     const QkNorm* norm = nullptr);
 
 // q/k/v: bf16 [b, seq, heads, D] with element strides; o: bf16, same convention.
 extern "C" int gpu_int8_attn_d(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk,
@@ -71,7 +85,8 @@ extern "C" int gpu_int8_attn_f16(const void* q, const void* k, const void* v, vo
 // dt: the sage dtype code of q/k/v and o, 1 fp16 or 2 bf16
 static int int8_attn(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq, int lk, int h, int hk,
                      int D, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs, int64_t k_rs, int64_t k_hs, int64_t v_bs,
-                     int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs, int64_t o_hs, float scale, int dt, void* stream) {
+                     int64_t v_rs, int64_t v_hs, int64_t o_bs, int64_t o_rs, int64_t o_hs, float scale, int dt, void* stream,
+                     const QkNorm* norm) {
     try {
         cudaStream_t st = (cudaStream_t)stream;
         const int ck = cta_k_for(lk, D);
@@ -86,8 +101,14 @@ static int int8_attn(const void* q, const void* k, const void* v, void* o, void*
         float* vs = (float*)take((int64_t)b * hk * D * 4);
         void* anchors = take((int64_t)b * hk * 4);
         // inputs are [B, H, L, D] views: (batch, head, seq) strides
-        launch_quant_qk_per_thread_int8(q, qi, qs, k, ki, ks, b, h, lq, hk, lk, D, 128, warp_q(D), ck, ck, q_bs, q_hs, q_rs,
-                                        k_bs, k_hs, k_rs, dt, anchors, st);
+        if (norm) {
+            if (D != 128 || dt != 2) throw std::runtime_error("fused q/k norm needs bf16 head dim 128");
+            launch_quant_qk_norm_rope_int8(q, qi, qs, k, ki, ks, b, h, lq, hk, lk, ck, q_bs, q_hs, q_rs, k_bs, k_hs, k_rs,
+                                           anchors, norm->qw, norm->kw, norm->rope, norm->eps, norm->rope_mode, st);
+        } else {
+            launch_quant_qk_per_thread_int8(q, qi, qs, k, ki, ks, b, h, lq, hk, lk, D, 128, warp_q(D), ck, ck, q_bs, q_hs,
+                                            q_rs, k_bs, k_hs, k_rs, dt, anchors, st);
+        }
         launch_quant_v_int8_kernel(v, vi, vs, b, hk, lk, D, plk, v_bs, v_hs, v_rs, dt, st);
         const int64_t qh = (int64_t)lq * D, kh = (int64_t)lk * D, vh = (int64_t)D * plk;
         launch_sage_attn_kernel(qi, ki, vi, o, qs, ks, vs, nullptr, 0, 0, 0, 0, 0, ck, b, lq, lk, h, hk, D, h * qh, D,
@@ -97,6 +118,19 @@ static int int8_attn(const void* q, const void* k, const void* v, void* o, void*
         return -400;
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -401;
+}
+
+// gpu_int8_attn with q and k taken through gpu_qk_norm_rope(qw, kw, eps, rope, rope_mode) first, in the quantizer. The
+// result is bit-identical to running gpu_qk_norm_rope and then gpu_int8_attn, and q and k in memory are left unnormalized.
+// Head dim 128, bf16.
+extern "C" int gpu_int8_attn_norm_rope(const void* q, const void* k, const void* v, void* o, void* ws, int b, int lq,
+                                      int lk, int h, int hk, int64_t q_bs, int64_t q_rs, int64_t q_hs, int64_t k_bs,
+                                      int64_t k_rs, int64_t k_hs, int64_t v_bs, int64_t v_rs, int64_t v_hs, int64_t o_bs,
+                                      int64_t o_rs, int64_t o_hs, float scale, const float* qw, const float* kw,
+                                      float eps, const float* rope, int rope_mode, void* stream) {
+    const QkNorm norm{qw, kw, rope, eps, rope_mode};
+    return int8_attn(q, k, v, o, ws, b, lq, lk, h, hk, 128, q_bs, q_rs, q_hs, k_bs, k_rs, k_hs, v_bs, v_rs, v_hs, o_bs, o_rs,
+                     o_hs, scale, 2, stream, &norm);
 }
 
 extern "C" void launch_sage_prepare_key_mask(const void* mask, float* packed, int batch, int heads, int length, int64_t stride_b,

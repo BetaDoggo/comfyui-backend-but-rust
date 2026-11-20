@@ -326,34 +326,37 @@ impl Dit {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn flash(&self, q: PM, kp: PM, v: PM, o: PM, lse: PM, batch: usize, sq: usize, sk: usize, qrow: usize, krow: usize, st: &Stream) -> Result<()> {
+    fn flash(&self, q: PM, kp: PM, v: PM, o: PM, lse: PM, batch: usize, sq: usize, sk: usize, qrow: usize, krow: usize, q_item: usize,
+        st: &Stream) -> Result<()> {
         let hs = HD as i64;
-        k!(gpu_flash_attn(q, kp, v, o, lse, batch as i32, sq as i32, sk as i32, H as i32, H as i32, (sq * qrow) as i64, qrow as i64, hs,
+        k!(gpu_flash_attn(q, kp, v, o, lse, batch as i32, sq as i32, sk as i32, H as i32, H as i32, (q_item * qrow) as i64, qrow as i64, hs,
             (sk * krow) as i64, krow as i64, hs, (sk * krow) as i64, krow as i64, hs, (sq * F) as i64, F as i64, hs, 1.0 / (HD as f32).sqrt(),
             self.attn_variant, s(st)))
     }
 
-    /// Attention of `batch` images, each of `lq` rows of `q` (rows `qrow` apart) over its `lk` rows of keys and values
-    /// (`krow` apart).
+    /// Attention of `batch` images, each of `lq` rows of `q` (rows `qrow` apart, images `q_item` rows apart) over its `lk`
+    /// rows of keys and values (`krow` apart).
     #[allow(clippy::too_many_arguments)]
-    fn attention(&self, q: PM, kp: PM, vp: PM, out: PM, batch: usize, lq: usize, lk: usize, qrow: usize, krow: usize, st: &Stream) -> Result<()> {
+    fn attention(&self, q: PM, kp: PM, vp: PM, out: PM, batch: usize, lq: usize, lk: usize, qrow: usize, krow: usize, q_item: usize,
+        st: &Stream) -> Result<()> {
         let (hs, b) = (HD as i64, batch as i32);
         if self.int8_attn {
             let ws = DevBuf::alloc_async(unsafe { crate::ffi::gpu_int8_attn_workspace(b, H as i32, H as i32, lq as i32, lk as i32) } as usize, st)?;
-            k!(gpu_int8_attn(q, kp, vp, out, ws.ptr(), b, lq as i32, lk as i32, H as i32, H as i32, (lq * qrow) as i64, qrow as i64, hs,
+            k!(gpu_int8_attn(q, kp, vp, out, ws.ptr(), b, lq as i32, lk as i32, H as i32, H as i32, (q_item * qrow) as i64, qrow as i64, hs,
                 (lk * krow) as i64, krow as i64, hs, (lk * krow) as i64, krow as i64, hs, (lq * F) as i64, F as i64, hs, 1.0 / (HD as f32).sqrt(), s(st)))
         } else {
             let lse = DevBuf::alloc_async(H * batch * lq * 4, st)?;
-            self.flash(q, kp, vp, out, lse.ptr(), batch, lq, lk, qrow, krow, st)
+            self.flash(q, kp, vp, out, lse.ptr(), batch, lq, lk, qrow, krow, q_item, st)
         }
     }
 
     /// One block over `rows` rows of `x` that `scale`, `gate` etc. modulate alike: `batch` sequences one after another, each
-    /// taking `rope`. `kv` is called with the rows of q, k and v (after the norm and RoPE) and returns the attention output
-    /// for them.
+    /// taking `rope`. `attend` is called with the first row of q, k and v (after the norm and RoPE) and writes the attention
+    /// output for them. The rows of q, k and v go to `dest` (the first row, and the rows between sequences) when given,
+    /// else to a buffer of their own.
     #[allow(clippy::too_many_arguments)]
-    fn block(&self, tag: &str, base: PM, lay: &Layout, x: &DevBuf, batch: usize, rows: usize, m: &Mod, rope: PM, st: &Stream,
-        attend: &mut dyn FnMut(&DevBuf, &DevBuf, &Stream) -> Result<()>) -> Result<()> {
+    fn block(&self, tag: &str, base: PM, lay: &Layout, x: &DevBuf, batch: usize, rows: usize, m: &Mod, rope: PM, dest: Option<(PM, usize)>,
+        st: &Stream, attend: &mut dyn FnMut(PM, &DevBuf, &Stream) -> Result<()>) -> Result<()> {
         let wp = |key: &str| off(base, lay.off(key));
         let (fi, mi) = (F as i64, rows as i32);
         let vec = |j: usize| off(m.vecs.ptr(), j * F * 2);
@@ -361,24 +364,32 @@ impl Dit {
         let mark = |stage: &'static str| self.prof.borrow_mut().mark(stage, st);
         let a8 = DevBuf::alloc_async(rows * MLP, st)?;
         let asc = DevBuf::alloc_async(rows * 4, st)?;
-        let qkv = DevBuf::alloc_async(rows * QKV * 2, st)?;
+        let each = rows / batch;
+        let own = if dest.is_none() { Some(DevBuf::alloc_async(rows * QKV * 2, st)?) } else { None };
+        let (qkv, item) = dest.unwrap_or_else(|| (own.as_ref().map_or(std::ptr::null_mut(), |b| b.ptr()), each));
         mark("start")?;
         k!(gpu_quant_rows(DT_BF16, PRO_LN_MOD, x.ptr(), fi, null(), 0, 0, null(), EPS, vec(0), zero, a8.ptr(), asc.ptr(), mi, F as i32, 1, s(st)))?;
         mark("quant")?;
-        k!(gpu_int8_gemm(a8.ptr(), wp("wqkv"), asc.ptr(), wp("sqkv"), null(), qkv.ptr(), rows as i64, QKV as i64, fi, DT_BF16, s(st)))?;
+        if item == each {
+            k!(gpu_int8_gemm(a8.ptr(), wp("wqkv"), asc.ptr(), wp("sqkv"), null(), qkv, rows as i64, QKV as i64, fi, DT_BF16, s(st)))?;
+        } else {
+            for i in 0..batch {
+                k!(gpu_int8_gemm(off(a8.ptr(), i * each * F), wp("wqkv"), off(asc.ptr(), i * each * 4), wp("sqkv"), null(),
+                    off(qkv, i * item * QKV * 2), each as i64, QKV as i64, fi, DT_BF16, s(st)))?;
+            }
+        }
         mark("qkv gemm")?;
-        let each = rows / batch;
         for i in 0..batch {
-            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(qkv.ptr(), i * each * QKV * 2), QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn"), wp("kn"),
+            k!(gpu_qk_norm_rope(DT_BF16, HD as i32, off(qkv, i * item * QKV * 2), QKV as i64, 0, F as i32, H as i32, H as i32, wp("qn"), wp("kn"),
                 EPS, rope, 1, each as i32, s(st)))?;
         }
         mark("norm rope")?;
         let attn = DevBuf::alloc_async(rows * F * 2, st)?;
         trace(tag, "x_in", x, rows * F * 2, st)?;
-        attend(&qkv, &attn, st)?;
+        attend(qkv, &attn, st)?;
         mark("attention")?;
         trace(tag, "attn", &attn, rows * F * 2, st)?;
-        drop(qkv);
+        drop(own);
         k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, attn.ptr(), fi, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), mi, F as i32, 1, s(st)))?;
         mark("quant")?;
         drop(attn);
@@ -400,16 +411,18 @@ impl Dit {
 
     /// One block over the prefix `x` (modulated by `m0`). Its keys and values go to `kout` and `vout`, [rows, F] each.
     #[allow(clippy::too_many_arguments)]
-    fn prefix_block(&self, tag: &str, base: PM, lay: &Layout, x: &DevBuf, pf: &Prefix, m0: &Mod, kout: PM, vout: PM, st: &Stream) -> Result<()> {
+    /// `kout` and `vout` take the keys and values, rows `out_row` values apart.
+    #[allow(clippy::too_many_arguments)]
+    fn prefix_block(&self, tag: &str, base: PM, lay: &Layout, x: &DevBuf, pf: &Prefix, m0: &Mod, kout: PM, vout: PM, out_row: usize,
+        st: &Stream) -> Result<()> {
         let p = pf.rows;
-        self.block(&format!("p{tag}"), base, lay, x, 1, p, m0, pf.rope.ptr(), st, &mut |qkv, attn, st| {
-            let q = qkv.ptr();
+        self.block(&format!("p{tag}"), base, lay, x, 1, p, m0, pf.rope.ptr(), None, st, &mut |q, attn, st| {
             let (kp, vp) = (off(q, F * 2), off(q, 2 * F * 2));
             for &(row, w) in pf.v_scale.iter().filter(|&&(row, _)| row < p) {
                 k!(gpu_scale_bf16(off(vp, row * QKV * 2), F as i64, w, s(st)))?;
             }
-            memcpy_2d_d2d(kout, F * 2, kp, QKV * 2, F * 2, p, st)?;
-            memcpy_2d_d2d(vout, F * 2, vp, QKV * 2, F * 2, p, st)?;
+            memcpy_2d_d2d(kout, out_row * 2, kp, QKV * 2, F * 2, p, st)?;
+            memcpy_2d_d2d(vout, out_row * 2, vp, QKV * 2, F * 2, p, st)?;
             let mut at = 0;
             for seg in &pf.segs {
                 let n = seg.rows();
@@ -421,7 +434,7 @@ impl Dit {
                     // everything before it and all of itself
                     Seg::Image { .. } => {
                         let lse = DevBuf::alloc_async(H * n * 4, st)?;
-                        self.flash(qs, kp, vp, os, lse.ptr(), 1, n, at + n, QKV, QKV, st)?;
+                        self.flash(qs, kp, vp, os, lse.ptr(), 1, n, at + n, QKV, QKV, n, st)?;
                     }
                 }
                 at += n;
@@ -441,7 +454,7 @@ impl Dit {
             let base = self.blocks.acquire(b, st)?;
             let lay = self.blocks.layouts[b].clone();
             let slot = off(kv.ptr(), b * 2 * p * F * 2);
-            self.prefix_block(&b.to_string(), base, &lay, &x, pf, &m0, slot, off(slot, p * F * 2), st)?;
+            self.prefix_block(&b.to_string(), base, &lay, &x, pf, &m0, slot, off(slot, p * F * 2), F, st)?;
             self.blocks.release(b, st)?;
             if let Some(pr) = probe.as_mut() {
                 pr(&format!("prefix_block{b}"), &x, p * F * 2);
@@ -474,9 +487,10 @@ impl Dit {
             self.gemm(ti, self.g("img_in"), off(x.ptr(), i * lt * F * 2), lt, F, CH, st)?;
         }
 
-        // each image's keys and values: the prefix's, then its own
-        let kcat = DevBuf::alloc_async(batch * kl * F * 2, st)?;
-        let vcat = DevBuf::alloc_async(batch * kl * F * 2, st)?;
+        // each image's rows of q | k | v: the prefix's (keys and values only), then its own, which the block's GEMM writes in
+        // place, so the attention reads keys and values without a copy
+        let cat = DevBuf::alloc_async(batch * kl * QKV * 2, st)?;
+        let (kc, vc) = (off(cat.ptr(), F * 2), off(cat.ptr(), 2 * F * 2));
         let (xp, m0) = if pf.kv.is_none() {
             let xp = DevBuf::alloc_async(p * F * 2, st)?;
             memcpy_d2d(xp.ptr(), pf.tokens.ptr(), p * F * 2, st)?;
@@ -491,29 +505,25 @@ impl Dit {
             match (&pf.kv, &xp, &m0) {
                 (Some(kv), ..) => {
                     let slot = off(kv.ptr(), b * 2 * p * F * 2);
-                    memcpy_d2d(kcat.ptr(), slot, p * F * 2, st)?;
-                    memcpy_d2d(vcat.ptr(), off(slot, p * F * 2), p * F * 2, st)?;
+                    memcpy_2d_d2d(kc, QKV * 2, slot, F * 2, F * 2, p, st)?;
+                    memcpy_2d_d2d(vc, QKV * 2, off(slot, p * F * 2), F * 2, F * 2, p, st)?;
                 }
                 (None, Some(xp), Some(m0)) => {
-                    self.prefix_block(&b.to_string(), base, &lay, xp, pf, m0, kcat.ptr(), vcat.ptr(), st)?;
+                    self.prefix_block(&b.to_string(), base, &lay, xp, pf, m0, kc, vc, QKV, st)?;
                 }
                 _ => unreachable!(),
             }
             for i in 1..batch {
-                memcpy_d2d(off(kcat.ptr(), i * kl * F * 2), kcat.ptr(), p * F * 2, st)?;
-                memcpy_d2d(off(vcat.ptr(), i * kl * F * 2), vcat.ptr(), p * F * 2, st)?;
+                memcpy_d2d(off(cat.ptr(), i * kl * QKV * 2), cat.ptr(), p * QKV * 2, st)?;
             }
-            let (kc, vc) = (kcat.ptr(), vcat.ptr());
-            self.block(&format!("t{b}"), base, &lay, &x, batch, rows, &m, rope_t, st, &mut |qkv, attn, st| {
+            let own = off(cat.ptr(), p * QKV * 2);
+            self.block(&format!("t{b}"), base, &lay, &x, batch, rows, &m, rope_t, Some((own, kl)), st, &mut |q, attn, st| {
                 for i in 0..batch {
-                    let (q, at) = (off(qkv.ptr(), i * lt * QKV * 2), (i * kl + p) * F * 2);
-                    memcpy_2d_d2d(off(kc, at), F * 2, off(q, F * 2), QKV * 2, F * 2, lt, st)?;
-                    memcpy_2d_d2d(off(vc, at), F * 2, off(q, 2 * F * 2), QKV * 2, F * 2, lt, st)?;
                     for &(row, w) in pf.v_scale.iter().filter(|&&(row, _)| (p..kl).contains(&row)) {
-                        k!(gpu_scale_bf16(off(vc, (i * kl + row) * F * 2), F as i64, w, s(st)))?;
+                        k!(gpu_scale_bf16(off(vc, (i * kl + row) * QKV * 2), F as i64, w, s(st)))?;
                     }
                 }
-                self.attention(qkv.ptr(), kc, vc, attn.ptr(), batch, lt, kl, QKV, F, st)
+                self.attention(q, kc, vc, attn.ptr(), batch, lt, kl, QKV, QKV, kl, st)
             })?;
             self.blocks.release(b, st)?;
             if let Some(pr) = probe.as_mut() {

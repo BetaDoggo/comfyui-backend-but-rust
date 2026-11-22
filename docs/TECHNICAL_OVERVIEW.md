@@ -318,6 +318,22 @@ to pageable memory and staging. The blocks leave VRAM before the video decode an
 re-planned for its size. The text encoder and refiner only hold VRAM while they run. The video decoder holds 2.4 GB of
 pinned RAM between clips, and takes no VRAM while sampling.
 
+A bake packs each block's pinned copy from the file on several threads, since a copy out of the mapping is paced by its
+page faults, and reads the weights it patches from that copy rather than from the mapping; that took the pi-H3 adapter's
+bake from 9.4 s to 5.2 s with the file cached.
+
+The text encoder decodes its nvfp4 weights to float32 for cuBLAS only for prompts longer than 128 tokens. Shorter ones go
+through `gpu_nvfp4_gemm`, which decodes the weights in shared memory as it multiplies them, to the same values, with q, k
+and v, and gate and up, each one launch: writing and reading back 100 GB of float32 weights per prompt cost more than
+the products. Its time then hides under the copies of the weights to the card.
+
+A block's out and down projections add into the residual stream through each segment's own gate (text, audio, video),
+so they ran one GEMM per segment. They now run one GEMM over every row, and `gpu_add_gated_rows_bf16` applies each row's
+gate, rounded as the residual epilogue rounds, so the results are the same bits. The audio decoder's wide convolutions
+are tiled through shared memory in the same summation order, and its weights stay in pinned RAM between clips. A DWD
+head streams through the cast buffers like a text encoder, so it doesn't push the blocks out of VRAM, runs its norms
+and GEMMs over all rows at once, and writes its frames on the GPU, in fp16.
+
 ## Source layout
 
 ```

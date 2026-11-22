@@ -1285,6 +1285,27 @@ impl Dit {
             i += run;
         }
         segs.extend([(text, nc, 2, 0), (a0, ar, 1, 2), (al, vr, 0, 0)].into_iter().filter(|s| s.1 > 0));
+        // each row's first modulation vector in `modb`, for the residual GEMMs that run every segment at once
+        let sel: Vec<i32> = segs.iter().flat_map(|seg| std::iter::repeat_n(((seg.2 * 3 + seg.3) * 6) as i32, seg.1)).collect();
+        anyhow::ensure!(sel.len() == l, "segments of {} rows for {l} tokens", sel.len());
+        let sel_d = DevBuf::alloc_async(l * 4, st)?;
+        sel_d.upload(0, &sel.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), st)?;
+        // x += gate * (a8 . w), the gate the segment's modulation vector `j`
+        let residual = |w: PM, scale: PM, kk: usize, j: usize| -> Result<()> {
+            if segs.len() > 1 {
+                // one GEMM over every row, then the gates row by row, rounded as the residual epilogue rounds
+                k!(gpu_int8_gemm(a8.ptr(), w, asc.ptr(), scale, null(), hid.ptr(), l as i64, fi, kk as i64, DT_BF16, s(st)))?;
+                k!(gpu_add_gated_rows_bf16(xp, hid.ptr(), off(modb.ptr(), j * F * 2), sel_d.ptr(), l as i32, F as i32, s(st)))?;
+            } else {
+                for seg in &segs {
+                    let xs = off(xp, seg.0 * F * 2);
+                    let gate = off(modb.ptr(), ((seg.2 * 3 + seg.3) * 6 + j) * F * 2);
+                    k!(gpu_int8_gemm_residual(off(a8.ptr(), seg.0 * kk), w, off(asc.ptr(), seg.0 * 4), scale, null(), gate, xs, xs, seg.1 as i64, fi, kk as i64, DT_BF16,
+                        s(st)))?;
+                }
+            }
+            Ok(())
+        };
         let pdd_head = self.pdd_head(sigma, sigma_next, st)?;
 
         for b in 0..self.blocks.len() {
@@ -1376,11 +1397,7 @@ impl Dit {
                 self.prof.mark("quant", st)?;
                 let w = weight(1, F, INNER)?;
                 self.prof.mark("w6", st)?;
-                for seg in &segs {
-                    let xs = off(xp, seg.0 * F * 2);
-                    k!(gpu_int8_gemm_residual(off(a8.ptr(), seg.0 * INNER), w, off(asc.ptr(), seg.0 * 4), wp("c_o"), null(), vecs(seg, 2), xs, xs, seg.1 as i64, fi, INNER as i64,
-                        DT_BF16, s(st)))?;
-                }
+                residual(w, wp("c_o"), INNER, 2)?;
             }
             self.prof.mark("gemm", st)?;
             modulate(2, 1)?;
@@ -1409,11 +1426,7 @@ impl Dit {
                 self.prof.mark("quant", st)?;
                 let w = weight(3, F, FFN)?;
                 self.prof.mark("w6", st)?;
-                for seg in &segs {
-                    let xs = off(xp, seg.0 * F * 2);
-                    k!(gpu_int8_gemm_residual(off(a8.ptr(), seg.0 * FFN), w, off(asc.ptr(), seg.0 * 4), wp("c_d"), null(), vecs(seg, 5), xs, xs, seg.1 as i64, fi, FFN as i64,
-                        DT_BF16, s(st)))?;
-                }
+                residual(w, wp("c_d"), FFN, 5)?;
             }
             self.prof.mark("gemm", st)?;
             self.blocks.release(b, st)?;

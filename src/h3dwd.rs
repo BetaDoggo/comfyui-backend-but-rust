@@ -17,6 +17,7 @@ use crate::h3vae::Clip;
 use crate::offload::{plan, Layout, Plan, WeightSet};
 use crate::st::{f32_bytes, SafeTensors};
 use anyhow::{bail, ensure, Result};
+use half::slice::HalfFloatSliceExt;
 use half::{bf16, f16};
 use std::sync::Arc;
 
@@ -41,6 +42,8 @@ const TIME_SHIFT: usize = 2;
 const PAIRS: usize = 24;
 /// Windows gathered for one attention call.
 const MAX_WINDOWS: usize = 32;
+/// Rows each norm, quantization and GEMM runs at once, for the size of their buffers.
+const CHUNK_ROWS: usize = 16384;
 /// `RGBColorEncoder`'s affine codec of the head's ImageNet-normalized RGB, to [-1, 1].
 const COLOR_MEAN: [f32; 3] = [-0.03, -0.088, -0.188];
 const COLOR_STD: [f32; 3] = [0.458, 0.448, 0.45];
@@ -55,9 +58,11 @@ pub fn activation_bytes((t, th, tw): (usize, usize, usize)) -> usize {
     let hw = 4 * th * tw;
     let n = t * hw + t.div_ceil(BLOCK) * S;
     let block = BLOCK * hw + S;
+    let chunk = n.clamp(1, CHUNK_ROWS);
     let window = (BLOCK + 1) * WINDOW * WINDOW + 2 * S;
-    // q, k and v, the residual stream and the attention output; a block's MLP; one batch of gathered windows
-    n * (QKV + 2 * D) * 2 + block * (FF + 4 + 4 * FF + 3 * PATCH_T * PATCH * PATCH * 2) + MAX_WINDOWS * window * (QKV + D) * 2 + (256 << 20)
+    // q, k and v, the residual stream and the attention output; a chunk's MLP; a block's pixels; one batch of gathered
+    // windows
+    n * (QKV + 2 * D) * 2 + chunk * (FF + 4 + 4 * FF) + block * 3 * PATCH_T * PATCH * PATCH * 2 + MAX_WINDOWS * window * (QKV + D) * 2 + (256 << 20)
 }
 
 /// `[lo, hi)` of the windows along one axis of `n`, shifted by `shift`, clipped to `[0, n)`.
@@ -203,6 +208,8 @@ impl Refiner {
             lay.push(l);
         }
         let ws = WeightSet::lazy("dwd head", st.clone(), lay, Plan { resident: 0, slots: 0 }, threads)?;
+        // it runs once per clip: streamed through the cast buffers, it leaves the diffusion model's blocks in VRAM
+        ws.once_per_prompt();
         ws.keep_images();
         let mut gl = Layout::new();
         for key in ["feature_expand.weight", "feature_expand.bias", "first_frame_proj_out.weight", "first_frame_proj_out.bias", "proj_out.weight", "proj_out.bias", "register_tokens"] {
@@ -237,7 +244,7 @@ impl Refiner {
     }
 
     /// bf16 features `[t * th * tw, width]` of a `(t, th, tw)` H3 token grid, in its (t, y, x) order, to RGB f32
-    /// `[3, frames, 32th, 32tw]` in 0..1: `refine` then `MiniMaxH3DWD.decode`, rounded to fp16 as it returns them.
+    /// `[3, frames, 32th, 32tw]` in 0..1: `refine` then `MiniMaxH3DWD.decode`, fp16 values as it returns them.
     pub fn decode(&mut self, features: &DevBuf, (t, th, tw): (usize, usize, usize), st: &Stream) -> Result<Clip> {
         self.prof.mark("start", st)?;
         let (h, w) = (th * 2, tw * 2);
@@ -279,11 +286,14 @@ impl Refiner {
         self.prof.mark("expand", st)?;
 
         let block_rows = geo.rows.iter().map(|r| r.1 - r.0).max().unwrap_or(0);
+        // the row-wise work runs over every row at once, in chunks: only attention sees the native blocks
+        let chunk = n.clamp(1, CHUNK_ROWS);
+        let chunks: Vec<(usize, usize)> = (0..n).step_by(chunk).map(|r0| (r0, (r0 + chunk).min(n))).collect();
         let qkv = DevBuf::alloc_async(n * QKV * 2, st)?;
         let attn = DevBuf::alloc_async(n * D * 2, st)?;
-        let a8 = DevBuf::alloc_async(block_rows * FF, st)?;
-        let asc = DevBuf::alloc_async(block_rows * 4, st)?;
-        let hid = DevBuf::alloc_async(block_rows * 2 * FF * 2, st)?;
+        let a8 = DevBuf::alloc_async(chunk * FF, st)?;
+        let asc = DevBuf::alloc_async(chunk * 4, st)?;
+        let hid = DevBuf::alloc_async(chunk * 2 * FF * 2, st)?;
         let (mut gather, mut wout, mut wsz) = (0usize, 0usize, 0usize);
         for b in geo.windows.iter().flatten() {
             gather = gather.max(b.n * b.lk);
@@ -303,7 +313,7 @@ impl Refiner {
             let lay = self.ws.layouts[li].clone();
             let wp = |key: &str| off(base, lay.off(key));
             let rope = geo.rope[li % 2].ptr();
-            for &(r0, r1) in &geo.rows {
+            for &(r0, r1) in &chunks {
                 let m = (r1 - r0) as i32;
                 k!(gpu_quant_rows(DT_BF16, PRO_RMS, off(xp, r0 * D * 2), di, null(), 0, 0, wp("n1"), EPS, null(), null(), a8.ptr(), asc.ptr(), m, D as i32, 1, s(st)))?;
                 let qb = off(q, r0 * QKV * 2);
@@ -329,7 +339,7 @@ impl Refiner {
                     DH as i32, 0, rs, hs, 0, rs, hs, 0, rs, hs, 0, di, DH as i64, sc, 0, s(st)))?;
             }
             self.prof.mark("attn", st)?;
-            for &(r0, r1) in &geo.rows {
+            for &(r0, r1) in &chunks {
                 let (m, xs, at) = ((r1 - r0) as i32, off(xp, r0 * D * 2), off(attn.ptr(), r0 * D * 2));
                 k!(gpu_quant_rows(DT_BF16, PRO_PLAIN, at, di, null(), 0, 0, null(), 0.0, null(), null(), a8.ptr(), asc.ptr(), m, D as i32, 1, s(st)))?;
                 k!(gpu_int8_gemm_residual(a8.ptr(), wp("w_o"), asc.ptr(), wp("s_o"), wp("b_o"), wp("s1"), xs, xs, m as i64, di, di, DT_BF16, s(st)))?;
@@ -348,6 +358,7 @@ impl Refiner {
         let mut clip = Clip { c: 3, t: frames, h: h * PATCH, w: w * PATCH, data: vec![0.0; 3 * frames * h * PATCH * w * PATCH] };
         let (first_n, rest_n) = (3 * FIRST_T * PATCH * PATCH, 3 * PATCH_T * PATCH * PATCH);
         let out = DevBuf::alloc_async(block_rows * rest_n * 2, st)?;
+        let pix = DevBuf::alloc_async(clip.data.len() * 2, st)?;
         let mut f0 = 0;
         for &(r0, r1) in &geo.rows {
             let lat = (r1 - r0 - S) / hw;
@@ -361,40 +372,17 @@ impl Refiner {
                 k!(gpu_gemm(off(y, hw * D * 2), di, self.g("proj_out.weight"), di, rest, rest_n as i64, self.g("proj_out.bias"), ((lat - 1) * hw) as i64, rest_n as i64, di, 1,
                     DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
             }
-            let mut raw = vec![0u8; (hw * first_n + (lat - 1) * hw * rest_n) * 2];
-            out.download(0, &mut raw, st)?;
-            let val = |i: usize| bf16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]).to_f32();
-            let (ph, pw) = (clip.h, clip.w);
-            for yy in 0..h {
-                for xx in 0..w {
-                    let tok = yy * w + xx;
-                    for c in 0..3 {
-                        for py in 0..PATCH {
-                            for px in 0..PATCH {
-                                let v = val(tok * first_n + (c * PATCH + py) * PATCH + px);
-                                clip.data[((c * frames + f0) * ph + yy * PATCH + py) * pw + xx * PATCH + px] = v;
-                                for l in 1..lat {
-                                    for pt in 0..PATCH_T {
-                                        let v = val(hw * first_n + ((l - 1) * hw + tok) * rest_n + ((c * PATCH_T + pt) * PATCH + py) * PATCH + px);
-                                        let f = f0 + FIRST_T + (l - 1) * PATCH_T + pt;
-                                        clip.data[((c * frames + f) * ph + yy * PATCH + py) * pw + xx * PATCH + px] = v;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            f0 += FIRST_T + (lat - 1) * PATCH_T;
-        }
-        st.sync()?;
-        let plane = frames * clip.h * clip.w;
-        for c in 0..3 {
-            for v in &mut clip.data[c * plane..][..plane] {
-                *v = f16::from_f32(((*v * COLOR_STD[c] + COLOR_MEAN[c]).clamp(-1.0, 1.0) + 1.0) * 0.5).to_f32();
-            }
+            // the patches to their pixels, through the color codec, rounded to fp16
+            let bf = FIRST_T + (lat - 1) * PATCH_T;
+            k!(gpu_dwd_unpatch(out.ptr(), h as i32, w as i32, bf as i32, pix.ptr(), frames as i32, f0 as i32, COLOR_MEAN.as_ptr(), COLOR_STD.as_ptr(), s(st)))?;
+            f0 += bf;
         }
         self.prof.mark("head", st)?;
+        let t0 = std::time::Instant::now();
+        let mut half = vec![f16::ZERO; clip.data.len()];
+        pix.download(0, unsafe { std::slice::from_raw_parts_mut(half.as_mut_ptr().cast::<u8>(), half.len() * 2) }, st)?;
+        half.convert_to_f32_slice(&mut clip.data);
+        self.prof.host("download", t0);
         self.prof.report("dwd", st)?;
         Ok(clip)
     }

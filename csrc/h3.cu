@@ -1,6 +1,7 @@
 // MiniMax H3: its weight formats, split-half RoPE on part of a head, and the audio decoder's 1-D ops.
 #include "common.cuh"
 #include <cuda_fp8.h>
+#include <algorithm>
 
 __device__ __forceinline__ float e4m3(uint8_t v) { return __half2float(__nv_cvt_fp8_to_halfraw(v, __NV_E4M3)); }
 
@@ -87,27 +88,264 @@ GPU_API int gpu_nvfp4_dequant(const void* q, const void* scales, float scale2, c
 }
 
 // ---------------------------------------------------------------------------------------------
+// out[M, N] = A[M, K] . W^T (+ beta * out), f32, with W decoded from nvfp4 on the fly, to the values
+// gpu_nvfp4_dequant writes: for short prompts, where writing and reading back the f32 weights costs far more than the
+// products. W may be up to three weights side by side in N (q, k and v; gate and up), each its own tensor. Tiles of
+// BM rows by 64 columns, 128 threads of TM x 4; split along K into `ws`, summed in order by nvfp4_splits_kernel.
+// ---------------------------------------------------------------------------------------------
+struct NvWeights {
+    const uint8_t* q[3];
+    const uint8_t* sc[3];
+    const bf16* pre[3];
+    float scale2[3];
+    int n[3];
+    int count;
+};
+
+template <int BM>
+__global__ void __launch_bounds__(128) nvfp4_gemm_kernel(const float* __restrict__ A, int64_t lda, int M, int K, NvWeights wt, float* out, int64_t ldd,
+                                                         float beta, float* ws, int64_t ntot, int kc) {
+    constexpr int BN = 64, BK = 32, TM = BM / 8;
+    __shared__ __align__(16) float As[BK][BM];
+    __shared__ __align__(16) float Ws[BK][BN];
+    __shared__ float lut[16];
+    const int t = threadIdx.x, tm = t >> 4, tn = t & 15;
+    if (t < 16) lut[t] = kE2M1[t];
+    const int col0 = blockIdx.x * BN;
+    int si = 0, base = 0;
+    while (si < wt.count - 1 && col0 >= base + wt.n[si]) base += wt.n[si++];
+    const uint8_t* sc = wt.sc[si];
+    const bf16* pre = wt.pre[si];
+    const float scale2 = wt.scale2[si];
+    const int m0 = blockIdx.y * BM, k0 = blockIdx.z * kc, k1 = min(K, k0 + kc);
+    // this thread decodes 16 values of weight row `n` per tile, the tile's first or second group
+    const int wn = t & 63, wg = t >> 6, n = col0 - base + wn;
+    const uint8_t* qrow = wt.q[si] + (int64_t)n * (K / 2);
+    const int64_t cblocks = (K / 16 + 3) / 4, tbase = (int64_t)(n / 128) * cblocks;
+    const int rr = n % 128, sub = (rr % 32) * 16 + (rr / 32) * 4;
+    float acc[TM][4];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
+    __syncthreads();
+    for (int kb = k0; kb < k1; kb += BK) {
+#pragma unroll
+        for (int i = t; i < BM * BK; i += 128) {
+            const int mm = i / BK, kk = i % BK, m = m0 + mm;
+            As[kk][mm] = m < M ? A[(int64_t)m * lda + kb + kk] : 0.f;
+        }
+        {
+            const int c = kb / 16 + wg;
+            const uint2 qv = *reinterpret_cast<const uint2*>(qrow + c * 8);
+            const float total = rnd<bf16>(scale2 * rnd<bf16>(e4m3(sc[(tbase + c / 4) * 512 + sub + c % 4])));
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                const unsigned v = ((b < 4 ? qv.x : qv.y) >> ((b & 3) * 8)) & 0xFF;
+                float a = rnd<bf16>(lut[v >> 4] * total), d = rnd<bf16>(lut[v & 15] * total);
+                if (pre) {
+                    a *= __bfloat162float(pre[c * 16 + 2 * b]);
+                    d *= __bfloat162float(pre[c * 16 + 2 * b + 1]);
+                }
+                Ws[wg * 16 + 2 * b][wn] = a;
+                Ws[wg * 16 + 2 * b + 1][wn] = d;
+            }
+        }
+        __syncthreads();
+#pragma unroll 8
+        for (int kk = 0; kk < BK; ++kk) {
+            const float4 w = *reinterpret_cast<const float4*>(&Ws[kk][tn * 4]);
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                const float a = As[kk][tm * TM + i];
+                acc[i][0] = fmaf(a, w.x, acc[i][0]);
+                acc[i][1] = fmaf(a, w.y, acc[i][1]);
+                acc[i][2] = fmaf(a, w.z, acc[i][2]);
+                acc[i][3] = fmaf(a, w.w, acc[i][3]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int m = m0 + tm * TM + i;
+        if (m >= M) continue;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int64_t col = col0 + tn * 4 + j;
+            if (ws) {
+                ws[((int64_t)blockIdx.z * M + m) * ntot + col] = acc[i][j];
+            } else {
+                float* o = out + (int64_t)m * ldd + col;
+                *o = beta != 0.f ? acc[i][j] + beta * *o : acc[i][j];
+            }
+        }
+    }
+}
+
+__global__ void nvfp4_splits_kernel(const float* ws, int splits, int M, int64_t ntot, float* out, int64_t ldd, float beta) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)M * ntot) return;
+    const int64_t m = i / ntot, col = i % ntot;
+    float s = ws[i];
+    for (int z = 1; z < splits; ++z) s += ws[(int64_t)z * M * ntot + i];
+    float* o = out + m * ldd + col;
+    *o = beta != 0.f ? s + beta * *o : s;
+}
+
+// `count` weights of `n[i]` rows (multiples of 64) by K (a multiple of 32); `ws` takes splits x M x sum(n) floats
+GPU_API int gpu_nvfp4_gemm(const float* A, int64_t lda, int M, int K, const void* const* q, const void* const* sc, const void* const* pre,
+                           const float* scale2, const int* n, int count, float* out, int64_t ldd, float beta, float* ws, int64_t ws_bytes, void* stream) {
+    if (count < 1 || count > 3 || K % 32 || M < 1) return -1;
+    NvWeights wt{};
+    int64_t ntot = 0;
+    for (int i = 0; i < count; ++i) {
+        if (n[i] % 64) return -1;
+        wt.q[i] = (const uint8_t*)q[i];
+        wt.sc[i] = (const uint8_t*)sc[i];
+        wt.pre[i] = (const bf16*)pre[i];
+        wt.scale2[i] = scale2[i];
+        wt.n[i] = n[i];
+        ntot += n[i];
+    }
+    wt.count = count;
+    const int bm = M <= 16 ? 16 : M <= 32 ? 32 : 64;
+    const int mt = (M + bm - 1) / bm;
+    // enough blocks to cover the SMs about four times, each K split at least 512 wide
+    int sms = 0, dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    const int64_t tiles = (ntot / 64) * mt;
+    int splits = (int)std::min<int64_t>(std::max<int64_t>(1, (4 * sms + tiles - 1) / tiles), K / 512);
+    while (splits > 1 && (int64_t)splits * M * ntot * 4 > ws_bytes) --splits;
+    if (splits < 1) splits = 1;
+    const int kc = ((K + splits - 1) / splits + 31) / 32 * 32;
+    splits = (K + kc - 1) / kc;
+    float* w = splits > 1 ? ws : nullptr;
+    const dim3 grid((unsigned)(ntot / 64), (unsigned)mt, (unsigned)splits);
+    cudaStream_t s = (cudaStream_t)stream;
+    if (bm == 16) nvfp4_gemm_kernel<16><<<grid, 128, 0, s>>>(A, lda, M, K, wt, out, ldd, beta, w, ntot, kc);
+    else if (bm == 32) nvfp4_gemm_kernel<32><<<grid, 128, 0, s>>>(A, lda, M, K, wt, out, ldd, beta, w, ntot, kc);
+    else nvfp4_gemm_kernel<64><<<grid, 128, 0, s>>>(A, lda, M, K, wt, out, ldd, beta, w, ntot, kc);
+    KCHECK();
+    if (w) {
+        const int64_t total = (int64_t)M * ntot;
+        nvfp4_splits_kernel<<<(unsigned)((total + 255) / 256), 256, 0, s>>>(w, splits, M, ntot, out, ldd, beta);
+        KCHECK();
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Per-head RMSNorm with a weight, then split-half RoPE on the first 2*pairs dims, bf16 in place.
 // x [L, H, d] with rows `stride` and heads `hs` elements apart; rope [L][pairs][(cos, sin)]; w may be null.
 // ---------------------------------------------------------------------------------------------
-__global__ void rope_bf16_kernel(bf16* x, int64_t stride, int64_t hs, const float* w, float eps, const float* rope, int H, int d, int pairs) {
-    __shared__ float red[33];
-    const int t = blockIdx.x / H, h = blockIdx.x % H, i = threadIdx.x;
+// A warp per head, its d / 32 values strided by 32 over the lanes, as the old block of d threads held them: the sum
+// of squares reduces in the same order, so the results are the same bits. `ew` stages the head for the pair partners.
+__global__ void rope_bf16_kernel(bf16* x, int64_t stride, int64_t hs, const float* w, float eps, const float* rope, int L, int H, int d, int pairs) {
+    __shared__ float ew[8][128];
+    const int lane = threadIdx.x & 31, wi = threadIdx.x >> 5;
+    const int64_t head = (int64_t)blockIdx.x * (blockDim.x >> 5) + wi;
+    if (head >= (int64_t)L * H) return;
+    const int t = (int)(head / H), h = (int)(head % H), nw = d >> 5;
     bf16* v = x + (int64_t)t * stride + (int64_t)h * hs;
-    const float e = __bfloat162float(v[i]);
-    const float rstd = rsqrtf(block_sum(e * e, red) / (float)d + eps);
-    const float wi = w ? w[i] : 1.f;
-    if (i < pairs) {
-        const float* r = rope + ((int64_t)t * pairs + i) * 2;
-        const float a = rnd<bf16>(e * rstd * wi), b = rnd<bf16>(__bfloat162float(v[i + pairs]) * rstd * (w ? w[i + pairs] : 1.f));
-        v[i] = __float2bfloat16_rn(a * r[0] - b * r[1]);
-        v[i + pairs] = __float2bfloat16_rn(b * r[0] + a * r[1]);
-    } else if (i >= 2 * pairs) {
-        v[i] = __float2bfloat16_rn(e * rstd * wi);
+    float* e = ew[wi];
+    float part[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        if (j < nw) {
+            const float a = __bfloat162float(v[j * 32 + lane]);
+            e[j * 32 + lane] = a;
+            part[j] = warp_sum(a * a);
+        }
+    }
+    // block_sum's second stage: the warps' sums in the first lanes, the rest zero
+    float tot = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        if (j < nw && lane == j) tot = part[j];
+    const float rstd = rsqrtf(warp_sum(tot) / (float)d + eps);
+    __syncwarp();
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        if (j >= nw) continue;
+        const int i = j * 32 + lane;
+        if (i < 2 * pairs) {
+            const int p = i < pairs ? i : i - pairs;
+            const float* r = rope + ((int64_t)t * pairs + p) * 2;
+            const float a = rnd<bf16>(e[p] * rstd * (w ? w[p] : 1.f)), b = rnd<bf16>(e[p + pairs] * rstd * (w ? w[p + pairs] : 1.f));
+            if (i < pairs) v[i] = __float2bfloat16_rn(a * r[0] - b * r[1]);
+            else v[i] = __float2bfloat16_rn(b * r[0] + a * r[1]);
+        } else {
+            v[i] = __float2bfloat16_rn(e[i] * rstd * (w ? w[i] : 1.f));
+        }
     }
 }
 GPU_API int gpu_rope_bf16(void* x, int64_t stride, int64_t hs, const float* w, float eps, const float* rope, int L, int H, int d, int pairs, void* stream) {
-    rope_bf16_kernel<<<L * H, d, 0, (cudaStream_t)stream>>>((bf16*)x, stride, hs, w, eps, rope, H, d, pairs);
+    if (d % 32 || d > 128) return -1;
+    const int64_t heads = (int64_t)L * H;
+    rope_bf16_kernel<<<(unsigned)((heads + 7) / 8), 256, 0, (cudaStream_t)stream>>>((bf16*)x, stride, hs, w, eps, rope, L, H, d, pairs);
+    KCHECK();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The DWD pixel head's patches of one native block to frames: `out` bf16 holds the first latent's `hw` tokens of
+// 3x16x16 values, then the other latents' tokens of 3x4x16x16 (c, t, y, x). Each pixel goes through the head's color
+// codec, std * v + mean to [-1, 1] then to 0..1, into fp16 `clip` [3, frames, 16h, 16w] at frame f0.
+// ---------------------------------------------------------------------------------------------
+__global__ void dwd_unpatch_kernel(const bf16* out, int h, int w, int bf, half* clip, int frames, int f0, float m0, float m1, float m2,
+                                   float s0, float s1, float s2) {
+    const int H = h * 16, W = w * 16, hw = h * w;
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)3 * bf * H * W) return;
+    const int X = (int)(i % W), Y = (int)((i / W) % H);
+    const int fb = (int)((i / ((int64_t)W * H)) % bf), c = (int)(i / ((int64_t)W * H * bf));
+    const int tok = (Y >> 4) * w + (X >> 4), py = Y & 15, px = X & 15;
+    int64_t src;
+    if (fb == 0) {
+        src = (int64_t)tok * 768 + (c * 16 + py) * 16 + px;
+    } else {
+        const int l = (fb - 1) >> 2, pt = (fb - 1) & 3;
+        src = (int64_t)hw * 768 + ((int64_t)l * hw + tok) * 3072 + ((c * 4 + pt) * 16 + py) * 16 + px;
+    }
+    const float mean = c == 0 ? m0 : c == 1 ? m1 : m2, sd = c == 0 ? s0 : c == 1 ? s1 : s2;
+    // unfused, as the host computed it
+    const float v = fminf(1.f, fmaxf(-1.f, __fadd_rn(__fmul_rn(__bfloat162float(out[src]), sd), mean)));
+    clip[(((int64_t)c * frames + f0 + fb) * H + Y) * W + X] = __float2half_rn(__fmul_rn(__fadd_rn(v, 1.f), 0.5f));
+}
+GPU_API int gpu_dwd_unpatch(const void* out, int h, int w, int bf, void* clip, int frames, int f0, const float* mean, const float* sd, void* stream) {
+    const int64_t n = (int64_t)3 * bf * h * 16 * w * 16;
+    dwd_unpatch_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const bf16*)out, h, w, bf, (half*)clip, frames, f0, mean[0], mean[1], mean[2], sd[0], sd[1],
+                                                                                    sd[2]);
+    KCHECK();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// x[r] += gate[r] * y[r], bf16 rows of `cols`, each row's gate the row `sel[r]` of `gates`: a residual GEMM's epilogue
+// (gpu_int8_gemm_residual) after a plain GEMM of every row, when the rows' gates differ. Rounded as that epilogue rounds:
+// y is the plain GEMM's bf16 output, the product and the sum stay f32, then bf16.
+// ---------------------------------------------------------------------------------------------
+__global__ void add_gated_rows_kernel(bf16* x, const bf16* y, const bf16* gates, const int* sel, int64_t rows, int cols) {
+    const int64_t i = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (i >= rows * cols) return;
+    const int64_t r = i / cols;
+    const int c = (int)(i % cols);
+    const uint4 yv = *reinterpret_cast<const uint4*>(y + i);
+    const uint4 gv = *reinterpret_cast<const uint4*>(gates + (int64_t)sel[r] * cols + c);
+    uint4 xv = *reinterpret_cast<const uint4*>(x + i);
+    const bf16* yb = reinterpret_cast<const bf16*>(&yv);
+    const bf16* gb = reinterpret_cast<const bf16*>(&gv);
+    bf16* xb = reinterpret_cast<bf16*>(&xv);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) xb[j] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(__bfloat162float(gb[j]), __bfloat162float(yb[j])), __bfloat162float(xb[j])));
+    *reinterpret_cast<uint4*>(x + i) = xv;
+}
+GPU_API int gpu_add_gated_rows_bf16(void* x, const void* y, const void* gates, const int* sel, int rows, int cols, void* stream) {
+    if (cols % 8) return -1;
+    const int64_t n = (int64_t)rows * cols / 8;
+    add_gated_rows_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((bf16*)x, (const bf16*)y, (const bf16*)gates, sel, rows, cols);
     KCHECK();
     return 0;
 }
@@ -133,7 +371,66 @@ __global__ void conv1d_kernel(const float* x, const float* w, const float* bias,
     }
     out[i] = acc + (bias ? bias[c] : 0.f);
 }
+// conv1d_kernel in tiles of 32 output channels by 64 samples, staged through shared memory, for the wide layers. Each
+// output sums in the same order, taps outer and input channels inner, so the results are the same bits.
+__global__ void __launch_bounds__(256) conv1d_tiled_kernel(const float* x, const float* w, const float* bias, float* out, int Ci, int Co, int T, int K, int dil,
+                                                           int pad) {
+    constexpr int CT = 32, TT = 64, CC = 16;
+    __shared__ float xs[CC][TT];
+    __shared__ float wsm[CT][CC + 1];
+    const int tid = threadIdx.x, cy = tid >> 5, tx = tid & 31;
+    const int t0 = blockIdx.x * TT, c0 = blockIdx.y * CT, b = blockIdx.z;
+    const float* xb = x + (int64_t)b * Ci * T;
+    float acc[4][2] = {};
+    for (int k = 0; k < K; ++k) {
+        const int shift = k * dil - pad;
+        // a tap past either end adds nothing, as the plain kernel skips it
+        bool in[2];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int s = t0 + tx + 32 * j + shift;
+            in[j] = s >= 0 && s < T;
+        }
+        for (int ci0 = 0; ci0 < Ci; ci0 += CC) {
+            __syncthreads();
+            for (int i = tid; i < CC * TT; i += 256) {
+                const int ci = i / TT, tt = i % TT, s = t0 + tt + shift;
+                xs[ci][tt] = (ci0 + ci < Ci && s >= 0 && s < T) ? xb[(int64_t)(ci0 + ci) * T + s] : 0.f;
+            }
+            for (int i = tid; i < CT * CC; i += 256) {
+                const int cc = i / CC, ci = i % CC;
+                wsm[cc][ci] = ci0 + ci < Ci ? w[((int64_t)(c0 + cc) * Ci + ci0 + ci) * K + k] : 0.f;
+            }
+            __syncthreads();
+            const int n = min(CC, Ci - ci0);
+            for (int ci = 0; ci < n; ++ci) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float wv = wsm[cy * 4 + i][ci];
+#pragma unroll
+                    for (int j = 0; j < 2; ++j)
+                        if (in[j]) acc[i][j] = fmaf(wv, xs[ci][tx + 32 * j], acc[i][j]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int c = c0 + cy * 4 + i;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int t = t0 + tx + 32 * j;
+            if (t < T) out[((int64_t)b * Co + c) * T + t] = acc[i][j] + (bias ? bias[c] : 0.f);
+        }
+    }
+}
 GPU_API int gpu_conv1d(const void* x, const void* w, const void* bias, void* out, int B, int Ci, int Co, int T, int K, int dil, int pad, void* stream) {
+    if (Co % 32 == 0) {
+        const dim3 grid((unsigned)((T + 63) / 64), (unsigned)(Co / 32), (unsigned)B);
+        conv1d_tiled_kernel<<<grid, 256, 0, (cudaStream_t)stream>>>((const float*)x, (const float*)w, (const float*)bias, (float*)out, Ci, Co, T, K, dil, pad);
+        KCHECK();
+        return 0;
+    }
     const int64_t n = (int64_t)B * Co * T;
     conv1d_kernel<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const float*)x, (const float*)w, (const float*)bias, (float*)out, B, Ci, Co, T, K, dil, pad);
     KCHECK();

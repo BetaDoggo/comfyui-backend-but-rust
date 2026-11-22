@@ -871,6 +871,12 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         let dit = if args.h3_image { args.model(&args.dit, H3_IMAGE_DIT) } else { dit };
         return run_h3_image(args, load, dit, te);
     }
+    if args.batch > 1 {
+        bail!("--batch on MiniMax H3: use --count for several clips, one after another");
+    }
+    if args.count > 1 && args.ref_noise.is_some() {
+        bail!("--ref-noise takes --count 1");
+    }
     let frames = h3::align_frames(args.frames);
     if args.width % 32 != 0 || args.height % 32 != 0 {
         bail!("MiniMax H3 needs a width and height in multiples of 32");
@@ -890,21 +896,8 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             Some(diffusion::h3window::ContextWindows::from_frames(l.trim().parse()?, o.trim().parse()?, diffusion::h3window::Fuse::Pyramid, true)?)
         }
     };
-    let mut noise = match &args.ref_noise {
-        Some(p) => {
-            let st = st::SafeTensors::open(p)?;
-            let mut v = st.f32_vec("noise0", false)?;
-            v.extend(st.f32_vec("noise1", false)?);
-            v
-        }
-        None => diffusion::sampling::torch_randn_streams(args.seed, &[shape.video_len(), shape.audio_len()]).concat(),
-    };
-    if let Some(w) = &windows {
-        w.freenoise(&mut noise, &shape, args.seed);
-    }
     // HyperFlow H3 Flash was distilled with euler; res_multistep also runs on it
     let default = if h3::hyperflow_config(&dit).is_some() { "euler" } else { "res_multistep" };
-    let sampling = args.sampling(default, ModelSampling::Flow { shift: h3::SHIFT_VIDEO }, args.seed, (args.width / 16, args.height / 16))?;
     let ms = ModelSampling::Flow { shift: h3::SHIFT_VIDEO };
     let method = match args.sparse.as_deref() {
         None => None,
@@ -939,63 +932,85 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         vae: Some(vae),
         keyframes,
     };
-    let r = pipeline::H3Request {
-        positive: vec![pipeline::Cond::plain(Prompt::text(&args.prompt))],
-        negative: vec![pipeline::Cond::plain(Prompt::text(&args.negative))],
-        shape,
-        sampling,
-        shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO),
-        noise,
-        sparse,
-        windows,
-        conds: vec![conds],
-        seed: args.seed,
-    };
-    let mut dump = pipeline::Dump::new();
-    let t0 = Instant::now();
-    let (latent, _) = gen.sample_h3(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
-    eprintln!("sampled in {:.2}s", t0.elapsed().as_secs_f64());
-    dump.insert("samples".into(), ("F32".into(), vec![latent.len()], st::f32_bytes(&latent).to_vec()));
-    if let Some(d) = &args.dump {
-        write_safetensors(d, &dump)?;
-    }
-    let t1 = Instant::now();
-    // a DWD adapter's pixel head already decoded the frames, in place of the VAE
-    let clip = match gen.take_h3_dwd_pixels() {
-        Some(c) => {
-            eprintln!("video from the DWD adapter's pixel head (no VAE decode)");
-            c
-        }
-        None => {
-            let c = gen.decode_h3(&args.model(&args.vae, H3_VAE), &latent, shape, frames)?;
-            eprintln!("video decoded in {:.2}s", t1.elapsed().as_secs_f64());
-            c
-        }
-    };
-    let t1 = Instant::now();
-    let wave = gen.decode_h3_audio(&args.model(&None, H3_AUDIO_VAE), &latent[shape.video_len()..], shape.audio_t)?;
-    eprintln!("audio decoded in {:.2}s", t1.elapsed().as_secs_f64());
-    let (h, w) = (clip.h, clip.w);
-    let mut frames_hwc = vec![0f32; frames * h * w * 3];
-    let mut rgb = vec![0u8; frames * h * w * 3];
-    for c in 0..3 {
-        for f in 0..frames {
-            for i in 0..h * w {
-                let v = clip.data[((c * frames + f) * h) * w + i];
-                frames_hwc[(f * h * w + i) * 3 + c] = v;
-                rgb[(f * h * w + i) * 3 + c] = (v * 255.0).round() as u8;
+    // clips one after another, each prompt with seed, seed + 1, ..., with the models loaded once
+    let prompts = args.prompts()?;
+    let total = prompts.len() * args.count;
+    for (pi, prompt) in prompts.iter().enumerate() {
+        for i in 0..args.count {
+            let seed = args.seed + i as u64;
+            let out = out_path(&args.out, pi * args.count + i, total);
+            let mut noise = match &args.ref_noise {
+                Some(p) => {
+                    let st = st::SafeTensors::open(p)?;
+                    let mut v = st.f32_vec("noise0", false)?;
+                    v.extend(st.f32_vec("noise1", false)?);
+                    v
+                }
+                None => diffusion::sampling::torch_randn_streams(seed, &[shape.video_len(), shape.audio_len()]).concat(),
+            };
+            if let Some(w) = &windows {
+                w.freenoise(&mut noise, &shape, seed);
             }
+            let sampling = args.sampling(default, ModelSampling::Flow { shift: h3::SHIFT_VIDEO }, seed, (args.width / 16, args.height / 16))?;
+            let r = pipeline::H3Request {
+                positive: vec![pipeline::Cond::plain(Prompt::text(prompt))],
+                negative: vec![pipeline::Cond::plain(Prompt::text(&args.negative))],
+                shape,
+                sampling,
+                shifts: (h3::SHIFT_VIDEO, h3::SHIFT_AUDIO),
+                noise,
+                sparse: sparse.clone(),
+                windows: windows.clone(),
+                conds: vec![conds.clone()],
+                seed,
+            };
+            let mut dump = pipeline::Dump::new();
+            let t0 = Instant::now();
+            let (latent, _) = gen.sample_h3(&r, |_| true, args.dump.as_ref().map(|_| &mut dump))?;
+            eprintln!("sampled in {:.2}s", t0.elapsed().as_secs_f64());
+            dump.insert("samples".into(), ("F32".into(), vec![latent.len()], st::f32_bytes(&latent).to_vec()));
+            if let Some(d) = &args.dump {
+                write_safetensors(d, &dump)?;
+            }
+            let t1 = Instant::now();
+            // a DWD adapter's pixel head already decoded the frames, in place of the VAE
+            let clip = match gen.take_h3_dwd_pixels() {
+                Some(c) => {
+                    eprintln!("video from the DWD adapter's pixel head (no VAE decode)");
+                    c
+                }
+                None => {
+                    let c = gen.decode_h3(&args.model(&args.vae, H3_VAE), &latent, shape, frames)?;
+                    eprintln!("video decoded in {:.2}s", t1.elapsed().as_secs_f64());
+                    c
+                }
+            };
+            let t1 = Instant::now();
+            let wave = gen.decode_h3_audio(&args.model(&None, H3_AUDIO_VAE), &latent[shape.video_len()..], shape.audio_t)?;
+            eprintln!("audio decoded in {:.2}s", t1.elapsed().as_secs_f64());
+            let (h, w) = (clip.h, clip.w);
+            let mut frames_hwc = vec![0f32; frames * h * w * 3];
+            let mut rgb = vec![0u8; frames * h * w * 3];
+            for c in 0..3 {
+                for f in 0..frames {
+                    for i in 0..h * w {
+                        let v = clip.data[((c * frames + f) * h) * w + i];
+                        frames_hwc[(f * h * w + i) * 3 + c] = v;
+                        rgb[(f * h * w + i) * 3 + c] = (v * 255.0).round() as u8;
+                    }
+                }
+            }
+            let samples = wave.len() / 2;
+            let stereo: Vec<f32> = (0..samples).flat_map(|i| [wave[i], wave[samples + i]]).collect();
+            dump.insert("frames".into(), ("F32".into(), vec![1, frames, h, w, 3], st::f32_bytes(&frames_hwc).to_vec()));
+            dump.insert("wave".into(), ("F32".into(), vec![1, samples, 2], st::f32_bytes(&stereo).to_vec()));
+            if let Some(d) = &args.dump {
+                write_safetensors(d, &dump)?;
+            }
+            write_video(&out, &rgb, w, h, &stereo)?;
+            eprintln!("saved {} ({frames} frames at 24 fps, seed {seed}), {:.1}s in all", out.display(), t_all.elapsed().as_secs_f64());
         }
     }
-    let samples = wave.len() / 2;
-    let stereo: Vec<f32> = (0..samples).flat_map(|i| [wave[i], wave[samples + i]]).collect();
-    dump.insert("frames".into(), ("F32".into(), vec![1, frames, h, w, 3], st::f32_bytes(&frames_hwc).to_vec()));
-    dump.insert("wave".into(), ("F32".into(), vec![1, samples, 2], st::f32_bytes(&stereo).to_vec()));
-    if let Some(d) = &args.dump {
-        write_safetensors(d, &dump)?;
-    }
-    write_video(&args.out, &rgb, w, h, &stereo)?;
-    eprintln!("saved {} ({frames} frames at 24 fps, seed {}), {:.1}s in all", args.out.display(), args.seed, t_all.elapsed().as_secs_f64());
     Ok(())
 }
 

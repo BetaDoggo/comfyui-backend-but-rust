@@ -451,6 +451,12 @@ The first video decode reads 2.4 GB from the file, about 23 s on this drive.
 Baking the LoRA adds about 11 s when it changes, and text encoding from a cold disk takes about 140 s on both engines, as the drive reads at about 100 MB/s.
 ComfyUI's text encoding took 151 s cold.
 
+A prompt of up to 128 tokens multiplies the encoder's nvfp4 weights as it decodes them, rather than writing each weight
+out as float32 for cuBLAS; longer prompts, where cuBLAS is faster, still do that. With the models warm, a new short
+prompt then encoded in 0.55 to 0.58 s, against 0.87 to 1.0 s before, which is about what copying the encoder's 13 GB to
+the card takes. Its output moved by 3e-7 relative. The token refiner's int8 activations round that differently, so the
+context moved by 1.3% and the clips by as much as two runs of the two engines differ; see [pi-H3](#pi-h3).
+
 Longer clips, per step once warm, 4 turbo LoRA steps, against ComfyUI run with SwarmUI's flags (`--fast --use-ck-attention`,
 comfy-kitchen's int8 attention):
 
@@ -638,18 +644,32 @@ Against ComfyUI-piFlow on SwarmUI's ComfyUI (`tools/pih3_ref.py`), seed 42, the 
 
 | | 512x512, 5 frames | 512x384, 22 frames |
 |---|---|---|
-| Frames, CLI against ComfyUI | 28.1 dB | 28.0 dB |
+| Frames, CLI against ComfyUI | 28.1 dB | 28.7 dB |
 | DWD head alone, fed ComfyUI's features | about 60 dB, largest error 0.011 | 59.5 dB |
 | Frames, `comfy-server` over HTTP against ComfyUI | 26.2 to 26.6 dB | not run |
 
+The 22-frame figure was measured again after the text encoder's short-prompt path (see [MiniMax H3](#minimax-h3)): it was
+28.0 dB before, and the two versions' frames are 26 dB apart, with the same picture. The other figures are from before.
 Patched weights match ComfyUI's to bf16 rounding. The first evaluation is 9.8% from ComfyUI's on video, more than plain
 H3's, and block by block the gap grows steadily with no single block standing out, so it reads as rounding through 50
 blocks rather than a mapping error. The server's frames are about 28 dB from the CLI's with the same picture, and two
 server runs are bit-identical; what differs between the two paths wasn't tracked down.
 
-Timings on this machine, warm: at 512x384, 22 frames, 1.36 s for the two evaluations and 0.78 s for the DWD head,
-against 15.08 s for ComfyUI's sampling. Through the server at 512x512, 5 frames, 0.72 s sampling; the head took 2.0 s on
-its first run and 0.05 s after. Cold, baking the adapter took 25 to 51 s. The table is the 2-step adapter's; the
+Timings on this machine at 512x384, 22 frames, warm: the CLI makes clip after clip with `-n` and `--prompt-file`, and
+these are the clips after the first, against the earlier build run the same way:
+
+| Stage | Here | Before |
+|---|---|---|
+| Two evaluations | 0.79 to 1.07 s | 0.81 to 0.98 s |
+| DWD head | 0.06 to 0.09 s | 0.14 to 0.17 s |
+| Audio decode | 0.06 to 0.08 s | 0.09 to 0.13 s |
+| Encoding a new prompt | 0.55 to 0.58 s | 0.87 to 1.0 s |
+| Baking the adapter, file cached | 5.2 s | 9.4 s |
+
+The evaluations' spread is the card's: the same work ran 60% slower in some clips than others, through both builds.
+The maintainer confirmed this build in SwarmUI itself.
+ComfyUI's sampling took 15.08 s. Earlier, through the server at 512x512, 5 frames: 0.72 s sampling, and the head took
+2.0 s on its first run and 0.05 s after. Cold, baking the adapter took 25 to 51 s. The table is the 2-step adapter's; the
 4-step one has the same layout and loads through the same path, but hasn't been compared with ComfyUI. Both work in
 SwarmUI itself. Not tried: the adapters without DWD, anything larger than 512x512 or longer than 22 frames. Audio not
 judged by ear.

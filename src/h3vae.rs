@@ -917,10 +917,10 @@ const UPS: [(usize, usize); 7] = [(5, 9), (5, 9), (2, 4), (2, 4), (2, 4), (2, 4)
 const KERNELS: [usize; 3] = [3, 7, 11];
 const DILATIONS: [usize; 3] = [1, 3, 5];
 
-/// The audio decoder's weights, held in RAM between clips.
+/// The audio decoder's weights, held in page-locked RAM between clips: each clip copies them to VRAM at full speed.
 pub struct AudioDecoder {
     gl: Layout,
-    host: Vec<u8>,
+    host: crate::cuda::PinnedBuf,
     mean: Vec<f32>,
     std: Vec<f32>,
 }
@@ -934,8 +934,8 @@ impl AudioDecoder {
                 gl.raw(&f, name, std::slice::from_ref(name))?;
             }
         }
-        let mut host = vec![0u8; gl.size];
-        gl.pack(&f, &mut host)?;
+        let mut host = crate::cuda::PinnedBuf::alloc(gl.size)?;
+        gl.pack(&f, host.as_mut_slice())?;
         Ok(AudioDecoder { gl, host, mean: f.f32_vec("latents_mean", false)?, std: f.f32_vec("latents_std", false)? })
     }
 }
@@ -943,8 +943,12 @@ impl AudioDecoder {
 /// Audio latents [32, 2, t] -> stereo samples [2, 800 t], in -1..1.
 pub fn decode_audio(dec: &AudioDecoder, latent: &[f32], t: usize, st: &Stream) -> Result<Vec<f32>> {
     let (gl, mean, std) = (&dec.gl, &dec.mean, &dec.std);
+    let prof = std::cell::RefCell::new(crate::prof::Prof::new());
+    let mark = |stage: &'static str| prof.borrow_mut().mark(stage, st);
+    mark("start")?;
     let w = DevBuf::alloc_async(gl.size, st)?;
-    w.upload(0, &dec.host, st)?;
+    crate::cuda::memcpy_h2d(w.ptr(), dec.host.ptr(), gl.size, st)?;
+    mark("upload")?;
     let g = |n: &str| w.at(gl.off(n));
     let mut z = vec![0f32; 2 * 32 * t];
     for b in 0..2 {
@@ -960,12 +964,15 @@ pub fn decode_audio(dec: &AudioDecoder, latent: &[f32], t: usize, st: &Stream) -
         let o = DevBuf::alloc_async(2 * co * t * 4, st)?;
         let bias: crate::ffi::P = b_.map_or(null(), |n| g(n) as crate::ffi::P);
         k!(gpu_conv1d(x, g(w_), bias, o.ptr(), 2, ci as i32, co as i32, t as i32, kk as i32, dil as i32, ((kk - 1) * dil / 2) as i32, s(st)))?;
+        mark("conv")?;
         Ok(o)
     };
     let act = |x: &DevBuf, p: &str, c: usize, t: usize| -> Result<()> {
         let tmp = DevBuf::alloc_async(2 * c * 2 * t * 4, st)?;
-        k!(gpu_aa_snake(x.ptr(), g(&format!("{p}.act.alpha")), g(&format!("{p}.act.beta")), g(&format!("{p}.upsample.filter")), g(&format!("{p}.downsample.lowpass.filter")), tmp.ptr(), 2, c as i32, t as i32, s(st)))
+        k!(gpu_aa_snake(x.ptr(), g(&format!("{p}.act.alpha")), g(&format!("{p}.act.beta")), g(&format!("{p}.upsample.filter")), g(&format!("{p}.downsample.lowpass.filter")), tmp.ptr(), 2, c as i32, t as i32, s(st)))?;
+        mark("snake")
     };
+    mark("in")?;
     let mut x = conv(x0.ptr(), "dec_in_proj.weight", Some("dec_in_proj.bias"), 32, 2048, t, 1, 1)?;
     x = conv(x.ptr(), "decoder.conv_pre.weight", Some("decoder.conv_pre.bias"), 2048, 1024, t, 7, 1)?;
     let (mut ch, mut len) = (1024, t);
@@ -974,6 +981,7 @@ pub fn decode_audio(dec: &AudioDecoder, latent: &[f32], t: usize, st: &Stream) -
         let tout = (len - 1) * u + kk - 2 * ((kk - u) / 2);
         let o = DevBuf::alloc_async(2 * co * tout * 4, st)?;
         k!(gpu_conv_t1d(x.ptr(), g(&format!("decoder.ups.{i}.0.weight")), g(&format!("decoder.ups.{i}.0.bias")), o.ptr(), 2, ch as i32, co as i32, len as i32, *kk as i32, *u as i32, ((kk - u) / 2) as i32, s(st)))?;
+        mark("ups")?;
         (x, ch, len) = (o, co, tout);
         let n = (2 * ch * len) as i64;
         let sum = DevBuf::alloc_async(n as usize * 4, st)?;
@@ -1000,12 +1008,14 @@ pub fn decode_audio(dec: &AudioDecoder, latent: &[f32], t: usize, st: &Stream) -
         }
         let (p, co) = ([sum.ptr() as crate::ffi::P], [1.0f32 / 3.0]);
         k!(gpu_lincomb(sum.ptr(), n, 1, p.as_ptr(), co.as_ptr(), s(st)))?;
+        mark("add")?;
         x = sum;
     }
     act(&x, "decoder.activation_post", ch, len)?;
     let o = conv(x.ptr(), "decoder.conv_post.weight", None, ch, 1, len, 7, 1)?;
     let mut raw = vec![0u8; 2 * len * 4];
     o.download(0, &mut raw, st)?;
+    prof.borrow_mut().report("audio", st)?;
     Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).clamp(-1.0, 1.0)).collect())
 }
 

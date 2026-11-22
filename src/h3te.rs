@@ -1,7 +1,7 @@
 //! MiniMax H3 text encoder: Qwen3-VL 32B language model cut to 50 layers (nvfp4 AWQ weights), fp32
 //! activations like ComfyUI's full_precision_mm path. Conditioning is the hidden state after the
-//! last layer, with no final norm. Weights are decoded to f32 for each use, so the encoder only
-//! needs VRAM for one layer and streams the rest. Pictures come from the vision tower in the same file: their tokens
+//! last layer, with no final norm. Weights are decoded to f32 values for each use, as they are read for a short prompt,
+//! so the encoder only needs VRAM for one layer and streams the rest. Pictures come from the vision tower in the same file: their tokens
 //! take the place of `<|image_pad|>` ids, with MRoPE positions and DeepStack features, as in Qwen3-VL.
 
 use crate::cuda::{memcpy_2d_d2d, memcpy_2d_d2h, memcpy_d2d, memcpy_h2d, DevBuf, PinnedBuf, Stream};
@@ -28,6 +28,11 @@ pub const VISION_END: u32 = 151653;
 /// stands for one picture's tokens in the ids
 pub const IMAGE_PAD: u32 = 151655;
 const MODULES: [&str; 7] = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"];
+/// Output columns of each of the modules.
+const COLS: [usize; 7] = [HQ * HD, HK * HD, HK * HD, D, FF, FF, D];
+/// Prompts of up to this many tokens run [`crate::ffi::gpu_nvfp4_gemm`], which decodes the weights as it reads them;
+/// longer ones decode each weight to f32 for cuBLAS, which is faster past about this many rows.
+const FUSED_ROWS: usize = 128;
 
 /// Bytes of one token's keys and values in a layer.
 const KV: usize = 2 * HK * HD * 4;
@@ -202,7 +207,8 @@ impl TextEncoder {
         let rope_rows = off(rope_d.ptr(), kept * HD * 4);
 
         let n = DevBuf::alloc_async(rows * D * 4, st)?;
-        let wf = DevBuf::alloc_async(FF * D * 4, st)?;
+        // a long prompt's f32 weights, or a short one's split sums
+        let wf = DevBuf::alloc_async(if rows <= FUSED_ROWS { 16 << 20 } else { FF * D * 4 }, st)?;
         let qkv = DevBuf::alloc_async(rows * QKV * 4, st)?;
         let attn = DevBuf::alloc_async(rows * HQ * HD * 4, st)?;
         let gu = DevBuf::alloc_async(rows * 2 * FF * 4, st)?;
@@ -225,17 +231,33 @@ impl TextEncoder {
             let lay = &self.ws.layouts[i];
             let w = |key: &str| off(base, lay.off(key));
             let sc2 = self.scales[i];
-            // out[.., cols] = a[rows, kk] @ W^T, with a row stride of `ldd` in `out`
-            let lin = |a: PM, j: usize, pre: P, cols: usize, kk: usize, out: PM, ldd: usize, beta: f32| -> Result<()> {
-                k!(gpu_nvfp4_dequant(w(&format!("w{j}")), w(&format!("s{j}")), sc2[j], pre, wf.ptr(), cols as i64, kk as i32, s(st)))?;
-                prof.borrow_mut().mark("dequant", st)?;
-                k!(gpu_gemm(a, kk as i64, wf.ptr(), kk as i64, out, ldd as i64, null(), rows as i64, cols as i64, kk as i64, 1, DT_F32, DT_F32, 1.0, beta, s(st)))?;
-                prof.borrow_mut().mark("gemm", st)
+            // out[.., cols] = a[rows, kk] @ W^T for the weights `js` side by side, with a row stride of `ldd` in `out`
+            let lin = |a: PM, js: &[usize], pre: P, kk: usize, out: PM, ldd: usize, beta: f32| -> Result<()> {
+                if rows <= FUSED_ROWS {
+                    // short prompts decode the weights as they read them, rather than writing and reading back f32 copies
+                    let ptrs = |p: &str| -> Vec<P> { js.iter().map(|j| w(&format!("{p}{j}")) as P).collect() };
+                    let (q, sc) = (ptrs("w"), ptrs("s"));
+                    let pres = vec![pre; js.len()];
+                    let s2: Vec<f32> = js.iter().map(|&j| sc2[j]).collect();
+                    let n: Vec<i32> = js.iter().map(|&j| COLS[j] as i32).collect();
+                    k!(gpu_nvfp4_gemm(a, kk as i64, m, kk as i32, q.as_ptr(), sc.as_ptr(), pres.as_ptr(), s2.as_ptr(), n.as_ptr(), js.len() as i32, out, ldd as i64, beta,
+                        wf.ptr(), wf.size() as i64, s(st)))?;
+                    return prof.borrow_mut().mark("gemm", st);
+                }
+                let mut col = 0;
+                for &j in js {
+                    let cols = COLS[j];
+                    k!(gpu_nvfp4_dequant(w(&format!("w{j}")), w(&format!("s{j}")), sc2[j], pre, wf.ptr(), cols as i64, kk as i32, s(st)))?;
+                    prof.borrow_mut().mark("dequant", st)?;
+                    k!(gpu_gemm(a, kk as i64, wf.ptr(), kk as i64, off(out, col * 4), ldd as i64, null(), rows as i64, cols as i64, kk as i64, 1, DT_F32, DT_F32, 1.0, beta,
+                        s(st)))?;
+                    prof.borrow_mut().mark("gemm", st)?;
+                    col += cols;
+                }
+                Ok(())
             };
             k!(gpu_prologue_rows(DT_F32, PRO_RMS, xp, d, null(), 0, 0, w("ln1"), EPS, null(), null(), n.ptr(), d, m, D as i32, s(st)))?;
-            lin(n.ptr(), 0, null(), HQ * HD, D, qkv.ptr(), QKV, 0.0)?;
-            lin(n.ptr(), 1, null(), HK * HD, D, keys, QKV, 0.0)?;
-            lin(n.ptr(), 2, null(), HK * HD, D, values, QKV, 0.0)?;
+            lin(n.ptr(), &[0, 1, 2], null(), D, qkv.ptr(), QKV, 0.0)?;
             k!(gpu_qk_norm_rope(DT_F32, HD as i32, qkv.ptr(), QKV as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32, w("qn"), w("kn"), EPS, rope_rows, 2, m, s(st)))?;
             if let Some(b) = &keep {
                 memcpy_2d_d2h(unsafe { b.ptr().add(i * l * KV) }, KV, keys, QKV * 4, KV, l, st)?;
@@ -251,12 +273,11 @@ impl TextEncoder {
                 _ => k!(gpu_attn_small(DT_F32, qkv.ptr(), QKV as i64, keys, values, QKV as i64, HQ as i32, HK as i32, HD as i32, m, m, attn.ptr(), (HQ * HD) as i64, scale, 1, s(st)))?,
             }
             prof.borrow_mut().mark("attn", st)?;
-            lin(attn.ptr(), 3, w("pre_o") as P, D, HQ * HD, xp, D, 1.0)?;
+            lin(attn.ptr(), &[3], w("pre_o") as P, HQ * HD, xp, D, 1.0)?;
             k!(gpu_prologue_rows(DT_F32, PRO_RMS, xp, d, null(), 0, 0, w("ln2"), EPS, null(), null(), n.ptr(), d, m, D as i32, s(st)))?;
-            lin(n.ptr(), 4, null(), FF, D, gu.ptr(), 2 * FF, 0.0)?;
-            lin(n.ptr(), 5, null(), FF, D, off(gu.ptr(), FF * 4), 2 * FF, 0.0)?;
+            lin(n.ptr(), &[4, 5], null(), D, gu.ptr(), 2 * FF, 0.0)?;
             k!(gpu_prologue_rows(DT_F32, PRO_SWIGLU, gu.ptr(), (2 * FF) as i64, null(), 0, FF as i64, null(), 0.0, null(), null(), act.ptr(), FF as i64, m, FF as i32, s(st)))?;
-            lin(act.ptr(), 6, w("pre_d") as P, D, FF, xp, D, 1.0)?;
+            lin(act.ptr(), &[6], w("pre_d") as P, FF, xp, D, 1.0)?;
             prof.borrow_mut().mark("other", st)?;
             self.ws.release(i, st)?;
             if let Some(d) = deepstack.get(i) {

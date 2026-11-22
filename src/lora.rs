@@ -2,7 +2,7 @@
 //! is dequantized to bf16, the patches are added in bf16, and it is requantized with fresh row scales
 //! and stochastic rounding seeded by the module's name. Sampling then runs the normal int8 kernels.
 
-use crate::cuda::{DevBuf, Stream};
+use crate::cuda::{memcpy_h2d, DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_BF16, DT_F32};
 use crate::lora_adapters::{self as adapters, Tensor, Work};
 use crate::offload::{Placed, Store, Stored};
@@ -567,6 +567,8 @@ struct Model<'a> {
     stores: Vec<Store<'a>>,
     /// model tensor -> (store, unit, place)
     places: HashMap<String, (usize, usize, Placed)>,
+    /// (store, unit) -> whether its image in RAM still holds the file's bytes where this pass hasn't written
+    clean: HashMap<(usize, usize), bool>,
 }
 
 impl Model<'_> {
@@ -581,6 +583,23 @@ impl Model<'_> {
 
     fn file_name(&self, tensor: &str) -> String {
         format!("{}{tensor}", self.prefix)
+    }
+
+    /// A raw tensor as the file holds it, on the device. It comes from its unit's page-locked image when that image is
+    /// the file's, which copies at full speed, else from the file's mapping. Each tensor is read before this pass
+    /// writes it, so an image that was the file's when the pass first looked still is, where it is read.
+    fn upload_original(&mut self, tensor: &str, st: &Stream) -> Result<DevBuf> {
+        let (store, unit, p) = self.place(tensor)?;
+        if matches!(p.kind, Stored::Raw) {
+            let image = self.stores[store].unit_image(unit)?;
+            let clean = *self.clean.entry((store, unit)).or_insert(image.is_some_and(|(_, rewritten)| !rewritten));
+            if let (true, Some((base, _))) = (clean, image) {
+                let d = DevBuf::alloc_async(p.len, st)?;
+                memcpy_h2d(d.ptr(), unsafe { base.add(p.off) }, p.len, st)?;
+                return Ok(d);
+            }
+        }
+        upload(self.st.bytes(&self.file_name(tensor))?, st)
     }
 
     /// Put a tensor back as the file holds it.
@@ -622,8 +641,8 @@ impl Model<'_> {
                 let stem = tensor.strip_suffix(".weight").ok_or_else(|| anyhow!("{tensor}: not a weight"))?;
                 let scale_name = format!("{stem}.weight_scale");
                 let sp = self.place(&scale_name)?;
-                let q = upload(self.st.bytes(&name)?, st)?;
-                let sc = upload(self.st.bytes(&self.file_name(&scale_name))?, st)?;
+                let q = self.upload_original(tensor, st)?;
+                let sc = self.upload_original(&scale_name, st)?;
                 k!(gpu_convrot_dequant(dt, q.ptr(), sc.ptr(), w.ptr(), rows as i64, per_row as i32, s(st)))?;
                 add_patches(&w, dt, rows, per_row, patches, files, tensor, st)?;
                 let seed = string_to_seed(&self.arch.module(stem));
@@ -656,9 +675,9 @@ impl Model<'_> {
         let (place, rp, cp) = (self.place(tensor)?, self.place(&rel)?, self.place(&chan)?);
         let rows = self.st.info(&self.file_name(tensor))?.shape[0];
         let per_row = self.st.info(&self.file_name(&rel))?.shape[1] * G;
-        let q = upload(self.st.bytes(&self.file_name(tensor))?, st)?;
-        let r = upload(self.st.bytes(&self.file_name(&rel))?, st)?;
-        let c = upload(self.st.bytes(&self.file_name(&chan))?, st)?;
+        let q = self.upload_original(tensor, st)?;
+        let r = self.upload_original(&rel, st)?;
+        let c = self.upload_original(&chan, st)?;
         let i8s = DevBuf::alloc_async(rows * per_row, st)?;
         let w = DevBuf::alloc_async(rows * per_row * 2, st)?;
         k!(gpu_w6_decode(q.ptr(), r.ptr(), i8s.ptr(), rows as i64, per_row as i32, G as i32, s(st)))?;
@@ -746,7 +765,7 @@ pub fn apply(arch: Arch, st: &SafeTensors, prefix: &str, mut stores: Vec<Store>,
         }
     }
     let restore: Vec<String> = state.baked.keys().filter(|k| !want.contains_key(*k)).cloned().collect();
-    let mut m = Model { arch, st, prefix, stores: std::mem::take(&mut stores), places };
+    let mut m = Model { arch, st, prefix, stores: std::mem::take(&mut stores), places, clean: HashMap::new() };
     for tensor in &restore {
         m.restore(tensor, s0)?;
         state.baked.remove(tensor);

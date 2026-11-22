@@ -190,6 +190,43 @@ impl Layout {
         Ok(())
     }
 
+    /// [`Self::pack`] with the file's tensors copied on several threads: a copy out of the mapping is paced by its
+    /// page faults, which threads take in parallel.
+    pub fn pack_parallel(&self, st: &SafeTensors, dst: &mut [u8]) -> Result<()> {
+        const PIECE: usize = 8 << 20;
+        // (source address, offset in `dst`, bytes)
+        let mut jobs: Vec<(usize, usize, usize)> = Vec::new();
+        for e in &self.entries {
+            match &e.src {
+                Src::Raw(names) => {
+                    let mut o = e.off;
+                    for n in names {
+                        let b = st.bytes(n)?;
+                        for c in (0..b.len()).step_by(PIECE) {
+                            jobs.push((b.as_ptr() as usize + c, o + c, PIECE.min(b.len() - c)));
+                        }
+                        o += b.len();
+                    }
+                    anyhow::ensure!(o <= e.off + e.len && e.off + e.len <= dst.len(), "a unit's tensors overrun its layout");
+                }
+                _ => Self::pack_entry(e, st, &mut dst[e.off..e.off + e.len])?,
+            }
+        }
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+        let (base, next) = (dst.as_mut_ptr() as usize, AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while let Some(&(src, off, len)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        // the jobs' destinations are disjoint ranges of `dst`, checked above, and `dst` outlives the scope
+                        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, (base + off) as *mut u8, len) };
+                    }
+                });
+            }
+        });
+        Ok(())
+    }
+
     /// This unit as it can go to VRAM from the file's mapping: its large raw tensors where they lie, page-locked, and
     /// the rest packed in a small buffer. None when much of it isn't stored as the unit reads it, or the driver won't
     /// lock the mapping.
@@ -292,6 +329,14 @@ impl Store<'_> {
         match self {
             Store::Set(w) => &w.layouts,
             Store::Buf(_, l) => std::slice::from_ref(*l),
+        }
+    }
+
+    /// [`WeightSet::unit_image`]; None for a plain buffer.
+    pub fn unit_image(&mut self, unit: usize) -> Result<Option<(*const u8, bool)>> {
+        match self {
+            Store::Set(w) => w.unit_image(unit),
+            Store::Buf(..) => Ok(None),
         }
     }
 
@@ -1022,6 +1067,22 @@ impl WeightSet {
         self.copy.sync()
     }
 
+    /// `unit`'s bytes in RAM, and whether they were ever rewritten. A lazy set packs its image from the file now if it
+    /// has none, as [`Self::write`] would on the unit's first change. None for a unit with no copy in RAM.
+    pub fn unit_image(&mut self, unit: usize) -> Result<Option<(*const u8, bool)>> {
+        let rewritten = self.rewritten[unit];
+        if let Some(l) = &self.lazy {
+            let mut image = l.images[unit].write().unwrap();
+            if !matches!(&*image, Some(Image::Pinned(_) | Image::Plain(_))) {
+                let mut b = Image::new(self.layouts[unit].size);
+                self.layouts[unit].pack_parallel(&l.st, &mut b.bytes().unwrap()[..self.layouts[unit].size])?;
+                *image = Some(b);
+            }
+            return Ok(image.as_mut().unwrap().bytes().map(|b| (b.as_ptr() as *const u8, rewritten)));
+        }
+        Ok(self.stores[unit].host.as_ref().map(|h| (h.ptr() as *const u8, rewritten)))
+    }
+
     /// Copy `len` bytes of `src` over every copy of `unit`. Call [`Self::restart_ring`] when done.
     fn write(&mut self, unit: usize, off: usize, src: &DevBuf, len: usize, st: &Stream) -> Result<()> {
         self.rewritten[unit] = true;
@@ -1033,7 +1094,7 @@ impl WeightSet {
             // a rewritten unit is no longer what the file holds
             if !matches!(&*image, Some(Image::Pinned(_) | Image::Plain(_))) {
                 let mut b = Image::new(self.layouts[unit].size);
-                self.layouts[unit].pack(&l.st, &mut b.bytes().unwrap()[..self.layouts[unit].size])?;
+                self.layouts[unit].pack_parallel(&l.st, &mut b.bytes().unwrap()[..self.layouts[unit].size])?;
                 *image = Some(b);
             }
             src.download(0, &mut image.as_mut().unwrap().bytes().unwrap()[off..off + len], st)?;

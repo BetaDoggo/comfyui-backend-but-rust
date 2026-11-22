@@ -14,8 +14,8 @@ RTX 5070 12 GB with PCIe 5.0 and 64 GB of RAM. To set up, see the [README](../RE
 | `--steps`, `--shift`, `--seed` | sampler settings; the seed gives the **same noise as ComfyUI's KSampler** |
 | `--sampler`, `--scheduler`, `--cfg`, `--negative` | any ComfyUI sampler and scheduler, on any model |
 | `--image`, `--ref-image`, `--ref-method` | Krea 2 reference images, see [Krea 2 reference images](MODELS.md#reference-images) |
-| `--prompt-file f.txt`, `-n N` | many prompts / seeds with the models loaded once. `--prompt-file` is read by Krea 2, Anima, MOSS Image and MiniMax-H3-Image |
-| `--batch N` | sample up to N of a prompt's `-n` images together, through the model at once. Each image keeps its own seed's noise, and the sampler's own noise is one tensor for the batch, as in ComfyUI, so stochastic samplers give other images than with `--batch 1` |
+| `--prompt-file f.txt`, `-n N` | many prompts / seeds with the models loaded once. `--prompt-file` is read by Krea 2, Anima, MOSS Image, MiniMax H3 (with HyperFlow and pi-H3) and MiniMax-H3-Image; H3 makes its clips one after another |
+| `--batch N` | sample up to N of a prompt's `-n` images together, through the model at once. Each image keeps its own seed's noise, and the sampler's own noise is one tensor for the batch, as in ComfyUI, so stochastic samplers give other images than with `--batch 1`. Refused on MiniMax H3 |
 | `--attention flash` | bf16 FlashAttention-2 like ComfyUI's default (closest numerics, ~15% slower per step); the default is `int8`, comfy-kitchen's SageAttention-style INT8 attention. On SD 1.x and SDXL, `flash` is exact fp16 attention as a GEMM and a softmax, about twice as slow as `int8` |
 | `--reserve-vram MB` | VRAM left untouched for the desktop (default 256, as ComfyUI's `--reserve-vram`; 512 with `--legacy-offload`) |
 | `--slots N` | cast buffers for streamed blocks (default 2, ComfyUI's offload streams); the streaming ring's slots with `--legacy-offload` |

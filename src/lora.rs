@@ -165,6 +165,10 @@ fn key_map(arch: Arch, keys: &[(String, usize)]) -> HashMap<String, Target> {
             Some(base) => {
                 map.insert(format!("lora_unet_{}", base.replace('.', "_")), whole(k));
                 map.insert(format!("diffusion_model.{base}"), whole(k));
+                // ComfyUI's MiniMax H3 also takes bare module names, as LakonLab's pi-H3 adapters write them
+                if arch == Arch::H3 {
+                    map.insert(base.to_string(), whole(k));
+                }
                 if arch == Arch::Moss {
                     map.insert(base.to_string(), whole(k));
                     if let Some(proj) = base.strip_suffix(".qkv").filter(|b| b.ends_with(".proj")) {
@@ -227,6 +231,15 @@ enum Op {
     /// A MOSS Image control adapter's wider `video_embedder`: with no control image its extra inputs
     /// are zeros, so only the columns the model has count.
     SetLeft(String),
+    /// A LakonLab adapter's replacement weight in ComfyUI's int8 ConvRot (weight, row scales): dequantized and set, at
+    /// full strength whatever the adapter's, as `patch_model_with_adapter` sets it.
+    SetQuant(String, String),
+}
+
+/// A LakonLab adapter (ComfyUI-piFlow's `Load LakonLab Adapter`), such as pi-H3's: LoRA pairs, and whole tensors that
+/// replace the model's. The LoRA path takes its pairs and its int8 ConvRot weights; the model takes the rest.
+pub fn is_lakonlab_adapter(st: &SafeTensors) -> bool {
+    st.metadata.contains_key("policy_config") || st.tensors.keys().any(|k| k.starts_with("dwd_"))
 }
 
 /// One side of a Kronecker product: a whole tensor, or two with an optional Tucker core.
@@ -338,6 +351,22 @@ fn load_patches(st: &SafeTensors, file: usize, name: &str, strength: f32, arch: 
             put(to, Op::Set(n(".set_weight")));
         }
     }
+    if arch == Arch::H3 && is_lakonlab_adapter(st) {
+        for x in st.tensors.keys().filter_map(|k| k.strip_suffix(".comfy_quant")) {
+            let (w, sc) = (format!("{x}.weight"), format!("{x}.weight_scale"));
+            if x.starts_with("dwd_") {
+                continue;
+            }
+            let Some(to) = map.get(x) else {
+                return Err(Unsupported(format!("{name}: a replacement for {x}, which this model doesn't have")).into());
+            };
+            let quant = st.bytes(&format!("{x}.comfy_quant")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
+            if !quant.is_some_and(|q| q["format"] == "int8_tensorwise" && q["convrot"] == true && q["convrot_groupsize"] == 256) || !st.has(&sc) {
+                return Err(Unsupported(format!("{name}: {x} is quantized other than int8 ConvRot with 256-wide groups")).into());
+            }
+            put(to, Op::SetQuant(w, sc));
+        }
+    }
     Ok((found.into_iter().map(|((t, rows), op)| (t, Patch { file, op, strength, rows })).collect(), ignored))
 }
 
@@ -419,7 +448,7 @@ fn change_of(op: &Op, f: &SafeTensors, strength: f32, dt: i32, weight: &mut dyn 
             let diff = adapters::boft(&t(blocks)?, rescale.as_ref(), a, strength, &weight()?)?;
             (diff, if dora.is_some() { a } else { 1.0 }, dora)
         }
-        Op::Diff(_) | Op::Set(_) | Op::SetLeft(_) => unreachable!("handled by add_patches"),
+        Op::Diff(_) | Op::Set(_) | Op::SetLeft(_) | Op::SetQuant(..) => unreachable!("handled by add_patches"),
     };
     Ok(match dora {
         Some(d) => Change::Replace(adapters::dora(&t(d)?, &weight()?, &diff.data, scale, strength, work)?),
@@ -467,6 +496,15 @@ fn add_patches(w: &DevBuf, dt: i32, rows: usize, per_row: usize, patches: &[Patc
                 } else if p.strength != 0.0 {
                     k!(gpu_lora_add(dt, dst, d.ptr(), p.strength, want as i64, s(st)))?;
                 }
+            }
+            Op::SetQuant(name, scale) => {
+                let info = f.info(name)?;
+                if info.numel() != want || info.shape.first() != Some(&n) {
+                    eprintln!("[lora] WARNING SHAPE MISMATCH {tensor} WEIGHT NOT MERGED");
+                    continue;
+                }
+                let (q, sc) = (upload(f.bytes(name)?, st)?, upload(f.bytes(scale)?, st)?);
+                k!(gpu_convrot_dequant(dt, q.ptr(), sc.ptr(), dst, n as i64, per_row as i32, s(st)))?;
             }
             Op::SetLeft(name) => {
                 let t = tensor_of(f, name, dt)?;
@@ -626,6 +664,11 @@ impl Model<'_> {
         k!(gpu_w6_decode(q.ptr(), r.ptr(), i8s.ptr(), rows as i64, per_row as i32, G as i32, s(st)))?;
         k!(gpu_convrot_dequant(DT_BF16, i8s.ptr(), c.ptr(), w.ptr(), rows as i64, per_row as i32, s(st)))?;
         add_patches(&w, DT_BF16, rows, per_row, patches, files, tensor, st)?;
+        if let Some(dir) = std::env::var_os("LORA_DUMP").filter(|d| Path::new(d).join(format!("{stem}.want")).exists()) {
+            let mut v = vec![0u8; w.size()];
+            w.download(0, &mut v, st)?;
+            std::fs::write(Path::new(&dir).join(format!("{stem}.float.bin")), &v)?;
+        }
         let seed = string_to_seed(&self.arch.module(stem));
         k!(gpu_w6_requant(w.ptr(), q.ptr(), r.ptr(), c.ptr(), rows as i64, per_row as i32, seed, s(st)))?;
         self.write(place, &q, st)?;

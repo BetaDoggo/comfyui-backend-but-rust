@@ -151,6 +151,7 @@ extern "C" {
     pub fn gpu_voxel_lookup(q: P, n: i32, x: i32, y: i32, z: i32, keys: P, vals: P, cap: i32, out: PM, s: PM) -> i32;
     pub fn gpu_sparse_gather(x: P, c: i32, nbr: P, r0: i32, rows: i32, out: PM, s: PM) -> i32;
     pub fn gpu_gather_rows(x: P, bytes: i64, idx: P, n: i32, out: PM, s: PM) -> i32;
+    pub fn gpu_scatter_rows(x: P, bytes: i64, idx: P, n: i32, out: PM, s: PM) -> i32;
     pub fn gpu_skip_add_f16(h: PM, skip: P, m: i64, cs: i32, rep: i32, s: PM) -> i32;
     pub fn gpu_add_f16(x: PM, y: P, n: i64, s: PM) -> i32;
     pub fn gpu_pixel_shuffle3d_f16(inp: P, out: PM, r: i32, c: i32, s: PM) -> i32;

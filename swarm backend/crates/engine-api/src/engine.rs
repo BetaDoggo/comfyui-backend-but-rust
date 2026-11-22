@@ -114,6 +114,12 @@ pub trait Engine: Send + Sync + 'static {
     fn vae_encode(&self, req: &VaeEncodeRequest) -> EngineResult<Latent>;
     fn vae_decode_audio(&self, req: &VaeDecodeAudioRequest) -> EngineResult<AudioData>;
 
+    /// ComfyUI-piFlow's `DWD Decode`: the frames a LakonLab DWD adapter's pixel head decoded at the last step of the
+    /// sampling run that returned `latent`, in place of a VAE decode. Default: unsupported.
+    fn dwd_decode(&self, _latent: &Latent) -> EngineResult<ImageBatch> {
+        Err(EngineError::Unsupported("DWD Decode (LakonLab DWD adapters)".into()))
+    }
+
     /// See [`SegmentRequest`] (`<segment:>`, `<clear:>`). Default: unsupported.
     fn segment(&self, req: &SegmentRequest) -> EngineResult<Mask> {
         Err(EngineError::Unsupported(match req {

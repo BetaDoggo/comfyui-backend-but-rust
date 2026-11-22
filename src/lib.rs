@@ -11,6 +11,7 @@ pub mod dit;
 pub mod ffi;
 pub mod flux2vae;
 pub mod h3;
+pub mod h3dwd;
 pub mod h3te;
 pub mod h3vae;
 pub mod h3window;

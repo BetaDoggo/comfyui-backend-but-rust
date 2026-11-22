@@ -116,13 +116,17 @@ Differences to know about:
   norm weights this engine doesn't store as patchable; control images; different LoRAs on the positive and negative text encoders;
   and LoRA hooks. Files for ComfyUI custom nodes, such as SnapRef's `anima_ref_kv`, match no key and change nothing, as in ComfyUI.
   SnapRef files go to `--snapref` instead.
+* LakonLab adapters (pi-H3's) load through `--lora` on H3 and apply as a whole, as ComfyUI-piFlow's `Load LakonLab Adapter`
+  applies them: LoRA pairs at the given strength, replaced weights and, in a DWD adapter, a pixel head that writes the
+  frames in place of the video VAE ([details](MODELS.md#pi-h3)). One per run.
 
 ## Samplers
 
 Every ComfyUI sampler and scheduler runs on the image and video models, plus SwarmUI's `turbo`, `align_your_steps`,
 `flux2`, `ideogram4`, `ideogram4turbo` and `ltxv` (`ltxv-image` is refused), its Sigma Min, Sigma Max and Rho overrides,
 and any CFG with a negative prompt, now including Krea 2. One more scheduler, `hyperflow`, is HyperFlow H3 Flash's
-4, 6 or 8-step grid and runs on that model only, with `euler` or `res_multistep` ([details](MODELS.md#hyperflow-h3-flash)):
+4, 6 or 8-step grid and runs on that model only, with `euler` or `res_multistep` ([details](MODELS.md#hyperflow-h3-flash)).
+Another, `piflow`, is ComfyUI-piFlow's pi-Flow schedule for H3 with a pi-H3 adapter ([details](MODELS.md#pi-h3)):
 
 ```bash
 target/release/diffusion.exe --anima --sampler dpmpp_2m_sde_gpu --scheduler karras --steps 12 --cfg 4 --negative "lowres" -p "no humans, scenery, mountain lake"

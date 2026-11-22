@@ -38,6 +38,14 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
         },
     );
 
+    // ComfyUI-piFlow's: the frames a LakonLab DWD adapter's pixel head decoded at the last step of the run that returned
+    // the samples, in place of a VAE
+    r.add(
+        env,
+        |_| NodeSchema::new("DWD Decode", "DWD Decode", "LakonLab").input(link("samples", "LATENT")).output("IMAGE", "IMAGE"),
+        |i, ctx| Ok(NodeOutput::one(Value::Image(ctx.engine.dwd_decode(i.latent("samples")?)?))),
+    );
+
     r.add(
         env,
         |_| tiled_inputs(NodeSchema::new("VAEDecodeTiled", "VAE Decode (Tiled)", "model/latent").input(link("samples", "LATENT")).input(link("vae", "VAE")), true).output("IMAGE", "IMAGE"),

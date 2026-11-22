@@ -4,7 +4,7 @@
 //! per segment from a small basis of the time curve. bf16 activations like ComfyUI.
 
 use crate::cuda::{DevBuf, Stream};
-use crate::ffi::{k, null, off, s, DT_BF16, DT_F32, PM, PRO_ADALN, PRO_PLAIN, PRO_RMS, PRO_SWIGLU};
+use crate::ffi::{k, null, off, s, DT_BF16, DT_F32, PM, PRO_ADALN, PRO_LN_MOD, PRO_PLAIN, PRO_RMS, PRO_SWIGLU};
 use crate::offload::{plan, Layout, Plan, Store, WeightSet};
 use crate::st::{f32_bytes, Dt, SafeTensors};
 use anyhow::{bail, Context, Result};
@@ -199,6 +199,8 @@ fn patchify(v: &[f32], t: usize, h: usize, w: usize) -> Vec<f32> {
 pub struct Pack<'a> {
     pub tags: &'a [u8],
     pub cond: Option<(&'a DevBuf, &'a Extra)>,
+    /// keep the DWD features of this evaluation: the last step's positive one, as ComfyUI-piFlow decodes it
+    pub dwd: bool,
 }
 
 /// RoPE table [rows][48][(cos, sin)], in bf16 steps as ComfyUI's rotation table is.
@@ -626,25 +628,72 @@ impl Pdd {
     }
 }
 
-fn globals_layout(st: &SafeTensors, blocks: usize) -> Result<Layout> {
+/// The small tensors of the w6a8 checkpoint, with those a LakonLab adapter replaces taken from `ad`. A replaced video
+/// head is float32, like HyperFlow's; returns whether it is.
+fn globals_layout(st: &SafeTensors, blocks: usize, ad: Option<&SafeTensors>) -> Result<(Layout, bool)> {
     let mut g = Layout::new();
-    for (key, name) in [("vid_w", "video_patch_proj.weight"), ("vid_b", "video_patch_proj.bias"), ("aud_w", "audio_patch_proj.weight"), ("aud_b", "audio_patch_proj.bias"),
-        ("ao_w", "final_layer.audio_out.weight"), ("ao_b", "final_layer.audio_out.bias"), ("vo_b", "final_layer.video_out.bias"), ("vo_w", "final_layer.video_out.weight"),
-        ("vo_r", "final_layer.video_out.weight_s_rel"), ("vo_c", "final_layer.video_out.weight_s_channel")]
-    {
-        g.raw(st, key, &[name.to_string()])?;
+    let from = |name: &str| ad.filter(|a| a.has(name));
+    let float = from("final_layer.video_out.weight").is_some();
+    let video: &[(&str, &str)] = if float {
+        &[("vo_b", "final_layer.video_out.bias"), ("vo_w", "final_layer.video_out.weight")]
+    } else {
+        &[("vo_b", "final_layer.video_out.bias"), ("vo_w", "final_layer.video_out.weight"), ("vo_r", "final_layer.video_out.weight_s_rel"), ("vo_c", "final_layer.video_out.weight_s_channel")]
+    };
+    let heads = [("vid_w", "video_patch_proj.weight"), ("vid_b", "video_patch_proj.bias"), ("aud_w", "audio_patch_proj.weight"), ("aud_b", "audio_patch_proj.bias"),
+        ("ao_w", "final_layer.audio_out.weight"), ("ao_b", "final_layer.audio_out.bias")];
+    for &(key, name) in heads.iter().chain(video) {
+        match from(name) {
+            Some(a) => g.bytes(key, row_bytes(a, name)?),
+            None => g.raw(st, key, &[name.to_string()])?,
+        }
     }
     g.bf16(st, "cond_w", &["condition_proj.weight".to_string()])?;
     g.bf16(st, "cond_b", &["condition_proj.bias".to_string()])?;
-    g.bf16(st, "fn", &["final_layer.norm.weight".to_string()])?;
-    g.f32(st, "rn", "token_refiner.final_norm.weight", 0.0)?;
-    g.bytes("fa_w", row_bytes(st, "final_layer.adaln_proj.linear.weight")?);
-    g.bytes("fa_b", row_bytes(st, "final_layer.adaln_proj.linear.bias")?);
-    for i in 0..blocks {
-        g.bytes(&format!("a{i}_w"), row_bytes(st, &format!("blocks.{i}.adaln_proj.linear.weight"))?);
-        g.bytes(&format!("a{i}_b"), row_bytes(st, &format!("blocks.{i}.adaln_proj.linear.bias"))?);
+    match from("final_layer.norm.weight") {
+        Some(a) => g.bytes("fn", a.bf16_bytes("final_layer.norm.weight")?),
+        None => g.bf16(st, "fn", &["final_layer.norm.weight".to_string()])?,
     }
-    Ok(g)
+    g.f32(st, "rn", "token_refiner.final_norm.weight", 0.0)?;
+    let rows = |name: &str| match from(name) {
+        Some(a) => row_bytes(a, name),
+        None => row_bytes(st, name),
+    };
+    g.bytes("fa_w", rows("final_layer.adaln_proj.linear.weight")?);
+    g.bytes("fa_b", rows("final_layer.adaln_proj.linear.bias")?);
+    for i in 0..blocks {
+        g.bytes(&format!("a{i}_w"), rows(&format!("blocks.{i}.adaln_proj.linear.weight"))?);
+        g.bytes(&format!("a{i}_b"), rows(&format!("blocks.{i}.adaln_proj.linear.bias"))?);
+    }
+    Ok((g, float))
+}
+
+/// A pi-H3 DWD adapter's output norm before its pixel head: `linear(silu(t_emb))` to (scale, shift).
+struct DwdNorm {
+    w: Vec<f32>,
+    b: Vec<f32>,
+}
+
+/// Every tensor of a LakonLab adapter must be one this engine applies: LoRA pairs and int8 ConvRot replacements of the
+/// blocks' linears (through the LoRA path), the small tensors of [`globals_layout`], and the DWD head.
+fn check_adapter(ad: &SafeTensors, blocks: usize) -> Result<()> {
+    let block = |k: &str| k.strip_prefix("blocks.").and_then(|r| r.split_once('.')).filter(|(i, _)| i.parse::<usize>().is_ok_and(|i| i < blocks)).map(|(_, r)| r.to_string());
+    let small = |k: &str| {
+        block(k).is_some_and(|r| r == "adaln_proj.linear.weight" || r == "adaln_proj.linear.bias")
+            || ["final_layer.adaln_proj.linear.weight", "final_layer.adaln_proj.linear.bias", "final_layer.norm.weight", "final_layer.video_out.weight",
+                "final_layer.video_out.bias", "final_layer.audio_out.weight", "final_layer.audio_out.bias", "dwd_norm_out.linear.weight", "dwd_norm_out.linear.bias"]
+                .contains(&k)
+    };
+    let linear = |k: &str| {
+        block(k).is_some_and(|r| {
+            let m = [".lora_A.weight", ".lora_B.weight", ".weight_scale", ".comfy_quant", ".weight"].iter().find_map(|s| r.strip_suffix(s));
+            m.is_some_and(|m| MODULES.iter().any(|(_, name)| *name == m))
+        })
+    };
+    let other: Vec<&String> = ad.tensors.keys().filter(|k| !k.starts_with("dwd_pixel_refiner.") && !small(k) && !linear(k)).collect();
+    if let Some(k) = other.first() {
+        bail!("this LakonLab adapter has {} tensors that MiniMax H3 doesn't take here, such as {k}", other.len());
+    }
+    Ok(())
 }
 
 pub fn n_blocks(st: &SafeTensors) -> usize {
@@ -747,6 +796,11 @@ pub struct Dit {
     pdd: Option<Pdd>,
     /// the token refiner is plain bf16
     dense_refiner: bool,
+    /// the video head is float32: HyperFlow's, or a LakonLab adapter's
+    float_video_head: bool,
+    /// a pi-H3 DWD adapter's output norm, and the features its last step kept for the pixel head
+    dwd: Option<DwdNorm>,
+    dwd_features: Option<(DevBuf, (usize, usize, usize))>,
     pub prof: crate::prof::Prof,
 }
 
@@ -812,7 +866,7 @@ impl Dit {
         } else {
             let n = n_blocks(st);
             block_ids = (0..n).collect();
-            gl = globals_layout(st, n)?;
+            gl = globals_layout(st, n, None)?.0;
             layouts = (0..n).map(|i| block_layout(st, i)).collect::<Result<Vec<_>>>()?;
             units = vec![Unit { lins: [Lin::W6; 4], ranks: [0; 6] }; n];
             ref_layouts = (0..REFINER).map(|i| refiner_layout(st, i)).collect::<Result<Vec<_>>>()?;
@@ -827,12 +881,54 @@ impl Dit {
         globals.upload(0, &host, s0)?;
         s0.sync()?;
         let mid_width = units.iter().map(Unit::mid_width).max().unwrap_or(0);
+        let float_video_head = hyper.is_some();
         let blocks = WeightSet::lazy("h3 blocks", st.clone(), layouts, Plan { resident: 0, slots: 0 }, threads)?;
         let refiner = WeightSet::lazy("h3 refiner", st.clone(), ref_layouts, Plan { resident: 0, slots: 0 }, threads)?;
         refiner.once_per_prompt();
         Ok(Dit { globals, gl, blocks, units, refiner, table, inv_freq, tdim, hyper, mid_width, int8_attn: true, attn_variant: 0,
-            sparse: None, sparse_logged: Vec::new(), block_ids, shifts: (SHIFT_VIDEO as f32, SHIFT_AUDIO as f32), pdd, dense_refiner,
-            prof: crate::prof::Prof::new() })
+            sparse: None, sparse_logged: Vec::new(), block_ids, shifts: (SHIFT_VIDEO as f32, SHIFT_AUDIO as f32), float_video_head, pdd, dense_refiner,
+            dwd: None, dwd_features: None, prof: crate::prof::Prof::new() })
+    }
+
+    /// Apply a LakonLab adapter's small tensors (`ad`) over the w6a8 checkpoint `st`, or take them back out (`None`). Its
+    /// LoRA pairs and replaced linears go through the LoRA path.
+    pub fn set_adapter(&mut self, st: &SafeTensors, ad: Option<&SafeTensors>, s0: &Stream) -> Result<()> {
+        if self.hyper.is_some() || self.pdd.is_some() {
+            bail!("LakonLab adapters on HyperFlow H3 Flash or MiniMax-H3-Image (pi-H3's are for MiniMax H3)");
+        }
+        let n = self.blocks.len();
+        if let Some(a) = ad {
+            check_adapter(a, n)?;
+        }
+        let (gl, float) = globals_layout(st, n, ad)?;
+        let mut host = vec![0u8; gl.size];
+        gl.pack(st, &mut host)?;
+        let globals = DevBuf::alloc(gl.size)?;
+        globals.upload(0, &host, s0)?;
+        s0.sync()?;
+        (self.globals, self.gl, self.float_video_head) = (globals, gl, float);
+        self.dwd = match ad.filter(|a| a.has("dwd_norm_out.linear.weight")) {
+            Some(a) => {
+                let (w, b) = (a.f32_vec("dwd_norm_out.linear.weight", false)?, a.f32_vec("dwd_norm_out.linear.bias", false)?);
+                if w.len() != 2 * F * self.tdim || b.len() != 2 * F {
+                    bail!("a DWD output norm of {} values, not MiniMax H3's", w.len());
+                }
+                Some(DwdNorm { w, b })
+            }
+            None => None,
+        };
+        self.dwd_features = None;
+        Ok(())
+    }
+
+    /// A pi-H3 DWD adapter is applied: the last step's positive evaluation keeps features for its pixel head.
+    pub fn has_dwd(&self) -> bool {
+        self.dwd.is_some()
+    }
+
+    /// The DWD features the last [`Pack::dwd`] evaluation kept, bf16 `[t * th * tw, 5376]`, with its token grid.
+    pub fn take_dwd_features(&mut self) -> Option<(DevBuf, (usize, usize, usize))> {
+        self.dwd_features.take()
     }
 
     /// MiniMax-H3-Image, which samples one image without audio.
@@ -1328,6 +1424,21 @@ impl Dit {
             }
         }
 
+        // a DWD adapter's head reads the final hidden states of the video rows through its own affine-free LayerNorm,
+        // modulated by `linear(silu(t_emb))` at the video's time
+        if let (true, Some(dn)) = (pack.dwd, &self.dwd) {
+            let c = self.curve(t_v).map(silu);
+            let v: Vec<f32> = (0..2 * F).map(|o| bf16::from_f32(dn.b[o] + dot(&dn.w[o * td..][..td], &c)).to_f32()).collect();
+            let mods = DevBuf::alloc_async(2 * F * 2, st)?;
+            mods.upload(0, &crate::st::bf16_bytes(&v), st)?;
+            let feat = DevBuf::alloc_async(vr * F * 2, st)?;
+            k!(gpu_prologue_rows_b(DT_BF16, PRO_LN_MOD, off(xp, al * F * 2), fi, null(), null(), EPS, mods.ptr(), off(mods.ptr(), F * 2), feat.ptr(), fi, vr as i32, F as i32,
+                s(st)))?;
+            if let Some(p) = probe.as_mut() {
+                p("dwd_features", &feat, vr * F * 2);
+            }
+            self.dwd_features = Some((feat, (sh.t, th, tw)));
+        }
         // final layer: [2][shift | scale]
         let fm = DevBuf::alloc_async(2 * 2 * F * 4, st)?;
         k!(gpu_gemm(cd.ptr(), td as i64, self.g("fa_w"), td as i64, fm.ptr(), (2 * F) as i64, self.g("fa_b"), 2, (2 * F) as i64, td as i64, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
@@ -1344,8 +1455,8 @@ impl Dit {
         if let Some(head) = pdd_head {
             k!(gpu_gemm(off(fbuf.ptr(), ar * F * 4), fi, head, fi, vout.ptr(), PATCH as i64, off(head, PATCH * F * 4), vr as i64, PATCH as i64, fi, 1, DT_F32, DT_F32, 1.0, 0.0,
                 s(st)))?;
-        } else if self.hyper.is_some() {
-            // HyperFlow keeps the video head in float32
+        } else if self.float_video_head {
+            // HyperFlow and LakonLab adapters keep the video head in float32
             k!(gpu_gemm(off(fbuf.ptr(), ar * F * 4), fi, self.g("vo_w"), fi, vout.ptr(), PATCH as i64, self.g("vo_b"), vr as i64, PATCH as i64, fi, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
         } else {
             k!(gpu_w6_decode(self.g("vo_w"), self.g("vo_r"), wdec.ptr(), PATCH as i64, F as i32, G, s(st)))?;

@@ -191,6 +191,24 @@ GPU_API int gpu_gather_rows(const void* x, int64_t bytes, const int* idx, int n,
     return 0;
 }
 
+// out[idx[i]] = x[i] for rows of `bytes` bytes (a multiple of 2): gpu_gather_rows the other way.
+__global__ void scatter_rows_kernel(const uint16_t* x, int64_t w, const int* idx, int n, uint16_t* out) {
+    const int64_t t = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n * w) return;
+    const int64_t i = t / w, c = t % w;
+    out[(int64_t)idx[i] * w + c] = x[t];
+}
+
+GPU_API int gpu_scatter_rows(const void* x, int64_t bytes, const int* idx, int n, void* out, void* stream) {
+    if (bytes % 2) return -1;
+    const int64_t total = (int64_t)n * (bytes / 2);
+    if (total > 0)
+        scatter_rows_kernel<<<(unsigned)((total + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const uint16_t*)x, bytes / 2, idx,
+                                                                                               n, (uint16_t*)out);
+    KCHECK();
+    return 0;
+}
+
 // The C2S skip: h[m, c * rep + r] += skip[m, c], in f16.
 __global__ void skip_add_kernel(half* h, const half* skip, int64_t m, int cs, int rep) {
     const int64_t t = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;

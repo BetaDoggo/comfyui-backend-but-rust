@@ -12,6 +12,7 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | SD 1.x and SDXL | Images | `euler`, `simple`, 20 steps, CFG 7 on the CLI | fp16 base checkpoints with their CLIP and VAE |
 | MiniMax H3 | Video with audio | `res_multistep`, `simple` | `w6a8` only |
 | HyperFlow H3 Flash | Video with audio, with reference pictures on `ref2va` | `euler` or `res_multistep`, `hyperflow`, 6 steps | int8 ConvRot, ComfyUI's single file of either task |
+| pi-H3 (2- and 4-step DWD adapters) | Video with audio, frames from the adapter's pixel head | `euler`, `piflow`, the adapter's steps, CFG 1 | the adapter on H3's `w6a8` checkpoint |
 | MiniMax-H3-Image | Images | `euler`, `simple`, 6 steps | int8 ConvRot (`minimax_h3_image_pruned_int8_convrot`) only |
 | Pixal3D | A 3D mesh from one image | the example workflow's four `euler` samplers | int8 ConvRot (`pixal3d_int8_convrot`) only |
 | Idol (TripoSplat) | A 3D gaussian splat from one image | `dpmpp_2m`, `simple`, 20 steps, CFG 3 | Comfy-Org's fp16 files |
@@ -47,7 +48,7 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | VAE tiling, Seamless Tileable | Refused | Refused | Refused | Refused | Refused | Only the 256 / 64 tile | - |
 | Background removal | - | - | - | - | - | - | Yes (BiRefNet) |
 
-HyperFlow H3 Flash, MiniMax-H3-Image, Idol, SeedVR2 and RelayVSR aren't in this matrix; their own sections below say what they
+HyperFlow H3 Flash, pi-H3, MiniMax-H3-Image, Idol, SeedVR2 and RelayVSR aren't in this matrix; their own sections below say what they
 take. ControlNet, regions, IP-Adapter, style models, GLIGEN, LoRA hooks and embeddings are refused on every family. Anima
 takes both `(word:1.2)` and `<weight>`; Qwen Image 2.1's encoder reads `(word:1.2)` as plain text. SD 1.x and SDXL take
 `(word:1.2)` in a plain prompt and `<weight>` through SwarmUI's text node, which reads parentheses literally, as
@@ -597,6 +598,61 @@ Reference videos and audio are refused, as on H3. Keyframes on HyperFlow are no 
 per-block ranks, but it hasn't been run. Its diffusers folder used to run here, before the single files: at 512x512,
 22 frames, 6 steps, a clean, coherent clip at 0.49 s per evaluation warm, with the int8 GEMMs about 215 ms, the
 low-rank pairs about 100 ms and attention about 90 ms.
+
+### pi-H3
+
+[pi-H3](https://huggingface.co/Lakonik/pi-H3) is LakonLab's pi-Flow distillation of H3, shipped as adapters for H3's
+own checkpoint. The int8 ConvRot DWD adapters, `pi_h3_2step_dwd_adapter_int8_convrot.safetensors` and
+`pi_h3_4step_dwd_adapter_int8_convrot.safetensors`, run here; the full-precision files, which use diffusers names, are
+refused. Put one in
+`Lora/` and load it like a LoRA on `minimax_h3_fl2va_pruned_w6a8`: `--lora` on the CLI, a LoRA in SwarmUI, or
+`LoraLoaderModelOnly` or ComfyUI-piFlow's `Load LakonLab Adapter` in a workflow. A file is read as a LakonLab adapter by
+its `policy_config` metadata or its `dwd_` tensors, and the whole file applies, as `Load LakonLab Adapter` applies it:
+
+* LoRA pairs on blocks 0 to 45, at the given strength.
+* Replacements of blocks 46 to 49's linears (int8 ConvRot, dequantized and requantized to w6 as ComfyUI's set patch
+  does), every block's AdaLN and the final layer. The video head then runs in float32 instead of w6.
+* The DWD pixel head: at the last step the DiT's video features go through a LayerNorm and an 8-layer windowed ViT
+  (int8 ConvRot, as in ComfyUI-piFlow) that writes the frames directly, so the video VAE never runs. Audio still decodes
+  through the audio VAE.
+
+Run it with `euler`, the `piflow` scheduler, the adapter's steps (2 or 4) and CFG 1:
+
+```bash
+target/release/diffusion.exe --h3 --dit "$MODELS_ROOT/Stable-diffusion/minimax_h3_fl2va_pruned_w6a8.safetensors" --lora "$MODELS_ROOT/Lora/pi_h3_2step_dwd_adapter_int8_convrot.safetensors" --sampler euler --scheduler piflow --steps 2 --cfg 1 --width 512 --height 384 --frames 22 -p "a stone lighthouse on a sea cliff at dawn, waves crashing on the rocks, no people" -o clip.mp4
+```
+
+`piflow` is ComfyUI-piFlow's `pi-Flow Scheduler` with its defaults: raw times from `max_raw_t` (0.93 for 2 steps, 0.96
+otherwise) down to 0, the last step 0.6 times as long, then H3's shift. At 2 steps it gives exactly ComfyUI-piFlow's
+sigmas, and at 4 steps the same ones to the five places ComfyUI-piFlow printed. In SwarmUI it's listed on `SwarmKSampler` with `hyperflow`; ComfyUI's KSampler doesn't list it, as there.
+
+The comfy-rust SwarmUI extension swaps the video decode for `DWD Decode` when the sampler's model went through a LoRA
+loader with a DWD adapter. Server-side, `DWD Decode` returns the frames the head wrote for that video latent; the
+latest 4 runs are kept.
+
+Refused with a DWD adapter: more than one LakonLab adapter at once, context windows, regional prompts (more than one
+positive entry), HyperFlow and MiniMax-H3-Image. ComfyUI's `SamplerCustomAdvanced` graph, ComfyUI-piFlow's own
+example, isn't supported on the native engine, so use `SwarmKSampler`.
+
+Against ComfyUI-piFlow on SwarmUI's ComfyUI (`tools/pih3_ref.py`), seed 42, the lighthouse prompt above:
+
+| | 512x512, 5 frames | 512x384, 22 frames |
+|---|---|---|
+| Frames, CLI against ComfyUI | 28.1 dB | 28.0 dB |
+| DWD head alone, fed ComfyUI's features | about 60 dB, largest error 0.011 | 59.5 dB |
+| Frames, `comfy-server` over HTTP against ComfyUI | 26.2 to 26.6 dB | not run |
+
+Patched weights match ComfyUI's to bf16 rounding. The first evaluation is 9.8% from ComfyUI's on video, more than plain
+H3's, and block by block the gap grows steadily with no single block standing out, so it reads as rounding through 50
+blocks rather than a mapping error. The server's frames are about 28 dB from the CLI's with the same picture, and two
+server runs are bit-identical; what differs between the two paths wasn't tracked down.
+
+Timings on this machine, warm: at 512x384, 22 frames, 1.36 s for the two evaluations and 0.78 s for the DWD head,
+against 15.08 s for ComfyUI's sampling. Through the server at 512x512, 5 frames, 0.72 s sampling; the head took 2.0 s on
+its first run and 0.05 s after. Cold, baking the adapter took 25 to 51 s. The table is the 2-step adapter's; the
+4-step one has the same layout and loads through the same path, but hasn't been compared with ComfyUI. Both work in
+SwarmUI itself. Not tried: the adapters without DWD, anything larger than 512x512 or longer than 22 frames. Audio not
+judged by ear.
 
 ## MiniMax-H3-Image
 

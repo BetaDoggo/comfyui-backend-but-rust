@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use diffusion::h3;
+use diffusion::h3vae;
 use diffusion::h3window;
 use diffusion::pipeline::{
     AnimaRequest, Cancelled, Cond, Generator, H3Conds, H3Request, Inpaint, KreaEntry, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Region, Sampling, SdRequest,
@@ -127,6 +128,37 @@ pub struct NativeEngine {
     gen: Mutex<Generator>,
     live_previews: bool,
     threads: usize,
+    /// The frames of the latest runs with a LakonLab DWD adapter, by the fingerprint of the video latent each returned,
+    /// for `DWD Decode`, as ComfyUI-piFlow files them.
+    dwd: Mutex<Vec<(u64, ImageBatch)>>,
+}
+
+/// ComfyUI-piFlow keeps the frames of this many runs.
+const DWD_RUNS: usize = 4;
+
+/// A video latent's fingerprint, by its values.
+fn latent_fingerprint(data: &[f32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.len().hash(&mut h);
+    for v in data {
+        v.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// RGB f32 `[3, frames, h, w]` in 0..1 to an image batch of `frames` images.
+fn clip_images(clip: &h3vae::Clip, frames: usize) -> ImageBatch {
+    let (h, w) = (clip.h, clip.w);
+    let mut rgb = vec![0u8; frames * h * w * 3];
+    for c in 0..3 {
+        for f in 0..frames {
+            for i in 0..h * w {
+                rgb[(f * h * w + i) * 3 + c] = (clip.data[((c * clip.t + f) * h) * w + i] * 255.0).round() as u8;
+            }
+        }
+    }
+    ImageBatch::from_u8(frames as u32, h as u32, w as u32, 3, rgb)
 }
 
 /// The prompt to encode, or why this conditioning can't be used. Only checked when a prompt is
@@ -1174,7 +1206,7 @@ impl NativeEngine {
             lossy: o.lossy,
             comfy_memory: o.comfy_memory,
         };
-        Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads })
+        Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads, dwd: Mutex::new(Vec::new()) })
     }
 
     /// SeedVR2's restore of the picture or clip `SeedVR2Conditioning` carries: a clip (`[1, 16, T, H/8, W/8]`) is one
@@ -1711,7 +1743,15 @@ impl NativeEngine {
             .sample_h3(&r, |step| report(mode, progress, 1, step, |x0| (preview::h3(x0, t, lh, lw), lh, lw)), None)
             .map_err(internal)?;
         tracing::info!("h3: text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
+        let dwd = gen.take_h3_dwd_pixels();
+        drop(gen);
         let audio_data = latent.split_off(shape.video_len());
+        if let Some(clip) = dwd {
+            let mut runs = self.dwd.lock().unwrap_or_else(|e| e.into_inner());
+            runs.push((latent_fingerprint(&latent), clip_images(&clip, clip.t)));
+            let excess = runs.len().saturating_sub(DWD_RUNS);
+            runs.drain(..excess);
+        }
         Ok(req.latent.with_samples(LatentSamples::AudioVideo {
             video: LatentTensor { format: video.format, shape: video.shape.clone(), data: Opaque::new(HostLatent { data: latent }) },
             audio: LatentTensor { format: audio.format, shape: audio.shape.clone(), data: Opaque::new(HostLatent { data: audio_data }) },
@@ -1803,16 +1843,7 @@ impl NativeEngine {
         let frames = if lt == 1 { 1 } else { (lt.max(2) - 2) / 5 * 17 + 5 };
         let shape = h3::Shape { t: lt, h: lh, w: lw, audio_t: 0 };
         let clip = self.gen().decode_h3(&file.path, &latent.data, shape, frames).map_err(internal)?;
-        let (h, w) = (clip.h, clip.w);
-        let mut rgb = vec![0u8; frames * h * w * 3];
-        for c in 0..3 {
-            for f in 0..frames {
-                for i in 0..h * w {
-                    rgb[(f * h * w + i) * 3 + c] = (clip.data[((c * frames + f) * h) * w + i] * 255.0).round() as u8;
-                }
-            }
-        }
-        Ok(ImageBatch::from_u8(frames as u32, h as u32, w as u32, 3, rgb))
+        Ok(clip_images(&clip, frames))
     }
 
     fn sample_moss(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, plan: &Plan, progress: &mut dyn ProgressSink)
@@ -2488,6 +2519,23 @@ impl Engine for NativeEngine {
             _ => return Ok(None),
         };
         Ok(Some(self.gen().seedvr_frames_that_fit(lw * 8, lh * 8, frames).map_err(internal)?))
+    }
+
+    fn dwd_decode(&self, latent: &Latent) -> EngineResult<ImageBatch> {
+        let video = match &latent.samples {
+            LatentSamples::AudioVideo { video, .. } => video,
+            LatentSamples::Single(t) if t.format == LatentFormat::MiniMaxH3Video => t,
+            _ => return Err(unsupported("DWD Decode of a latent other than MiniMax H3's (only pi-H3's DWD adapters have a pixel head)")),
+        };
+        let data = video.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("DWD Decode of a latent this engine didn't sample"))?;
+        let key = latent_fingerprint(&data.data);
+        let runs = self.dwd.lock().unwrap_or_else(|e| e.into_inner());
+        match runs.iter().rev().find(|(k, _)| *k == key) {
+            Some((_, images)) => Ok(images.clone()),
+            None => Err(EngineError::InvalidInput(format!(
+                "no DWD frames for this latent: connect the output of a sampler whose model has a pi-H3 DWD adapter (the latest {DWD_RUNS} runs are kept)"
+            ))),
+        }
     }
 
     fn vae_decode_audio(&self, req: &VaeDecodeAudioRequest) -> EngineResult<AudioData> {

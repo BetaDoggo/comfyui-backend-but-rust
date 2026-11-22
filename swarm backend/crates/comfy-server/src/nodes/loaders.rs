@@ -176,6 +176,24 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
         },
     );
 
+    // ComfyUI-piFlow's: a LakonLab adapter (pi-H3) on the model. The engine tells it from a LoRA by its tensors and
+    // applies all of it, its replaced weights and DWD pixel head too.
+    r.add(
+        env,
+        |env| {
+            NodeSchema::new("Load LakonLab Adapter", "Load LakonLab Adapter", "LakonLab")
+                .input(link("model", "MODEL"))
+                .input(combo("adapter_name", &env.models.list(ModelFolder::Loras)))
+                .input(float("adapter_strength", 1.0, -100.0, 100.0, 0.01))
+                .output("MODEL", "MODEL")
+        },
+        |i, ctx| {
+            let file = resolve(ctx.env, &[ModelFolder::Loras], i.string("adapter_name")?)?;
+            let s = i.float("adapter_strength")? as f32;
+            Ok(NodeOutput::one(Value::Model(i.model("model")?.with_patch(ModelPatch::Lora { file, strength: s }))))
+        },
+    );
+
     r.add(
         env,
         |env| {

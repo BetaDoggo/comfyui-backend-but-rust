@@ -256,6 +256,7 @@ SwarmKSampler ─▶ LTXVSeparateAVLatent ─┬─[0]▶ VAEDecodeTiled(video V
 | Video End Image (from another model's image) | `BatchImagesNode(start, end)` → `SwarmTextEncodeAdvanced.images`, plus `last_frame` keyframe | server batches the images (resized to the first), the engine sees them as text-encoder images and a last-frame keyframe |
 | VAE tiling | `VAEDecodeTiled{256, 64, temporal_size 9999, 8}` | `VaeDecodeRequest.tiling` (9999 = don't tile temporally) |
 | 2-frame request | extra `ImageFromBatch(0,1)` after decode | handled server-side |
+| pi-H3 DWD adapter as a LoRA | the comfy-rust extension swaps `VAEDecodeTiled` for `DWD Decode(samples)` when the sampler's model went through a LoRA loader with a DWD adapter; Scheduler `piflow` on `SwarmKSampler` | the adapter applies through `ModelPatch::Lora`; the head's frames are kept by the video latent's fingerprint and `Engine::dwd_decode` returns them ([pi-H3](../../docs/MODELS.md#pi-h3)) |
 
 **Engine-side work:** a joint audio+video DiT over a nested (video, audio) latent; separate video and
 audio flow shifts; Qwen3-VL 32B encoding with multimodal refs; keyframe conditioning; video VAE decode to

@@ -20,7 +20,7 @@ pub const SAMPLERS: &[&str] = &[
 
 pub const SCHEDULERS: &[&str] = &[
     "simple", "sgm_uniform", "karras", "exponential", "ddim_uniform", "beta", "normal", "linear_quadratic", "kl_optimal", "turbo",
-    "align_your_steps", "ltxv", "flux2", "ideogram4", "ideogram4turbo", "hyperflow",
+    "align_your_steps", "ltxv", "flux2", "ideogram4", "ideogram4turbo", "hyperflow", "piflow",
 ];
 
 /// HyperFlow H3 Flash's raw sigma grids by step count, before the model's shift.
@@ -36,6 +36,28 @@ pub fn hyperflow_sigmas(ms: ModelSampling, steps: usize) -> Result<V> {
     let Some(grid) = HYPERFLOW_GRIDS.iter().find(|g| g.len() == steps + 1) else { bail!("the hyperflow scheduler has 4, 6 or 8 steps, not {steps}") };
     let s = shift as f32;
     Ok(grid.iter().map(|&g| s * g / (1.0 + (s - 1.0) * g)).collect())
+}
+
+/// ComfyUI-piFlow's `pi-Flow Scheduler` as its pi-H3 workflow sets it: `max_raw_t` 0.93 for 2 steps and 0.96 for more,
+/// `final_step_size_scale` 0.6, `min_raw_t` 0. Raw times run linearly from `max_raw_t`, the last step `final_step_size_scale`
+/// times as long as the others, and the model's own shift maps each to a sigma.
+pub fn piflow_sigmas(ms: ModelSampling, steps: usize) -> Result<V> {
+    if !matches!(ms, ModelSampling::Flow { .. }) {
+        bail!("the piflow scheduler needs a flow model");
+    }
+    if steps == 0 {
+        bail!("the piflow scheduler needs at least one step");
+    }
+    let (max, scale) = (if steps > 2 { 0.96f64 } else { 0.93 }, 0.6f64);
+    let end = max * scale / ((steps - 1) as f64 + scale);
+    // torch.linspace into float32: from the start for the first half, from the end for the rest
+    let step = if steps > 1 { (end - max) / (steps - 1) as f64 } else { 0.0 };
+    let mut s: V = (0..steps)
+        .map(|i| if i < steps / 2 { max + step * i as f64 } else { end - step * (steps - 1 - i) as f64 })
+        .map(|t| ms.percent_to_sigma(1.0 - (t as f32) as f64))
+        .collect();
+    s.push(0.0);
+    Ok(s)
 }
 
 /// True for samplers that read the uncond prediction even at CFG 1 (`disable_cfg1_optimization`).
@@ -569,6 +591,7 @@ pub fn sigmas(ms: ModelSampling, sampler: &str, scheduler: &str, steps: usize, (
         "ideogram4" => return Ok(ideogram4_sigmas(steps, w, h, 0.0, 1.75)),
         "ideogram4turbo" => return Ok(ideogram4_sigmas(steps, w, h, 0.5, 1.75)),
         "hyperflow" => return hyperflow_sigmas(ms, steps),
+        "piflow" => return piflow_sigmas(ms, steps),
         _ => {}
     }
     let scheduler = if scheduler == "ltxv" { "simple" } else { scheduler };
@@ -2336,6 +2359,18 @@ pub fn sample(sampler: &str, ms: ModelSampling, sigmas: &[f32], noise: &[f32], l
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn piflow_matches_comfyui_piflow() {
+        // pi-Flow Scheduler's sigmas for 2 steps on MiniMax H3 (shift 12), as ComfyUI-piFlow returns them
+        let s = super::piflow_sigmas(super::ModelSampling::Flow { shift: 12.0 }, 2).unwrap();
+        assert_eq!(s, vec![0.993766725063324, 0.8653398752212524, 0.0]);
+        // and for 4, as ComfyUI-piFlow printed them to five places
+        let s = super::piflow_sigmas(super::ModelSampling::Flow { shift: 12.0 }, 4).unwrap();
+        for (got, want) in s.iter().zip([0.99654, 0.96445, 0.89930, 0.69565, 0.0]) {
+            assert!((got - want).abs() < 1e-5, "{s:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

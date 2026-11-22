@@ -960,9 +960,18 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         write_safetensors(d, &dump)?;
     }
     let t1 = Instant::now();
-    let vae = args.model(&args.vae, H3_VAE);
-    let clip = gen.decode_h3(&vae, &latent, shape, frames)?;
-    eprintln!("video decoded in {:.2}s", t1.elapsed().as_secs_f64());
+    // a DWD adapter's pixel head already decoded the frames, in place of the VAE
+    let clip = match gen.take_h3_dwd_pixels() {
+        Some(c) => {
+            eprintln!("video from the DWD adapter's pixel head (no VAE decode)");
+            c
+        }
+        None => {
+            let c = gen.decode_h3(&args.model(&args.vae, H3_VAE), &latent, shape, frames)?;
+            eprintln!("video decoded in {:.2}s", t1.elapsed().as_secs_f64());
+            c
+        }
+    };
     let t1 = Instant::now();
     let wave = gen.decode_h3_audio(&args.model(&None, H3_AUDIO_VAE), &latent[shape.video_len()..], shape.audio_t)?;
     eprintln!("audio decoded in {:.2}s", t1.elapsed().as_secs_f64());

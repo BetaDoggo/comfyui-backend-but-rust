@@ -1,6 +1,8 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using FreneticUtilities.FreneticDataSyntax;
+using Newtonsoft.Json.Linq;
 using SwarmUI.Backends;
 using SwarmUI.Builtin_ComfyUIBackend;
 using SwarmUI.Core;
@@ -31,6 +33,113 @@ public class ComfyRustBackendExtension : Extension
             return has("video_patch_proj.weight") && has("audio_patch_proj.weight") && has("endpoint_time_embedder.proj_in.weight");
         }});
         Program.ModelPathsChangedEvent += OnModelPathsChanged;
+        // After SwarmUI's decode cleanup (200): a pi-H3 DWD adapter decodes the video itself at the last step
+        WorkflowGenerator.AddStep(UseDwdDecode, 201);
+    }
+
+    /// <summary>Whether each LoRA file is a LakonLab DWD adapter (pi-H3's), by path, size and time.</summary>
+    public static ConcurrentDictionary<string, bool> DwdAdapters = new();
+
+    /// <summary>True if the safetensors file at <paramref name="path"/> has a DWD pixel head, as pi-H3's DWD adapters do.</summary>
+    public static bool IsDwdAdapter(string path)
+    {
+        FileInfo info = new(path);
+        if (!info.Exists)
+        {
+            return false;
+        }
+        return DwdAdapters.GetOrAdd($"{path}|{info.Length}|{info.LastWriteTimeUtc.Ticks}", _ =>
+        {
+            using FileStream f = File.OpenRead(path);
+            byte[] len = new byte[8];
+            if (f.Read(len, 0, 8) != 8)
+            {
+                return false;
+            }
+            long n = BitConverter.ToInt64(len, 0);
+            if (n <= 0 || n > 100_000_000)
+            {
+                return false;
+            }
+            byte[] header = new byte[n];
+            f.ReadExactly(header, 0, (int)n);
+            return System.Text.Encoding.UTF8.GetString(header).Contains("\"dwd_norm_out.linear.weight\"");
+        });
+    }
+
+    /// <summary>The LoRA file a node's <c>lora_name</c> (or <c>adapter_name</c>) names, if SwarmUI knows it.</summary>
+    public static string LoraPath(string name)
+    {
+        T2IModelHandler loras = Program.T2IModelSets["LoRA"];
+        name = name.Replace('\\', '/');
+        foreach (string key in new[] { name, $"{name}.safetensors" })
+        {
+            if (loras.Models.TryGetValue(key, out T2IModel m))
+            {
+                return m.RawFilePath;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Whether the model at <paramref name="path"/> in the workflow passes through a LoRA loader with a DWD adapter.</summary>
+    public static bool HasDwdAdapter(WorkflowGenerator g, JArray path)
+    {
+        for (int depth = 0; depth < 64 && path is not null; depth++)
+        {
+            if (g.Workflow[$"{path[0]}"] is not JObject node)
+            {
+                return false;
+            }
+            string type = $"{node["class_type"]}";
+            JObject inputs = node["inputs"] as JObject;
+            if (type is "LoraLoader" or "LoraLoaderModelOnly" or "Load LakonLab Adapter")
+            {
+                string name = $"{inputs?["lora_name"] ?? inputs?["adapter_name"]}";
+                string file = LoraPath(name);
+                if (file is not null && IsDwdAdapter(file))
+                {
+                    return true;
+                }
+            }
+            path = inputs?["model"] as JArray;
+        }
+        return false;
+    }
+
+    /// <summary>On MiniMax H3, a video decode of a sampler's output whose model has a pi-H3 DWD adapter becomes ComfyUI-piFlow's
+    /// DWD Decode: the adapter's pixel head already decoded the frames at the last step, in place of the VAE.</summary>
+    public static void UseDwdDecode(WorkflowGenerator g)
+    {
+        if (!g.IsMiniMaxH3())
+        {
+            return;
+        }
+        void swap(string id, JObject data)
+        {
+            JArray samples = data["inputs"]?["samples"] as JArray;
+            if (samples is null || g.Workflow[$"{samples[0]}"] is not JObject source)
+            {
+                return;
+            }
+            // SwarmUI splits H3's joint latent before decoding its video
+            if ($"{source["class_type"]}" == "LTXVSeparateAVLatent" && $"{samples[1]}" == "0" && source["inputs"]?["av_latent"] is JArray av
+                && g.Workflow[$"{av[0]}"] is JObject joint)
+            {
+                source = joint;
+            }
+            if ($"{source["class_type"]}" is not ("SwarmKSampler" or "KSamplerAdvanced" or "KSampler"))
+            {
+                return;
+            }
+            if (HasDwdAdapter(g, source["inputs"]?["model"] as JArray))
+            {
+                data["class_type"] = "DWD Decode";
+                data["inputs"] = new JObject() { ["samples"] = samples };
+            }
+        }
+        g.RunOnNodesOfClass("VAEDecode", swap);
+        g.RunOnNodesOfClass("VAEDecodeTiled", swap);
     }
 
     public void OnModelPathsChanged()

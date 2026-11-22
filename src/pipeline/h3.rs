@@ -6,7 +6,7 @@ use super::{Cond, Dump, FamilyState, Generator, Kind, Prompt, Sampling, SharedTe
 use crate::cuda::{self, DevBuf, Stream};
 use crate::st::f32_bytes;
 use crate::vision::{self, PromptImage};
-use crate::{h3, h3te, h3vae, h3window, lora, offload, st, tokenizer};
+use crate::{h3, h3dwd, h3te, h3vae, h3window, lora, offload, st, tokenizer};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -110,6 +110,8 @@ struct Model {
     dit: h3::Dit,
     st: Arc<st::SafeTensors>,
     lora: lora::State,
+    /// the LakonLab adapter among the LoRAs, whose small tensors the model holds
+    adapter: Option<(PathBuf, Arc<st::SafeTensors>)>,
 }
 
 #[derive(Default)]
@@ -127,6 +129,10 @@ pub(super) struct H3 {
     ref_latents: Vec<((PathBuf, PromptImage), Arc<Vec<f32>>)>,
     /// Latest encoded prompts with their length and per-token tags (1 text, 0 vision), most recent last.
     contexts: Vec<(H3Key, usize, DevBuf, Vec<u8>)>,
+    /// The pixel head of the adapter's file, loaded by the first run that decodes with it.
+    dwd: Option<(PathBuf, h3dwd::Refiner)>,
+    /// The frames that head decoded at the end of the latest run.
+    dwd_pixels: Option<h3vae::Clip>,
 }
 
 impl FamilyState for H3 {
@@ -137,6 +143,25 @@ impl FamilyState for H3 {
         }
         if m.dit.is_image() && !loras.is_empty() {
             bail!("LoRAs on MiniMax-H3-Image (not supported yet)");
+        }
+        // a LakonLab adapter (pi-H3) also replaces small tensors and may bring a DWD pixel head
+        let mut adapters = Vec::new();
+        for l in loras {
+            let f = st::SafeTensors::open(&l.path)?;
+            if lora::is_lakonlab_adapter(&f) {
+                adapters.push((l.path.clone(), f));
+            }
+        }
+        if adapters.len() > 1 {
+            return Err(lora::Unsupported("more than one LakonLab adapter on MiniMax H3".into()).into());
+        }
+        let adapter = adapters.pop();
+        if m.adapter.as_ref().map(|a| &a.0) != adapter.as_ref().map(|a| &a.0) {
+            let name = adapter.as_ref().map(|(p, _)| p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned()));
+            m.dit.set_adapter(&m.st, adapter.as_ref().map(|a| &a.1), st).map_err(|e| lora::Unsupported(format!("{}: {e:#}", name.unwrap_or_default())))?;
+            m.adapter = adapter.map(|(p, f)| (p, Arc::new(f)));
+            self.dwd = None;
+            self.dwd_pixels = None;
         }
         if lora::apply(lora::Arch::H3, &m.st, "", m.dit.stores(), &mut m.lora, loras, st)? {
             self.clear_prompts();
@@ -363,7 +388,8 @@ impl Generator {
         dit.int8_attn = env.int8_attn;
         let name = if dit.is_hyperflow() { "HyperFlow H3 Flash" } else { "MiniMax H3" };
         eprintln!("{name} loaded in {:.1}s", t0.elapsed().as_secs_f64());
-        f.model = Some(Model { path: path.to_path_buf(), dit, st: dst, lora: lora::State::default() });
+        f.model = Some(Model { path: path.to_path_buf(), dit, st: dst, lora: lora::State::default(), adapter: None });
+        f.dwd_pixels = None;
         Ok(())
     }
 
@@ -440,6 +466,12 @@ impl Generator {
         Ok(out)
     }
 
+    /// The frames a DWD adapter's pixel head decoded at the end of the latest [`Self::sample_h3`], RGB f32
+    /// `[3, frames, h, w]` in 0..1.
+    pub fn take_h3_dwd_pixels(&mut self) -> Option<h3vae::Clip> {
+        self.family.h3().and_then(|f| f.dwd_pixels.take())
+    }
+
     /// Sample a clip; returns the pack of latents, video then audio.
     pub fn sample_h3(&mut self, r: &H3Request, mut progress: impl FnMut(Step) -> bool, mut dump: Option<&mut Dump>) -> Result<(Vec<f32>, Stats)> {
         let t0 = Instant::now();
@@ -458,6 +490,14 @@ impl Generator {
             bail!("{} sets of pictures and keyframes for {} positive entries", r.conds.len(), r.positive.len());
         }
         let windowed = r.windows.as_ref().is_some_and(|w| w.applies(&r.shape));
+        let dwd = dit.has_dwd();
+        if dwd && windowed {
+            return Err(lora::Unsupported("context windows with a DWD adapter (its pixel head decodes the whole clip at the last step)".into()).into());
+        }
+        if dwd && r.positive.len() > 1 {
+            // ComfyUI-piFlow only decodes an evaluation of one positive entry, and finds no pixels otherwise
+            return Err(lora::Unsupported("several positive conditioning entries with a DWD adapter".into()).into());
+        }
         let conditioned = |c: &H3Conds| !c.keyframes.is_empty() || c.pictures.iter().any(|p| p.latent.is_some());
         if r.conds.iter().any(conditioned) && (windowed || r.sparse.is_some()) {
             bail!("keyframes and reference pictures with context windows or sparse attention");
@@ -563,11 +603,15 @@ impl Generator {
         let n = r.noise.len();
         let mut first = dump;
         let sigmas = &r.sampling.sigmas;
+        // the DWD head decodes the positive evaluation at the schedule's last sigma above zero, as `torch.isclose` finds it
+        let last = sigmas.iter().rev().copied().find(|s| *s > 0.0).unwrap_or(0.0);
+        f.dwd_pixels = None;
         let mut model = |x: &DevBuf, den: &DevBuf, sigma: f32, side: Side, e: usize| -> Result<()> {
             let u = *map[usize::from(side.negative)].get(side.entry).context("no such conditioning entry")?;
             let (ctx, text, tags) = encoded[u];
             let (extra, rows) = &packs[u];
-            let pack = h3::Pack { tags, cond: rows.as_ref().map(|c| (c, extra)) };
+            let at_last = (sigma - last).abs() <= 1e-8 + 1e-5 * last.abs();
+            let pack = h3::Pack { tags, cond: rows.as_ref().map(|c| (c, extra)), dwd: dwd && !side.negative && at_last };
             // the first evaluation of the first positive entry is dumped
             let dumped = e == 0 && side == Side::POSITIVE;
             // the schedule's next sigma after the nearest one, as HyperFlow's ComfyUI node finds it
@@ -614,6 +658,32 @@ impl Generator {
         let pos_regions = regions(&r.positive);
         let neg_regions = if r.sampling.uses_negative() { regions(&r.negative) } else { PLAIN.to_vec() };
         let mut out = run_sampler(&r.sampling, &r.noise, [&pos_regions, &neg_regions], st, &mut stats, &mut model, &mut progress)?;
+        if let Some((features, grid)) = dit.take_dwd_features() {
+            if let Some(d) = first.as_mut() {
+                let mut v = vec![0u8; features.size()];
+                features.download(0, &mut v, st)?;
+                d.insert("dwd_features".into(), ("BF16".into(), vec![v.len() / 2], v));
+            }
+            // the pixel head runs with the blocks out of VRAM, as a decoder does
+            let t1 = Instant::now();
+            st.sync()?;
+            dit.park()?;
+            cuda::trim_pool()?;
+            let (path, ad) = m.adapter.as_ref().context("DWD features without an adapter")?;
+            if f.dwd.as_ref().is_none_or(|(p, _)| p != path) {
+                f.dwd = None;
+                f.dwd = Some((path.clone(), h3dwd::Refiner::load(ad, env.threads, st)?));
+            }
+            let head = &mut f.dwd.as_mut().unwrap().1;
+            head.place(cuda::device_free()?.saturating_sub(env.reserve + (3 << 30) + h3dwd::activation_bytes(grid)))?;
+            let pixels = head.decode(&features, grid, st)?;
+            drop(features);
+            head.park()?;
+            eprintln!("DWD head: {} frames of {}x{} in {:.2}s", pixels.t, pixels.w, pixels.h, t1.elapsed().as_secs_f64());
+            f.dwd_pixels = Some(pixels);
+        } else if dwd {
+            eprintln!("DWD adapter: no evaluation at the schedule's last sigma kept features, so there are no DWD frames");
+        }
         // the sampler carries the audio scaled onto the video schedule
         let scale = shifts.0 / shifts.1;
         for v in &mut out[r.shape.video_len()..] {

@@ -1264,7 +1264,6 @@ impl Dit {
         let sparse = self.sparse_work(l, sigma, st)?;
         let modf = DevBuf::alloc_async(trows * MODS * 4, st)?;
         let modb = DevBuf::alloc_async(trows * MODS * 2, st)?;
-        let folded = DevBuf::alloc_async(6 * F * 2, st)?;
         // HyperFlow's low-rank pairs: the SwiGLU output in bf16, and the rank-wide middle
         let (lrin, mid) = match self.hyper {
             Some(_) => (Some(DevBuf::alloc_async(l * FFN * 2, st)?), Some(DevBuf::alloc_async(l * self.mid_width.max(8) * 2, st)?)),
@@ -1288,6 +1287,8 @@ impl Dit {
         // each row's first modulation vector in `modb`, for the residual GEMMs that run every segment at once
         let sel: Vec<i32> = segs.iter().flat_map(|seg| std::iter::repeat_n(((seg.2 * 3 + seg.3) * 6) as i32, seg.1)).collect();
         anyhow::ensure!(sel.len() == l, "segments of {} rows for {l} tokens", sel.len());
+        // each segment's two folded norm weights; a reference picture splits the text into more runs
+        let folded = DevBuf::alloc_async(segs.len().max(1) * 2 * F * 2, st)?;
         let sel_d = DevBuf::alloc_async(l * 4, st)?;
         sel_d.upload(0, &sel.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), st)?;
         // x += gate * (a8 . w), the gate the segment's modulation vector `j`

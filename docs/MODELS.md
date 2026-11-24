@@ -210,6 +210,28 @@ embedding; every block's self-attention keys and values are kept (about 0.9 GB p
 target evaluation, which runs with the adapter's target LoRA. The keys are cached until the pictures, caption, mode,
 size, LoRAs or model change, and dropped when the backend goes idle.
 
+Style mode (`v2s-pre1` and later) takes only the art style of the pictures; the prompt describes the character and the
+scene. It runs through the adapter's mode-gated branches, extra LoRAs that the node adds after the reference or target
+LoRA only in the modes they list, a target branch only in evaluations that read the pictures. This engine merges each
+projection's LoRA and branches into one LoRA of their summed rank at load time, so the sum is rounded to bf16 once
+instead of once per LoRA. An adapter without a style branch is refused in Style mode, as the node refuses it, and so is
+a branch that targets a projection this engine doesn't apply LoRAs to. `cs` and `char` load exactly as before,
+including on `v2s`, whose branches they don't use. `v2s-pre1` has one branch, on the reference stream: rank 64 on every
+projection the reference LoRA covers, so those projections run a rank-192 LoRA in Style mode.
+
+Style mode on `v2s-pre1`, compared with the SwarmUI-SnapRef extension's copy of the node in the same setup as above (a
+1024x1024 woodblock-print scenery as the picture, a lighthouse prompt, 8 turbo steps, this engine's reference latent):
+
+| | Style | `cs` on `v2s-pre1` |
+|---|---|---|
+| Reference keys / values, first block | 0.34% / 0.29% | 0.16% / 0.04% |
+| Reference keys / values, last block | 0.56% / 0.99% | 0.59% / 1.6% |
+| Target first block, first evaluation | 1.3% | 1.2% |
+| Image PSNR | 20.2 dB | 15.6 dB |
+
+Both images look the same as ComfyUI's. In Style mode the lighthouse keeps the prompt's scene and takes the picture's
+outlines and flat colors; `cs` also copies the picture's wave.
+
 ```bash
 target/release/diffusion.exe --anima --snapref Lora/snapref_v2a.safetensors --image robot.png -p "no humans, robot, sitting on a park bench, autumn leaves"
 ```
@@ -227,16 +249,17 @@ robot and an 8-step turbo run at 1024x1024, both engines start from this engine'
 
 The VAE encode of that picture differs from ComfyUI's by 2.2%, which moves the first block's reference keys by 10%.
 Images are 17 to 18 dB from ComfyUI's, the same as this engine's int8 and flash attention are from each other (17.3 dB),
-and show the same character in the same pose. Only v2a was compared; v1a and v1b were not run.
+and show the same character in the same pose. Only v2a and v2s-pre1 were compared; v1a and v1b were not run.
 
 Speed at 1024x1024 with one 1 MP picture: encoding the picture's keys takes about 225 ms once. Each evaluation takes
 183 ms instead of 129 ms. A strength other than 1, or Fidelity below 1 on the negative, uses bf16 flash attention with a
 log-sum-exp merge, which takes 264 ms per evaluation.
 
 Refused: `ref_guidance_on`, which needs an extra model call per step (SwarmUI never sends it), a CLIP other than the
-prompt's, and more than one SnapRef node. `multi_layout` stitch, `use_batch` and the per-picture weights are implemented
-but were only run through the mock server, not on real output. The extension itself was not run in SwarmUI; the node
-was tested through `comfy-server` over HTTP and through the CLI.
+prompt's, and more than one SnapRef node. `multi_layout` stitch, `use_batch`, the per-picture weights and the fourth and fifth
+pictures (`image_4`, `image_5`, which the extension's copy of the node adds) are implemented but were only run through
+the mock server, not on real output. Style mode with `v2s-pre1` works in SwarmUI itself, through the extension; the
+other modes were tested through `comfy-server` over HTTP and through the CLI, not in SwarmUI.
 
 ## MOSS Image
 

@@ -115,19 +115,21 @@ pub struct Context {
 #[derive(Clone, Copy)]
 pub enum Pass<'a> {
     Plain,
-    /// A target evaluation: the adapter's "tgt" LoRA (SnapRef) or none (a training-free style reference), and the
-    /// references' keys and values when `read` is set.
-    Target { adapter: Option<&'a Adapter>, read: Option<(&'a RefKv, &'a RefRead)> },
-    /// A reference: its "ref" LoRA, recording each block's self-attention k and v at row `row0` of `out` (if any).
-    Reference { adapter: Option<&'a Adapter>, out: Option<&'a RefKv>, row0: usize },
+    /// A target evaluation: the adapter's "tgt" LoRA (SnapRef) and its mode, or none (a training-free style reference),
+    /// and the references' keys and values when `read` is set. The mode's target branches run only when it is.
+    Target { adapter: Option<(&'a Adapter, &'a str)>, read: Option<(&'a RefKv, &'a RefRead)> },
+    /// A reference: its "ref" LoRA and the mode's reference branches, recording each block's self-attention k and v at
+    /// row `row0` of `out` (if any).
+    Reference { adapter: Option<(&'a Adapter, &'a str)>, out: Option<&'a RefKv>, row0: usize },
 }
 
 impl Pass<'_> {
-    fn lora(&self) -> Option<(&Adapter, LoraStream)> {
+    /// The adapter, the stream, and the mode whose branches run.
+    fn lora(&self) -> Option<(&Adapter, LoraStream, Option<&str>)> {
         match *self {
             Pass::Plain => None,
-            Pass::Target { adapter, .. } => adapter.map(|a| (a, LoraStream::Tgt)),
-            Pass::Reference { adapter, .. } => adapter.map(|a| (a, LoraStream::Ref)),
+            Pass::Target { adapter, read } => adapter.map(|(a, mode)| (a, LoraStream::Tgt, read.map(|_| mode))),
+            Pass::Reference { adapter, .. } => adapter.map(|(a, mode)| (a, LoraStream::Ref, Some(mode))),
         }
     }
 }
@@ -612,9 +614,11 @@ impl Dit {
         let table = rope_positions(ht, wt, adapter.ref_t, h0, w0);
         let rope = DevBuf::alloc_async(table.len() * 4, st)?;
         rope.upload(0, &crate::st::f32_bytes(&table), st)?;
+        adapter.check_mode(mode)?;
         let t = self.time(0.0, adapter.mode_embed(mode, F)?, st)?;
         let (x, _) = self.embed(latent, 1, h, w, st)?;
-        self.blocks(&x, 1, ht * wt, c, rope.ptr(), &t, None, &Pass::Reference { adapter: Some(adapter), out: Some(out), row0 }, st, &mut None)
+        self.blocks(&x, 1, ht * wt, c, rope.ptr(), &t, None, &Pass::Reference { adapter: Some((adapter, mode)), out: Some(out), row0 }, st,
+            &mut None)
     }
 
     /// A training-free style reference: `latent` (f32 [16, h, w], already noised to `sigma`) through the plain model at
@@ -674,7 +678,7 @@ impl Dit {
 
         // SnapRef's LoRAs: their bf16 inputs, rank-wide intermediates and deltas
         let lora_bufs = match lora {
-            Some((a, stream)) => {
+            Some((a, stream, _)) => {
                 let wide = if stream == LoraStream::Ref { MLP } else { QKV };
                 Some((DevBuf::alloc_async(rows * wide * 2, st)?, DevBuf::alloc_async(rows * 3 * a.max_rank.max(1) * 2, st)?,
                     DevBuf::alloc_async(rows * wide * 2, st)?, DevBuf::alloc_async(rows * F * 2, st)?))
@@ -741,7 +745,7 @@ impl Dit {
             let shift = |j: usize| off(bm, j * MOD * 2);
             let scale = |j: usize| off(bm, (j * MOD + F) * 2);
             let gate = |j: usize| off(bm, (j * MOD + 2 * F) * 2);
-            let mat = |module: Module| lora.and_then(|(a, stream)| a.mat(stream, b, module).map(|mm| (a, mm)));
+            let mat = |module: Module| lora.and_then(|(a, stream, mode)| a.mat(stream, b, module, mode).map(|mm| (a, mm)));
             let lb = lora_bufs.as_ref().map(|(xn, lt, dl, yb)| (xn.ptr(), lt.ptr(), dl.ptr(), yb.ptr()));
             // layer norm j's modulated output, as the projections' bf16 input
             let normed = |j: usize, out: PM| -> Result<()> {
@@ -970,14 +974,15 @@ fn lora_delta(a: &Adapter, mm: &Mat, x: PM, ldx: usize, rows: usize, tmp: PM, ou
 }
 
 /// Activation memory SnapRef adds to a target step of `l` tokens per image next to `ref_rows` reference tokens: the
-/// LoRA scratch, and the keys prepended (or their groups' outputs, `groups` of them).
-pub fn snapref_step_bytes(l: usize, ref_rows: usize, groups: usize) -> usize {
-    l * (QKV * 2 * 2 + F * 2 + 3 * 128 * 2) + (ref_rows + l) * KV * 2 * 2 + (groups + 1) * l * (F * 2 + H * 4)
+/// LoRA scratch of rank `rank`, and the keys prepended (or their groups' outputs, `groups` of them).
+pub fn snapref_step_bytes(l: usize, ref_rows: usize, groups: usize, rank: usize) -> usize {
+    l * (QKV * 2 * 2 + F * 2 + 3 * rank * 2) + (ref_rows + l) * KV * 2 * 2 + (groups + 1) * l * (F * 2 + H * 4)
 }
 
-/// Activation memory of SnapRef's reference stream over `l` reference tokens, the keys it keeps aside.
-pub fn reference_bytes(l: usize) -> usize {
-    step_activation_bytes(l) + l * (MLP * 2 * 2 + F * 2 + 3 * 256 * 2)
+/// Activation memory of SnapRef's reference stream over `l` reference tokens with a LoRA scratch of rank `rank`, the
+/// keys it keeps aside.
+pub fn reference_bytes(l: usize, rank: usize) -> usize {
+    step_activation_bytes(l) + l * (MLP * 2 * 2 + F * 2 + 3 * rank * 2)
 }
 
 /// Bytes of the keys and values kept for `rows` reference tokens in a model of `blocks` blocks.

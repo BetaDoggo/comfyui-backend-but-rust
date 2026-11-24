@@ -28,7 +28,7 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
                 .input(link("vae", "VAE"))
                 .input(link("image", "IMAGE").tooltip("the reference (first image of the batch)"))
                 .input(combo("adapter", &adapter_files(env)))
-                .input(combo("mode", &["cs", "char"]).tooltip("cs = character and style from the reference; char = character only (put artist tags in the prompt)"))
+                .input(combo("mode", &["cs", "char", "style"]).tooltip("cs = character and style from the reference; char = character only (put artist tags in the prompt); style = only the art style of the picture (write the character and the scene in the prompt; needs an adapter with a style branch, e.g. snapref_v2s_pre)"))
                 .input(boolean("ref_in_uncond", false).tooltip("off (trained default): only the positive branch reads the reference, so CFG pushes toward it. on: weaker, closer to the prompt"))
                 .input(float("ref_megapixels", 1.0, 0.25, 2.0, 0.05).tooltip("the reference is shrunk (never enlarged) to this area, aspect kept; trained at <= 1.0"))
                 .input(float("strength", 0.0, -3.0, 3.0, 0.1).optional().tooltip("attention to the reference, log scale. 0 = as trained; +1 = about 2.7x more, -1 = about 2.7x less. Non-zero values make sampling about 1.3x slower"))
@@ -45,6 +45,11 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
                 .input(weight("weight_2", "how much image_2 counts (e.g. 0.4: mostly the first image, a little of this one); 0 = ignored"))
                 .input(weight("weight_3", "how much image_3 counts"))
                 .input(float("fidelity", 1.0, 0.0, 1.0, 0.05).optional().tooltip("1 = keep every detail of the picture; lower = follow the prompt more freely. Ignored when ref_in_uncond or ref_guidance_on is on"))
+                // SwarmUI-SnapRef's copy of the node: two more references, after fidelity
+                .input(link("image_4", "IMAGE").optional().tooltip("a fourth reference of the same character (style: of the same artist)"))
+                .input(link("image_5", "IMAGE").optional().tooltip("a fifth reference of the same character (style: of the same artist)"))
+                .input(weight("weight_4", "how much image_4 counts"))
+                .input(weight("weight_5", "how much image_5 counts"))
                 .output("MODEL", "MODEL")
         },
         |i, ctx| {
@@ -54,7 +59,7 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
             let use_batch = opt_bool("use_batch")?;
             // `_reference_images`: the first image of each input (every one with use_batch), weight-0 inputs dropped
             let mut references = Vec::new();
-            for (name, weight) in [("image", "weight_1"), ("image_2", "weight_2"), ("image_3", "weight_3")] {
+            for (name, weight) in [("image", "weight_1"), ("image_2", "weight_2"), ("image_3", "weight_3"), ("image_4", "weight_4"), ("image_5", "weight_5")] {
                 let w = opt_float(weight, 1.0)?;
                 let Some(img) = i.opt_image(name)? else { continue };
                 if w <= 0.0 {

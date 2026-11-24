@@ -2,7 +2,7 @@
 `diffusion --anima --snapref ... --dump`.
 
 usage: python snapref_ref.py <out_dir> <snapref node dir> <adapter.safetensors> <reference.png> [prompt]
-                             [--seed N] [--size W H] [--steps N] [--cfg X] [--negative TEXT] [--mode cs|char]
+                             [--seed N] [--size W H] [--steps N] [--cfg X] [--negative TEXT] [--mode cs|char|style]
                              [--strength X] [--fidelity X] [--latent ours.safetensors]
 
 Run it with SwarmUI's python_embeded and ComfyUI (ref/ComfyUI is too old), with SWARM_DIR set to the SwarmUI folder

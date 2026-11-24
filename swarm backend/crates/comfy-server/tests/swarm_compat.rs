@@ -1180,6 +1180,28 @@ async fn snapref_patches_the_model_like_the_swarm_extension() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn snapref_style_mode_takes_five_references() {
+    let engine = RecordingEngine::new();
+    let s = TestServer::start_engine(engine.clone(), 0, false).await;
+    // SwarmUI-SnapRef's Style mode with five prompt images: image_3 to image_5 reuse the fixture's two pictures
+    let mut w = fixture("anima_snapref.json");
+    let n = &mut w["104"]["inputs"];
+    n["mode"] = json!("style");
+    for (i, src) in [(3, "102"), (4, "103"), (5, "102")] {
+        n[format!("image_{i}")] = json!([src, 0]);
+        n[format!("weight_{i}")] = json!(0.5 + i as f64 / 10.0);
+    }
+    let r = run_like_swarm(&s, w, |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    let seen = engine.seen.lock().unwrap();
+    let p = seen.model_patches.iter().find(|p| p.starts_with("SnapRef")).expect("SnapRef patch");
+    for want in ["mode: \"style\"", "0.8)", "0.9)", "1.0)"] {
+        assert!(p.contains(want), "{want} missing from {p}");
+    }
+    assert_eq!(p.matches("ImageBatch(").count(), 5, "{p}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn snapref_refuses_when_every_weight_is_zero() {
     let s = TestServer::start(0).await;
     let mut w = fixture("anima_snapref.json");

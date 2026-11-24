@@ -8,6 +8,11 @@
 //!
 //! The LoRAs stay apart from the model's weights, which are int8: each targeted projection adds
 //! `up(down(x)) * alpha / rank` to its output, from its bf16 input, as the node's forward hooks do.
+//!
+//! Adapters from v2s on may carry mode-gated branches (`anima_ref_kv.branch.<branch>.<module>.down / up / alpha`):
+//! extra LoRAs of one stream that run only in the modes they list, added after that stream's LoRA. A reference-stream
+//! branch runs while the reference is encoded, a target-stream one only in target evaluations that read the reference.
+//! Style mode exists only through such a branch.
 
 use crate::cuda::{DevBuf, Stream};
 use crate::ffi::PM;
@@ -89,9 +94,32 @@ pub struct Adapter {
     mode_embed: Option<DevBuf>,
     buf: DevBuf,
     mats: HashMap<(LoraStream, usize, Module), Mat>,
-    /// Largest rank, for scratch sizes.
+    /// The projections a mode's branches touch, by mode: the stream's LoRA (if any) and each branch's, merged into one
+    /// LoRA of their summed rank (see [`merge`]). Projections no branch touches keep their entry in `mats`.
+    branched: HashMap<(String, LoraStream, usize, Module), Mat>,
+    /// Modes whose branches target something the engine can't apply, and why: refused when used.
+    broken: Vec<(String, String)>,
+    /// Largest rank, merged ones included, for scratch sizes.
     pub max_rank: usize,
 }
+
+/// One LoRA on a projection: the key root of each part (none for a part it leaves alone) and its matrices' suffixes.
+#[derive(Clone)]
+struct Lora {
+    roots: Vec<Option<String>>,
+    down: &'static str,
+    up: &'static str,
+}
+
+/// A branch's metadata entry (`branches.<name>`), as the node reads it.
+struct Branch {
+    name: String,
+    stream: LoraStream,
+    modes: Vec<String>,
+}
+
+/// The modes that exist only through a branch: `cs` and `char` work with every adapter.
+const BRANCH_MODES: [&str; 1] = ["style"];
 
 /// The JSON metadata of a safetensors file.
 fn metadata(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
@@ -119,8 +147,9 @@ fn e4m3(b: u8) -> f32 {
     sign * if e == 0 { m as f32 / 8.0 * 2f32.powi(-6) } else { (1.0 + m as f32 / 8.0) * 2f32.powi(e as i32 - 7) }
 }
 
-/// A LoRA matrix as bf16 bytes. FP8 files carry a float32 scale per row (`<key>_scale`), as the node dequantizes them.
-fn matrix(st: &SafeTensors, key: &str) -> Result<(Vec<u8>, usize, usize)> {
+/// A LoRA matrix, rounded to bf16 as the node holds it, and its rows and columns. FP8 files carry a float32 scale per
+/// row (`<key>_scale`), as the node dequantizes them.
+fn matrix(st: &SafeTensors, key: &str) -> Result<(Vec<f32>, usize, usize)> {
     let i = st.info(key)?;
     let &[rows, cols] = i.shape.as_slice() else { bail!("{key}: expected a matrix, got shape {:?}", i.shape) };
     let scale_key = format!("{key}_scale");
@@ -142,7 +171,93 @@ fn matrix(st: &SafeTensors, key: &str) -> Result<(Vec<u8>, usize, usize)> {
     } else {
         values
     };
-    Ok((values.iter().flat_map(|v| bf16::from_f32(*v).to_le_bytes()).collect(), rows, cols))
+    Ok((values.iter().map(|v| bf16::from_f32(*v).to_f32()).collect(), rows, cols))
+}
+
+fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|v| bf16::from_f32(*v).to_le_bytes()).collect()
+}
+
+/// Several LoRAs on one projection as one: their down matrices stacked (rank r1 + r2 + ...) and their up matrices side
+/// by side, each later one's up scaled by its scale over the first's, which stays the GEMM's. The sum of their deltas,
+/// as the node adds them one after another, in one bf16 rounding instead of one per LoRA. A part a LoRA leaves alone
+/// gets zeros. Returns each part's down [rank, k] and up [n, rank], the summed rank, k, n and the scale.
+#[allow(clippy::type_complexity)]
+fn merge(st: &SafeTensors, loras: &[Lora], parts: usize) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, usize, usize, usize, f32)> {
+    // per LoRA: per part (down, up) or none, its rank and scale
+    let mut loaded = Vec::new();
+    let (mut k, mut n) = (0, 0);
+    for l in loras {
+        let (mut rank, mut scale) = (0, 0.0);
+        let mut mats = Vec::new();
+        for root in &l.roots {
+            let Some(root) = root else {
+                mats.push(None);
+                continue;
+            };
+            let (down, r, kk) = matrix(st, &format!("{root}.{}", l.down))?;
+            let (up, nn, r2) = matrix(st, &format!("{root}.{}", l.up))?;
+            let alpha = st.f32_vec(&format!("{root}.alpha"), false)?.first().copied().unwrap_or(r as f32);
+            if r2 != r || (rank > 0 && r != rank) || (k > 0 && (kk, nn) != (k, n)) {
+                bail!("{root}: mismatched LoRA shapes");
+            }
+            (rank, k, n, scale) = (r, kk, nn, alpha / r as f32);
+            mats.push(Some((down, up)));
+        }
+        loaded.push((mats, rank, scale));
+    }
+    let total: usize = loaded.iter().map(|l| l.1).sum();
+    let first = loaded[0].2;
+    let (mut downs, mut ups) = (Vec::new(), Vec::new());
+    for p in 0..parts {
+        let mut down = Vec::with_capacity(total * k);
+        let mut up = vec![0.0; n * total];
+        let mut at = 0;
+        for (mats, rank, scale) in &loaded {
+            match &mats[p] {
+                Some((d, u)) => {
+                    down.extend_from_slice(d);
+                    let f = scale / first;
+                    for row in 0..n {
+                        for c in 0..*rank {
+                            up[row * total + at + c] = u[row * rank + c] * f;
+                        }
+                    }
+                }
+                None => down.resize(down.len() + rank * k, 0.0),
+            }
+            at += rank;
+        }
+        downs.push(down);
+        ups.push(up);
+    }
+    Ok((downs, ups, total, k, n, first))
+}
+
+/// The node's `_read_branches`: the branches its metadata lists, in their order. A stream other than ref or tgt, or a
+/// combine other than add, is refused as the node refuses it.
+fn branches(meta: &serde_json::Value, path: &Path) -> Result<Vec<Branch>> {
+    let Some(specs) = meta["branches"].as_object() else { return Ok(Vec::new()) };
+    specs.iter().map(|(name, spec)| {
+        let combine = spec["combine"].as_str().unwrap_or("add");
+        let stream = match spec["stream"].as_str() {
+            Some("ref") if combine == "add" => LoraStream::Ref,
+            Some("tgt") if combine == "add" => LoraStream::Tgt,
+            s => bail!("{}: branch {name} (stream {s:?}, combine {combine}) is not supported (stream ref or tgt, combine add)", path.display()),
+        };
+        let modes = spec["modes"].as_array().map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        Ok(Branch { name: name.clone(), stream, modes })
+    }).collect()
+}
+
+/// `<prefix>blocks.<i>.<module>` of a key root: the block and the projection and part.
+fn target(key: &str, name: &str) -> Result<(usize, Module, usize)> {
+    let Some((index, module)) = name.strip_prefix("blocks.").and_then(|n| n.split_once('.')) else {
+        bail!("{key}: SnapRef LoRAs outside the blocks are not supported");
+    };
+    let index: usize = index.parse().map_err(|_| anyhow!("{key}: bad block index"))?;
+    let (module, part) = Module::parse(module).ok_or_else(|| anyhow!("{key}: unsupported target {module}"))?;
+    Ok((index, module, part))
 }
 
 /// The node's `_adapter_block_map`: model block of each adapter block.
@@ -172,11 +287,35 @@ impl Adapter {
             None => vec!["cs".into()],
         };
         let st = SafeTensors::open(path)?;
+        let branch_specs = branches(&meta, path)?;
 
-        // anima_ref_kv.<stream>.blocks.<i>.<module>.lora_down
-        let mut found: HashMap<(LoraStream, usize, Module), Vec<Option<String>>> = HashMap::new();
+        // anima_ref_kv.<stream>.blocks.<i>.<module>.lora_down, and the branches' anima_ref_kv.branch.<branch>.<module>.down
+        type Found = HashMap<(LoraStream, usize, Module), Vec<Option<String>>>;
+        let mut found: Found = HashMap::new();
+        let mut branch_found: HashMap<String, Found> = HashMap::new();
+        // branches with a target the engine can't apply: refused when their mode is used, so the others still load
+        let mut unsupported: HashMap<String, String> = HashMap::new();
         let mut indices = Vec::new();
+        let branch_prefix = format!("{PREFIX}branch.");
         for key in st.tensors.keys() {
+            if let Some(rest) = key.strip_prefix(&branch_prefix) {
+                let Some(root) = key.strip_suffix(".down") else { continue };
+                let (branch, name) = rest[..root.len() - branch_prefix.len()].split_once('.').ok_or_else(|| anyhow!("{key}: unexpected key"))?;
+                let Some(spec) = branch_specs.iter().find(|b| b.name == branch) else {
+                    bail!("{}: branch {branch} has weights but no metadata (branches.{branch})", path.display());
+                };
+                match target(key, name) {
+                    Ok((index, module, part)) => {
+                        indices.push(index);
+                        branch_found.entry(branch.to_string()).or_default()
+                            .entry((spec.stream, index, module)).or_insert_with(|| vec![None; module.parts()])[part] = Some(root.to_string());
+                    }
+                    Err(e) => {
+                        unsupported.entry(branch.to_string()).or_insert(e.to_string());
+                    }
+                }
+                continue;
+            }
             let Some(root) = key.strip_suffix(".lora_down") else { continue };
             let rest = root.strip_prefix(PREFIX).ok_or_else(|| anyhow!("{key}: unexpected key"))?;
             let (stream, name) = rest.split_once('.').ok_or_else(|| anyhow!("{key}: unexpected key"))?;
@@ -185,11 +324,7 @@ impl Adapter {
                 "tgt" => LoraStream::Tgt,
                 s => bail!("{key}: unknown stream {s}"),
             };
-            let Some((index, module)) = name.strip_prefix("blocks.").and_then(|n| n.split_once('.')) else {
-                bail!("{key}: SnapRef LoRAs outside the blocks are not supported");
-            };
-            let index: usize = index.parse().map_err(|_| anyhow!("{key}: bad block index"))?;
-            let (module, part) = Module::parse(module).ok_or_else(|| anyhow!("{key}: unsupported target {module}"))?;
+            let (index, module, part) = target(key, name)?;
             indices.push(index);
             found.entry((stream, index, module)).or_insert_with(|| vec![None; module.parts()])[part] = Some(root.to_string());
         }
@@ -198,37 +333,54 @@ impl Adapter {
         let map = block_map(&indices, model_blocks)?;
 
         let mut host: Vec<u8> = Vec::new();
-        let mut push = |bytes: &[u8]| {
+        let mut push = |values: &[f32]| {
             let at = host.len().next_multiple_of(256);
             host.resize(at, 0);
-            host.extend_from_slice(bytes);
+            host.extend_from_slice(&bf16_bytes(values));
             at
         };
-        let mut mats = HashMap::new();
         let mut max_rank = 0;
-        for ((stream, index, module), roots) in found {
-            let roots: Vec<String> = roots.into_iter().collect::<Option<_>>()
-                .ok_or_else(|| anyhow!("block {index}: the adapter has some but not all of self_attn.q/k/v_proj"))?;
-            let mut downs = Vec::new();
-            let mut ups = [0usize; 3];
-            let (mut rank, mut k, mut n, mut scale) = (0, 0, 0, 0.0);
-            for (p, root) in roots.iter().enumerate() {
-                let (down, r, kk) = matrix(&st, &format!("{root}.lora_down"))?;
-                let (up, nn, r2) = matrix(&st, &format!("{root}.lora_up"))?;
-                let alpha = st.f32_vec(&format!("{root}.alpha"), false)?.first().copied().unwrap_or(r as f32);
-                if r2 != r || (p > 0 && (r, kk, nn) != (rank, k, n)) {
-                    bail!("{root}: mismatched LoRA shapes");
-                }
-                (rank, k, n, scale) = (r, kk, nn, alpha / r as f32);
-                downs.extend_from_slice(&down);
-                ups[p] = push(&up);
-            }
+        let mut upload = |loras: &[Lora], index: usize, module: Module| -> Result<Mat> {
+            let (downs, ups, rank, k, n, scale) = merge(&st, loras, module.parts())?;
             if k != width && !matches!(module, Module::Mlp2) {
                 bail!("block {index}: a LoRA of {k} inputs on a model {width} wide");
             }
-            let down = push(&downs);
+            let mut up = [0usize; 3];
+            for (p, u) in ups.iter().enumerate() {
+                up[p] = push(u);
+            }
             max_rank = max_rank.max(rank);
-            mats.insert((stream, map[index], module), Mat { down, up: ups, parts: module.parts(), rank, k, n, scale });
+            Ok(Mat { down: push(&downs.concat()), up, parts: module.parts(), rank, k, n, scale })
+        };
+        let stream_lora = |roots: &Vec<Option<String>>| Lora { roots: roots.clone(), down: "lora_down", up: "lora_up" };
+        let mut mats = HashMap::new();
+        for (&(stream, index, module), roots) in &found {
+            if roots.iter().any(Option::is_none) {
+                bail!("block {index}: the adapter has some but not all of self_attn.q/k/v_proj");
+            }
+            mats.insert((stream, map[index], module), upload(&[stream_lora(roots)], index, module)?);
+        }
+        // each branch mode's projections: the stream's LoRA, then its branches in metadata order (`style_branch._forward`)
+        let mut branched = HashMap::new();
+        let mut broken = Vec::new();
+        for mode in modes.iter().filter(|m| BRANCH_MODES.contains(&m.as_str())) {
+            let active: Vec<&Branch> = branch_specs.iter().filter(|b| b.modes.contains(mode) && branch_found.contains_key(&b.name)).collect();
+            if let Some(e) = active.iter().find_map(|b| unsupported.get(&b.name)) {
+                broken.push((mode.clone(), e.clone()));
+                continue;
+            }
+            let mut keys: Vec<(LoraStream, usize, Module)> = active.iter().flat_map(|b| branch_found[&b.name].keys().copied()).collect();
+            keys.sort_by_key(|&(s, i, m)| (s as u8, i, m as u8));
+            keys.dedup();
+            for (stream, index, module) in keys {
+                let mut loras: Vec<Lora> = found.get(&(stream, index, module)).map(stream_lora).into_iter().collect();
+                for b in active.iter().filter(|b| b.stream == stream) {
+                    if let Some(roots) = branch_found[&b.name].get(&(stream, index, module)) {
+                        loras.push(Lora { roots: roots.clone(), down: "down", up: "up" });
+                    }
+                }
+                branched.insert((mode.clone(), stream, map[index], module), upload(&loras, index, module)?);
+            }
         }
         let buf = DevBuf::alloc(host.len().max(1))?;
         buf.upload(0, &host, st0)?;
@@ -248,11 +400,35 @@ impl Adapter {
             false => None,
         };
         st0.sync()?;
-        Ok(Adapter { path: path.to_path_buf(), ref_t, modes, mode_embed, buf, mats, max_rank })
+        Ok(Adapter { path: path.to_path_buf(), ref_t, modes, mode_embed, buf, mats, branched, broken, max_rank })
     }
 
-    pub fn mat(&self, stream: LoraStream, block: usize, module: Module) -> Option<&Mat> {
-        self.mats.get(&(stream, block, module))
+    /// The LoRA on a projection in `stream`; with `branches`, the one of that mode's branches merged in, where they
+    /// touch it.
+    pub fn mat(&self, stream: LoraStream, block: usize, module: Module, branches: Option<&str>) -> Option<&Mat> {
+        branches.and_then(|mode| self.branched.get(&(mode.to_string(), stream, block, module)))
+            .or_else(|| self.mats.get(&(stream, block, module)))
+    }
+
+    /// The node's `check_mode`: `cs` and `char` always pass; a branch mode needs the adapter to list it, to carry its
+    /// mode embedding and to have a branch for it, or the render would silently be a `cs`-like one.
+    pub fn check_mode(&self, mode: &str) -> Result<()> {
+        if !BRANCH_MODES.contains(&mode) {
+            return Ok(());
+        }
+        let name = self.path.file_name().map_or_else(|| self.path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        if !self.modes.iter().any(|m| m == mode) {
+            bail!("SnapRef: {name} has no '{mode}' mode (its modes: {}). Style mode needs an adapter with a style branch, such as \
+                snapref_v2s_pre1; use mode cs or char with this adapter.", self.modes.join(", "));
+        }
+        if let Some((_, e)) = self.broken.iter().find(|(m, _)| m == mode) {
+            bail!("SnapRef: {name}'s '{mode}' branch can't run on this engine: {e}");
+        }
+        if self.mode_embed.is_none() || !self.branched.keys().any(|k| k.0 == mode) {
+            bail!("SnapRef: {name} lists the '{mode}' mode but has no mode_embed row or branch weights for it. Style mode needs an \
+                adapter such as snapref_v2s_pre1.");
+        }
+        Ok(())
     }
 
     pub fn at(&self, off: usize) -> PM {
@@ -414,6 +590,67 @@ mod tests {
         assert_eq!((w, h), (5, 2));
         assert_eq!(&rgb[..12], &[1.0; 12]);
         assert_eq!(&rgb[12..15], &[0.0; 3]);
+    }
+
+    /// A safetensors file of f32 tensors.
+    fn write_st(path: &Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) {
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, shape, values) in tensors {
+            let start = data.len();
+            data.extend_from_slice(&crate::st::f32_bytes(values));
+            header.insert(name.to_string(), serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, data.len()]}));
+        }
+        let h = serde_json::to_vec(&header).unwrap();
+        let mut out = (h.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(&h);
+        out.extend_from_slice(&data);
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn merged_loras_sum_their_deltas() {
+        let path = std::env::temp_dir().join(format!("snapref_merge_{}.safetensors", std::process::id()));
+        // stream LoRA: rank 2, alpha 1 (scale 0.5); branch: rank 1, alpha 2 (scale 2); k = 3, n = 2
+        let (d1, u1) = (vec![1.0, 0.0, 2.0, 0.0, 1.0, -1.0], vec![1.0, 2.0, -1.0, 0.5]);
+        let (d2, u2) = (vec![0.5, 0.5, 0.5], vec![1.0, -2.0]);
+        write_st(&path, &[
+            ("s.lora_down", vec![2, 3], d1.clone()), ("s.lora_up", vec![2, 2], u1.clone()), ("s.alpha", vec![], vec![1.0]),
+            ("b.down", vec![1, 3], d2.clone()), ("b.up", vec![2, 1], u2.clone()), ("b.alpha", vec![], vec![2.0]),
+        ]);
+        let st = SafeTensors::open(&path).unwrap();
+        let loras = [
+            Lora { roots: vec![Some("s".into())], down: "lora_down", up: "lora_up" },
+            Lora { roots: vec![Some("b".into())], down: "down", up: "up" },
+        ];
+        let (downs, ups, rank, k, n, scale) = merge(&st, &loras, 1).unwrap();
+        drop(st);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((rank, k, n, scale), (3, 3, 2, 0.5));
+        let x = [0.3f32, -1.0, 2.0];
+        // up(down(x)) * scale, for one LoRA of rank r
+        let delta = |d: &[f32], u: &[f32], r: usize, s: f32| -> Vec<f32> {
+            let t: Vec<f32> = (0..r).map(|i| (0..3).map(|j| d[i * 3 + j] * x[j]).sum()).collect();
+            (0..2).map(|o| (0..r).map(|i| u[o * r + i] * t[i]).sum::<f32>() * s).collect()
+        };
+        let want: Vec<f32> = delta(&d1, &u1, 2, 0.5).iter().zip(delta(&d2, &u2, 1, 2.0)).map(|(a, b)| a + b).collect();
+        let got = delta(&downs[0], &ups[0], 3, scale);
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-5, "{got:?} != {want:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_part_is_zero() {
+        let path = std::env::temp_dir().join(format!("snapref_parts_{}.safetensors", std::process::id()));
+        write_st(&path, &[("q.down", vec![1, 2], vec![1.0, 1.0]), ("q.up", vec![2, 1], vec![1.0, 1.0]), ("q.alpha", vec![], vec![1.0])]);
+        let st = SafeTensors::open(&path).unwrap();
+        let (downs, ups, rank, ..) = merge(&st, &[Lora { roots: vec![Some("q".into()), None, None], down: "down", up: "up" }], 3).unwrap();
+        drop(st);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(rank, 1);
+        assert_eq!(downs[0], vec![1.0, 1.0]);
+        assert_eq!((downs[1].clone(), ups[2].clone()), (vec![0.0, 0.0], vec![0.0, 0.0]));
     }
 
     #[test]

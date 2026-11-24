@@ -333,10 +333,11 @@ impl Anima {
         let sizes: Vec<usize> = r.references.iter().map(|x| (x.height / 2) * (x.width / 2)).collect();
         let most = sizes.iter().copied().max().unwrap_or(0);
         let nb = m.dit.blocks.len();
-        env.plan(&mut m.dit.blocks, &m.st, anima::reference_bytes(most) + anima::ref_kv_bytes(nb, sizes.iter().sum()))?;
+        let adapter = self.snapref.as_ref().unwrap();
+        adapter.check_mode(&r.mode)?;
+        env.plan(&mut m.dit.blocks, &m.st, anima::reference_bytes(most, adapter.max_rank.max(256)) + anima::ref_kv_bytes(nb, sizes.iter().sum()))?;
         let kv = snapref::RefKv::alloc(nb, sizes.clone(), anima::REF_ROW_BYTES)?;
         let caption = &self.contexts.iter().find(|(p, _)| *p == r.caption).context("caption not encoded")?.1;
-        let adapter = self.snapref.as_ref().unwrap();
         let mut row0 = 0;
         for (x, rows) in r.references.iter().zip(&sizes) {
             if x.latent.len() != dit::CH * x.height * x.width {
@@ -517,10 +518,10 @@ impl Generator {
             }
         }
         // SnapRef's extra activations per image: its LoRA scratch and the reference keys beside the image's
-        let snap_need = match (&r.snapref, &a.ref_kv) {
-            (Some(sr), Some((_, kv))) => {
+        let snap_need = match (&r.snapref, &a.ref_kv, &a.snapref) {
+            (Some(sr), Some((_, kv)), Some(adapter)) => {
                 let groups = snapref::RefRead { biases: sr.biases.clone() }.groups(&kv.sizes).len();
-                anima::snapref_step_bytes((lh / 2) * (lw / 2), kv.rows, groups)
+                anima::snapref_step_bytes((lh / 2) * (lw / 2), kv.rows, groups, adapter.max_rank.max(128))
             }
             _ => 0,
         };
@@ -533,7 +534,7 @@ impl Generator {
         let style_rows = style.as_ref().map_or(0, |s| (s.reference.height / 2) * (s.reference.width / 2));
         // shared attention: the reference's keys beside each image's; AdaIN alone keeps no keys
         let style_attention = style.as_ref().is_some_and(|s| s.attention);
-        let snap_need = snap_need + if style_attention { anima::snapref_step_bytes((lh / 2) * (lw / 2), style_rows, 1) } else { 0 };
+        let snap_need = snap_need + if style_attention { anima::snapref_step_bytes((lh / 2) * (lw / 2), style_rows, 1, 128) } else { 0 };
         if style.is_some() && r.snapref.is_some() {
             bail!("a style reference and SnapRef can't be used together");
         }
@@ -549,7 +550,7 @@ impl Generator {
         let together = {
             let m = a.model.as_mut().context("no diffusion model loaded")?;
             let style_fixed = if style.is_some() {
-                anima::reference_bytes(style_rows) + if style_attention { anima::ref_kv_bytes(m.dit.blocks.len(), style_rows) } else { 0 }
+                anima::reference_bytes(style_rows, 256) + if style_attention { anima::ref_kv_bytes(m.dit.blocks.len(), style_rows) } else { 0 }
             } else {
                 0
             };
@@ -570,10 +571,13 @@ impl Generator {
             (snapref::RefRead { biases: sr.biases.clone() }, neg.map(|biases| snapref::RefRead { biases }))
         });
         let (pos_pass, neg_pass) = match (&reads, a.snapref.as_ref(), a.ref_kv.as_ref()) {
-            (Some((pr, nr)), Some(adapter), Some((_, kv))) => (
-                anima::Pass::Target { adapter: Some(adapter), read: Some((kv, pr)) },
-                anima::Pass::Target { adapter: Some(adapter), read: nr.as_ref().map(|n| (kv, n)) },
-            ),
+            (Some((pr, nr)), Some(adapter), Some((_, kv))) => {
+                let mode = r.snapref.as_ref().map_or("cs", |sr| sr.mode.as_str());
+                (
+                    anima::Pass::Target { adapter: Some((adapter, mode)), read: Some((kv, pr)) },
+                    anima::Pass::Target { adapter: Some((adapter, mode)), read: nr.as_ref().map(|n| (kv, n)) },
+                )
+            }
             (Some(_), _, _) => bail!("SnapRef's references weren't encoded"),
             _ => (anima::Pass::Plain, anima::Pass::Plain),
         };

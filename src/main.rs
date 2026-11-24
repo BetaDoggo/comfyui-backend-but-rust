@@ -252,7 +252,8 @@ struct Args {
     /// Anima: a SnapRef weight file, the reference adapter that takes --image as pictures of the character
     #[arg(long)]
     snapref: Option<PathBuf>,
-    /// SnapRef: "cs" (character and style) or "char" (character only)
+    /// SnapRef: "cs" (character and style), "char" (character only) or "style" (art style only; needs an adapter with a
+    /// style branch, such as v2s)
     #[arg(long, default_value = "cs")]
     snapref_mode: String,
     /// SnapRef: how much the pictures count, 1 as trained

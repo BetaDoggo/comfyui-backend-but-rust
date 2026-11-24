@@ -1538,7 +1538,8 @@ impl NativeEngine {
             return Err(unsupported("a SnapRef CLIP other than the prompt's text encoder"));
         }
         check_text_encoder_loras(prompt, cc)?;
-        if !matches!(p.mode.as_str(), "cs" | "char") {
+        // style needs an adapter with a style branch, which the engine checks when it loads the adapter
+        if !matches!(p.mode.as_str(), "cs" | "char" | "style") {
             return Err(EngineError::InvalidInput(format!("SnapRef mode {}", p.mode)));
         }
         if !(0.25..=2.0).contains(&p.ref_megapixels) {

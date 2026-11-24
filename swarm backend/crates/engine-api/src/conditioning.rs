@@ -27,6 +27,10 @@ pub struct CondMeta {
     pub end_percent: f64,
     /// `ReferenceLatent` nodes append VAE-encoded reference images here (Krea 2 edit-style refs).
     pub reference_latents: Vec<Latent>,
+    /// `HiDreamO1ReferenceImages` appends its pictures here, as they are: SenseNova's text tower reads them (each frame of a
+    /// batch is one picture). On the positive prompt they make it an edit; on the negative, the prompt becomes the
+    /// pictures alone, as SenseNova Conditioning's `image` task encodes them.
+    pub reference_images: Vec<ImageBatch>,
     /// `FluxKontextMultiReferenceLatentMethod` (Krea 2 sets this when refs are enabled):
     /// one of `offset`, `index`, `uxo/uno`, `index_timestep_zero`, ...
     pub reference_latents_method: Option<String>,
@@ -177,6 +181,7 @@ impl Default for CondMeta {
             start_percent: 0.0,
             end_percent: 1.0,
             reference_latents: Vec::new(),
+            reference_images: Vec::new(),
             reference_latents_method: None,
             minimax_keyframes: Vec::new(),
             minimax_frame_count: None,

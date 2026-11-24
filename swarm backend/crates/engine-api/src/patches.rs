@@ -18,6 +18,8 @@ pub enum ModelPatch {
     SamplingAuraFlow { shift: f64, sampling: String },
     /// `ModelSamplingSD3` (not used by the three target models; kept for custom workflows).
     SamplingSd3 { shift: f64 },
+    /// `SenseNovaSamplingOptions`: SenseNova's flow shift. SwarmUI emits it only when the user sets Sigma Shift.
+    SenseNovaSampling { shift: f64 },
     /// `MiniMaxH3SigmaShift`. Always emitted for MiniMax H3: video shift = Sigma Shift param
     /// (default 12), audio shift = 3.
     MiniMaxH3Shift { shift_video: f64, shift_audio: f64 },

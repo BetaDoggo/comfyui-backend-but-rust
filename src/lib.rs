@@ -1,4 +1,4 @@
-//! diffusion: Rust + CUDA reimplementation of ComfyUI's image generation, for quantized checkpoints of Krea 2, Anima, MOSS Image and MiniMax H3,
+//! diffusion: Rust + CUDA reimplementation of ComfyUI's image generation, for quantized checkpoints of Krea 2, Anima, MOSS Image, Qwen Image 2.1, SenseNova U1.6 and MiniMax H3,
 //! Pixal3D image to 3D, and TripoSplat / Idol image to gaussian splat.
 
 pub mod anima;
@@ -32,6 +32,7 @@ pub mod samplers;
 pub mod sampling;
 pub mod seedvr;
 pub mod sdvae;
+pub mod sensenova;
 pub mod seedvr_vae;
 pub mod snapref;
 pub mod st;

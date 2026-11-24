@@ -1,0 +1,13 @@
+{
+  "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sensenova_u1.6_8b_mot_int8_convrot.safetensors"}},
+  "100": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["4", 0], "lora_name": "sensenova_8step.safetensors", "strength_model": 1.0}},
+  "101": {"class_type": "SenseNovaSamplingOptions", "inputs": {"model": ["100", 0], "shift": 2.5}},
+  "200": {"class_type": "SwarmLoadImageB64", "inputs": {"image_base64": "$IMAGE_B64"}},
+  "5": {"class_type": "EmptyHiDreamO1LatentImage", "inputs": {"batch_size": 1, "height": 1024, "width": 1024}},
+  "6": {"class_type": "SwarmTextEncodeAdvanced", "inputs": {"clip": ["4", 1], "lora_hooks": null, "steps": 8, "prompt": "make it night, with a starry sky", "width": 1024, "height": 1024, "target_width": 1024, "target_height": 1024, "guidance": -1.0, "images": null}},
+  "7": {"class_type": "SwarmTextEncodeAdvanced", "inputs": {"clip": ["4", 1], "lora_hooks": null, "steps": 8, "prompt": "", "width": 1024, "height": 1024, "target_width": 1024, "target_height": 1024, "guidance": -1.0, "images": null}},
+  "201": {"class_type": "HiDreamO1ReferenceImages", "inputs": {"positive": ["6", 0], "negative": ["7", 0], "images.image_1": ["200", 0]}},
+  "10": {"class_type": "SwarmKSampler", "inputs": {"model": ["101", 0], "noise_seed": 42, "steps": 8, "cfg": 1.0, "sampler_name": "euler", "scheduler": "normal", "positive": ["201", 0], "negative": ["201", 1], "latent_image": ["5", 0], "start_at_step": 0, "end_at_step": 10000, "return_with_leftover_noise": "disable", "add_noise": "enable", "control_after_generate": "fixed", "var_seed": 0, "var_seed_strength": 0.0, "sigma_min": -1.0, "sigma_max": -1.0, "rho": 7.0, "previews": "default", "tile_sample": false, "tile_size": 1024, "model_negative": null}},
+  "8": {"class_type": "VAEDecode", "inputs": {"vae": ["4", 2], "samples": ["10", 0]}},
+  "9": {"class_type": "SwarmSaveImageWS", "inputs": {"images": ["8", 0], "bit_depth": "8bit"}}
+}

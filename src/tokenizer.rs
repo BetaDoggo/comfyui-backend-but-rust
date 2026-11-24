@@ -50,6 +50,30 @@ impl Tokenizer {
         Self::build(VOCAB35, MERGES35, CONFIG35)
     }
 
+    /// SenseNova's tokenizer: Qwen2.5's, with the tokens `SenseNovaQwen2Tokenizer` adds as special ones, which take the
+    /// ids after the last of Qwen's (so `<img>` is 151670).
+    pub fn sensenova() -> Result<Self> {
+        let mut t = Self::new()?;
+        let mut names: Vec<String> = ["<IMG_CONTEXT>", "<img>", "</img>", "<quad>", "</quad>", "<ref>", "</ref>", "<box>", "</box>", "<|action_start|>",
+            "<|action_end|>", "<|plugin|>", "<|interpreter|>"]
+            .map(String::from)
+            .to_vec();
+        names.extend((0..254).map(|i| format!("<FAKE_PAD_{i}>")));
+        let first = t.special.iter().map(|s| s.1).max().ok_or_else(|| anyhow!("tokenizer without added tokens"))? + 1;
+        for (i, n) in names.into_iter().enumerate() {
+            t.special.push((n, first + i as u32));
+        }
+        t.special.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        Ok(t)
+    }
+
+    /// `text` with no added token recognized, as transformers' `split_special_tokens=True` tokenizes it.
+    pub fn encode_text(&self, text: &str) -> Result<Vec<u32>> {
+        let mut out = Vec::new();
+        self.encode_plain(text, &mut out)?;
+        Ok(out)
+    }
+
     fn build(vocab: &str, merges: &str, config: &str) -> Result<Self> {
         let vocab: HashMap<String, u32> = serde_json::from_str(vocab)?;
         let mut ranks = HashMap::new();

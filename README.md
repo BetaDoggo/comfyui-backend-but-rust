@@ -23,6 +23,7 @@ It really generates with these image, video and image-to-3D models, from specifi
 | MiniMax H3 | Text to video with audio | 0.24 s/step, 5 frames at 512x512 | 1.59 s/step |
 | HyperFlow H3 Flash | Text to video with audio, 6 steps | 0.49 s/step, 22 frames at 512x512 | needs custom nodes, not timed |
 | MiniMax-H3-Image | Text to image, 6 steps | 0.35 s/step, 1.07 s/step at 2048x2048 | 0.68 s/step, 1.34 s/step at 2048x2048 |
+| SenseNova U1.6 | Text to image and edits with reference pictures, in pixel space, with its 8-step LoRA | 0.14 s/step at CFG 1 | about 1.04 s/step |
 | Pixal3D | Image to a vertex-coloured 3D mesh (GLB), cutting the object out first with BiRefNet | 40 s per mesh at resolution 1024, 110 s at 1536 | not timed |
 | Idol (TripoSplat) | Image to a 3D gaussian splat (PLY), cutting the object out first with BiRefNet | 14.4 s per splat, 0.57 s/step at CFG 3 | 111 s/step headless here, not tuned |
 | SeedVR2 3B | Restores a picture or clip, as SwarmUI's SeedVR stage | 0.79 s per 1024 restore, DiT 145 ms | DiT 235 ms |
@@ -66,6 +67,7 @@ Put your models in one folder, keeping these subfolders, and point `MODELS_ROOT`
 | MiniMax H3 | `minimax_h3_fl2va_pruned_w6a8.safetensors` | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `MiniMaxH3/minimax_h3_video_vae_int8_convrot.safetensors`, `MiniMaxH3/minimax_h3_audio_vae_fp32.safetensors` |
 | HyperFlow H3 Flash | `minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors`, or the `fl2va` file, from the `_comfyui` folders of [its repository](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash) | as MiniMax H3 | as MiniMax H3 |
 | MiniMax-H3-Image | `minimax_h3_image_pruned_int8_convrot.safetensors` | as MiniMax H3 | `MiniMaxH3/minimax_h3_image_vae_fp16.safetensors` |
+| SenseNova U1.6 | `sensenova_u1.6_8b_mot_int8_convrot.safetensors` from [Comfy-Org/SenseNova-U1](https://huggingface.co/Comfy-Org/SenseNova-U1); its 8-step LoRA goes in `Lora/` | in the checkpoint | none: it samples pixels |
 | SD 1.x | `v1-5-pruned-emaonly-fp16.safetensors`, or another SD 1.x checkpoint | in the checkpoint | in the checkpoint, or any SD VAE |
 | SDXL | `sd_xl_base_1.0.safetensors`, or another SDXL base checkpoint | in the checkpoint | in the checkpoint, or any SD VAE |
 

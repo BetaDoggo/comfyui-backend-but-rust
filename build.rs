@@ -73,6 +73,7 @@ fn main() {
         Unit { src: csrc.join("triposplat.cu"), fast_math: false, quiet: false },
         Unit { src: csrc.join("birefnet.cu"), fast_math: false, quiet: false },
         Unit { src: csrc.join("qwen21.cu"), fast_math: false, quiet: false },
+        Unit { src: csrc.join("sensenova.cu"), fast_math: false, quiet: false },
         Unit { src: csrc.join("seedvr.cu"), fast_math: false, quiet: false },
         Unit { src: csrc.join("relayvsr.cu"), fast_math: false, quiet: false },
         Unit { src: csrc.join("sd.cu"), fast_math: false, quiet: true },

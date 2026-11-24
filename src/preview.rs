@@ -149,6 +149,12 @@ pub fn sd(x0: &[f32], h: usize, w: usize, xl: bool) -> Vec<u8> {
     rgb(factors, *bias, h, w, |c, y, x| x0[(c * h + y) * w + x])
 }
 
+/// Pixel-space models (SenseNova): a [3, h, w] image in -1..1 to [h / every, w / every, 3], every `every`th pixel.
+pub fn pixels(x0: &[f32], h: usize, w: usize, every: usize) -> Vec<u8> {
+    let (ph, pw) = (h / every, w / every);
+    rgb(&[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0; 3], ph, pw, |c, y, x| x0[(c * h + y * every) * w + x * every])
+}
+
 /// MiniMax H3: the first frame of a [24, t, h, w] latent to [h, w, 3].
 pub fn h3(x0: &[f32], t: usize, h: usize, w: usize) -> Vec<u8> {
     rgb(&H3_VIDEO.0, H3_VIDEO.1, h, w, |c, y, x| x0[(c * t * h + y) * w + x])

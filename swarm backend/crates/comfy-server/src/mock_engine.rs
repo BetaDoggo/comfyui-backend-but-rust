@@ -263,6 +263,10 @@ impl Engine for MockEngine {
                 LatentTensor { format: LatentFormat::Flux2, shape: vec![b, 128, height as usize / 16, width as usize / 16], data },
                 PixelInfo::image(width, height, req.batch_size),
             ),
+            EmptyLatentKind::Pixel { width, height } => Latent::single(
+                LatentTensor { format: LatentFormat::Pixel, shape: vec![b, 3, height as usize, width as usize], data },
+                PixelInfo::image(width, height, req.batch_size),
+            ),
             EmptyLatentKind::MiniMaxH3Image { width, height } => Latent::single(
                 LatentTensor { format: LatentFormat::MiniMaxH3Video, shape: vec![b, 24, 1, height as usize / 16, width as usize / 16], data },
                 PixelInfo::image(width, height, req.batch_size),

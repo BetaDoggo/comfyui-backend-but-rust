@@ -85,7 +85,7 @@ the ones on `ref/ComfyUI` with `ref/venv/Scripts/python.exe`.
 
 | ComfyUI | Scripts |
 |---|---|
-| SwarmUI's, through `SWARM_DIR` | `birefnet_ref`, `flux2_vae_ref`, `h3_ref`, `h3_image_ref`, `krea_image_ref`, `lora_ref`, `pih3_ref`, `pixal3d_ref`, `qwen21_ref`, `relayvsr_ref`, `seedvr_ref`, `snapref_ref`, `triposplat_ref` |
+| SwarmUI's, through `SWARM_DIR` | `birefnet_ref`, `flux2_vae_ref`, `h3_ref`, `h3_image_ref`, `krea_image_ref`, `lora_ref`, `pih3_ref`, `pixal3d_ref`, `qwen21_ref`, `relayvsr_ref`, `seedvr_ref`, `sensenova_ref`, `snapref_ref`, `triposplat_ref` |
 | SwarmUI's, with the SwarmUI folder as the first argument | `cfg_ref`, `latent_ops_ref`, `partial_ref`, `swarm_prompt_ref` |
 | `ref/ComfyUI` | `anima_ref`, `moss_ref`, `ref_dump` (Krea 2), `sampler_ref`, `sd_ref` (or `COMFY_DIR`), `te_hidden`, `te_l0`, `chk_dtypes`, `chk_te` |
 | None: they compare, inspect or write files | Every `*_cmp.py` except `qwen21_cmp`, `compare.py`, `psnr.py`, `glb_preview.py`, `st_header.py`, `h3_refiner_check`, `lora_formats` |

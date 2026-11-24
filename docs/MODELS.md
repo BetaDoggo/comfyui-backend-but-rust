@@ -14,6 +14,7 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | HyperFlow H3 Flash | Video with audio, with reference pictures on `ref2va` | `euler` or `res_multistep`, `hyperflow`, 6 steps | int8 ConvRot, ComfyUI's single file of either task |
 | pi-H3 (2- and 4-step DWD adapters) | Video with audio, frames from the adapter's pixel head | `euler`, `piflow`, the adapter's steps, CFG 1 | the adapter on H3's `w6a8` checkpoint |
 | MiniMax-H3-Image | Images | `euler`, `simple`, 6 steps | int8 ConvRot (`minimax_h3_image_pruned_int8_convrot`) only |
+| SenseNova U1.6 | Images in pixel space, and edits | `euler`, `normal`; 8 steps at CFG 1 with its LoRA | int8 ConvRot (`sensenova_u1.6_8b_mot_int8_convrot`) only |
 | Pixal3D | A 3D mesh from one image | the example workflow's four `euler` samplers | int8 ConvRot (`pixal3d_int8_convrot`) only |
 | Idol (TripoSplat) | A 3D gaussian splat from one image | `dpmpp_2m`, `simple`, 20 steps, CFG 3 | Comfy-Org's fp16 files |
 | SeedVR2 3B | A restored copy of a picture (SwarmUI's SeedVR stage) | `euler`, `simple`, 1 step, CFG 1 | int8 ConvRot (`seedvr2_3b_int8_convrot`) only |
@@ -48,7 +49,7 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | VAE tiling, Seamless Tileable | Refused | Refused | Refused | Refused | Refused | Only the 256 / 64 tile | - |
 | Background removal | - | - | - | - | - | - | Yes (BiRefNet) |
 
-HyperFlow H3 Flash, pi-H3, MiniMax-H3-Image, Idol, SeedVR2 and RelayVSR aren't in this matrix; their own sections below say what they
+HyperFlow H3 Flash, pi-H3, MiniMax-H3-Image, SenseNova U1.6, Idol, SeedVR2 and RelayVSR aren't in this matrix; their own sections below say what they
 take. ControlNet, regions, IP-Adapter, style models, GLIGEN, LoRA hooks and embeddings are refused on every family. Anima
 takes both `(word:1.2)` and `<weight>`; Qwen Image 2.1's encoder reads `(word:1.2)` as plain text. SD 1.x and SDXL take
 `(word:1.2)` in a plain prompt and `<weight>` through SwarmUI's text node, which reads parentheses literally, as
@@ -361,6 +362,49 @@ edit keeps its transparency.
 Not tested: SwarmUI itself (the two graphs SwarmUI makes for alpha text to image and a two-picture edit ran through
 `comfy-server` over HTTP, 8 s and 11 s from a cold start), more than two reference images, and the fp8 and bf16 files,
 which are refused.
+
+## SenseNova U1.6
+
+Runs `sensenova_u1.6_8b_mot_int8_convrot.safetensors` from [Comfy-Org/SenseNova-U1](https://huggingface.co/Comfy-Org/SenseNova-U1),
+ComfyUI's `sensenova_u15` class, with or without its 8-step LoRA. It is a mixture of two transformers in one file, and it
+samples pixels, so there is no VAE: ComfyUI's `pixel_space` VAE only maps -1..1 to 0..1. It runs through `comfy-server`
+only; there is no CLI. The maintainer reports it works in SwarmUI; the numbers below are from `comfy-server` over HTTP.
+
+* **The text tower** reads the prompt once and keeps each layer's keys and values. Its int8 ConvRot weights are
+  dequantized to f32, where ComfyUI runs bf16.
+* **The generation tower** is W8A8 int8 with int8 attention by default. It attends to the text tower's keys and values,
+  and predicts the clean picture; the velocity is `(x - prediction) / max(1 - t, 0.02)`, as ComfyUI computes it.
+* **Noise** is scaled by the size, as ComfyUI's `noise_scaling` does. `SenseNovaSamplingOptions` sets the shift, 3 by
+  default.
+
+**Edits.** `HiDreamO1ReferenceImages` attaches pictures to both prompts. Each picture keeps its size, padded to a
+multiple of 32 by wrapping round, and goes through the text tower's own patch embedding. Its tokens sit in the prompt
+as SenseNova Conditioning's `image` task places them, labelled `Image-N` when there is more than one. The negative
+prompt becomes the pictures alone. The engine does this whenever pictures are attached, so SwarmUI's graph, which has no
+SenseNova Conditioning, gives the same picture as ComfyUI's graph with it. That node's other tasks generate text first
+and are refused. The edit outputs look posterized in ComfyUI too.
+
+Measured here (RTX 5070, 12 GB), `euler`, `normal`, after warm-up:
+
+| | ComfyUI | This engine | Apart |
+|---|---|---|---|
+| 1024x1024, 8 steps, CFG 1 | about 1.04 s/step (legacy memory path) | 1.12 s (0.14 s/step) | 45.97 dB |
+| 1024x1024, 8 steps, the 8-step LoRA | not timed | not timed | 39.68 dB |
+| 1280x768, 20 steps, CFG 4, shift 2.5 | not timed | 4.3 s (215 ms/evaluation) | 26.45 dB |
+| 2048x2048, 8 steps, the 8-step LoRA | not timed | 3.49 s | not compared |
+| Edit, one picture, the 8-step LoRA | not timed | not timed | 30.84 dB |
+| Edit, base model, 20 steps, CFG 4 | 9.2 s (DynamicVRAM) | 4.4 s | 20.2 dB |
+
+Sampling times leave out the text tower: 1.7 s for an edit's 1293 tokens. The first evaluation's velocity is within
+0.18% of ComfyUI's on a text prompt. At CFG 4 this engine's int8 and flash attention are as far apart as it is from ComfyUI
+(26.06 and 20.5 dB), so the gap there is guidance magnifying rounding. On an edit the picture's keys and values drift
+smoothly from ComfyUI's, to 14 to 27% at the last layer, from ComfyUI's bf16 against this engine's f32. The LoRA's 294
+tensors bake in 1.29 s. A cold load after another program pushed the file out of the page cache took about 65 s.
+
+Refused: prompt weights and `<break>`, text tower LoRAs, Prompt Images through SwarmUI's text node (Prompt Images reach
+the model through `HiDreamO1ReferenceImages`), VAE Encode (so init images), pictures under 16 pixels a side, and
+SenseNova Conditioning's text-generating tasks. Not tested: samplers other than `euler`, live previews, and edits in
+SwarmUI itself.
 
 ## SD 1.x and SDXL
 

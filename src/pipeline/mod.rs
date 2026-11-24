@@ -16,6 +16,7 @@ mod qwen21;
 mod relayvsr;
 mod sd;
 mod seedvr;
+mod sensenova;
 
 pub use anima::{AnimaRequest, SnapRefRequest, StyleRequest};
 pub use h3::{h3_presentation, h3_tokens, image_pictures, ref2va_pictures, ref2va_size, resize as h3_resize, size_short_edge, H3Conds, H3Picture, H3Request};
@@ -25,6 +26,7 @@ pub use qwen21::Qwen21Request;
 pub use relayvsr::{Frames as RelayVsrFrames, RelayVsrRequest};
 pub use sd::{is_sd, SdRequest, SizeCond};
 pub use seedvr::SeedVrRequest;
+pub use sensenova::SenseNovaRequest;
 pub use crate::samplers::Inpaint;
 
 use crate::cuda::{self, DevBuf, Event, Stream};
@@ -698,6 +700,7 @@ enum Kind {
     Qwen21,
     H3,
     Sd,
+    SenseNova,
 }
 
 impl Kind {
@@ -732,6 +735,7 @@ enum Family {
     Qwen21(qwen21::Qwen21),
     H3(h3::H3),
     Sd(sd::Sd),
+    SenseNova(sensenova::SenseNova),
 }
 
 impl Family {
@@ -743,6 +747,7 @@ impl Family {
             Kind::Qwen21 => Family::Qwen21(Default::default()),
             Kind::H3 => Family::H3(Default::default()),
             Kind::Sd => Family::Sd(Default::default()),
+            Kind::SenseNova => Family::SenseNova(Default::default()),
         }
     }
 
@@ -755,6 +760,7 @@ impl Family {
             Family::Qwen21(_) => Kind::Qwen21,
             Family::H3(_) => Kind::H3,
             Family::Sd(_) => Kind::Sd,
+            Family::SenseNova(_) => Kind::SenseNova,
         })
     }
 
@@ -767,6 +773,7 @@ impl Family {
             Family::Qwen21(f) => f,
             Family::H3(f) => f,
             Family::Sd(f) => f,
+            Family::SenseNova(f) => f,
         })
     }
 }

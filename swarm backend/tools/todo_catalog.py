@@ -30,9 +30,7 @@ NODES = {
     'TripleCLIPLoader': ('other_arch', 'arch', 'SD3'),
     'T5TokenizerOptions': ('other_arch', 'arch', 'T5-based models'),
     'QuadrupleCLIPLoader': ('other_arch', 'arch', 'HiDream'),
-    'EmptyHiDreamO1LatentImage': ('other_arch', 'arch', 'HiDream O1'),
     'HiDreamO1PatchSeamSmoothing': ('other_arch', 'arch', 'HiDream O1'),
-    'HiDreamO1ReferenceImages': ('other_arch', 'arch', 'HiDream O1'),
     'FluxDisableGuidance': ('other_arch', 'arch', 'Flux dev (Flux Disable Guidance)'),
     'FluxKVCache': ('other_arch', 'arch', 'Flux'),
     'StableCascade_EmptyLatentImage': ('other_arch', 'arch', 'Stable Cascade'),
@@ -78,7 +76,6 @@ NODES = {
     'EmptyYuE2LatentAudio': ('other_arch', 'arch', 'YuE 2'),
     'YuE2GenerateABC': ('other_arch', 'arch', 'YuE 2'),
     'YuE2GenerateMusic': ('other_arch', 'arch', 'YuE 2'),
-    'SenseNovaSamplingOptions': ('other_arch', 'arch', 'SenseNova'),
     'TextEncodeQwenImageEdit': ('other_arch', 'arch', 'Qwen Image Edit (2509 and earlier)'),
     'TextEncodeQwenImageEditPlus': ('other_arch', 'arch', 'Qwen Image Edit Plus'),
     # ---------------------------------------------------------------- third-party (not in core ComfyUI)

@@ -117,6 +117,15 @@ extern "C" {
     pub fn gpu_flux2_latent_in(lat: P, mean: P, std: P, out: PM, c: i32, h: i32, w: i32, s: PM) -> i32;
     pub fn gpu_convrot_dequant(dtype: i32, q: P, s_: P, out: PM, n: i64, k: i32, s: PM) -> i32;
     pub fn gpu_convrot_requant(dtype: i32, x: P, q: PM, s_: PM, n: i64, k: i32, seed: u64, s: PM) -> i32;
+    /// SenseNova's q/k: two 64-wide RMS norms per 128-wide head, then RoPE over 64, 32 and 32 values from `rope`
+    /// ([l][64][(cos, sin)]). In place, bf16 or f32.
+    pub fn gpu_sn_qk(dtype: i32, buf: PM, row_stride: i64, q_off: i32, k_off: i32, hq: i32, hk: i32, qn: P, qn_hw: P, kn: P, kn_hw: P,
+        eps: f32, rope: P, l: i32, s: PM) -> i32;
+    pub fn gpu_sn_gelu_rope2d(x: PM, gh: i32, gw: i32, c: i32, freqs: P, s: PM) -> i32;
+    pub fn gpu_sn_space_to_depth2(x: P, out: PM, h: i32, w: i32, c: i32, s: PM) -> i32;
+    pub fn gpu_sn_pixel_shuffle(inp: P, out: PM, h: i32, w: i32, c: i32, r: i32, s: PM) -> i32;
+    pub fn gpu_sn_gelu(x: PM, n: i64, s: PM) -> i32;
+    pub fn gpu_sn_denoise(y: P, x: P, den: PM, h: i32, w: i32, sigma: f32, denom: f32, s: PM) -> i32;
     pub fn gpu_lora_add(dtype: i32, w: PM, d: P, scale: f32, n: i64, s: PM) -> i32;
     pub fn gpu_w6_decode(q: P, s_rel: P, out: PM, n: i64, k: i32, g: i32, s: PM) -> i32;
     pub fn gpu_add_gated_rows_bf16(x: PM, y: P, gates: P, sel: P, rows: i32, cols: i32, s: PM) -> i32;

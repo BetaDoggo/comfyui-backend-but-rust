@@ -151,6 +151,8 @@ Two things to handle in `sample` / `vae_decode` (details in the mapping doc):
 
 * Qwen Image 2.1 arrives with a half-size 4-channel placeholder latent. Call `Latent::conform_empty`.
 * Alpha-capable VAEs (Qwen Image 2.1) return 4-channel `ImageBatch`es. The server saves them as RGBA PNGs.
+* SenseNova U1.6 samples pixels: `EmptyHiDreamO1LatentImage` gives a `LatentFormat::Pixel` latent, and `VAEDecode` with the
+  checkpoint's `pixel_space` VAE maps it to the picture.
 
 Everything ComfyUI does with pure data (patch nodes, conditioning metadata, image resizing/batching,
 base64 decoding, output encoding, queue/history/websocket protocol) is already handled by the server.

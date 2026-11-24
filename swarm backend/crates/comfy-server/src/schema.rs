@@ -125,8 +125,13 @@ impl InputSpec {
             }
             InputKind::Float { default, min, max, step } => {
                 opts.insert("default".into(), json!(default));
-                opts.insert("min".into(), json!(min));
-                opts.insert("max".into(), json!(max));
+                // f64::MIN and f64::MAX stand for a bound the node doesn't declare, as `input_from_v1` reads one
+                if *min != f64::MIN {
+                    opts.insert("min".into(), json!(min));
+                }
+                if *max != f64::MAX {
+                    opts.insert("max".into(), json!(max));
+                }
                 if let Some(s) = step {
                     opts.insert("step".into(), json!(s));
                 }
@@ -226,6 +231,11 @@ pub fn float(name: &str, default: f64, min: f64, max: f64, step: f64) -> InputSp
     InputSpec::new(name, InputKind::Float { default, min, max, step: Some(step) })
 }
 
+/// A FLOAT widget that declares no `min` or `max` (V3 nodes that leave them out).
+pub fn float_unbounded(name: &str, default: f64, step: f64) -> InputSpec {
+    InputSpec::new(name, InputKind::Float { default, min: f64::MIN, max: f64::MAX, step: Some(step) })
+}
+
 /// A FLOAT widget that declares no `step` (some Swarm nodes).
 pub fn float_nostep(name: &str, default: f64, min: f64, max: f64) -> InputSpec {
     InputSpec::new(name, InputKind::Float { default, min, max, step: None })
@@ -256,6 +266,12 @@ pub fn link(name: &str, ty: &str) -> InputSpec {
 
 pub fn autogrow(name: &str, prefix: &str, min: u32, max: u32, item: InputSpec) -> InputSpec {
     InputSpec::new(name, InputKind::Autogrow { prefix: prefix.to_string(), min, max, item: Box::new(item), names: Vec::new() })
+}
+
+/// A V3 `Autogrow` whose members are `names` (`TemplateNames`).
+pub fn autogrow_names(name: &str, names: Vec<String>, item: InputSpec) -> InputSpec {
+    let max = names.len() as u32;
+    InputSpec::new(name, InputKind::Autogrow { prefix: String::new(), min: 0, max, item: Box::new(item), names })
 }
 
 pub fn dynamic_combo(name: &str, options: Vec<(&str, Vec<InputSpec>)>) -> InputSpec {

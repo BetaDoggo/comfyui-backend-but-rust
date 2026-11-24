@@ -87,6 +87,7 @@ the baked weights match ComfyUI's bit for bit. Sampling then runs the normal int
 | Anima | `src/anima.rs`, int8 ConvRot | Qwen3 0.6B, `src/qwen3.rs` | Qwen-Image (Wan 2.1), `src/vae.rs` |
 | MOSS Image | `src/moss.rs`, int8 ConvRot | Qwen3.5 9B, `src/qwen35.rs` | Flux 2, `src/flux2vae.rs` |
 | Qwen Image 2.1 | `src/qwen21.rs`, int8 ConvRot | Qwen3-VL 8B, `src/te.rs` and `src/vision.rs` | RGBA Wan 2.2 layout, `src/vae21.rs` |
+| SenseNova U1.6 | `src/sensenova.rs`, the generation tower, W8A8 int8 | the text tower in the same file, int8 ConvRot dequantized to f32, `src/sensenova.rs`; its keys and values are the generation tower's context | none: it samples pixels |
 | MiniMax H3 | `src/h3.rs`, w6a8 | Qwen3-VL 32B, `src/h3te.rs` | Video and audio, `src/h3vae.rs` |
 | Pixal3D | `src/trellis.rs`, int8 ConvRot | DINOv3 ViT-L and NAF, `src/dino3.rs` | Sparse convolution shape and texture decoders, `src/trellis_vae.rs` |
 | SeedVR2 3B | `src/seedvr.rs`, int8 ConvRot | none: a fixed prompt stored in the checkpoint | Causal video VAE, a frame at a time, `src/seedvr_vae.rs` |
@@ -345,6 +346,7 @@ csrc/attn.cu        FlashAttention-2 forward wrapper (only the needed variants i
 csrc/attn_int8.cu   INT8 attention wrapper, the default
 csrc/h3.cu          MiniMax H3 kernels
 csrc/qwen21.cu      Qwen Image 2.1: VAE shortcuts, prefix attention for text and reference tokens
+csrc/sensenova.cu   SenseNova U1.6: q/k norm and rope, patch embedding (GELU, 2D rope, space to depth), pixel shuffle, the denoised pixels
 csrc/seedvr.cu      SeedVR2: patch embedding input, window attention reordering, VAE pixel shuffle and temporal taps
 csrc/relayvsr.cu    RelayVSR: tensor-core sliding-window attention over several planes, int8 key cache, LQ projection, Flash output
 csrc/trellis.cu     Pixal3D: per-head QK norm, voxel hashing and sparse-conv gathers, NAF attention, feature sampling

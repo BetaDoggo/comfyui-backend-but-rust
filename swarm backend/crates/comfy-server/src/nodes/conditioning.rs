@@ -60,6 +60,69 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
     r.add(
         env,
         |_| {
+            let names = (1..=100).map(|n| format!("image_{n}")).collect();
+            let images = autogrow_names("images", names, link("image", "IMAGE"));
+            NodeSchema::new("HiDreamO1ReferenceImages", "HiDream-O1 Reference Images", "model/conditioning/hidream")
+                .describe("Attach ordered reference images to positive and negative conditioning.")
+                .input(link("positive", "CONDITIONING"))
+                .input(link("negative", "CONDITIONING"))
+                .input(images.optional().tooltip("Reference images are used in numeric socket order."))
+                .output("CONDITIONING", "positive")
+                .output("CONDITIONING", "negative")
+        },
+        |i, _| {
+            // in socket order; with none (SwarmUI sends it without Prompt Images too) both prompts stay as they are
+            let mut images: Vec<_> = i.group("images").into_iter().filter_map(|(n, v)| if let Value::Image(b) = v { Some((n, b.clone())) } else { None }).collect();
+            images.sort_by_key(|(n, _)| *n);
+            let attach = |c: &swarm_engine_api::Conditioning| c.map_meta(|m| m.reference_images.extend(images.iter().map(|(_, b)| b.clone())));
+            let (pos, neg) = (i.conditioning("positive")?, i.conditioning("negative")?);
+            Ok(NodeOutput::values(vec![Value::Conditioning(attach(pos)), Value::Conditioning(attach(neg))]))
+        },
+    );
+
+    r.add(
+        env,
+        |_| {
+            let samples = || link("samples", "LATENT").optional().tooltip("Previous sampler output, connected when continuing after an image request.");
+            NodeSchema::new("SenseNovaConditioning", "SenseNova Conditioning", "model/sampling/sensenova")
+                .describe("Encode reference images, image thinking, interleaved text, or self-correction with CLIP. Connect HiDream-O1 Reference Images before this node and use a standard sampler for images. Text-to-image without thinking needs only CLIP Text Encode; text-only output can use Generate Text.")
+                .input(link("clip", "CLIP").optional())
+                .input(link("conditioning", "CONDITIONING"))
+                .input(link("negative", "CONDITIONING").optional())
+                .input(
+                    dynamic_combo(
+                        "task",
+                        vec![
+                            ("image", vec![]),
+                            ("image thinking", vec![]),
+                            ("interleave", vec![boolean("thinking", true), samples()]),
+                            ("self-correction", vec![samples()]),
+                        ],
+                    )
+                    .tooltip("Select the task. Its prompt template and stopping behavior are set automatically."),
+                )
+                .input(int("max_tokens", 1024, 1, 8192).advanced().tooltip("Maximum tokens generated during this call."))
+                .output("CONDITIONING", "conditioning")
+                .output("STRING", "generated_text")
+                .output("CONDITIONING", "negative")
+                .output("BOOLEAN", "image_requested")
+        },
+        |i, _| {
+            // The image task re-encodes the prompts with their reference pictures, which the engine always does with
+            // pictures attached: the prompts pass through. The others generate text first, which the engine doesn't.
+            let task = i.string("task")?;
+            if task != "image" {
+                return Err(swarm_engine_api::EngineError::Unsupported(format!("SenseNova Conditioning's {task} task (it generates text; only the image task runs here)")).into());
+            }
+            let positive = i.conditioning("conditioning")?.clone();
+            let negative = i.opt_conditioning("negative")?.cloned().unwrap_or_else(|| swarm_engine_api::Conditioning { entries: Vec::new() });
+            Ok(NodeOutput::values(vec![Value::Conditioning(positive), Value::Str(String::new()), Value::Conditioning(negative), Value::Bool(true)]))
+        },
+    );
+
+    r.add(
+        env,
+        |_| {
             NodeSchema::new("MiniMaxH3ImageConditioning", "MiniMax H3 Image Conditioning", "model/conditioning/minimax")
                 .describe("Text-to-image, or with images an edit guided by them. The prompt refers to them as <Picture 1>, <Picture 2>, ...")
                 .input(link("clip", "CLIP"))

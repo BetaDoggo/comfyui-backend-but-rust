@@ -120,6 +120,21 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
     r.add(
         env,
         |_| {
+            NodeSchema::new("EmptyHiDreamO1LatentImage", "Empty HiDream-O1 Latent Image", "model/latent/hidream")
+                .describe(
+                    "Empty pixel-space latent for HiDream-O1-Image. The model was trained at ~4 megapixels; lower resolutions go off-distribution and quality regresses noticeably. Trained resolutions: 2048x2048, 2304x1728, 1728x2304, 2560x1440, 1440x2560, 2496x1664, 1664x2496, 3104x1312, 1312x3104, 2304x1792, 1792x2304.",
+                )
+                .input(int_step("width", 2048, 64, 4096, 32))
+                .input(int_step("height", 2048, 64, 4096, 32))
+                .input(int("batch_size", 1, 1, 64))
+                .output("LATENT", "LATENT")
+        },
+        |i, ctx| empty_latent(ctx, EmptyLatentKind::Pixel { width: i.uint("width")?, height: i.uint("height")? }, i.uint("batch_size")?),
+    );
+
+    r.add(
+        env,
+        |_| {
             NodeSchema::new("SwarmEmptyMiniMaxH3LatentAV", "Swarm Empty MiniMax H3 AV Latent", "SwarmUI/video")
                 .describe("Joint video+audio latent for MiniMax H3.")
                 .input(int_step("width", 1344, 32, MAX_RESOLUTION, 32))
@@ -230,6 +245,18 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
                 .output("MODEL", "MODEL")
         },
         |i, _| Ok(NodeOutput::one(Value::Model(i.model("model")?.with_patch(ModelPatch::SamplingSd3 { shift: i.float("shift")? })))),
+    );
+
+    r.add(
+        env,
+        |_| {
+            NodeSchema::new("SenseNovaSamplingOptions", "SenseNova Sampling Options", "model/patch/sensenova")
+                .describe("Set the SenseNova flow shift.")
+                .input(link("model", "MODEL"))
+                .input(float_unbounded("shift", 3.0, 0.01))
+                .output("MODEL", "MODEL")
+        },
+        |i, _| Ok(NodeOutput::one(Value::Model(i.model("model")?.with_patch(ModelPatch::SenseNovaSampling { shift: i.float("shift")? })))),
     );
 
     r.add(

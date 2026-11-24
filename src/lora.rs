@@ -38,6 +38,8 @@ pub enum Arch {
     Moss,
     H3,
     Qwen21,
+    /// SenseNova's generation tower: ComfyUI names it as `convert_sensenova` renames the checkpoint's weights.
+    SenseNova,
     /// Only for [`matched_modules`]: the engine can't patch SeedVR2.
     SeedVr2,
     /// `comfy` names the encoder inside ComfyUI's text encoder model, as in `qwen3vl_4b`.
@@ -49,6 +51,7 @@ impl Arch {
     fn module(self, stem: &str) -> String {
         match self {
             Arch::TextEncoder { comfy } => format!("{comfy}.transformer.model.{stem}"),
+            Arch::SenseNova => format!("diffusion_model.{}", sensenova_name(stem).unwrap_or_else(|| stem.to_string())),
             _ => format!("diffusion_model.{stem}"),
         }
     }
@@ -138,6 +141,16 @@ fn krea2_to_diffusers(layers: usize) -> Vec<(String, String)> {
     v
 }
 
+/// ComfyUI's name for a tensor of a SenseNova checkpoint's generation tower (`convert_sensenova`), or `None` for the
+/// text tower's, which ComfyUI loads as the text encoder.
+fn sensenova_name(name: &str) -> Option<String> {
+    if !name.contains("_mot_gen") && !name.starts_with("fm_modules.") {
+        return None;
+    }
+    let n = name.strip_prefix("language_model.model.").or_else(|| name.strip_prefix("fm_modules.")).unwrap_or(name);
+    Some(n.replace("vision_model_mot_gen.embeddings.", "patch_embed.").replace("fm_head.", "head.").replace("_mot_gen", ""))
+}
+
 /// `comfy.lora.model_lora_keys_clip` for an encoder of one Llama-like model: `lora_te_` is kohya's.
 fn text_encoder_keys(comfy: &str, keys: &[(String, usize)]) -> HashMap<String, Target> {
     let mut map = HashMap::new();
@@ -160,6 +173,21 @@ fn key_map(arch: Arch, keys: &[(String, usize)]) -> HashMap<String, Target> {
     }
     let mut map = HashMap::new();
     let whole = |t: &str| Target { tensor: t.to_string(), rows: None };
+    if arch == Arch::SenseNova {
+        for (k, _) in keys {
+            let Some(name) = sensenova_name(k) else { continue };
+            match name.strip_suffix(".weight") {
+                Some(base) => {
+                    map.insert(format!("lora_unet_{}", base.replace('.', "_")), whole(k));
+                    map.insert(format!("diffusion_model.{base}"), whole(k));
+                }
+                None => {
+                    map.insert(format!("diffusion_model.{name}"), whole(k));
+                }
+            }
+        }
+        return map;
+    }
     for (k, rows) in keys {
         match k.strip_suffix(".weight") {
             Some(base) => {
@@ -853,6 +881,19 @@ mod tests {
         assert_eq!(m["transformer.transformer_blocks.0.attn.to_gate"].tensor, "blocks.0.attn.gate.weight");
         assert_eq!(m["diffusion_model.blocks.0.attn.gate"].tensor, "blocks.0.attn.gate.weight");
         assert_eq!(m["lycoris_text_fusion_projector"].tensor, "txtfusion.projector.weight");
+    }
+
+    #[test]
+    fn sensenova_takes_comfys_converted_names() {
+        let gen = "language_model.model.layers.3.self_attn.q_proj_mot_gen.weight";
+        let m = key_map(Arch::SenseNova, &[(gen.to_string(), 4096), ("language_model.model.layers.3.mlp_mot_gen.down_proj.weight".to_string(), 4096),
+            ("language_model.model.layers.3.self_attn.q_proj.weight".to_string(), 4096)]);
+        assert_eq!(m["diffusion_model.layers.3.self_attn.q_proj"].tensor, gen);
+        assert_eq!(m["lora_unet_layers_3_mlp_down_proj"].tensor, "language_model.model.layers.3.mlp_mot_gen.down_proj.weight");
+        // the text tower is ComfyUI's text encoder, not the diffusion model
+        assert_eq!(m.len(), 4);
+        assert_eq!(Arch::SenseNova.module("language_model.model.layers.3.self_attn.q_proj_mot_gen"), "diffusion_model.layers.3.self_attn.q_proj");
+        assert_eq!(sensenova_name("fm_modules.vision_model_mot_gen.embeddings.patch_embedding.weight").unwrap(), "patch_embed.patch_embedding.weight");
     }
 
     #[test]

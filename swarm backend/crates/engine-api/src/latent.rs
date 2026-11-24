@@ -26,6 +26,9 @@ pub enum LatentFormat {
     /// SeedVR2's VAE: `[B, 16, H/8, W/8]` for one frame, `[B, 16, T, H/8, W/8]` for a clip (ComfyUI's is always 5D). Made by
     /// `VAEEncode` with the SeedVR2 VAE, sampled by the SeedVR2 model with `SeedVR2Conditioning`.
     SeedVr2,
+    /// `EmptyHiDreamO1LatentImage`: `[B, 3, H, W]`, the pixels themselves from -1 to 1, which ComfyUI's `pixel_space` VAE
+    /// decodes. SenseNova U1.6 samples it.
+    Pixel,
     /// RelayVSR's keyframe latent: `[1, 48, keyframes, lh, lw]`, made by `RelayVSRConditioning` (every 15th frame of the
     /// low-quality clip and its last), sampled by the RelayVSR model and decoded by `VSRDecode`.
     RelayVsr,

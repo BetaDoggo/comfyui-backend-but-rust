@@ -73,6 +73,8 @@ pub enum ModelSampling {
     Flow { shift: f64 },
     Flux { shift: f64 },
     Grid(SigmaGrid),
+    /// `SenseNovaModelSampling`: sigma is the shifted `1 - timestep`, over a table of 1001 sigmas from 0 to 1.
+    SenseNova { shift: f64 },
     /// The linear beta schedule from 0.00085 to 0.012 over 1000 timesteps.
     Discrete,
 }
@@ -135,6 +137,11 @@ impl SigmaGrid {
     }
 }
 
+/// `time_snr_shift`.
+fn snr_shift(shift: f32, v: f32) -> f32 {
+    if shift == 1.0 { v } else { shift * v / (1.0 + (shift - 1.0) * v) }
+}
+
 fn flux_shift(mu: f64, t: f32) -> f32 {
     let e = mu.exp() as f32;
     e / (e + (1.0 / t - 1.0))
@@ -148,6 +155,7 @@ impl ModelSampling {
             ModelSampling::Flow { shift } => shift as f32 * t / (1.0 + (shift - 1.0) as f32 * t),
             ModelSampling::Flux { shift } => flux_shift(shift, t),
             ModelSampling::Grid(g) => g.sigma(t),
+            ModelSampling::SenseNova { shift } => snr_shift(shift as f32, 1.0 - t),
             ModelSampling::Discrete => {
                 let logs = &discrete_table().1;
                 let t = t.clamp(0.0, (logs.len() - 1) as f32);
@@ -160,6 +168,10 @@ impl ModelSampling {
 
     /// `model_sampling.timestep(sigma)`: the sigma itself on flow models, the nearest of the 1000 on discrete ones.
     pub fn timestep(self, sigma: f32) -> f32 {
+        if let ModelSampling::SenseNova { shift } = self {
+            let s = shift as f32;
+            return 1.0 - if s == 1.0 { sigma } else { sigma / (s - (s - 1.0) * sigma) };
+        }
         if self.is_flow() {
             return sigma;
         }
@@ -220,6 +232,10 @@ impl ModelSampling {
         if self == ModelSampling::Discrete {
             return discrete_table().0.clone();
         }
+        if let ModelSampling::SenseNova { .. } = self {
+            // linspace(1000, 0, 1001) through `sigma`, ascending
+            return (0..=1000).rev().map(|t| self.sigma(t as f32 / 1000.0)).collect();
+        }
         let n = self.table_len();
         (1..=n).map(|i| self.sigma(i as f32 / n as f32)).collect()
     }
@@ -232,6 +248,9 @@ impl ModelSampling {
     pub fn sigma_min(self) -> f32 {
         if self == ModelSampling::Discrete {
             return discrete_table().0[0];
+        }
+        if let ModelSampling::SenseNova { .. } = self {
+            return 0.0;
         }
         self.sigma(1.0 / self.table_len() as f32)
     }
@@ -249,7 +268,7 @@ impl ModelSampling {
         }
         (match self {
             ModelSampling::Flow { shift } if shift == 1.0 => t,
-            ModelSampling::Flow { shift } => shift * t / (1.0 + (shift - 1.0) * t),
+            ModelSampling::Flow { shift } | ModelSampling::SenseNova { shift } => shift * t / (1.0 + (shift - 1.0) * t),
             ModelSampling::Flux { shift } => shift.exp() / (shift.exp() + (1.0 / t - 1.0)),
             ModelSampling::Discrete => return self.sigma((t * 999.0) as f32),
             ModelSampling::Grid(_) => unreachable!(),

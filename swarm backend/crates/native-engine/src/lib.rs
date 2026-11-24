@@ -1,5 +1,5 @@
 //! [`Engine`] implementation on the diffusion library: text-to-image for int8 ConvRot checkpoints of
-//! Krea 2, Anima, MOSS Image and Qwen Image 2.1, fp16 SD 1.x and SDXL checkpoints, and text-to-video with audio for MiniMax H3, with every ComfyUI
+//! Krea 2, Anima, MOSS Image, Qwen Image 2.1 and SenseNova U1.6, fp16 SD 1.x and SDXL checkpoints, and text-to-video with audio for MiniMax H3, with every ComfyUI
 //! sampler and scheduler, any CFG and LoRAs, plus the prompt images and reference
 //! latents of Krea 2 and of Qwen Image 2.1's edits, and MiniMax H3's reference pictures and keyframes. The image models also sample partially, from
 //! a latent and with a noise mask: init images, refiners and inpainting. Each
@@ -21,7 +21,7 @@ use diffusion::h3vae;
 use diffusion::h3window;
 use diffusion::pipeline::{
     AnimaRequest, Cancelled, Cond, Generator, H3Conds, H3Request, Inpaint, KreaEntry, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Region, Sampling, SdRequest,
-    SeedVrRequest, SizeCond, SnapRefRequest, Step, StyleRequest,
+    SenseNovaRequest, SeedVrRequest, SizeCond, SnapRefRequest, Step, StyleRequest,
 };
 use diffusion::pixal3d;
 use diffusion::triposplat;
@@ -51,6 +51,9 @@ const MOSS_ENCODER: &str = "moss_image";
 /// Image 1 shares.
 const QWEN21_ENCODER: &str = "qwen_image_2.1";
 const MINIMAX_ENCODER: &str = "minimax";
+/// [`TextEncoderHandle::encoder_type`] of a SenseNova checkpoint's text tower, which only `CheckpointLoaderSimple` hands
+/// out.
+const SENSENOVA_ENCODER: &str = "sensenova";
 /// [`TextEncoderHandle::encoder_type`] of an SD 1.x or SDXL checkpoint's own CLIP text encoders, which only
 /// `CheckpointLoaderSimple` hands out.
 const SD1_ENCODER: &str = "sd1";
@@ -71,6 +74,8 @@ enum Family {
     RelayVsr,
     /// SD 1.x and SDXL base checkpoints, with their own CLIP and VAE
     Sd,
+    /// SenseNova U1.6: its text tower is in the same file, and it samples pixels
+    SenseNova,
 }
 
 impl Family {
@@ -80,6 +85,7 @@ impl Family {
             Family::Moss => (diffusion::moss::CH, 16),
             Family::Qwen21 => (diffusion::qwen21::CH, diffusion::vae21::SCALE),
             Family::Sd => (diffusion::unet::CH, 8),
+            Family::SenseNova => (3, 1),
             _ => (16, 8),
         }
     }
@@ -264,6 +270,13 @@ fn check_dit(file: &ModelFile) -> EngineResult<Family> {
         }
         return Ok(Family::Qwen21);
     }
+    if let Some(p) = diffusion::sensenova::key_prefix(|k| h.get(k).is_some()) {
+        let q = &h[format!("{p}language_model.model.layers.0.self_attn.q_proj_mot_gen.weight")];
+        if !p.is_empty() || q["dtype"] != "I8" || h.get(format!("{p}language_model.model.layers.0.self_attn.q_proj_mot_gen.weight_scale")).is_none() {
+            return Err(unsupported(format!("{}: this backend only runs the int8 ConvRot SenseNova U1.6 release, as published", file.name)));
+        }
+        return Ok(Family::SenseNova);
+    }
     if let Some(p) = diffusion::anima::key_prefix(|k| h.get(k).is_some()) {
         if h.get(format!("{p}blocks.0.mlp.layer1.weight_scale")).is_none() {
             return Err(unsupported(format!("{}: this backend only runs int8 ConvRot Anima checkpoints", file.name)));
@@ -295,7 +308,7 @@ fn check_dit(file: &ModelFile) -> EngineResult<Family> {
     }
     // The keys SwarmUI's `isKrea2` tests.
     if ["txtfusion.projector.weight", "blocks.0.attn.gate.weight", "blocks.0.mod.lin"].iter().any(|k| h.get(k).is_none()) {
-        return Err(unsupported(format!("{}: this backend only runs Krea 2, Anima, MOSS Image, Qwen Image 2.1, SD 1.x, SDXL, MiniMax H3 and MiniMax-H3-Image models", file.name)));
+        return Err(unsupported(format!("{}: this backend only runs Krea 2, Anima, MOSS Image, Qwen Image 2.1, SenseNova U1.6, SD 1.x, SDXL, MiniMax H3 and MiniMax-H3-Image models", file.name)));
     }
     if h.get("blocks.0.attn.gate.weight_scale").is_none() {
         return Err(unsupported(format!("{}: this backend only runs W8A8 (ConvRot int8) Krea 2 checkpoints", file.name)));
@@ -425,6 +438,9 @@ fn chunk_segments(leaves: &[PromptLeaf], family: Family) -> Result<Vec<(String, 
     for leaf in leaves {
         match &leaf.kind {
             PromptLeafKind::Text(t) if family == Family::Anima => segments.extend(token_weights(t, leaf.weight as f32)),
+            // SenseNova's tokenizer gives every token weight 1, and its prompts are keys and values ComfyUI never weights
+            PromptLeafKind::Text(_) if family == Family::SenseNova && leaf.weight != 1.0 => return Err("prompt weights on SenseNova".into()),
+            PromptLeafKind::Text(t) if family == Family::SenseNova => text.push_str(t),
             // one segment per leaf, tokenized apart and weighted by the pipeline, as SwarmTextEncodeAdvanced does for a tokenizer without weights
             PromptLeafKind::Text(t) if matches!(family, Family::Krea2 | Family::Qwen21) => segments.push((t.clone(), leaf.weight as f32)),
             PromptLeafKind::Text(t) if family.one_piece() => text.push_str(t),
@@ -437,7 +453,7 @@ fn chunk_segments(leaves: &[PromptLeaf], family: Family) -> Result<Vec<(String, 
             PromptLeafKind::Break => unreachable!("chunks() splits on breaks"),
         }
     }
-    if family.one_piece() && !matches!(family, Family::Krea2 | Family::Qwen21) {
+    if family == Family::SenseNova || family.one_piece() && !matches!(family, Family::Krea2 | Family::Qwen21) {
         segments.push((text, 1.0));
     }
     Ok(segments)
@@ -483,7 +499,7 @@ fn encode_chunks(req: &TextEncodeRequest, family: Family) -> Result<Encoded, Str
         TextEncodeMode::MiniMax { text, .. } if family == Family::H3 => Ok(Encoded::Whole(vec![vec![(text.clone(), 1.0)]])),
         TextEncodeMode::MiniMax { .. } => Err("MiniMax H3 pictures on another text encoder".into()),
         TextEncodeMode::Swarm(s) => {
-            if s.images.is_some() && !family.one_piece() && family != Family::H3 {
+            if s.images.is_some() && (!family.one_piece() && family != Family::H3 || family == Family::SenseNova) {
                 return Err("Prompt Images".into());
             }
             if s.minimax_refs.is_some() && family != Family::H3 || s.clip_vision.is_some() {
@@ -612,6 +628,7 @@ fn single_prompt(c: &Conditioning, family: Family) -> EngineResult<(&DeferredCon
         && m.end_percent == 1.0
         && m.mask.is_none()
         && (family.references() || m.reference_latents.is_empty())
+        && m.reference_images.is_empty()
         && m.gligen.is_empty()
         && m.inpaint.is_none()
         && m.embedding_ops.is_empty()
@@ -639,6 +656,7 @@ fn conds(c: &Conditioning, family: Family, (lh, lw): (usize, usize)) -> EngineRe
     for e in &c.entries {
         let m = &e.meta;
         let plain = (family.references() || m.reference_latents.is_empty())
+            && (family == Family::SenseNova || m.reference_images.is_empty())
             && m.gligen.is_empty()
             && m.inpaint.is_none()
             && m.embedding_ops.is_empty()
@@ -737,6 +755,23 @@ fn entry_references(m: &CondMeta, family: Family) -> EngineResult<Vec<Reference>
         }
         let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("a reference latent this engine didn't encode"))?;
         out.push(Reference { latent: latent.data.clone(), height, width });
+    }
+    Ok(out)
+}
+
+/// A SenseNova entry's reference pictures, each frame of a batch one (`split_reference_batches`), RGB as
+/// `preprocess_reference` takes it: the first three channels, or fewer repeated round.
+fn sensenova_references(m: &CondMeta) -> EngineResult<Vec<diffusion::sensenova::Reference>> {
+    let mut out = Vec::new();
+    for b in &m.reference_images {
+        if b.width < 16 || b.height < 16 {
+            return Err(unsupported(format!("a {}x{} reference picture on SenseNova (16 pixels or more a side)", b.width, b.height)));
+        }
+        let c = b.channels as usize;
+        for f in 0..b.count {
+            let rgb = b.frame_f32(f).chunks_exact(c).flat_map(|px| [px[0], px[1 % c], px[2 % c]]).collect();
+            out.push(diffusion::sensenova::Reference { width: b.width as usize, height: b.height as usize, rgb });
+        }
     }
     Ok(out)
 }
@@ -900,6 +935,7 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
         // WAN22_RelayVSR keeps WAN21_T2V's sampling_settings
         Family::RelayVsr => ModelSampling::Flow { shift: 8.0 },
         Family::Sd => ModelSampling::Discrete,
+        Family::SenseNova => ModelSampling::SenseNova { shift: diffusion::sensenova::SHIFT as f64 },
     };
     let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None, snapref: None, style: None, v_pred: None, attn_token_weights: None };
     let mut sparse = None;
@@ -908,7 +944,8 @@ fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSett
             ModelPatch::SamplingFlux { max_shift, base_shift, width, height } if matches!(family, Family::Krea2 | Family::Qwen21) => {
                 s.model_sampling = ModelSampling::Flux { shift: flux_shift(*max_shift, *base_shift, *width, *height) }
             }
-            ModelPatch::SamplingAuraFlow { shift, sampling } if !matches!(family, Family::Krea2 | Family::Sd) && sampling == "flow" => {
+            ModelPatch::SenseNovaSampling { shift } if family == Family::SenseNova => s.model_sampling = ModelSampling::SenseNova { shift: *shift },
+            ModelPatch::SamplingAuraFlow { shift, sampling } if !matches!(family, Family::Krea2 | Family::Sd | Family::SenseNova) && sampling == "flow" => {
                 s.model_sampling = ModelSampling::Flow { shift: *shift }
             }
             ModelPatch::SamplingDiscrete { sampling, zsnr } if family == Family::Sd => {
@@ -1388,6 +1425,7 @@ impl NativeEngine {
             Family::H3 => (self.gen().ensure_h3(&file.path), "minimax-h3"),
             Family::H3Image => (self.gen().ensure_h3(&file.path), "minimax-h3-image"),
             Family::Qwen21 => (self.gen().ensure_qwen21(&file.path), "qwen-image-2.1"),
+            Family::SenseNova => (self.gen().ensure_sensenova(&file.path), "sensenova-u1.5"),
             Family::SeedVr2 => (self.gen().ensure_seedvr(&file.path), "seedvr2"),
             Family::RelayVsr => (self.gen().ensure_relayvsr(&file.path), "relayvsr"),
             Family::Sd if sd_file_is_xl(file)? => (self.gen().ensure_sd(&file.path), "stable-diffusion-xl-v1-base"),
@@ -1679,6 +1717,53 @@ impl NativeEngine {
             .sample_qwen21(&r, |step| report(mode, progress, batch, step, |x0| (preview::qwen21(x0, lh, lw), lh, lw)), None)
             .map_err(internal)?;
         tracing::info!("qwen image 2.1: {batch} image(s): text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
+        Ok(latent)
+    }
+
+    /// SenseNova U1.6 text to image and edits: each conditioning entry's prompt, with its reference pictures, runs through
+    /// the checkpoint's text tower once, and the generation tower samples the pixels against its keys and values.
+    fn sample_sensenova(&self, req: &SampleRequest, shape: (usize, usize, usize), settings: &ModelSettings, plan: &Plan, progress: &mut dyn ProgressSink)
+        -> EngineResult<Vec<f32>> {
+        let (batch, height, width) = shape;
+        let mode = self.preview_mode(req);
+        let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
+        let sampling = sampling(req, settings, plan, batch)?;
+        let positive = conds(&req.positive, Family::SenseNova, (height, width))?;
+        let negative = if sampling.uses_negative() { conds(&req.negative, Family::SenseNova, (height, width))? } else { Vec::new() };
+        let first = positive[0].0;
+        for (c, ..) in positive.iter().chain(&negative) {
+            if c.text_encoder != first.text_encoder {
+                return Err(unsupported("conditioning entries from different text encoders"));
+            }
+            if !c.loras.is_empty() {
+                return Err(unsupported("LoRAs on SenseNova's text tower"));
+            }
+        }
+        if settings.attn_token_weights.is_some() {
+            return Err(unsupported("SwarmAttnTokenWeights on SenseNova"));
+        }
+        let refs = |side: &[(&DeferredCond, &CondMeta, Cond)]| side.iter().map(|(_, m, _)| sensenova_references(m)).collect::<EngineResult<Vec<_>>>();
+        let (positive_refs, negative_refs) = (refs(&positive)?, refs(&negative)?);
+        let mut gen = self.gen();
+        gen.ensure_sensenova(&file.path).map_err(internal)?;
+        gen.ensure_sensenova_te(&first.text_encoder).map_err(internal)?;
+        gen.set_int8_attention(settings.int8_attention);
+        gen.set_loras(&settings.loras).map_err(internal)?;
+        let r = SenseNovaRequest {
+            text_encoder: first.text_encoder.clone(),
+            positive: positive.into_iter().map(|(.., c)| c).collect(),
+            negative: negative.into_iter().map(|(.., c)| c).collect(),
+            positive_refs,
+            negative_refs,
+            width,
+            height,
+            sampling,
+            noise: plan.noise(req, batch, (3, height, width)),
+        };
+        let (latent, stats) = gen
+            .sample_sensenova(&r, |step| report(mode, progress, batch, step, |x0| (preview::pixels(x0, height, width, 8), height / 8, width / 8)))
+            .map_err(internal)?;
+        tracing::info!("sensenova: {batch} image(s): text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
         Ok(latent)
     }
 
@@ -2129,6 +2214,12 @@ impl Engine for NativeEngine {
             let vae = VaeHandle::new(is_sd_vae(&req.file).then(|| req.file.clone()), Opaque::none());
             return Ok((model, te, vae));
         }
+        if check_dit(&req.file)? == Family::SenseNova {
+            // the text tower is in the file, and ComfyUI gives the checkpoint its pixel_space VAE
+            let model = self.load_model(&req.file)?;
+            let te = TextEncoderHandle { sources: vec![req.file.clone()], encoder_type: SENSENOVA_ENCODER.into(), device: "default".into(), engine: Opaque::none(), patches: vec![] };
+            return Ok((model, te, VaeHandle::new(None, Opaque::none())));
+        }
         // The other families' files hold only the diffusion model; SwarmUI adds its own CLIPLoader and VAELoader.
         Ok((
             self.load_model(&req.file)?,
@@ -2214,6 +2305,7 @@ impl Engine for NativeEngine {
             QWEN21_ENCODER => Family::Qwen21,
             KREA_ENCODER => Family::Krea2,
             SD1_ENCODER | SDXL_ENCODER => Family::Sd,
+            SENSENOVA_ENCODER => Family::SenseNova,
             t => return Err(unsupported(format!("text encoder type {t}"))),
         };
         let images = match &req.mode {
@@ -2265,6 +2357,12 @@ impl Engine for NativeEngine {
             let (b, h, w) = (req.batch_size as usize, height as usize / 16, width as usize / 16);
             return Ok(Latent::single(
                 LatentTensor { format: LatentFormat::Flux2, shape: vec![b, diffusion::moss::CH, h, w], data: Opaque::none() },
+                PixelInfo::image(width, height, req.batch_size),
+            ));
+        }
+        if let EmptyLatentKind::Pixel { width, height } = req.kind {
+            return Ok(Latent::single(
+                LatentTensor { format: LatentFormat::Pixel, shape: vec![req.batch_size as usize, 3, height as usize, width as usize], data: Opaque::none() },
                 PixelInfo::image(width, height, req.batch_size),
             ));
         }
@@ -2346,6 +2444,7 @@ impl Engine for NativeEngine {
             Family::Moss => self.sample_moss(req, shape, &settings, &plan, progress)?,
             Family::Qwen21 => self.sample_qwen21(req, shape, &settings, &plan, progress)?,
             Family::Sd => self.sample_sd(req, shape, &settings, &plan, progress)?,
+            Family::SenseNova => self.sample_sensenova(req, shape, &settings, &plan, progress)?,
             Family::H3 | Family::H3Image | Family::SeedVr2 | Family::RelayVsr => unreachable!("H3, SeedVR2 and RelayVSR sample above"),
         })
     }
@@ -2387,6 +2486,22 @@ impl Engine for NativeEngine {
             return Err(unsupported(format!("latent shape {:?}", t.shape)));
         };
         let latent = t.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("decoding a latent this engine didn't sample"))?;
+        if (t.format == LatentFormat::Pixel) != req.vae.source.is_none() {
+            return Err(unsupported(if req.vae.source.is_none() {
+                "the pixel-space VAE on another model's latent"
+            } else {
+                "a SenseNova pixel latent through a VAE (it decodes with its checkpoint's own pixel_space VAE)"
+            }));
+        }
+        if t.format == LatentFormat::Pixel {
+            // ComfyUI's pixel_space VAE: (x + 1) / 2, clamped
+            let mut rgb = Vec::with_capacity(batch * lh * lw * 3);
+            for image in latent.data.chunks_exact(channels * lh * lw) {
+                rgb.extend_from_slice(&diffusion::sensenova::to_rgb8(image, lw, lh));
+            }
+            progress.progress(batch as u32, batch as u32);
+            return Ok(ImageBatch::from_u8(batch as u32, lh as u32, lw as u32, 3, rgb));
+        }
         let file = req.vae.source.as_ref().ok_or_else(|| unsupported("the pixel-space VAE"))?;
         if is_qwen21_vae(file) {
             return self.decode_qwen21(file, batch, channels, (lh, lw), &latent.data, progress);
@@ -2565,6 +2680,7 @@ impl Engine for NativeEngine {
                 MOSS_ENCODER => gen.ensure_qwen35(&f.path),
                 MINIMAX_ENCODER => gen.ensure_h3_te(&f.path),
                 SD1_ENCODER | SDXL_ENCODER => gen.ensure_sd(&f.path),
+                SENSENOVA_ENCODER => gen.ensure_sensenova_te(&f.path),
                 // the 8B of Qwen Image 2.1 as ensure_te takes it too
                 _ => gen.ensure_te(&f.path),
             }

@@ -31,6 +31,8 @@ const MODEL_FILES: &[&str] = &[
     "diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors",
     "VAE/MiniMaxH3/minimax_h3_image_vae_fp16.safetensors",
     "diffusion_models/moss_image_sft_int8.safetensors",
+    "Stable-Diffusion/sensenova_u1.6_8b_mot_int8_convrot.safetensors",
+    "Lora/sensenova_8step.safetensors",
     "diffusion_models/qwen_image_2.1_fp8.safetensors",
     "text_encoders/qwen3.5_9b_int8_convrot.safetensors",
     "text_encoders/qwen3vl_8b_int8_convrot.safetensors",
@@ -263,7 +265,7 @@ async fn object_info_has_what_swarm_reads() {
     let unets: Vec<&str> = info["UNETLoader"]["input"]["required"]["unet_name"][0].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
     assert!(unets.contains(&"krea2/krea2_fp8_scaled.safetensors") && unets.contains(&"minimax_h3_fp8.safetensors"), "{unets:?}");
     let loras = &info["LoraLoader"]["input"]["required"]["lora_name"][0];
-    assert_eq!(loras, &json!(["anima/flat_color_style.safetensors", "qwen21_style.safetensors", "snapref_v2a.safetensors"]));
+    assert_eq!(loras, &json!(["anima/flat_color_style.safetensors", "qwen21_style.safetensors", "sensenova_8step.safetensors", "snapref_v2a.safetensors"]));
     // SwarmUI-SnapRef enables its parameters when SnapRef is listed, and sends its weight file's name as `adapter`
     assert_eq!(info["SnapRef"]["input"]["required"]["adapter"][0], json!(["snapref_v2a.safetensors"]));
     let samplers = &info["SwarmKSampler"]["input"]["required"]["sampler_name"][0];
@@ -366,6 +368,42 @@ async fn moss_image_text_to_image() {
     assert_eq!(r.outputs.len(), 1);
     assert_eq!(png_dims(&r.outputs[0].bytes), (1024, 1024));
     assert_eq!(png_alpha_range(&r.outputs[0].bytes), None, "Flux 2 VAE is RGB");
+}
+
+/// SwarmUI's SenseNova graph with a Prompt Image: the checkpoint's own CLIP and pixel_space VAE, HiDreamO1ReferenceImages
+/// putting the picture on both prompts, the 8-step LoRA and a Sigma Shift.
+#[tokio::test(flavor = "multi_thread")]
+async fn sensenova_edit_carries_the_picture_on_both_prompts() {
+    let engine = RecordingEngine::new();
+    let s = TestServer::start_engine(engine.clone(), 0, false).await;
+    let r = run_like_swarm(&s, fixture("sensenova_edit.json"), |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    assert_eq!(png_dims(&r.outputs[0].bytes), (1024, 1024));
+    let seen = engine.seen.lock().unwrap();
+    assert_eq!(seen.sample_shapes, [vec![1, 3, 1024, 1024]], "a pixel latent");
+    for side in [&seen.positive, &seen.negative] {
+        assert_eq!(side.len(), 1);
+        let pics = &side[0].reference_images;
+        assert_eq!((pics.len(), pics[0].width, pics[0].height), (1, 300, 200));
+    }
+    assert!(seen.model_patches[0].starts_with("Lora"), "{:?}", seen.model_patches);
+    assert_eq!(seen.model_patches[1], "SenseNovaSampling { shift: 2.5 }");
+}
+
+/// SenseNova Conditioning runs only its image task here, which passes the prompts on; the others generate text first.
+#[tokio::test(flavor = "multi_thread")]
+async fn sensenova_conditioning_runs_the_image_task_only() {
+    let s = TestServer::start(0).await;
+    let mut wf = fixture("sensenova_edit.json");
+    wf["202"] = json!({"class_type": "SenseNovaConditioning", "inputs": {"clip": ["4", 1], "conditioning": ["201", 0], "negative": ["201", 1], "task": "image", "max_tokens": 1024}});
+    wf["10"]["inputs"]["positive"] = json!(["202", 0]);
+    wf["10"]["inputs"]["negative"] = json!(["202", 2]);
+    let r = run_like_swarm(&s, wf.clone(), |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    wf["202"]["inputs"]["task"] = json!("image thinking");
+    let r = run_like_swarm(&s, wf, |_| {}).await;
+    assert_eq!(r.status(), "error");
+    assert!(r.history.to_string().contains("image thinking task"), "{:#}", r.history);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -869,11 +907,13 @@ async fn stock_schema_parity() {
             }
         }
         let ty = if ty == "COMBO" { o["options"].clone() } else { ty.clone() };
-        if let Some(t) = o.get("template").filter(|t| t.get("prefix").is_none()) {
+        if let Some(t) = o.get("template").filter(|t| t.get("input").is_none()) {
             // MatchType: `{template_id, allowed_types}`.
             keep.insert("template".into(), t.clone());
         } else if let Some(t) = o.get("template") {
-            keep.insert("template".into(), json!([t["prefix"], t["min"], t["max"], t["input"]["required"].as_object().unwrap().iter().map(|(k, v)| json!([k, norm(v)])).collect::<Vec<_>>()]));
+            // Autogrow, by `prefix` or by `names`
+            let input = t["input"]["required"].as_object().unwrap().iter().map(|(k, v)| json!([k, norm(v)])).collect::<Vec<_>>();
+            keep.insert("template".into(), json!([t["prefix"], t["names"], t["min"], t["max"], input]));
         }
         if spec[0] == "COMFY_DYNAMICCOMBO_V3" {
             let opts: Vec<Value> = o["options"].as_array().unwrap().iter().map(|x| json!([x["key"], x["inputs"]["required"].as_object().map(|m| m.iter().map(|(k, v)| json!([k, norm(v)])).collect::<Vec<_>>())])).collect();

@@ -261,6 +261,8 @@ pub enum EmptyLatentKind {
     Image16Ch { width: u32, height: u32 },
     /// `EmptyFlux2LatentImage`: `[B, 128, H/16, W/16]` (MOSS Image).
     Flux2 { width: u32, height: u32 },
+    /// `EmptyHiDreamO1LatentImage`: `[B, 3, H, W]` pixels (SenseNova U1.6).
+    Pixel { width: u32, height: u32 },
     /// `SwarmEmptyMiniMaxH3LatentAV`: joint video `[1, 24, T, H/16, W/16]` + audio `[1, 32, 2, A]`.
     MiniMaxH3AudioVideo { width: u32, height: u32, length: u32 },
     /// `MiniMaxH3ImageConditioning`'s latent for MiniMax-H3-Image: one frame, `[1, 24, 1, H/16, W/16]`.

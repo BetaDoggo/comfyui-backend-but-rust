@@ -7,7 +7,7 @@ Everything here was traced from SwarmUI's `WorkflowGenerator*.cs` / `WGNodeData.
 Python nodes (`ExtraNodes/SwarmComfyCommon`), cloned 2026-10-29 (SwarmUI `e7f38c3`, ComfyUI `fd7639f`).
 The fixtures in `crates/comfy-server/tests/fixtures/` are concrete examples of each graph.
 To add another model, see [ADDING_MODELS.md](ADDING_MODELS.md). SD 1.x and SDXL are in [section 12](#12-sd-1x-and-sdxl).
-HyperFlow H3 Flash, MiniMax-H3-Image, SnapRef and Idol don't have sections here yet; their fixtures, and the [Models](../../docs/MODELS.md) sections, show what they take.
+SenseNova U1.6 is in [section 14](#14-sensenova-u16). HyperFlow H3 Flash, MiniMax-H3-Image, SnapRef and Idol don't have sections here yet; their fixtures, and the [Models](../../docs/MODELS.md) sections, show what they take.
 
 **Verified against a live SwarmUI** (built from the clone above, "ComfyUI API By URL" → this server,
 mock engine, fake model files tagged via `modelspec.architecture`): backend loads with all Swarm-node
@@ -503,3 +503,37 @@ The server checks that the latent has as many keyframes as the frames given to `
 * Variation Seed, a noise mask, and conditioning changes on the entry
 * `VAEDecode` of a RelayVSR latent
 * `VAEEncode` with the Flash decoder
+
+---
+
+## 14. SenseNova U1.6
+
+**Detected as:** the int8 ConvRot release (`sensenova_u1.6_8b_mot_int8_convrot.safetensors`), from its generation tower's
+int8 `q_proj_mot_gen` weights. It sits in `Stable-diffusion/`, so SwarmUI loads it with `CheckpointLoaderSimple`, which
+returns the model, its text tower as the CLIP, and ComfyUI's `pixel_space` VAE.
+
+**Graph** (`tests/fixtures/sensenova_edit.json`, written from SwarmUI's generator, not captured from a live SwarmUI):
+
+```
+CheckpointLoaderSimple ─▶ LoraLoaderModelOnly ─▶ SenseNovaSamplingOptions ─▶ SwarmKSampler ─▶ VAEDecode ─▶ SwarmSaveImageWS
+  ├─▶ SwarmTextEncodeAdvanced (+) ─┐                                         ▲         ▲
+  └─▶ SwarmTextEncodeAdvanced (−) ─┴▶ HiDreamO1ReferenceImages ◀─ SwarmLoadImageB64     │
+EmptyHiDreamO1LatentImage ──────────────────────────────────────────────────────────────┘
+```
+
+| SwarmUI param | Arrives as | Engine sees |
+|---|---|---|
+| Prompt / Negative | `SwarmTextEncodeAdvanced`, no `images` | the plain text; prompt weights and `<break>` refused |
+| Width / Height | `EmptyHiDreamO1LatentImage` (multiples of 32) | `EmptyLatentKind::Pixel`, a `[B,3,H,W]` `LatentFormat::Pixel` latent |
+| Sigma Shift | `SenseNovaSamplingOptions.shift` | `ModelPatch::SenseNovaSampling`, 3 when absent |
+| Sampler / Scheduler | `euler` / `normal` | as given |
+| Prompt Images | `HiDreamO1ReferenceImages` on both prompts, `images.image_N` | `CondMeta.reference_images` on every entry of both, in socket order. SwarmUI sends the node with no pictures too, which changes nothing |
+| LoRAs | `LoraLoaderModelOnly` | `ModelPatch::Lora`, baked into the int8 weights |
+
+**SenseNova Conditioning.** Stock ComfyUI only reads the pictures through `SenseNovaConditioning`'s `image` task, which
+re-encodes both prompts with them, and SwarmUI's graph doesn't have that node. The engine encodes pictures that way
+whenever they are attached, so the node passes its prompts through and both graphs give the same picture. Its other
+tasks generate text first and are refused.
+
+Refused: VAE Encode with the `pixel_space` VAE (so init images), text tower LoRAs, `SwarmAttnTokenWeights`, Prompt Images
+through `SwarmTextEncodeAdvanced.images`, and `VAEDecode` of a pixel latent through any other VAE.

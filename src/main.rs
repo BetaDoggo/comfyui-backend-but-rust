@@ -274,6 +274,9 @@ struct Args {
     /// MiniMax H3: PNG anchored as the clip's last frame, stretched to its size
     #[arg(long)]
     last_frame: Option<PathBuf>,
+    /// MiniMax H3: a reference video (anything ffmpeg reads, taken at 24 fps), `<Video k>` in the prompt (repeatable)
+    #[arg(long)]
+    ref_video: Vec<PathBuf>,
     /// Krea 2: how reference latents are used, "index" or "index_timestep_zero"
     #[arg(long, default_value = "index")]
     ref_method: String,
@@ -815,9 +818,13 @@ fn run_h3_image(args: &Args, load: pipeline::LoadOptions, dit: PathBuf, te: Path
     let sampling = pipeline::Sampling::new(args.sampler.as_deref().unwrap_or("euler"), &args.scheduler, ms, steps, args.cfg, args.seed, (args.width / 16, args.height / 16))?;
     // MiniMaxH3ImageConditioning's edit pictures, through the image VAE
     let images = args.image.iter().map(|p| read_png(p)).collect::<Result<Vec<_>>>()?;
+    if !args.ref_video.is_empty() {
+        bail!("--ref-video on MiniMax-H3-Image");
+    }
     let conds = pipeline::H3Conds {
         label: "Picture {}: ".into(),
         pictures: pipeline::image_pictures(&images, true),
+        videos: Vec::new(),
         vae: Some(args.model(&args.vae, H3_IMAGE_VAE)),
         keyframes: Vec::new(),
     };
@@ -927,9 +934,14 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             keyframes.push((index, gen.encode_h3(&vae, &img)?));
         }
     }
+    let mut videos = Vec::new();
+    for p in &args.ref_video {
+        videos.push(pipeline::ref2va_video(&read_video(p)?, frames, true)?);
+    }
     let conds = pipeline::H3Conds {
         label: "<Picture {}>: ".into(),
         pictures: pipeline::ref2va_pictures(&images, (args.width, args.height), false, true),
+        videos,
         vae: Some(vae),
         keyframes,
     };
@@ -1013,6 +1025,30 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The frames of a video at 24 fps through ffmpeg, RGB 0 to 1.
+fn read_video(path: &Path) -> Result<Vec<diffusion::vision::PromptImage>> {
+    let probe = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .context("running ffprobe")?;
+    let dims = String::from_utf8_lossy(&probe.stdout);
+    let (w, h) = dims.trim().split_once(',').with_context(|| format!("{}: no video stream", path.display()))?;
+    let (w, h): (usize, usize) = (w.trim().parse()?, h.trim().parse()?);
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-r", "24", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .output()
+        .context("running ffmpeg")?;
+    if !out.status.success() {
+        bail!("ffmpeg failed on {}", path.display());
+    }
+    let frames: Vec<_> = out.stdout.chunks_exact(w * h * 3).map(|f| diffusion::vision::PromptImage { width: w, height: h, rgb: f.iter().map(|&v| v as f32 / 255.0).collect() }).collect();
+    eprintln!("{}: {} frames of {w}x{h}", path.display(), frames.len());
+    Ok(frames)
 }
 
 /// Encode with ffmpeg, which reads the frames from a pipe and the audio from a WAV next to the output.

@@ -16,7 +16,12 @@ def rel(a, b):
 
 
 if "context" in o:
-    print(f"context rel {rel(o['context'], r['context']):.3e}")
+    if o["context"].shape[-2] != r["context"].shape[-2]:
+        print(f"context lengths differ: ours {tuple(o['context'].shape)}, ref {tuple(r['context'].shape)}")
+    else:
+        print(f"context rel {rel(o['context'], r['context']):.3e}")
+if "ref0" in o and "ref0" in r:  # the first reference latent
+    print(f"ref0 latent rel {rel(o['ref0'].flatten(), r['ref0'].flatten()):.3e}, ref shape {tuple(r['ref0'].shape)}")
 pack = torch.cat([r["samples0"].flatten(), r["samples1"].flatten()])
 if "denoised0" in o and "step0_out" in r:
     d, ref = o["denoised0"].flatten(), r["step0_out"].flatten()

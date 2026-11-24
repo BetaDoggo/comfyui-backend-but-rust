@@ -252,6 +252,25 @@ fn block_layout(st: &SafeTensors, pre: &str, i: usize) -> Result<Layout> {
     Ok(l)
 }
 
+/// Patches of two frames `[n, 3 * 2 * 16 * 16]` (channel, then frame, then pixels), normalized to -1 to 1, in
+/// merge-block order: `process_video_block`'s temporal patch.
+fn pair_patches(a: &[f32], b: &[f32], gh: usize, gw: usize) -> Vec<f32> {
+    let stride = gw * PATCH;
+    let mut out = Vec::with_capacity(gh * gw * 2 * FRAME);
+    for (row, col) in merge_order(gh, gw) {
+        for c in 0..3 {
+            for rgb in [a, b] {
+                for y in 0..PATCH {
+                    for x in 0..PATCH {
+                        out.push((rgb[((row * PATCH + y) * stride + col * PATCH + x) * 3 + c] - 0.5) / 0.5);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The Conv3d weight of two identical frames, as one matrix `[d, 3 * 16 * 16]`: its slices add up.
 fn patch_matrix(st: &SafeTensors, pre: &str, d: usize) -> Result<Vec<f32>> {
     let name = format!("{pre}patch_embed.proj.weight");
@@ -276,6 +295,8 @@ impl Vision {
         // streamed units have to be in the order they run
         let mut patch = Layout::new();
         patch.bytes("w", f32_bytes(&patch_matrix(&st, pre, spec.d)?));
+        // two different frames: the Conv3d weight as it is, [d, 3 * 2 * 16 * 16]
+        patch.bytes("w2", f32_bytes(&st.f32_vec(&format!("{pre}patch_embed.proj.weight"), false)?));
         patch.f32(&st, "b", &format!("{pre}patch_embed.proj.bias"), 0.0)?;
         let mut layouts = vec![patch];
         for b in 0..spec.depth {
@@ -295,22 +316,45 @@ impl Vision {
     }
 
     /// The tokens of one image.
-    pub fn encode(&mut self, img: &PromptImage, st: &Stream, mut probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<Embeds> {
+    pub fn encode(&mut self, img: &PromptImage, st: &Stream, probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<Embeds> {
+        self.encode_frames(&[img], st, probe)
+    }
+
+    /// The tokens of two frames of a video in one temporal patch, as MiniMax H3's `process_video_block` gives them to
+    /// the tower: one block of tokens, as an image's.
+    pub fn encode_pair(&mut self, a: &PromptImage, b: &PromptImage, st: &Stream) -> Result<Embeds> {
+        if (a.width, a.height) != (b.width, b.height) {
+            bail!("video frames of {}x{} and {}x{}", a.width, a.height, b.width, b.height);
+        }
+        self.encode_frames(&[a, b], st, None)
+    }
+
+    /// One image, or two frames in the temporal patch.
+    fn encode_frames(&mut self, frames: &[&PromptImage], st: &Stream, mut probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>) -> Result<Embeds> {
         let _ = (&self.st, self.pre);
         let Spec { d: dm, ff: ff_w, depth, deepstack, out: out_w } = self.spec;
         let (hd, merged_w) = (self.spec.hd(), self.spec.merged());
+        let img = frames[0];
         let (gh, gw) = patch_grid(img.height, img.width);
         let n = gh * gw;
         let tokens = n / (MERGE * MERGE);
-        let resized = bilinear(img, gh * PATCH, gw * PATCH);
-        let px = DevBuf::alloc_async(n * FRAME * 4, st)?;
-        px.upload(0, &f32_bytes(&patches(&resized, gh, gw)), st)?;
+        let (px, width, key) = match frames {
+            [_] => (patches(&bilinear(img, gh * PATCH, gw * PATCH), gh, gw), FRAME, "w"),
+            [_, b] => (pair_patches(&bilinear(img, gh * PATCH, gw * PATCH), &bilinear(b, gh * PATCH, gw * PATCH), gh, gw), 2 * FRAME, "w2"),
+            _ => bail!("{} frames in one vision patch", frames.len()),
+        };
+        let px = {
+            let d = DevBuf::alloc_async(n * width * 4, st)?;
+            d.upload(0, &f32_bytes(&px), st)?;
+            d
+        };
         let rope = DevBuf::alloc_async(n * hd * 4, st)?;
         rope.upload(0, &f32_bytes(&rope_table(gh, gw, hd)), st)?;
 
         let nf = n as i64;
         let xb = DevBuf::alloc_async(n * dm * 4, st)?;
-        let wf = DevBuf::alloc_async((merged_w * merged_w).max(ff_w * dm) * 4, st)?; // largest weight
+        // the largest weight: an fc1 of the mergers, an MLP's, or a merger's fc2, which on MiniMax H3's 32B is wider
+        let wf = DevBuf::alloc_async((merged_w * merged_w).max(ff_w * dm).max(out_w * merged_w) * 4, st)?;
         let normed = DevBuf::alloc_async(n * dm * 4, st)?;
         let qkv = DevBuf::alloc_async(n * 3 * dm * 4, st)?;
         let attn = DevBuf::alloc_async(n * dm * 4, st)?;
@@ -337,8 +381,8 @@ impl Vision {
         let mut unit = 0;
         let base = self.ws.acquire(unit, st)?;
         let lay = &self.ws.layouts[unit];
-        k!(gpu_gemm(px.ptr(), FRAME as i64, off(base, lay.off("w")), FRAME as i64, x, dm as i64, off(base, lay.off("b")), nf, dm as i64,
-            FRAME as i64, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
+        k!(gpu_gemm(px.ptr(), width as i64, off(base, lay.off(key)), width as i64, x, dm as i64, off(base, lay.off("b")), nf, dm as i64,
+            width as i64, 1, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
         self.ws.release(unit, st)?;
         drop(px);
         if let Some(p) = probe.as_mut() {

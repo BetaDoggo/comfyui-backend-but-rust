@@ -8,6 +8,10 @@ the first step when --trace is given, samples, and the decoded frames.
 --context-windows LENGTH,OVERLAP applies MiniMaxH3ContextWindows as SwarmUI's Video Context Window does (pyramid,
 FreeNoise). step0_out is then the first step's fused denoised pack, from the sampler callback, and the dumped noise is
 from before FreeNoise.
+
+--ref-image PNG or --ref-video CLIP conditions the prompt on a reference through MiniMaxH3ReferenceToVideo, which
+SwarmUI's SwarmMiniMaxH3CollectReferences copies, and dumps its latent as ref0. Name it <Picture 1> or <Video 1> in the
+prompt. A video needs ffmpeg and ffprobe on PATH.
 """
 import argparse
 import os
@@ -34,6 +38,8 @@ ap.add_argument("--no-vae", action="store_true")
 ap.add_argument("--load-only", action="store_true")
 ap.add_argument("--trace", action="store_true", help="keep tensors from inside the first evaluation and stop")
 ap.add_argument("--context-windows", help="LENGTH,OVERLAP in frames")
+ap.add_argument("--ref-image", help="a reference picture (PNG), <Picture 1> in the prompt, through MiniMaxH3ReferenceToVideo")
+ap.add_argument("--ref-video", help="a reference video, <Video 1> in the prompt, through MiniMaxH3ReferenceToVideo (ffmpeg and ffprobe on PATH)")
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
 
@@ -86,7 +92,35 @@ if args.context_windows:
     model = MiniMaxH3ContextWindowsNode.execute(model, length, overlap, "pyramid", True).args[0]
 
 t0 = time.perf_counter()
-cond = clip.encode_from_tokens_scheduled(clip.tokenize(args.prompt))
+if args.ref_image:
+    import numpy as np
+    from PIL import Image
+    from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
+    image = torch.from_numpy(np.asarray(Image.open(args.ref_image).convert("RGB")).astype(np.float32) / 255.0)[None]
+    ref_vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(VAE))
+    cond = MiniMaxH3ReferenceToVideo.execute(clip, args.prompt, args.size[0], args.size[1], args.length, "match", vae=ref_vae,
+                                             ref_images={"ref_image_1": image}).args[0]
+    dump["ref0"] = cond[0][1]["minimax_refs"][0]["latent"].detach().cpu().float()
+    del ref_vae
+elif args.ref_video:
+    # MiniMaxH3ReferenceToVideo, which SwarmMiniMaxH3CollectReferences copies: the clip's frames at 24 fps
+    import subprocess
+    import numpy as np
+    from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", args.ref_video],
+                           capture_output=True, text=True, check=True).stdout.strip().split(",")
+    vw, vh = int(probe[0]), int(probe[1])
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", args.ref_video, "-r", "24", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
+    video = torch.from_numpy(np.frombuffer(raw, dtype=np.uint8).reshape(-1, vh, vw, 3).astype(np.float32) / 255.0)
+    ref_vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(VAE))
+    cond = MiniMaxH3ReferenceToVideo.execute(clip, args.prompt, args.size[0], args.size[1], args.length, "match", vae=ref_vae,
+                                             ref_videos={"ref_video_1": video}).args[0]
+    blocks = cond[0][1]["minimax_refs"]
+    dump["ref0"] = blocks[0]["latent"].detach().cpu().float()
+    print("reference video", tuple(video.shape), "latent", tuple(blocks[0]["latent"].shape), flush=True)
+    del ref_vae
+else:
+    cond = clip.encode_from_tokens_scheduled(clip.tokenize(args.prompt))
 neg = clip.encode_from_tokens_scheduled(clip.tokenize(args.negative))
 torch.cuda.synchronize()
 print(f"encode {time.perf_counter() - t0:.1f}s, tokens {cond[0][0].shape}", flush=True)

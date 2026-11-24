@@ -544,7 +544,7 @@ The audio hasn't been listened to or judged by ear. `tools/h3_ref.py` and `tools
 
 The LoRA's diffusers file, `minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors`, matches no key here or in ComfyUI. Use the `_comfyui` file.
 
-SwarmUI's Sigma Shift, CFG, every sampler and LoRAs work. These are refused with an error: Rescale CFG, Renorm CFG, CFG Zero Star and TCFG, `<break>`, reference videos and audio, and VAE tile sizes other than 256 / 64.
+SwarmUI's Sigma Shift, CFG, every sampler and LoRAs work. These are refused with an error: Rescale CFG, Renorm CFG, CFG Zero Star and TCFG, `<break>`, reference audio and reference videos' soundtracks, and VAE tile sizes other than 256 / 64.
 
 Single image mode (1 frame) samples one latent frame and decodes it as ComfyUI does: a chunk of five copies through the
 video decoder, keeping the first real frame. A 768x512 still at 20 steps and CFG 5 took about 1 s per step once warm, through
@@ -552,8 +552,22 @@ video decoder, keeping the first real frame. A 768x512 still at 20 steps and CFG
 
 ### Reference pictures and keyframes
 
-These were tried through SwarmUI, where the maintainer found them working. Which modes were tried wasn't recorded, nothing
-was measured, and nothing was compared with ComfyUI. They follow ComfyUI's code:
+Pictures and keyframes were tried through SwarmUI, where the maintainer found them working; which modes wasn't recorded.
+Reference videos work in SwarmUI per the maintainer; only the CLI runs below were measured. They follow ComfyUI's code.
+
+Compared with ComfyUI (`tools/h3_ref.py --ref-image` or `--ref-video`, then `tools/h3_cmp.py`), the base model with no
+LoRA, 640x640, 22 frames, seed 11, the same noise, one reference of 640x640:
+
+| Reference | Text encoder output | Reference latent | First evaluation, video / audio |
+|---|---|---|---|
+| A picture (a clip's first frame) | 2.3% | 0.12% | 4.3% / 19% |
+| A 22-frame clip | 1.5% | 0.13% | 4.3% / 20% |
+
+Before 2026-11-24 the vision tower's DeepStack features were overwritten on the 32B tower, whose merger is wider than the
+4B's and 8B's: the text encoder output was 108% from ComfyUI's with a picture, and the first evaluation 9.7% / 40%.
+Pictures still showed in the clips, through the merged tokens and the reference rows.
+
+* **Pictures** go through the 32B text encoder's vision tower (the 8B's tower with a 5120-wide merger, under `visual.`),
 
 * **Pictures** go through the 32B text encoder's vision tower (the 8B's tower with a 5120-wide merger, under `visual.`),
   shown as `<Picture i>: ` then the vision block, before the prompt, with Qwen3-VL's MRoPE positions and DeepStack. The
@@ -561,21 +575,30 @@ was measured, and nothing was compared with ComfyUI. They follow ComfyUI's code:
   picture is also encoded and packed as reference rows between the text and the targets, as `PackedLayout` does.
   SwarmUI's references (`SwarmMiniMaxH3CollectReferences`) are scaled to the clip's area (`match`) or a 2048 short edge
   (`max`), with lanczos, to multiples of 32. Its Prompt Images on `SwarmTextEncodeAdvanced` only reach the text encoder.
+* **Videos** (`SwarmMiniMaxH3CollectReferences`' `ref_videos`, from SwarmUI's prompt videos at 24 fps) are resized
+  to a 768 short edge capped at 768x1344 (never up), cut to the clip's length and down to the 17k + 5 grid. The text
+  encoder sees `<Video k>: `, then for every two frames at 2 fps a `<T.T seconds>` label and one vision block whose
+  temporal patch holds both frames. The video VAE encodes all the frames into reference rows after the pictures', on
+  the video's own grid, spanning its frames' time. A video's soundtrack is refused.
 * **Keyframes** (`SwarmMiniMaxH3AddKeyframes`: Image To Video's first frame, Video End Frame) are encoded by the video
   VAE and packed on the target's grid at their frame's time.
 * Both kinds of rows run at time `max(t, 0.999)` and are mixed with 0.1% of noise from the sampler's seed, as ComfyUI's
   `_cond_video_rows` does.
-* The VAE encoder ([`h3vae::Encoder`](../src/h3vae.rs)) runs one frame: each causal conv becomes a 2D conv with its last
-  temporal tap, with reflect padding and per-frame GroupNorm, in fp16 on 256px tiles blended on the host, as ComfyUI's
-  `tiled_encode` does. The video VAE takes the posterior's mean. MiniMax-H3-Image's VAE samples it with seed 42, as
+* The VAE encoder ([`h3vae::Encoder`](../src/h3vae.rs)) runs ComfyUI's 3D causal CNN with reflect padding and per-frame
+  GroupNorm, in fp16 on 256px tiles blended on the host, as `tiled_encode` does. One frame takes each conv's last
+  temporal tap alone. A clip is encoded 17 frames at a time, the last ones padded with copies of the last frame, and
+  loses its last three latents, as `encode_temporal` does. 22 frames at 640x640 take about 12.5 s. The video VAE takes the posterior's mean. MiniMax-H3-Image's VAE samples it with seed 42, as
   ComfyUI does.
 
-On the CLI, `--image` adds a reference picture and `--first-frame` and `--last-frame` add keyframes (stretched to the
-clip). Refused with an error: reference videos and audio (they need the video-block vision path and the audio encoder),
+On the CLI, `--image` adds a reference picture, `--ref-video` a reference video (read by `ffmpeg` at 24 fps), and
+`--first-frame` and `--last-frame` add keyframes (stretched to the clip). With the pi-H3 4-step adapter, the prompt
+`The same scene as <Video 1>, continuing, no people` and a generated clip of a wooden sailboat in a turquoise bay, the
+output keeps the boat, the bay and the shore. Refused with an error: reference audio and video soundtracks (they need
+the audio encoder),
 references or keyframes with context windows or sparse attention, pictures on the negative prompt,
 and SwarmUI Prompt Images together with references.
 
-Not done: the audio encoder, and encoding clips longer than one frame.
+Not done: the audio encoder.
 
 ### Sparse attention
 
@@ -665,7 +688,7 @@ misses them.
 per evaluation warm, and 5.4 s for the first, which reads the blocks. The clip kept the fox and the scene, and the fox
 stood and walked. Reading the files cold, the vision tower took 29 s to pack and the text encoder 32 s. The maintainer
 reports it works through SwarmUI. Not compared with ComfyUI's HyperFlow node, nothing larger tried, audio not listened to.
-Reference videos and audio are refused, as on H3. Keyframes on HyperFlow are no longer refused, but weren't tried.
+Reference videos take H3's path but weren't tried on HyperFlow; reference audio is refused, as on H3. Keyframes on HyperFlow are no longer refused, but weren't tried.
 
 `fl2va`'s single file has the same tensor names and format as `ref2va`'s, and differs only in its dropped blocks and
 per-block ranks, but it hasn't been run. Its diffusers folder used to run here, before the single files: at 512x512,

@@ -1,8 +1,8 @@
 //! MiniMax H3's decoders. Video: a 36-layer ViT (int8 ConvRot weights) over 256px tiles of overlapping
 //! 7-latent chunks, blended on the host as ComfyUI does. MiniMax-H3-Image's: the same ViT at half the width and 24
 //! layers, fp16 weights, one frame per latent and rope over height and width only. Audio: BigVGAN at 32 kHz, f32.
-//! Sizes come from the latents. The encoder, which both VAE files share, encodes single frames: reference pictures
-//! and keyframes.
+//! Sizes come from the latents. The encoder, which both VAE files share, encodes reference pictures and keyframes, one
+//! frame each, and reference videos.
 
 use crate::cuda::{DevBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_BF16, DT_F16, PM, PRO_LAYERNORM, PRO_PLAIN, PRO_RMS, PRO_SWIGLU};
@@ -669,18 +669,27 @@ const ENC_RGB: usize = 8;
 /// `IMAGE_ENCODE_SEED`: the image VAE conditions on a posterior sample drawn with this seed
 const IMAGE_ENCODE_SEED: u64 = 42;
 
-/// Conv weight [Cout, Cin, T, R, R] -> [Cout][R][R][Cin] f16 bytes of the last temporal tap, Cin zero-padded to `cin`.
+/// Time strides of the four downsampling levels.
+const ENC_TIME_DOWN: [usize; ENC_DOWN] = [1, 2, 2, 1];
+/// `clip_length`: frames the encoder takes at once; `token_drop`: latents dropped from the end of the clip.
+const ENC_CLIP: usize = 17;
+const ENC_TOKEN_DROP: usize = 3;
+
+/// Conv weight [Cout, Cin, T, R, R] -> [Cout][T][R][R][Cin] f16 bytes, Cin zero-padded to `cin`. A 3x3 conv has three
+/// temporal taps, a 1x1 one.
 fn enc_conv(st: &SafeTensors, name: &str, cin: usize) -> Result<Vec<u8>> {
     let info = st.info(name)?.clone();
     let [co, ci, t, r, r2] = info.shape[..] else { anyhow::bail!("{name}: a conv weight of shape {:?}", info.shape) };
-    anyhow::ensure!(r == r2 && ci <= cin, "{name}: a conv weight of shape {:?}", info.shape);
+    anyhow::ensure!(r == r2 && ci <= cin && t == r && (r == 1 || r == 3), "{name}: a conv weight of shape {:?}", info.shape);
     let v = st.f32_vec(name, false)?;
-    let mut out = vec![f16::ZERO; co * r * r * cin];
+    let mut out = vec![f16::ZERO; co * t * r * r * cin];
     for o in 0..co {
         for c in 0..ci {
-            for y in 0..r {
-                for x in 0..r {
-                    out[((o * r + y) * r + x) * cin + c] = f16::from_f32(v[(((o * ci + c) * t + t - 1) * r + y) * r + x]);
+            for k in 0..t {
+                for y in 0..r {
+                    for x in 0..r {
+                        out[(((o * t + k) * r + y) * r + x) * cin + c] = f16::from_f32(v[(((o * ci + c) * t + k) * r + y) * r + x]);
+                    }
                 }
             }
         }
@@ -770,88 +779,113 @@ impl Encoder {
         self.buf.at(self.lay.off(key))
     }
 
-    /// out (+= with `beta` 1) = conv of `x` [h, w, cin] by `key`: 1x1, or 3x3 at `stride` 1 or 2.
+    /// out (+= with `beta` 1) = conv of `t` frames `x` [t][h][w][cin] by `key`: 1x1x1, or 3x3x3 at `stride` 1 or 2 in
+    /// space and `tstride` in time, causal (two zero frames ahead). A single frame takes the kernel's last temporal tap
+    /// alone, as ComfyUI truncates the taps rather than convolve zero frames. Returns the frames out.
     #[allow(clippy::too_many_arguments)]
-    fn conv(&self, key: &str, x: PM, (h, w): (usize, usize), cin: usize, cout: usize, k: usize, stride: usize, out: PM, beta: f32, st: &Stream) -> Result<()> {
+    fn conv(&self, key: &str, x: PM, (t, h, w): (usize, usize, usize), cin: usize, cout: usize, k: usize, (stride, tstride): (usize, usize), out: PM, beta: f32,
+            st: &Stream) -> Result<usize> {
         let (wt, b) = (self.w(&format!("{key}.w")), self.w(&format!("{key}.b")));
         if k == 1 {
-            return k!(gpu_gemm(x, cin as i64, wt, cin as i64, out, cout as i64, b, (h * w) as i64, cout as i64, cin as i64, 1, DT_F16, DT_F16, 1.0, beta, s(st)));
+            k!(gpu_gemm(x, cin as i64, wt, cin as i64, out, cout as i64, b, (t * h * w) as i64, cout as i64, cin as i64, 1, DT_F16, DT_F16, 1.0, beta, s(st)))?;
+            return Ok(t);
         }
-        let (ho, wo, kk) = (h / stride, w / stride, 9 * cin);
+        let (ho, wo, ldw) = (h / stride, w / stride, 27 * cin);
+        if t == 1 {
+            let (kk, last) = (9 * cin, off(wt, 2 * 9 * cin * 2));
+            let rows = ((128usize << 20) / (wo * kk * 2)).clamp(1, ho);
+            let col = DevBuf::alloc_async(rows * wo * kk * 2, st)?;
+            for y0 in (0..ho).step_by(rows) {
+                let r = rows.min(ho - y0);
+                k!(gpu_h3_im2col3(x, h as i32, w as i32, cin as i32, stride as i32, y0 as i32, r as i32, col.ptr(), s(st)))?;
+                k!(gpu_gemm(col.ptr(), kk as i64, last, ldw as i64, off(out, y0 * wo * cout * 2), cout as i64, b, (r * wo) as i64, cout as i64, kk as i64, 1, DT_F16,
+                    DT_F16, 1.0, beta, s(st)))?;
+            }
+            return Ok(1);
+        }
+        let to_n = (t - 1) / tstride + 1;
+        let kk = ldw;
         let rows = ((128usize << 20) / (wo * kk * 2)).clamp(1, ho);
         let col = DevBuf::alloc_async(rows * wo * kk * 2, st)?;
-        for y0 in (0..ho).step_by(rows) {
-            let r = rows.min(ho - y0);
-            k!(gpu_h3_im2col3(x, h as i32, w as i32, cin as i32, stride as i32, y0 as i32, r as i32, col.ptr(), s(st)))?;
-            k!(gpu_gemm(col.ptr(), kk as i64, wt, kk as i64, off(out, y0 * wo * cout * 2), cout as i64, b, (r * wo) as i64, cout as i64, kk as i64, 1, DT_F16, DT_F16,
-                1.0, beta, s(st)))?;
+        for to in 0..to_n {
+            for y0 in (0..ho).step_by(rows) {
+                let r = rows.min(ho - y0);
+                k!(gpu_h3_im2col3t(x, h as i32, w as i32, cin as i32, stride as i32, tstride as i32, to as i32, y0 as i32, r as i32, col.ptr(), s(st)))?;
+                k!(gpu_gemm(col.ptr(), kk as i64, wt, ldw as i64, off(out, ((to * ho + y0) * wo) * cout * 2), cout as i64, b, (r * wo) as i64, cout as i64, kk as i64, 1,
+                    DT_F16, DT_F16, 1.0, beta, s(st)))?;
+            }
         }
-        Ok(())
+        Ok(to_n)
     }
 
-    fn norm_silu(&self, key: &str, x: PM, p: usize, c: usize, scratch: &DevBuf, st: &Stream) -> Result<DevBuf> {
-        let out = DevBuf::alloc_async(p * c * 2, st)?;
-        k!(gpu_h3_group_norm_f16(x, out.ptr(), self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), p as i64, c as i32, ENC_GROUPS, ENC_EPS, 1, scratch.ptr(),
-            s(st)))?;
+    /// GroupNorm then SiLU of `t` frames [p, c] each, with statistics per frame.
+    #[allow(clippy::too_many_arguments)]
+    fn norm_silu(&self, key: &str, x: PM, t: usize, p: usize, c: usize, scratch: &DevBuf, st: &Stream) -> Result<DevBuf> {
+        let out = DevBuf::alloc_async(t * p * c * 2, st)?;
+        for f in 0..t {
+            k!(gpu_h3_group_norm_f16(off(x, f * p * c * 2), off(out.ptr(), f * p * c * 2), self.w(&format!("{key}.w")), self.w(&format!("{key}.b")), p as i64,
+                c as i32, ENC_GROUPS, ENC_EPS, 1, scratch.ptr(), s(st)))?;
+        }
         Ok(out)
     }
 
-    /// The moments of one tile, f16 NHWC pixels [h, w, 8] -> [48, 1, h / 16, w / 16] after `quant_conv`.
-    fn tile(&self, px: &DevBuf, h: usize, w: usize, st: &Stream) -> Result<Clip> {
-        let alloc = |p: usize, c: usize| DevBuf::alloc_async(p * c * 2, st);
+    /// The moments of one tile, `t` frames of f16 NHWC pixels [h, w, 8] -> [48, t', h / 16, w / 16] after `quant_conv`.
+    fn tile(&self, px: &DevBuf, t: usize, h: usize, w: usize, st: &Stream) -> Result<Clip> {
+        let alloc = |n: usize, c: usize| DevBuf::alloc_async(n * c * 2, st);
         let scratch = DevBuf::alloc_async(2 * ENC_GROUPS as usize * 8, st)?;
-        let (mut hh, mut ww) = (h, w);
-        let mut x = alloc(h * w, ENC_CH[0])?;
-        self.conv("in", px.ptr(), (h, w), ENC_RGB, ENC_CH[0], 3, 1, x.ptr(), 0.0, st)?;
+        let (mut tt, mut hh, mut ww) = (t, h, w);
+        let mut x = alloc(t * h * w, ENC_CH[0])?;
+        self.conv("in", px.ptr(), (t, h, w), ENC_RGB, ENC_CH[0], 3, (1, 1), x.ptr(), 0.0, st)?;
         let mut cin = ENC_CH[0];
         for (l, &c) in ENC_CH.iter().enumerate() {
             let p = hh * ww;
             for i in 0..2 {
-                let t = self.norm_silu(&format!("{l}.{i}.norm1"), x.ptr(), p, cin, &scratch, st)?;
-                let h1 = alloc(p, c)?;
-                self.conv(&format!("{l}.{i}.c1"), t.ptr(), (hh, ww), cin, c, 3, 1, h1.ptr(), 0.0, st)?;
-                drop(t);
-                let t = self.norm_silu(&format!("{l}.{i}.norm2"), h1.ptr(), p, c, &scratch, st)?;
+                let n = self.norm_silu(&format!("{l}.{i}.norm1"), x.ptr(), tt, p, cin, &scratch, st)?;
+                let h1 = alloc(tt * p, c)?;
+                self.conv(&format!("{l}.{i}.c1"), n.ptr(), (tt, hh, ww), cin, c, 3, (1, 1), h1.ptr(), 0.0, st)?;
+                drop(n);
+                let n = self.norm_silu(&format!("{l}.{i}.norm2"), h1.ptr(), tt, p, c, &scratch, st)?;
                 drop(h1);
                 // conv2 adds onto the shortcut
                 if cin != c {
-                    let sc = alloc(p, c)?;
-                    self.conv(&format!("{l}.{i}.sc"), x.ptr(), (hh, ww), cin, c, 1, 1, sc.ptr(), 0.0, st)?;
+                    let sc = alloc(tt * p, c)?;
+                    self.conv(&format!("{l}.{i}.sc"), x.ptr(), (tt, hh, ww), cin, c, 1, (1, 1), sc.ptr(), 0.0, st)?;
                     x = sc;
                 }
-                self.conv(&format!("{l}.{i}.c2"), t.ptr(), (hh, ww), c, c, 3, 1, x.ptr(), 1.0, st)?;
+                self.conv(&format!("{l}.{i}.c2"), n.ptr(), (tt, hh, ww), c, c, 3, (1, 1), x.ptr(), 1.0, st)?;
                 cin = c;
             }
             if l < ENC_DOWN {
-                let y = alloc(p / 4, c)?;
-                self.conv(&format!("{l}.down"), x.ptr(), (hh, ww), c, c, 3, 2, y.ptr(), 0.0, st)?;
+                let ts = if tt == 1 { 1 } else { ENC_TIME_DOWN[l] };
+                let y = alloc(((tt - 1) / ts + 1) * p / 4, c)?;
+                tt = self.conv(&format!("{l}.down"), x.ptr(), (tt, hh, ww), c, c, 3, (2, ts), y.ptr(), 0.0, st)?;
                 x = y;
                 hh /= 2;
                 ww /= 2;
             }
         }
         let p = hh * ww;
-        let t = self.norm_silu("norm_out", x.ptr(), p, cin, &scratch, st)?;
-        let m = alloc(p, 2 * C)?;
-        self.conv("out", t.ptr(), (hh, ww), cin, 2 * C, 3, 1, m.ptr(), 0.0, st)?;
-        let q = alloc(p, 2 * C)?;
-        self.conv("quant", m.ptr(), (hh, ww), 2 * C, 2 * C, 1, 1, q.ptr(), 0.0, st)?;
-        let mut b = vec![0u8; p * 2 * C * 2];
+        let n = self.norm_silu("norm_out", x.ptr(), tt, p, cin, &scratch, st)?;
+        let m = alloc(tt * p, 2 * C)?;
+        self.conv("out", n.ptr(), (tt, hh, ww), cin, 2 * C, 3, (1, 1), m.ptr(), 0.0, st)?;
+        let q = alloc(tt * p, 2 * C)?;
+        self.conv("quant", m.ptr(), (tt, hh, ww), 2 * C, 2 * C, 1, (1, 1), q.ptr(), 0.0, st)?;
+        let mut b = vec![0u8; tt * p * 2 * C * 2];
         q.download(0, &mut b, st)?;
-        let mut o = Clip::new(2 * C, 1, hh, ww);
+        let mut o = Clip::new(2 * C, tt, hh, ww);
         for (i, v) in b.chunks_exact(2).enumerate() {
-            o.data[(i % (2 * C)) * p + i / (2 * C)] = f16::from_le_bytes([v[0], v[1]]).to_f32();
+            let (c, f, at) = (i % (2 * C), i / (2 * C) / p, i / (2 * C) % p);
+            o.data[(c * tt + f) * p + at] = f16::from_le_bytes([v[0], v[1]]).to_f32();
         }
         Ok(o)
     }
 
-    /// RGB f32 [h, w, 3] in 0..1 (sides multiples of 16) -> the sampler's latent [24, h / 16, w / 16]: ComfyUI's
-    /// `encode` through its 256px tiles.
-    pub fn encode(&self, rgb: &[f32], h: usize, w: usize, st: &Stream) -> Result<Vec<f32>> {
-        anyhow::ensure!(h.is_multiple_of(RATIO) && w.is_multiple_of(RATIO) && rgb.len() == h * w * 3, "an H3 VAE input of {w}x{h}");
+    /// The moments of `t` frames of RGB f32 [t][h][w][3] in 0..1, through 256px tiles blended as `tiled_encode` blends
+    /// them: [48, t', h / 16, w / 16].
+    fn moments(&self, rgb: &[f32], t: usize, h: usize, w: usize, st: &Stream) -> Result<Clip> {
         // process_input to -1..1, then _normalize_pixels, as fp16 ops
         let r = |v: f32| f16::from_f32(v).to_f32();
-        let mut px = vec![0f32; h * w * ENC_RGB];
+        let mut px = vec![0f32; t * h * w * ENC_RGB];
         for (o, v) in px.chunks_exact_mut(ENC_RGB).zip(rgb.chunks_exact(3)) {
             for c in 0..3 {
                 let x = r(r(v[c] * 2.0 - 1.0) + 1.0);
@@ -864,18 +898,21 @@ impl Encoder {
         for &y0 in &ys {
             let mut row = Vec::new();
             for &x0 in &xs {
-                let mut tile = Vec::with_capacity(th * tw * ENC_RGB);
-                for y in 0..th {
-                    tile.extend(px[((y0 + y) * w + x0) * ENC_RGB..][..tw * ENC_RGB].iter().map(|v| f16::from_f32(*v)));
+                let mut tile = Vec::with_capacity(t * th * tw * ENC_RGB);
+                for f in 0..t {
+                    for y in 0..th {
+                        tile.extend(px[((f * h + y0 + y) * w + x0) * ENC_RGB..][..tw * ENC_RGB].iter().map(|v| f16::from_f32(*v)));
+                    }
                 }
                 let d = DevBuf::alloc_async(tile.len() * 2, st)?;
                 d.upload(0, &tile.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), st)?;
-                row.push(self.tile(&d, th, tw, st)?);
+                row.push(self.tile(&d, t, th, tw, st)?);
             }
             rows.push(row);
         }
+        let tt = rows[0][0].t;
         let (ly, lx): (Vec<usize>, Vec<usize>) = (yo.iter().map(|o| o / RATIO).collect(), xo.iter().map(|o| o / RATIO).collect());
-        let mut m = Clip::new(2 * C, 1, h / RATIO, w / RATIO);
+        let mut m = Clip::new(2 * C, tt, h / RATIO, w / RATIO);
         let mut y = 0;
         for (i, row) in rows.iter().enumerate() {
             let (mut x, mut height) = (0, 0);
@@ -890,13 +927,18 @@ impl Encoder {
                 }
                 let keep_h = if i + 1 < rows.len() { tile.h - ly[i] } else { tile.h };
                 let keep_w = if j + 1 < row.len() { tile.w - lx[j] } else { tile.w };
-                paste(&mut m, &tile.crop((0, 1), (0, keep_h), (0, keep_w)), y, x);
+                paste(&mut m, &tile.crop((0, tt), (0, keep_h), (0, keep_w)), y, x);
                 x += keep_w;
                 height = keep_h;
             }
             y += height;
         }
-        let p = (h / RATIO) * (w / RATIO);
+        Ok(m)
+    }
+
+    /// The posterior's mean (or for MiniMax-H3-Image's VAE a sample) of moments `m`, normalized: the sampler's latent.
+    fn latent(&self, m: &Clip) -> Vec<f32> {
+        let p = m.t * m.h * m.w;
         let noise = if self.sample { crate::sampling::torch_randn(IMAGE_ENCODE_SEED, C * p) } else { Vec::new() };
         let mut out = vec![0f32; C * p];
         for c in 0..C {
@@ -909,7 +951,48 @@ impl Encoder {
                 out[c * p + i] = (z - self.mean[c]) / self.std[c];
             }
         }
-        Ok(out)
+        out
+    }
+
+    /// RGB f32 [h, w, 3] in 0..1 (sides multiples of 16) -> the sampler's latent [24, h / 16, w / 16]: ComfyUI's
+    /// `encode` through its 256px tiles.
+    pub fn encode(&self, rgb: &[f32], h: usize, w: usize, st: &Stream) -> Result<Vec<f32>> {
+        anyhow::ensure!(h.is_multiple_of(RATIO) && w.is_multiple_of(RATIO) && rgb.len() == h * w * 3, "an H3 VAE input of {w}x{h}");
+        Ok(self.latent(&self.moments(rgb, 1, h, w, st)?))
+    }
+
+    /// `t` frames of RGB f32 [t][h][w][3] in 0..1 (t on the 17k + 5 grid, sides multiples of 16) -> the sampler's latent
+    /// [24, t', h / 16, w / 16]: `encode_temporal`, which encodes each 17 frames on their own, the last ones padded with
+    /// copies of the last frame, and drops the clip's last three latents.
+    pub fn encode_video(&self, rgb: &[f32], t: usize, h: usize, w: usize, st: &Stream) -> Result<Vec<f32>> {
+        anyhow::ensure!(h.is_multiple_of(RATIO) && w.is_multiple_of(RATIO) && rgb.len() == t * h * w * 3 && t > 1, "an H3 VAE input of {t} frames of {w}x{h}");
+        anyhow::ensure!(!self.sample, "a clip through MiniMax-H3-Image's VAE, which encodes single pictures");
+        let frame = h * w * 3;
+        let mut parts = Vec::new();
+        for c0 in (0..t).step_by(ENC_CLIP) {
+            let mut clip = rgb[c0 * frame..(c0 + ENC_CLIP).min(t) * frame].to_vec();
+            while clip.len() < ENC_CLIP * frame {
+                clip.extend_from_slice(&rgb[(t - 1) * frame..t * frame]);
+            }
+            parts.push(self.moments(&clip, ENC_CLIP, h, w, st)?);
+        }
+        let total = parts.iter().map(|p| p.t).sum::<usize>();
+        anyhow::ensure!(total > ENC_TOKEN_DROP, "{t} frames make {total} latents");
+        let keep = total - ENC_TOKEN_DROP;
+        let (lh, lw) = (h / RATIO, w / RATIO);
+        let mut m = Clip::new(2 * C, keep, lh, lw);
+        let mut f0 = 0;
+        for p in &parts {
+            let n = p.t.min(keep.saturating_sub(f0));
+            for c in 0..2 * C {
+                for f in 0..n {
+                    let (a, b) = (m.at(c, f0 + f, 0, 0), p.at(c, f, 0, 0));
+                    m.data[a..a + lh * lw].copy_from_slice(&p.data[b..b + lh * lw]);
+                }
+            }
+            f0 += n;
+        }
+        Ok(self.latent(&m))
     }
 }
 

@@ -544,6 +544,36 @@ GPU_API int gpu_h3_im2col3(const void* in, int H, int W, int C, int stride, int 
     return 0;
 }
 
+// 3x3x3 causal patches of output frame `to`, rows [y0, y0 + rows), from NHWC frames [T][H][W][C]:
+// out[(y - y0) * Wo + x, ((kt * 3 + ky) * 3 + kx) * C + c]. Tap kt reads frame to * tstride + kt - 2, zero before the
+// first frame (the causal front padding); the spatial padding is im2col3's.
+__global__ void h3_im2col3t_kernel(const __half* in, int H, int W, int C, int stride, int tstride, int to, int y0, int rows, __half* out) {
+    const int Wo = stride == 1 ? W : W / 2, pad = stride == 1 ? 1 : 0;
+    const int64_t per = 27 * (int64_t)C;
+    const int64_t t = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (int64_t)rows * Wo * per) return;
+    const int64_t p = t / per;
+    const int rest = (int)(t % per);
+    const int k = rest / C, c = rest % C;
+    const int f = to * tstride + k / 9 - 2, ks = k % 9;
+    if (f < 0) {
+        out[t] = __float2half(0.f);
+        return;
+    }
+    const int y = y0 + (int)(p / Wo), x = (int)(p % Wo);
+    const int sy = reflect_at(y * stride + ks / 3 - pad, H), sx = reflect_at(x * stride + ks % 3 - pad, W);
+    out[t] = in[(((int64_t)f * H + sy) * W + sx) * C + c];
+}
+
+GPU_API int gpu_h3_im2col3t(const void* in, int H, int W, int C, int stride, int tstride, int to, int y0, int rows, void* out, void* stream) {
+    const int Wo = stride == 1 ? W : W / 2;
+    const int64_t total = (int64_t)rows * Wo * 27 * C;
+    h3_im2col3t_kernel<<<(unsigned)((total + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const __half*)in, H, W, C, stride, tstride, to, y0, rows,
+                                                                                         (__half*)out);
+    KCHECK();
+    return 0;
+}
+
 // sums and sums of squares per group, in double: acc [2 * G]
 __global__ void h3_gn_stats_kernel(const __half* x, int64_t P, int C, int G, double* acc) {
     const int g = blockIdx.y, cpg = C / G;

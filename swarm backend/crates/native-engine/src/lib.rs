@@ -538,6 +538,18 @@ fn first_rgb(b: &ImageBatch) -> PromptImage {
     PromptImage { width: b.width as usize, height: b.height as usize, rgb }
 }
 
+/// Every frame of a batch as RGB, its alpha dropped as `frames[..., :3]` does.
+fn rgb_frames(b: &ImageBatch) -> Vec<PromptImage> {
+    let channels = b.channels as usize;
+    (0..b.count)
+        .map(|i| PromptImage {
+            width: b.width as usize,
+            height: b.height as usize,
+            rgb: b.frame_f32(i).chunks_exact(channels).flat_map(|px| [0, 1, 2].map(|c| px[c.min(channels - 1)])).collect(),
+        })
+        .collect()
+}
+
 /// True for an H3 VAE file with the encoder, which both the video and the image VAE carry.
 fn has_h3_encoder(file: &ModelFile) -> bool {
     is_h3_vae(file) && read_header(&file.path).is_ok_and(|h| h.get("encoder.conv_in.weight").is_some())
@@ -558,8 +570,8 @@ fn h3_conds(cond: &DeferredCond, meta: &CondMeta, family: Family, sh: &h3::Shape
         out.pictures = cond.images.iter().map(|img| diffusion::pipeline::H3Picture { vision: img.clone(), latent: None }).collect();
     }
     if let Some(r) = &cond.minimax {
-        if !r.videos.is_empty() || !r.audios.is_empty() {
-            return Err(unsupported("reference videos and audio on MiniMax H3 (only pictures)"));
+        if !r.audios.is_empty() || r.videos.iter().any(|(_, track)| track.is_some()) {
+            return Err(unsupported("reference audio and reference video soundtracks on MiniMax H3 (pictures and silent videos only)"));
         }
         if r.ref_image_size != "match" && r.ref_image_size != "max" {
             return Err(unsupported(format!("MiniMax H3 ref_image_size {:?}", r.ref_image_size)));
@@ -583,6 +595,12 @@ fn h3_conds(cond: &DeferredCond, meta: &CondMeta, family: Family, sh: &h3::Shape
             (Family::H3Image, _) => return Err(unsupported("MiniMax H3 video references on MiniMax-H3-Image: set the model's class to MiniMax H3 Image in SwarmUI")),
             _ => return Err(unsupported("MiniMaxH3ImageConditioning's pictures on the MiniMax H3 video model")),
         };
+        // the videos are cut to the clip's length, as SwarmUI's node gives it
+        let clip = diffusion::pipeline::h3_clip_frames(r.length.max(1) as usize);
+        for (frames, _) in r.videos.iter().filter(|(b, _)| b.count > 0) {
+            let v = diffusion::pipeline::ref2va_video(&rgb_frames(frames), clip, vae.is_some()).map_err(|e| unsupported(format!("{e:#}")))?;
+            out.videos.push(v);
+        }
         out.vae = vae;
     }
     // the clip's frames on the 17k + 5 grid, or one for a still

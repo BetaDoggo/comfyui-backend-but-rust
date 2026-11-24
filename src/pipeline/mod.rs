@@ -19,7 +19,7 @@ mod seedvr;
 mod sensenova;
 
 pub use anima::{AnimaRequest, SnapRefRequest, StyleRequest};
-pub use h3::{h3_presentation, h3_tokens, image_pictures, ref2va_pictures, ref2va_size, resize as h3_resize, size_short_edge, H3Conds, H3Picture, H3Request};
+pub use h3::{adapt_canvas, h3_clip_frames, h3_presentation, h3_tokens, image_pictures, ref2va_pictures, ref2va_size, ref2va_video, resize as h3_resize, size_short_edge, H3Conds, H3Picture, H3Request, H3Video, VideoFrames};
 pub use krea::{KreaEntry, KreaRequest};
 pub use moss::{moss_tokens, MossRequest};
 pub use qwen21::Qwen21Request;

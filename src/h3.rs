@@ -124,17 +124,26 @@ pub struct Extra {
     pub keyframes: Vec<(usize, usize)>,
     /// each reference picture's latent height and width
     pub refs: Vec<(usize, usize)>,
+    /// each reference video's latent frames, height and width, packed after the pictures
+    pub videos: Vec<(usize, usize, usize)>,
+}
+
+/// `_ref_t_span` of a reference video of `t` latent frames: the time its frames take.
+fn video_span(t: usize) -> f64 {
+    (0..t).map(|f| FRAME_RESCALE * FRAME_PER_TOKEN[f % 5] as f64).sum()
 }
 
 impl Extra {
     /// Its rows in the sequence, for a target of shape `sh`.
     pub fn rows(&self, sh: &Shape) -> usize {
         let frame = sh.h.div_ceil(2) * sh.w.div_ceil(2);
-        self.keyframes.iter().map(|k| k.1 * frame).sum::<usize>() + self.refs.iter().map(|(h, w)| h.div_ceil(2) * w.div_ceil(2)).sum::<usize>()
+        self.keyframes.iter().map(|k| k.1 * frame).sum::<usize>()
+            + self.refs.iter().map(|(h, w)| h.div_ceil(2) * w.div_ceil(2)).sum::<usize>()
+            + self.videos.iter().map(|(t, h, w)| t * h.div_ceil(2) * w.div_ceil(2)).sum::<usize>()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.keyframes.is_empty() && self.refs.is_empty()
+        self.keyframes.is_empty() && self.refs.is_empty() && self.videos.is_empty()
     }
 }
 
@@ -152,8 +161,9 @@ pub fn positions(text: usize, sh: &Shape, extra: &Extra) -> Vec<[f64; 3]> {
     let frame = frame_grid(sh.h, sh.w);
     let mut p = Vec::with_capacity(text + extra.rows(sh) + 2 * sh.audio_t + sh.video_rows());
     p.extend((0..text).map(|i| [i as f64, 0.0, 0.0]));
-    // a reference takes one time step, ahead of the targets
-    let cursor = (text + extra.refs.len()) as f64;
+    // a reference picture takes one time step ahead of the targets, a video the time of its frames
+    let videos = (text + extra.refs.len()) as f64;
+    let cursor = videos + extra.videos.iter().map(|v| video_span(v.0)).sum::<f64>();
     for &(index, t) in &extra.keyframes {
         for at in frame_times(t, cursor + FRAME_RESCALE * index as f64) {
             p.extend(frame.iter().map(|[y, x]| [at, *y, *x]));
@@ -161,6 +171,15 @@ pub fn positions(text: usize, sh: &Shape, extra: &Extra) -> Vec<[f64; 3]> {
     }
     for (i, &(h, w)) in extra.refs.iter().enumerate() {
         p.extend(frame_grid(h, w).iter().map(|[y, x]| [(text + i) as f64, *y, *x]));
+    }
+    // each on its own grid, its frames from where the one before ends
+    let mut origin = videos;
+    for &(t, h, w) in &extra.videos {
+        let grid = frame_grid(h, w);
+        for at in frame_times(t, origin) {
+            p.extend(grid.iter().map(|[y, x]| [at, *y, *x]));
+        }
+        origin += video_span(t);
     }
     // the audio rows sit at the frame's outer columns
     for w in [frame[0][1], frame[frame.len() - 1][1]] {
@@ -1593,7 +1612,7 @@ mod tests {
     fn conditions_pack_between_text_and_targets() {
         // PackedLayout(3, 2, 4, 4, 0, keyframes=[frame 4, one latent], refs=[an image of 2 x 6 latents])
         let sh = Shape { t: 2, h: 4, w: 4, audio_t: 0 };
-        let extra = Extra { keyframes: vec![(4, 1)], refs: vec![(2, 6)] };
+        let extra = Extra { keyframes: vec![(4, 1)], refs: vec![(2, 6)], videos: Vec::new() };
         let p = positions(3, &sh, &extra);
         assert_eq!(extra.rows(&sh), 4 + 3);
         assert_eq!(p.len(), 3 + 7 + 8);
@@ -1607,5 +1626,21 @@ mod tests {
         assert!((p[9][2] - p[7][2] - 2.0 * (6.0 / 12f64.sqrt() / 3.0) * 32.0).abs() < 1e-9);
         // the targets start one step after the text
         assert_eq!(p[10][0], 4.0);
+    }
+
+    #[test]
+    fn reference_videos_take_their_frames_time() {
+        // PackedLayout(3, 2, 4, 4, 0, refs=[an image of 2 x 2 latents, a video of 2 latent frames of 2 x 2])
+        let sh = Shape { t: 2, h: 4, w: 4, audio_t: 0 };
+        let extra = Extra { keyframes: Vec::new(), refs: vec![(2, 2)], videos: vec![(2, 2, 2)] };
+        let p = positions(3, &sh, &extra);
+        assert_eq!(extra.rows(&sh), 1 + 2);
+        assert_eq!(p.len(), 3 + 3 + 8);
+        assert_eq!(p[3], [3.0, 0.0, 0.0]);
+        // the video after the picture's step, its second latent a frame's rescale later
+        assert_eq!(p[4], [4.0, 0.0, 0.0]);
+        assert!((p[5][0] - (4.0 + 5.0 / 3.0)).abs() < 1e-12);
+        // the targets after its 1 + 4 + ... frames: 5/3 + 20/3
+        assert!((p[6][0] - (4.0 + 25.0 / 3.0)).abs() < 1e-12);
     }
 }

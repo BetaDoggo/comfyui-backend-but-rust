@@ -20,6 +20,24 @@ pub struct H3Picture {
     pub latent: Option<PromptImage>,
 }
 
+/// Frames of a reference video, RGB `[frames][height][width][3]`, 0 to 1.
+#[derive(PartialEq)]
+pub struct VideoFrames {
+    pub width: usize,
+    pub height: usize,
+    pub frames: usize,
+    pub rgb: Vec<f32>,
+}
+
+/// A reference video, `MiniMaxH3ReferenceToVideo`'s `ref_videos`: its frames at 2 fps in pairs, each pair one temporal
+/// patch of the vision tower, the count of those frames, and the frames the VAE encodes into a reference latent, if any.
+#[derive(Clone, PartialEq)]
+pub struct H3Video {
+    pub vision: Vec<[PromptImage; 2]>,
+    pub sampled: usize,
+    pub latent: Option<Arc<VideoFrames>>,
+}
+
 /// What a positive conditioning entry is conditioned on besides its text.
 #[derive(Clone, Default, PartialEq)]
 pub struct H3Conds {
@@ -27,6 +45,8 @@ pub struct H3Conds {
     /// the video model's references, `Picture {}: ` for MiniMax-H3-Image's edits.
     pub label: String,
     pub pictures: Vec<H3Picture>,
+    /// Reference videos, presented after the pictures as `<Video {}>: `.
+    pub videos: Vec<H3Video>,
     /// The VAE whose encoder makes the pictures' latents.
     pub vae: Option<PathBuf>,
     /// Keyframes: the pixel frame each anchors, and its latent `[24, 1, h, w]` at the clip's size.
@@ -80,6 +100,69 @@ pub fn ref2va_pictures(images: &[PromptImage], clip: (usize, usize), max: bool, 
     }).collect()
 }
 
+/// `adapt_canvas`: a 768 short edge for the aspect of `width` x `height`, its area capped at 768 x 1344, each side rounded
+/// to 32.
+pub fn adapt_canvas(width: usize, height: usize) -> (usize, usize) {
+    let ratio = width as f64 / height as f64;
+    let (mut w, mut h) = if ratio >= 1.0 { (768.0 * ratio, 768.0) } else { (768.0, 768.0 / ratio) };
+    let max = 768.0 * 1344.0;
+    if w * h > max {
+        let s = (max / (w * h)).sqrt();
+        (w, h) = (w * s, h * s);
+    }
+    let side = |v: f64| ((v / 32.0).round_ties_even() as usize * 32).max(32);
+    (side(w), side(h))
+}
+
+/// The frames of a clip of `frames` on MiniMax H3's grid: 17k + 5, or one or two for a still.
+pub fn h3_clip_frames(frames: usize) -> usize {
+    match frames {
+        1 | 2 => frames,
+        n => crate::h3::align_frames(n.max(5)),
+    }
+}
+
+/// A reference video as `MiniMaxH3ReferenceToVideo` prepares it for a clip of `clip_frames` frames: resized to the
+/// reference canvas (never up), cut to the clip's length and down to the 17k + 5 grid, with every twelfth frame (2 fps)
+/// for the vision tower, in pairs, the last repeated to make the pairs even. `vae` keeps the frames for the VAE.
+pub fn ref2va_video(frames: &[PromptImage], clip_frames: usize, vae: bool) -> Result<H3Video> {
+    let Some(first) = frames.first() else { bail!("a reference video without frames") };
+    let (vw, vh) = (first.width, first.height);
+    if frames.iter().any(|f| (f.width, f.height) != (vw, vh)) {
+        bail!("a reference video whose frames differ in size");
+    }
+    let (mut cw, mut ch) = adapt_canvas(vw, vh);
+    if vw * vh < cw * ch {
+        let side = |v: usize| ((v as f64 / 32.0).round_ties_even() as usize * 32).max(32);
+        (cw, ch) = (side(vw), side(vh));
+    }
+    let mut n = frames.len().min(clip_frames);
+    if n < 5 {
+        bail!("MiniMax H3 reference videos need at least 5 frames (~0.2s at 24 fps)");
+    }
+    while n % 17 != 5 {
+        n -= 1;
+    }
+    let resized: Vec<PromptImage> = frames[..n].iter().map(|f| resize(f, cw, ch)).collect();
+    let mut picked: Vec<PromptImage> = resized.iter().step_by(12).cloned().collect();
+    let sampled = picked.len();
+    if sampled % 2 == 1 {
+        picked.push(picked[sampled - 1].clone());
+    }
+    let vision = picked.chunks_exact(2).map(|p| [p[0].clone(), p[1].clone()]).collect();
+    let latent = vae.then(|| Arc::new(VideoFrames { width: cw, height: ch, frames: n, rgb: resized.iter().flat_map(|f| f.rgb.iter().copied()).collect() }));
+    Ok(H3Video { vision, sampled, latent })
+}
+
+/// `<T.T seconds>` of a vision block of a video's `frames` frames at 2 fps: the mean of its two frames' times, the last
+/// of an odd count repeated.
+fn block_seconds(block: usize, frames: usize) -> String {
+    let at = |i: usize| i.min(frames - 1) as f64 / 2.0;
+    let t = (at(2 * block) + at(2 * block + 1)) / 2.0;
+    // Python's %.1f rounds the exact binary value half to even: 0.25 is 0.2
+    format!("<{:.1} seconds>", (t * 10.0).round_ties_even() / 10.0)
+}
+
 pub struct H3Request {
     /// The positive conditioning entries, mixed as ComfyUI's `calc_cond_batch` does.
     pub positive: Vec<Cond>,
@@ -102,8 +185,8 @@ pub struct H3Request {
     pub seed: u64,
 }
 
-/// A prompt's tokens with the pictures shown before them.
-type H3Key = (TokenKey, Vec<PromptImage>);
+/// A prompt's tokens with the vision blocks shown before them: a picture, or two frames of a video.
+type H3Key = (TokenKey, Vec<Vec<PromptImage>>);
 
 struct Model {
     path: PathBuf,
@@ -123,10 +206,12 @@ pub(super) struct H3 {
     audio: Option<(PathBuf, h3vae::AudioDecoder)>,
     /// The text encoder file's vision tower, loaded by the first picture.
     vision: Option<(PathBuf, vision::Vision)>,
-    /// Latest pictures through the tower, most recent last.
-    vision_cache: Vec<(PromptImage, Arc<vision::Embeds>)>,
+    /// Latest pictures and frame pairs through the tower, most recent last.
+    vision_cache: Vec<(Vec<PromptImage>, Arc<vision::Embeds>)>,
     /// Latest reference latents by VAE and picture, most recent last.
     ref_latents: Vec<((PathBuf, PromptImage), Arc<Vec<f32>>)>,
+    /// Latest reference video latents by VAE and frames, most recent last.
+    video_latents: Vec<((PathBuf, Arc<VideoFrames>), Arc<Vec<f32>>)>,
     /// Latest encoded prompts with their length and per-token tags (1 text, 0 vision), most recent last.
     contexts: Vec<(H3Key, usize, DevBuf, Vec<u8>)>,
     /// The pixel head of the adapter's file, loaded by the first run that decodes with it.
@@ -239,16 +324,25 @@ pub fn h3_tokens(t: &tokenizer::Tokenizer, segments: &[(String, f32)]) -> Result
     Ok((ids, factors))
 }
 
-/// The ids and per-token factors of `pictures` pictures, each `label` with its number then its vision block, before
-/// `segments`: `MiniMaxH3Tokenizer`'s presentation, which has no template.
-pub fn h3_presentation(t: &tokenizer::Tokenizer, label: &str, pictures: usize, segments: &[(String, f32)]) -> Result<(Vec<u32>, Vec<f32>)> {
+/// The ids and per-token factors of `pictures` pictures, each `label` with its number then its vision block, then of
+/// videos of `videos` frames at 2 fps, each `<Video k>: ` then each pair's time and vision block, before `segments`:
+/// `MiniMaxH3Tokenizer`'s presentation, which has no template.
+pub fn h3_presentation(t: &tokenizer::Tokenizer, label: &str, pictures: usize, videos: &[usize], segments: &[(String, f32)]) -> Result<(Vec<u32>, Vec<f32>)> {
     let mut ids = Vec::new();
+    let vision = [h3te::VISION_START, h3te::IMAGE_PAD, h3te::VISION_END];
     for i in 1..=pictures {
         ids.extend(t.encode(&label.replace("{}", &i.to_string()))?);
-        ids.extend([h3te::VISION_START, h3te::IMAGE_PAD, h3te::VISION_END]);
+        ids.extend(vision);
+    }
+    for (k, &frames) in videos.iter().enumerate() {
+        ids.extend(t.encode(&format!("<Video {}>: ", k + 1))?);
+        for b in 0..frames.div_ceil(2) {
+            ids.extend(t.encode(&block_seconds(b, frames))?);
+            ids.extend(vision);
+        }
     }
     let mut factors = vec![1.0; ids.len()];
-    if pictures == 0 {
+    if ids.is_empty() {
         return h3_tokens(t, segments);
     }
     for (text, weight) in segments {
@@ -259,10 +353,10 @@ pub fn h3_presentation(t: &tokenizer::Tokenizer, label: &str, pictures: usize, s
 }
 
 impl H3 {
-    /// The vision tower's tokens for `images`, through the cache.
-    fn vision_embeds(&mut self, images: &[PromptImage], threads: usize, st: &Stream) -> Result<Vec<Arc<vision::Embeds>>> {
-        let mut out = Vec::with_capacity(images.len());
-        for img in images {
+    /// The vision tower's tokens for `blocks`, each a picture or two frames of a video, through the cache.
+    fn vision_embeds(&mut self, blocks: &[Vec<PromptImage>], threads: usize, st: &Stream) -> Result<Vec<Arc<vision::Embeds>>> {
+        let mut out = Vec::with_capacity(blocks.len());
+        for img in blocks {
             if touch(&mut self.vision_cache, |(k, _)| k == img) {
                 out.push(self.vision_cache.last().unwrap().1.clone());
                 continue;
@@ -275,20 +369,28 @@ impl H3 {
                 eprintln!("vision tower ready in {:.1}s", t0.elapsed().as_secs_f64());
             }
             let t0 = Instant::now();
-            let e = Arc::new(self.vision.as_mut().unwrap().1.encode(img, st, None)?);
-            eprintln!("vision: {}x{}, {} tokens in {:.0} ms", img.width, img.height, e.tokens, t0.elapsed().as_secs_f64() * 1e3);
+            let tower = &mut self.vision.as_mut().unwrap().1;
+            let e = Arc::new(match &img[..] {
+                [a] => tower.encode(a, st, None)?,
+                [a, b] => tower.encode_pair(a, b, st)?,
+                _ => bail!("{} frames in one vision block", img.len()),
+            });
+            eprintln!("vision: {} frame(s) of {}x{}, {} tokens in {:.0} ms", img.len(), img[0].width, img[0].height, e.tokens, t0.elapsed().as_secs_f64() * 1e3);
             out.push(e.clone());
             remember(&mut self.vision_cache, (img.clone(), e), VISION_CACHE);
         }
         Ok(out)
     }
 
-    /// The cache key of `prompt` with `pictures` before it.
-    fn key(&self, prompt: &Prompt, label: &str, pictures: &[PromptImage]) -> Result<H3Key> {
+    /// The cache key of `prompt` with `pictures`, then the frame pairs of `videos`, before it.
+    fn key(&self, prompt: &Prompt, label: &str, pictures: &[PromptImage], videos: &[H3Video]) -> Result<H3Key> {
         let tok = self.tokenizer.as_ref().context("no H3 tokenizer")?;
-        let (ids, mut factors) = h3_presentation(tok, label, pictures.len(), prompt.segments()?)?;
+        let sampled: Vec<usize> = videos.iter().map(|v| v.sampled).collect();
+        let (ids, mut factors) = h3_presentation(tok, label, pictures.len(), &sampled, prompt.segments()?)?;
         factors.iter_mut().for_each(|f| *f *= prompt.scale);
-        Ok((vec![(ids, factors)], pictures.to_vec()))
+        let mut blocks: Vec<Vec<PromptImage>> = pictures.iter().map(|p| vec![p.clone()]).collect();
+        blocks.extend(videos.iter().flat_map(|v| v.vision.iter().map(|p| p.to_vec())));
+        Ok((vec![(ids, factors)], blocks))
     }
 
     /// Move the refined context of `key` to the end of the cache, encoding it if needed. A new one makes room by
@@ -319,6 +421,17 @@ impl H3 {
             let mut b = vec![0u8; len * h3te::D * 4];
             cond.download(0, &mut b, st)?;
             d.insert("context".into(), ("F32".into(), vec![1, len, h3te::D], b));
+            // each vision block's merged tokens
+            for (i, e) in embeds.iter().enumerate() {
+                let mut b = vec![0u8; e.merged.size()];
+                e.merged.download(0, &mut b, st)?;
+                d.insert(format!("vision{i}"), ("F32".into(), vec![e.tokens, b.len() / 4 / e.tokens], b));
+                for (j, ds) in e.deepstack.iter().enumerate() {
+                    let mut b = vec![0u8; ds.size()];
+                    ds.download(0, &mut b, st)?;
+                    d.insert(format!("vision{i}_ds{j}"), ("F32".into(), vec![e.tokens, b.len() / 4 / e.tokens], b));
+                }
+            }
         }
         let m = self.model.as_mut().context("no H3 model")?;
         let ctx = m.dit.encode_context(&cond, len, st)?;
@@ -354,6 +467,25 @@ impl H3 {
             remember(&mut self.ref_latents, ((vae.to_path_buf(), img.clone()), z), REF_LATENTS);
         }
         Ok(out)
+    }
+
+    /// The sampler's latent of reference video `frames` through the encoder of `vae`, through the cache.
+    fn video_latent(&mut self, vae: &Path, frames: &Arc<VideoFrames>, st: &Stream) -> Result<Arc<Vec<f32>>> {
+        if touch(&mut self.video_latents, |((p, k), _)| p == vae && k == frames) {
+            return Ok(self.video_latents.last().unwrap().1.clone());
+        }
+        // the diffusion model's blocks make room; it places them again when it samples
+        if let Some(m) = &mut self.model {
+            st.sync()?;
+            m.dit.park()?;
+            cuda::trim_pool()?;
+        }
+        let enc = h3vae::Encoder::load(vae, st)?;
+        let t0 = Instant::now();
+        let z = Arc::new(enc.encode_video(&frames.rgb, frames.frames, frames.height, frames.width, st)?);
+        eprintln!("reference video of {} frames at {}x{} encoded in {:.0} ms", frames.frames, frames.width, frames.height, t0.elapsed().as_secs_f64() * 1e3);
+        remember(&mut self.video_latents, ((vae.to_path_buf(), frames.clone()), z.clone()), REF_LATENTS);
+        Ok(z)
     }
 }
 
@@ -498,9 +630,12 @@ impl Generator {
             // ComfyUI-piFlow only decodes an evaluation of one positive entry, and finds no pixels otherwise
             return Err(lora::Unsupported("several positive conditioning entries with a DWD adapter".into()).into());
         }
-        let conditioned = |c: &H3Conds| !c.keyframes.is_empty() || c.pictures.iter().any(|p| p.latent.is_some());
+        let conditioned = |c: &H3Conds| !c.keyframes.is_empty() || c.pictures.iter().any(|p| p.latent.is_some()) || c.videos.iter().any(|v| v.latent.is_some());
         if r.conds.iter().any(conditioned) && (windowed || r.sparse.is_some()) {
-            bail!("keyframes and reference pictures with context windows or sparse attention");
+            bail!("keyframes and reference pictures or videos with context windows or sparse attention");
+        }
+        if dit.is_image() && r.conds.iter().any(|c| !c.videos.is_empty()) {
+            bail!("reference videos on MiniMax-H3-Image");
         }
         let several = r.positive.len() > 1 || r.sampling.uses_negative() && r.negative.len() > 1;
         if windowed && several && r.windows.as_ref().is_some_and(|w| w.split_conds) {
@@ -511,12 +646,12 @@ impl Generator {
         let mut positive = Vec::with_capacity(r.positive.len());
         for (p, c) in r.positive.iter().zip(&r.conds) {
             let vision: Vec<PromptImage> = c.pictures.iter().map(|p| p.vision.clone()).collect();
-            positive.push((f.key(&p.prompt, &c.label, &vision)?, c));
+            positive.push((f.key(&p.prompt, &c.label, &vision, &c.videos)?, c));
         }
         let mut negative = Vec::new();
         if r.sampling.uses_negative() {
             for n in &r.negative {
-                negative.push((f.key(&n.prompt, "", &[])?, &none));
+                negative.push((f.key(&n.prompt, "", &[], &[])?, &none));
             }
         }
         let (units, map) = units(positive, negative);
@@ -544,6 +679,14 @@ impl Generator {
                     extra.refs.push((img.height / 16, img.width / 16));
                     latents.push((z, 1, img.height / 16, img.width / 16));
                 }
+            }
+            for v in c.videos.iter().filter_map(|v| v.latent.as_ref()) {
+                let vae = c.vae.as_ref().context("reference videos to encode without a VAE")?;
+                let z = f.video_latent(vae, v, st)?;
+                let (h, w) = (v.height / 16, v.width / 16);
+                let t = z.len() / (24 * h * w);
+                extra.videos.push((t, h, w));
+                latents.push((z, t, h, w));
             }
             if let (true, Some(d)) = (u == main, dump.as_deref_mut()) {
                 for (i, (z, ..)) in latents.iter().skip(c.keyframes.len()).enumerate() {
@@ -702,6 +845,32 @@ mod tests {
         let (units, map) = units([("a", 1), ("b", 1), ("a", 1), ("a", 2)], [("a", 0), ("n", 0)]);
         assert_eq!(units, [("a", 1), ("b", 1), ("a", 2), ("a", 0), ("n", 0)]);
         assert_eq!(map, [vec![0, 1, 0, 2], vec![3, 4]]);
+    }
+
+    #[test]
+    fn video_blocks_are_timed_like_the_tokenizer() {
+        // "%.1f" % 0.25 is "0.2"; an odd count's last frame pairs with itself
+        assert_eq!(block_seconds(0, 2), "<0.2 seconds>");
+        assert_eq!(block_seconds(1, 4), "<1.2 seconds>");
+        assert_eq!(block_seconds(1, 3), "<1.0 seconds>");
+        assert_eq!(block_seconds(0, 1), "<0.0 seconds>");
+    }
+
+    #[test]
+    fn reference_videos_take_the_reference_canvas() {
+        assert_eq!(adapt_canvas(1920, 1080), (1344, 768));
+        assert_eq!(adapt_canvas(640, 640), (768, 768));
+        let frame = PromptImage { width: 640, height: 640, rgb: vec![0.5; 640 * 640 * 3] };
+        // 30 frames for a 22 frame clip: cut to 22, every twelfth frame for the tower
+        let v = ref2va_video(&vec![frame; 30], 22, true).unwrap();
+        assert_eq!((v.sampled, v.vision.len()), (2, 1));
+        let f = v.latent.unwrap();
+        assert_eq!((f.width, f.height, f.frames), (640, 640, 22));
+        // 21 frames fall back to the 17k + 5 grid's 5
+        let frame = PromptImage { width: 64, height: 48, rgb: vec![0.5; 64 * 48 * 3] };
+        let v = ref2va_video(&vec![frame; 21], 124, true).unwrap();
+        assert_eq!(v.latent.unwrap().frames, 5);
+        assert!(ref2va_video(&[], 22, true).is_err());
     }
 
     #[test]

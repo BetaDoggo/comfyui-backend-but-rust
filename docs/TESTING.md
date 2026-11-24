@@ -92,7 +92,7 @@ the ones on `ref/ComfyUI` with `ref/venv/Scripts/python.exe`.
 
 `pih3_ref` also needs [ComfyUI-piFlow](https://github.com/Lakonik/ComfyUI-piFlow), cloned to `ref/ComfyUI-piFlow` or
 wherever `PIFLOW_DIR` points; it imports the nodes itself, so they needn't be installed in SwarmUI's ComfyUI. Compare its
-output with `tools/h3_cmp.py`. `qwen21_cmp` imports SwarmUI's ComfyUI. `sparse_attn_ref` and `te_q` need `comfy_kitchen`, which SwarmUI's Python has.
+output with `tools/h3_cmp.py`. `h3_ref --ref-image` and `--ref-video` add a reference through `MiniMaxH3ReferenceToVideo`, and need `ffmpeg` and `ffprobe` on `PATH` for a video. `qwen21_cmp` imports SwarmUI's ComfyUI. `sparse_attn_ref` and `te_q` need `comfy_kitchen`, which SwarmUI's Python has.
 `comfy_bench.py` benchmarks a running ComfyUI over HTTP.
 
 ## Golden files

@@ -1195,8 +1195,9 @@ The key cache stays in VRAM. At 1080p to 4K x2 it is about 4.5 GB (estimated, no
 Nemotron-H language model (Mamba-2, attention and mixture-of-experts layers) writes a size header, then the image as rows
 of visual tokens, one per 16x16 patch, and the model's own ViT decoder turns them into pixels. ComfyUI has no port, so
 this one follows the model's `modeling_nemotron_h.py` and its tokenizer repository's decoder. It runs from the CLI
-(`--nemotron`) and through the server's `NemotronImageGenerate` node, which a SwarmUI extension can call; SwarmUI has no
-way to reach it yet. [Technical overview](TECHNICAL_OVERVIEW.md#nemotron-labs-image) has the design.
+(`--nemotron`) and through the server's `NemotronImageGenerate` node, which the
+[Nemotron extension](../swarm%20backend/nemotron-extension/README.md) sends from SwarmUI; it works in SwarmUI, per the
+maintainer. [Technical overview](TECHNICAL_OVERVIEW.md#nemotron-labs-image) has the design.
 
 The original is 130 GB of f32 shards. `tools/nemotron_image_convert.py` downloads one shard at a time into RAM and writes
 one 24 GB file: the routed experts as nvfp4, the other matrices as bf16, norms, Mamba-2 vectors and the router f32, the

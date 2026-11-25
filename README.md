@@ -27,7 +27,7 @@ It really generates with these image, video and image-to-3D models, from specifi
 | Pixal3D | Image to a vertex-coloured 3D mesh (GLB), cutting the object out first with BiRefNet | 40 s per mesh at resolution 1024, 110 s at 1536 | not timed |
 | Idol (TripoSplat) | Image to a 3D gaussian splat (PLY), cutting the object out first with BiRefNet | 14.4 s per splat, 0.57 s/step at CFG 3 | 111 s/step headless here, not tuned |
 | SeedVR2 3B | Restores a picture or clip, as SwarmUI's SeedVR stage | 0.79 s per 1024 restore, DiT 145 ms | DiT 235 ms |
-| Nemotron-Labs-Image | Text to image, written as visual tokens by a 30B-A3B language model; CLI and the server's own node, no SwarmUI tab yet | 99 s per image, 21.8 ms/token; 2 together in 139 s | not in ComfyUI |
+| Nemotron-Labs-Image | Text to image, written as visual tokens by a 30B-A3B language model; CLI, and SwarmUI through its extension | 99 s per image, 21.8 ms/token; 2 together in 139 s | not in ComfyUI |
 
 The image and video models take every ComfyUI sampler and scheduler and LoRAs, with exceptions listed in
 [Models](docs/MODELS.md): HyperFlow H3 Flash samples with `euler` and `res_multistep` only, and it, MiniMax-H3-Image, SD 1.x and SDXL refuse LoRAs. Nemotron-Labs-Image isn't diffusion, so it has no sampler and
@@ -96,7 +96,8 @@ Nemotron-Labs-Image uses `diffusion_models/Nemotron-Labs-Image-30B-A3B-nvfp4.saf
 generator with nvfp4 experts, its tokenizer and its image decoder. `tools/nemotron_image_convert.py` writes it from
 [nvidia/Nemotron-Labs-Image-30B-A3B](https://huggingface.co/nvidia/Nemotron-Labs-Image-30B-A3B), one shard at a time,
 and a converted copy is at [HDiffusion/Nemotron-Labs-Image-30B-A3B-NVFP4](https://huggingface.co/HDiffusion/Nemotron-Labs-Image-30B-A3B-NVFP4).
-Both are under NVIDIA's non-commercial license. It needs about 17 GB of free RAM for the pinned experts.
+Both are under NVIDIA's non-commercial license. It needs about 17 GB of free RAM for the pinned experts. In SwarmUI it
+runs through the [Nemotron extension](swarm%20backend/nemotron-extension/README.md), and works there.
 
 ### Generate from the command line
 

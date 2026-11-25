@@ -50,4 +50,19 @@ pub fn register(r: &mut NodeRegistry, env: &ServerEnv) {
             Ok(NodeOutput::one(Value::Image(engine.nemotron_image(&req, ctx)?)))
         },
     );
+
+    r.add(
+        env,
+        |env| {
+            NodeSchema::new("NemotronImageLoad", "Nemotron-Labs-Image Load", "image")
+                .describe("Loads a Nemotron-Labs-Image file without generating: the SwarmUI extension's model preload.")
+                .input(combo("unet_name", &env.models.list(ModelFolder::DiffusionModels)))
+                .output_node()
+        },
+        |i, ctx| {
+            let model = resolve(ctx.env, &[ModelFolder::DiffusionModels], i.string("unet_name")?)?;
+            ctx.engine.nemotron_load(&model)?;
+            Ok(NodeOutput::empty())
+        },
+    );
 }

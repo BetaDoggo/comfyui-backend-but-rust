@@ -1711,6 +1711,11 @@ async fn nemotron_image_generate_makes_a_batch() {
     let required = &info["NemotronImageGenerate"]["input"]["required"];
     assert!(required["unet_name"][0].as_array().unwrap().contains(&json!("Nemotron-Labs-Image-30B-A3B-nvfp4.safetensors")));
     assert_eq!(required["width"][1]["step"], 16);
+
+    // the extension's model preload: a workflow whose only output loads the file
+    let load = json!({ "1": { "class_type": "NemotronImageLoad", "inputs": { "unet_name": "Nemotron-Labs-Image-30B-A3B-nvfp4.safetensors" } } });
+    let r = run_like_swarm(&s, load, |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
 }
 
 #[tokio::test(flavor = "multi_thread")]

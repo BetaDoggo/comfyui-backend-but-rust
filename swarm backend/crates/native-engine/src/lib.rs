@@ -2777,6 +2777,13 @@ impl Engine for NativeEngine {
         Ok(ImageBatch::from_u8(images.len() as u32, h, w, 3, images.concat()))
     }
 
+    fn nemotron_load(&self, model: &ModelFile) -> EngineResult<()> {
+        if !nemotron_file(&model.path) {
+            return Err(EngineError::InvalidInput(format!("{} isn't a Nemotron-Labs-Image file from tools/nemotron_image_convert.py", model.name)));
+        }
+        self.gen().ensure_nemotron(&model.path).map_err(internal)
+    }
+
     fn image_to_3d(&self, req: &ImageTo3DRequest, progress: &mut dyn ProgressSink) -> EngineResult<Vec<u8>> {
         check_pixal3d(req)?;
         let (rgb, mask, w, h) = pixal3d_inputs(req)?;

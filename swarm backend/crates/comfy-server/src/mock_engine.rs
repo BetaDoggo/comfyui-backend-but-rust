@@ -643,6 +643,11 @@ impl Engine for MockEngine {
         Ok(ImageBatch::from_u8(req.batch_size, req.height, req.width, 3, vec![128; n]))
     }
 
+    fn nemotron_load(&self, model: &ModelFile) -> EngineResult<()> {
+        tracing::info!("[mock] nemotron_load {}", model.name);
+        Ok(())
+    }
+
     fn image_to_3d(&self, req: &ImageTo3DRequest, progress: &mut dyn ProgressSink) -> EngineResult<Vec<u8>> {
         tracing::info!("[mock] image_to_3d {} {:?} seed {} res {}", req.diffusion_model.name, req.image, req.seed, req.resolution);
         if req.mask.is_none() && !req.image.has_alpha() {

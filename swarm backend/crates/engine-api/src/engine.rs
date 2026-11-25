@@ -1,7 +1,7 @@
 //! The [`Engine`] trait: the heavy operations a native backend must provide.
 
 use crate::conditioning::{ClipVisionOutput, Conditioning};
-use crate::handles::{AddonHandle, ModelHandle, TextEncoderHandle, VaeHandle};
+use crate::handles::{AddonHandle, ModelFile, ModelHandle, TextEncoderHandle, VaeHandle};
 use crate::latent::Latent;
 use crate::custom::{CustomNodeRequest, NodeValue};
 use crate::custom_sampling::{CustomSampleOutput, CustomSampleRequest, ScheduleRequest, Sigmas};
@@ -167,6 +167,11 @@ pub trait Engine: Send + Sync + 'static {
     /// See [`NemotronImageRequest`]: the images, RGB. Default: unsupported.
     fn nemotron_image(&self, _req: &NemotronImageRequest, _progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
         Err(EngineError::Unsupported("Nemotron-Labs-Image (NemotronImageGenerate)".into()))
+    }
+
+    /// Loads a Nemotron-Labs-Image file without generating, for SwarmUI's model preload. Default: unsupported.
+    fn nemotron_load(&self, _model: &ModelFile) -> EngineResult<()> {
+        Err(EngineError::Unsupported("Nemotron-Labs-Image (NemotronImageLoad)".into()))
     }
 
     /// See [`ImageToSplatRequest`]: the gaussian splat as a 3DGS `.ply` file. Default: unsupported.

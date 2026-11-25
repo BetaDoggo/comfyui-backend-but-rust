@@ -538,15 +538,18 @@ tasks generate text first and are refused.
 Refused: VAE Encode with the `pixel_space` VAE (so init images), text tower LoRAs, `SwarmAttnTokenWeights`, Prompt Images
 through `SwarmTextEncodeAdvanced.images`, and `VAEDecode` of a pixel latent through any other VAE.
 
-## 15. Nemotron-Labs-Image (no SwarmUI graph yet)
+## 15. Nemotron-Labs-Image (through the Nemotron extension)
 
 Nemotron-Labs-Image 30B-A3B writes an image as visual tokens, one at a time, and decodes them with its own decoder.
-ComfyUI has no node for it and SwarmUI no graph, so the server offers its own node for an extension to send. It needs
-the single file `tools/nemotron_image_convert.py` writes, in `diffusion_models/`.
+ComfyUI has no node for it and SwarmUI no graph, so the server offers its own nodes, and the
+[Nemotron extension](../nemotron-extension/README.md) sends them in place of SwarmUI's whole workflow when a
+Nemotron-Labs-Image model is selected. They need the single file `tools/nemotron_image_convert.py` writes, in
+`diffusion_models/` or `Stable-Diffusion/`.
 
 | Node | Inputs | Engine |
 |---|---|---|
 | `NemotronImageGenerate` | `unet_name` (`diffusion_models/`), `prompt` (plain text), `width`, `height` (multiples of 16), `seed`, `batch_size` (1 to 8), `temperature` (0.9) | `NemotronImageRequest` to `Engine::nemotron_image`, which returns the images as an RGB `IMAGE` for `SaveImage` or `SwarmSaveImageWS` |
+| `NemotronImageLoad` (output node) | `unet_name` | `Engine::nemotron_load`: loads the file without generating, for SwarmUI's model preload |
 
 Image `i` of a batch takes seed `seed + i`. The engine refuses a file without the converter's `nemotron_image` metadata,
 sizes off the 16-pixel grid and batches over 8. There is no sampler, scheduler, CFG, negative prompt, LoRA, VAE or text

@@ -203,6 +203,13 @@ struct Args {
     /// Run MiniMax-H3-Image (text to image); --dit, --te and --vae then default to its files, --steps to its 6
     #[arg(long)]
     h3_image: bool,
+    /// Run Nemotron-Labs-Image (autoregressive text to image); --dit then defaults to its converted file. Takes --prompt,
+    /// --prompt-file, --seed, --width, --height (multiples of 16), --count, --batch (up to 8) and --temperature
+    #[arg(long)]
+    nemotron: bool,
+    /// Nemotron-Labs-Image: softmax temperature of the image tokens (the model card's 0.9); 0 takes the likeliest token
+    #[arg(long, default_value_t = 0.9)]
+    temperature: f32,
     /// MiniMax H3: block-sparse attention, "sol" (Sol-Attn's adaptive threshold) or "sla" (top-k), as ComfyUI's
     /// BlockSparseAttention node
     #[arg(long)]
@@ -417,6 +424,7 @@ const SDXL_DIT: &str = "Stable-diffusion/sd_xl_base_1.0.safetensors";
 const MOSS_VAE: &str = "VAE/flux2-vae.safetensors";
 const SEEDVR_DIT: &str = "diffusion_models/SeedVR2/seedvr2_3b_int8_convrot.safetensors";
 const SEEDVR_VAE: &str = "VAE/SeedVR2/seedvr2_ema_vae_fp16.safetensors";
+const NEMOTRON: &str = "diffusion_models/Nemotron-Labs-Image-30B-A3B-nvfp4.safetensors";
 const RELAYVSR_DIT: &str = "diffusion_models/relayvsr_x2_lightx2v_int8_convrot.safetensors";
 const RELAYVSR_VAE: &str = "VAE/relayvsr_flash_vae_x2_fp32.safetensors";
 const QWEN21_DIT: &str = "Stable-diffusion/rayQwen21_v1Int8Convrot.safetensors";
@@ -871,6 +879,60 @@ fn run_h3_image(args: &Args, load: pipeline::LoadOptions, dit: PathBuf, te: Path
     Ok(())
 }
 
+fn run_nemotron(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
+    // what this model has no use for is refused rather than dropped
+    let unused = [
+        (!args.lora.is_empty(), "--lora"),
+        (!args.image.is_empty() || !args.ref_image.is_empty(), "--image / --ref-image"),
+        (args.init_image.is_some(), "--init-image"),
+        (args.style_image.is_some() || args.snapref.is_some(), "--style-image / --snapref"),
+        (args.te.is_some() || args.vae.is_some(), "--te / --vae (the file holds its tokenizer and decoder)"),
+        (args.sampler.is_some(), "--sampler"),
+        (args.ref_noise.is_some() || args.dump.is_some(), "--ref-noise / --dump"),
+        (!args.steer.is_empty() || args.concept.is_some(), "--steer / --concept"),
+    ];
+    if let Some((_, flag)) = unused.iter().find(|(set, _)| *set) {
+        bail!("Nemotron-Labs-Image doesn't take {flag}");
+    }
+    if args.batch > diffusion::nemotron::MAX_BATCH {
+        bail!("Nemotron-Labs-Image samples up to {} images together (--batch)", diffusion::nemotron::MAX_BATCH);
+    }
+    let t_start = Instant::now();
+    let mut gen = pipeline::Generator::new(&load)?;
+    gen.ensure_nemotron(&args.model(&args.dit, NEMOTRON))?;
+    let prompts = args.prompts()?;
+    let n_jobs = prompts.len() * args.count;
+    for (p, prompt) in prompts.iter().enumerate() {
+        for (first, k) in args.batches() {
+            let req = pipeline::NemotronRequest {
+                prompt: prompt.clone(),
+                width: args.width,
+                height: args.height,
+                seed: args.seed + first as u64,
+                images: k,
+                temperature: args.temperature,
+            };
+            let t0 = Instant::now();
+            let mut last = Instant::now();
+            let images = gen.generate_nemotron(&req, |done, of| {
+                if last.elapsed().as_secs_f64() >= 5.0 || done == of {
+                    eprintln!("  {done} / {of} tokens");
+                    last = Instant::now();
+                }
+                true
+            })?;
+            for (j, rgb) in images.iter().enumerate() {
+                let img_i = p * args.count + first + j;
+                let path = out_path(&args.out, img_i, n_jobs);
+                std::fs::write(&path, pipeline::encode_png(args.width, args.height, rgb)?).with_context(|| format!("writing {}", path.display()))?;
+                eprintln!("[{img_i}] saved {} (seed {}) after {:.1}s", path.display(), req.seed + j as u64, t0.elapsed().as_secs_f64());
+            }
+        }
+    }
+    eprintln!("total {:.1}s", t_start.elapsed().as_secs_f64());
+    Ok(())
+}
+
 fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     use diffusion::h3;
     let t_all = Instant::now();
@@ -1319,6 +1381,9 @@ fn main() -> Result<()> {
     };
     if args.h3 || args.h3_image {
         return run_h3(&args, load);
+    }
+    if args.nemotron {
+        return run_nemotron(&args, load);
     }
     if args.anima {
         return run_anima(&args, load);

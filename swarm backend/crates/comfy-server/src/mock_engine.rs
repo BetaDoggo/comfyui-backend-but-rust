@@ -630,6 +630,19 @@ impl Engine for MockEngine {
         Ok(ClipVisionOutput { model: req.model.clone(), data: Opaque::new(key) })
     }
 
+    fn nemotron_image(&self, req: &NemotronImageRequest, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        tracing::info!("[mock] nemotron_image {} {}x{} seed {} x{} t {}", req.model.name, req.width, req.height, req.seed, req.batch_size, req.temperature);
+        let tokens = (req.width / 16) * (req.height / 16);
+        for t in (0..=tokens).step_by((tokens as usize / 8).max(1)) {
+            if progress.interrupted() {
+                return Err(EngineError::Interrupted);
+            }
+            progress.progress(t, tokens);
+        }
+        let n = (req.batch_size * req.width * req.height * 3) as usize;
+        Ok(ImageBatch::from_u8(req.batch_size, req.height, req.width, 3, vec![128; n]))
+    }
+
     fn image_to_3d(&self, req: &ImageTo3DRequest, progress: &mut dyn ProgressSink) -> EngineResult<Vec<u8>> {
         tracing::info!("[mock] image_to_3d {} {:?} seed {} res {}", req.diffusion_model.name, req.image, req.seed, req.resolution);
         if req.mask.is_none() && !req.image.has_alpha() {

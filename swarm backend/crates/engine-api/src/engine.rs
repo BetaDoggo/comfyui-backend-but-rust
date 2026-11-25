@@ -164,6 +164,11 @@ pub trait Engine: Send + Sync + 'static {
         Err(EngineError::Unsupported("image to 3D (Pixal3DImageTo3D)".into()))
     }
 
+    /// See [`NemotronImageRequest`]: the images, RGB. Default: unsupported.
+    fn nemotron_image(&self, _req: &NemotronImageRequest, _progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        Err(EngineError::Unsupported("Nemotron-Labs-Image (NemotronImageGenerate)".into()))
+    }
+
     /// See [`ImageToSplatRequest`]: the gaussian splat as a 3DGS `.ply` file. Default: unsupported.
     fn image_to_splat(&self, _req: &ImageToSplatRequest, _progress: &mut dyn ProgressSink) -> EngineResult<Vec<u8>> {
         Err(EngineError::Unsupported("image to gaussian splat (TripoSplatImageToSplat)".into()))

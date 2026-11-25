@@ -1,4 +1,5 @@
 //! diffusion: Rust + CUDA reimplementation of ComfyUI's image generation, for quantized checkpoints of Krea 2, Anima, MOSS Image, Qwen Image 2.1, SenseNova U1.6 and MiniMax H3,
+//! Nemotron-Labs-Image (autoregressive text to image),
 //! Pixal3D image to 3D, and TripoSplat / Idol image to gaussian splat.
 
 pub mod anima;
@@ -19,6 +20,7 @@ pub mod latent_ops;
 pub mod lora;
 mod lora_adapters;
 pub mod moss;
+pub mod nemotron;
 pub mod offload;
 pub mod pipeline;
 pub mod pixal3d;

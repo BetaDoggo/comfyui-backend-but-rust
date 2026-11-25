@@ -12,6 +12,7 @@ mod anima;
 mod h3;
 mod krea;
 mod moss;
+mod nemotron;
 mod qwen21;
 mod relayvsr;
 mod sd;
@@ -22,6 +23,7 @@ pub use anima::{AnimaRequest, SnapRefRequest, StyleRequest};
 pub use h3::{adapt_canvas, h3_clip_frames, h3_presentation, h3_tokens, image_pictures, ref2va_pictures, ref2va_size, ref2va_video, resize as h3_resize, size_short_edge, H3Conds, H3Picture, H3Request, H3Video, VideoFrames};
 pub use krea::{KreaEntry, KreaRequest};
 pub use moss::{moss_tokens, MossRequest};
+pub use nemotron::NemotronRequest;
 pub use qwen21::Qwen21Request;
 pub use relayvsr::{Frames as RelayVsrFrames, RelayVsrRequest};
 pub use sd::{is_sd, SdRequest, SizeCond};
@@ -701,6 +703,7 @@ enum Kind {
     H3,
     Sd,
     SenseNova,
+    Nemotron,
 }
 
 impl Kind {
@@ -736,6 +739,7 @@ enum Family {
     H3(h3::H3),
     Sd(sd::Sd),
     SenseNova(sensenova::SenseNova),
+    Nemotron(nemotron::Nemotron),
 }
 
 impl Family {
@@ -748,6 +752,7 @@ impl Family {
             Kind::H3 => Family::H3(Default::default()),
             Kind::Sd => Family::Sd(Default::default()),
             Kind::SenseNova => Family::SenseNova(Default::default()),
+            Kind::Nemotron => Family::Nemotron(Default::default()),
         }
     }
 
@@ -761,6 +766,7 @@ impl Family {
             Family::H3(_) => Kind::H3,
             Family::Sd(_) => Kind::Sd,
             Family::SenseNova(_) => Kind::SenseNova,
+            Family::Nemotron(_) => Kind::Nemotron,
         })
     }
 
@@ -774,6 +780,7 @@ impl Family {
             Family::H3(f) => f,
             Family::Sd(f) => f,
             Family::SenseNova(f) => f,
+            Family::Nemotron(f) => f,
         })
     }
 }

@@ -2081,6 +2081,11 @@ impl NativeEngine {
     }
 }
 
+/// Whether `path` is a converted Nemotron-Labs-Image file, from its header alone.
+fn nemotron_file(path: &std::path::Path) -> bool {
+    diffusion::st::SafeTensors::open(path).is_ok_and(|s| s.metadata.get("nemotron_image").is_some_and(|f| f == diffusion::nemotron::FORMAT))
+}
+
 /// Checks that each Pixal3D file is what its slot needs, before anything is unloaded for it.
 fn check_pixal3d(req: &ImageTo3DRequest) -> EngineResult<()> {
     let has = |f: &ModelFile, what: &str, test: fn(&dyn Fn(&str) -> bool) -> bool| -> EngineResult<()> {
@@ -2736,6 +2741,40 @@ impl Engine for NativeEngine {
         let masks = diffusion::birefnet::remove_backgrounds(&file.path, &frames, images.width as usize, images.height as usize).map_err(internal)?;
         drop(gen);
         Ok(Mask { count: images.count, height: images.height, width: images.width, data: Arc::new(masks.concat()) })
+    }
+
+    fn nemotron_image(&self, req: &NemotronImageRequest, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        if !nemotron_file(&req.model.path) {
+            return Err(EngineError::InvalidInput(format!("{} isn't a Nemotron-Labs-Image file from tools/nemotron_image_convert.py", req.model.name)));
+        }
+        if req.width % 16 != 0 || req.height % 16 != 0 || req.width == 0 || req.height == 0 {
+            return Err(EngineError::InvalidInput("Nemotron-Labs-Image needs width and height positive multiples of 16".into()));
+        }
+        if !(1..=diffusion::nemotron::MAX_BATCH as u32).contains(&req.batch_size) {
+            return Err(EngineError::InvalidInput(format!("Nemotron-Labs-Image samples 1 to {} images together", diffusion::nemotron::MAX_BATCH)));
+        }
+        if !(req.temperature >= 0.0 && req.temperature.is_finite()) {
+            return Err(EngineError::InvalidInput("temperature must be 0 or more".into()));
+        }
+        let mut gen = self.gen();
+        gen.ensure_nemotron(&req.model.path).map_err(internal)?;
+        let r = diffusion::pipeline::NemotronRequest {
+            prompt: req.prompt.clone(),
+            width: req.width as usize,
+            height: req.height as usize,
+            seed: req.seed,
+            images: req.batch_size as usize,
+            temperature: req.temperature as f32,
+        };
+        let images = gen
+            .generate_nemotron(&r, |done, of| {
+                progress.progress(done as u32, of as u32);
+                !progress.interrupted()
+            })
+            .map_err(internal)?;
+        drop(gen);
+        let (w, h) = (req.width, req.height);
+        Ok(ImageBatch::from_u8(images.len() as u32, h, w, 3, images.concat()))
     }
 
     fn image_to_3d(&self, req: &ImageTo3DRequest, progress: &mut dyn ProgressSink) -> EngineResult<Vec<u8>> {

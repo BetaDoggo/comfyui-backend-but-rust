@@ -59,6 +59,7 @@ const MODEL_FILES: &[&str] = &[
     "model_patches/patch_test.safetensors",
     "yolov8/face_yolov8m.pt",
     "diffusion_models/Pixal3D/pixal3d_int8_convrot.safetensors",
+    "diffusion_models/Nemotron-Labs-Image-30B-A3B-nvfp4.safetensors",
     "clip_vision/dino_v3_L_naf_fp32.safetensors",
     "VAE/Pixal3D/trellis_2_shape_vae_bf16.safetensors",
     "VAE/Pixal3D/trellis_2_texture_vae_bf16.safetensors",
@@ -1679,6 +1680,37 @@ async fn pixal3d_image_to_3d_saves_a_glb() {
     assert!(required["unet_name"][0].as_array().unwrap().contains(&json!("Pixal3D/pixal3d_int8_convrot.safetensors")));
     assert_eq!(required["resolution"][1]["step"], 128);
     assert!(info["Pixal3DImageTo3D"]["input"]["optional"]["mask"].is_array());
+}
+
+/// The engine's own node for Nemotron-Labs-Image, as an extension would wire it: the node makes the images, SaveImage
+/// keeps them.
+#[tokio::test(flavor = "multi_thread")]
+async fn nemotron_image_generate_makes_a_batch() {
+    let s = TestServer::start(0).await;
+    let mut wf = json!({
+        "1": { "class_type": "NemotronImageGenerate", "inputs": {
+            "unet_name": "Nemotron-Labs-Image-30B-A3B-nvfp4.safetensors", "prompt": "no humans, scenery, a lighthouse on a rocky coast",
+            "width": 96, "height": 64, "seed": 3, "batch_size": 2, "temperature": 0.9
+        } },
+        "2": { "class_type": "SaveImage", "inputs": { "images": ["1", 0], "filename_prefix": "tests/nemotron" } }
+    });
+    let r = run_like_swarm(&s, wf.clone(), |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    let images = r.history_entry()["outputs"]["2"]["images"].as_array().unwrap().clone();
+    assert_eq!(images.len(), 2, "{:#}", r.history);
+    let url = format!("view?filename={}&type=output&subfolder={}", images[0]["filename"].as_str().unwrap(), images[0]["subfolder"].as_str().unwrap());
+    let bytes = s.http.get(s.url(&url)).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(png_dims(&bytes), (96, 64));
+
+    // sizes off the 16-pixel grid are refused, not rounded
+    wf["1"]["inputs"]["width"] = json!(100);
+    let r = run_like_swarm(&s, wf, |_| {}).await;
+    assert_eq!(r.status(), "error", "{:#}", r.history);
+
+    let info = s.get("object_info/NemotronImageGenerate").await;
+    let required = &info["NemotronImageGenerate"]["input"]["required"];
+    assert!(required["unet_name"][0].as_array().unwrap().contains(&json!("Nemotron-Labs-Image-30B-A3B-nvfp4.safetensors")));
+    assert_eq!(required["width"][1]["step"], 16);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -94,6 +94,7 @@ the baked weights match ComfyUI's bit for bit. Sampling then runs the normal int
 | SeedVR2 3B | `src/seedvr.rs`, int8 ConvRot | none: a fixed prompt stored in the checkpoint | Causal video VAE, a frame at a time, `src/seedvr_vae.rs` |
 | RelayVSR | `src/relayvsr.rs`, int8 ConvRot Wan 2.2 TI2V 5B over keyframes | none: a fixed prompt stored in the checkpoint | The Flash decoder, fp16, which also reads the low-quality frames, `src/relayvsr.rs` |
 | TripoSplat / Idol | `src/triposplat.rs`, fp16 | DINOv3 ViT-H, `src/dino3.rs`, and the Flux 2 VAE's encoder | Octree gaussian decoder, `src/triposplat.rs` |
+| Nemotron-Labs-Image | `src/nemotron.rs`, a Nemotron-H language model (Mamba-2, attention, MoE) writing visual tokens: bf16 dense weights, nvfp4 experts | its own tokenizer, in the same file | the L24-SQ ViT token decoder, f32, in the same file |
 | SD 1.x and SDXL | `src/unet.rs`, fp16, transformer linears int8 by default | CLIP-L, and OpenCLIP bigG on SDXL, `src/clip.rs` | The 4-channel KL VAE, `src/sdvae.rs` |
 
 Each model is written directly against its checkpoint, with no general layer or graph abstraction. That is what allows
@@ -300,6 +301,22 @@ q/k RMS norms that follow it are one kernel. The context refiner doesn't depend 
 and uncond rather than every evaluation. The token anchors are torch's scrambled Sobol sequence, reproduced bit for bit,
 and the octree's point sampling uses torch's CPU generator the same way. Assembling the gaussians from the decoder's
 features, and the PLY, run on the CPU.
+
+### Nemotron-Labs-Image
+
+[`src/nemotron.rs`](../src/nemotron.rs) is the only model here that isn't diffusion. A 52-layer Nemotron-H language model
+(23 Mamba-2, 6 attention and 23 MoE layers, 30B parameters with 3B active) writes a size header, then the image as rows of
+visual tokens, one token per 16x16 patch. The L24-SQ ViT decoder turns them into pixels. Every token reads every dense
+weight once, so decoding is memory-bound. The kernels in [`csrc/nemotron.cu`](../csrc/nemotron.cu) are GEMVs over up to
+eight rows: bf16 for the dense layers, and nvfp4 for the routed experts, each job one expert and one row. Mamba-2 runs
+as its recurrence, one token at a time, in a block per head that keeps its 64 x 128 state in registers. The attention
+layers have no positional encoding, and their keys and values are cached.
+
+The routed experts are 16.5 GB, more than the GPU holds. They sit in pinned RAM, and the VRAM left after the dense
+weights (about 4.8 GB) and the decoder (1.2 GB) holds a cache of whole experts, the least recently used given up first.
+Routing has to reach the host to fill that cache, so each MoE layer waits for its router's choice. The images of one
+prompt run together: the prompt is read once and its state copied to each, and then every step reads the weights once
+for all of them.
 
 ### MiniMax H3
 

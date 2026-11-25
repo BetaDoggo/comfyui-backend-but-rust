@@ -234,7 +234,7 @@ pub fn parse_range(s: &str) -> Result<(usize, usize)> {
     }
 }
 
-fn write_safetensors(path: &Path, tensors: &BTreeMap<String, (String, Vec<usize>, Vec<u8>)>) -> Result<()> {
+pub(crate) fn write_safetensors(path: &Path, tensors: &BTreeMap<String, (String, Vec<usize>, Vec<u8>)>) -> Result<()> {
     let mut header = serde_json::Map::new();
     let mut offset = 0usize;
     for (k, (dt, shape, data)) in tensors {

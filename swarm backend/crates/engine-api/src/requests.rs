@@ -520,6 +520,25 @@ pub struct ImageTo3DRequest {
     pub max_faces: u32,
 }
 
+/// `NemotronImageGenerate`: Nemotron-Labs-Image's text to image. The model writes the image as visual tokens, one at a
+/// time, and decodes them itself: there is no sampler, scheduler, CFG, negative prompt, VAE or text encoder to choose.
+#[derive(Clone, Debug)]
+pub struct NemotronImageRequest {
+    /// `diffusion_models`: the file `tools/nemotron_image_convert.py` writes (generator, tokenizer and decoder)
+    pub model: ModelFile,
+    /// Plain text: the model card's chat template puts it after "Generate a WxH image."
+    pub prompt: String,
+    /// Multiples of 16.
+    pub width: u32,
+    pub height: u32,
+    /// The first image's seed; image `i` takes `seed + i`.
+    pub seed: u64,
+    /// Images sampled together, 1 to 8.
+    pub batch_size: u32,
+    /// Softmax temperature of the tokens (the model card's 0.9); 0 takes the likeliest token.
+    pub temperature: f64,
+}
+
 /// `TripoSplatImageToSplat` (the gaussian splat node of the Pixal3D SwarmUI extension): an image and its object mask to
 /// a 3D gaussian splat, following Comfy-Org's Idol example workflow from `TripoSplatPreprocessImage` to
 /// `VAEDecodeTripoSplat`. Works for TripoSplat and its fine-tune Idol.

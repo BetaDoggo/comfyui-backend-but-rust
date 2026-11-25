@@ -19,6 +19,7 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | Idol (TripoSplat) | A 3D gaussian splat from one image | `dpmpp_2m`, `simple`, 20 steps, CFG 3 | Comfy-Org's fp16 files |
 | SeedVR2 3B | A restored copy of a picture (SwarmUI's SeedVR stage) | `euler`, `simple`, 1 step, CFG 1 | int8 ConvRot (`seedvr2_3b_int8_convrot`) only |
 | RelayVSR | A video upscaled x2 or x4 (the RelayVSR extension's stage); works in SwarmUI, compared with ComfyUI through the CLI | `euler`, `simple`, 1 step, CFG 1 | int8 ConvRot keyframe models, fp32 Flash decoders |
+| Nemotron-Labs-Image | Images, as visual tokens from a language model | none: token temperature 0.9 | the file `tools/nemotron_image_convert.py` writes (`nvfp4-v1`) only |
 
 ## Support matrix
 
@@ -49,7 +50,7 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | VAE tiling, Seamless Tileable | Refused | Refused | Refused | Refused | Refused | Only the 256 / 64 tile | - |
 | Background removal | - | - | - | - | - | - | Yes (BiRefNet) |
 
-HyperFlow H3 Flash, pi-H3, MiniMax-H3-Image, SenseNova U1.6, Idol, SeedVR2 and RelayVSR aren't in this matrix; their own sections below say what they
+HyperFlow H3 Flash, pi-H3, MiniMax-H3-Image, SenseNova U1.6, Idol, SeedVR2, RelayVSR and Nemotron-Labs-Image aren't in this matrix; their own sections below say what they
 take. ControlNet, regions, IP-Adapter, style models, GLIGEN, LoRA hooks and embeddings are refused on every family. Anima
 takes both `(word:1.2)` and `<weight>`; Qwen Image 2.1's encoder reads `(word:1.2)` as plain text. SD 1.x and SDXL take
 `(word:1.2)` in a plain prompt and `<weight>` through SwarmUI's text node, which reads parentheses literally, as
@@ -1187,3 +1188,45 @@ Each of these is refused with an error SwarmUI shows:
 | `VAEDecode` of a RelayVSR latent, or `VAEEncode` with the Flash decoder | The decoder needs the low-quality frames, so only `VSRDecode` decodes |
 
 The key cache stays in VRAM. At 1080p to 4K x2 it is about 4.5 GB (estimated, not measured).
+
+## Nemotron-Labs-Image
+
+[nvidia/Nemotron-Labs-Image-30B-A3B](https://huggingface.co/nvidia/Nemotron-Labs-Image-30B-A3B) isn't diffusion. A
+Nemotron-H language model (Mamba-2, attention and mixture-of-experts layers) writes a size header, then the image as rows
+of visual tokens, one per 16x16 patch, and the model's own ViT decoder turns them into pixels. ComfyUI has no port, so
+this one follows the model's `modeling_nemotron_h.py` and its tokenizer repository's decoder. It runs from the CLI
+(`--nemotron`) and through the server's `NemotronImageGenerate` node, which a SwarmUI extension can call; SwarmUI has no
+way to reach it yet. [Technical overview](TECHNICAL_OVERVIEW.md#nemotron-labs-image) has the design.
+
+The original is 130 GB of f32 shards. `tools/nemotron_image_convert.py` downloads one shard at a time into RAM and writes
+one 24 GB file: the routed experts as nvfp4, the other matrices as bf16, norms, Mamba-2 vectors and the router f32, the
+decoder f32 as shipped, and the tokenizer. The nvfp4 experts are 8.6% RMS from the originals, relative.
+
+The prompt is the model card's chat template, `Generate a {W}x{H} image.` and the prompt; the ids match the `tokenizers`
+library's. Decoding is constrained to the grid: after the header only visual tokens are allowed within a row, then
+`<|vis_row|>` or `<|img_end|>` where the grid needs them. The header the model writes must match the size asked for, or
+the request is refused: at 512x512 it wrote `height=1024 width=1024`. The card's sizes are 1024x1024, 1184x880,
+1248x832 and 880x1184; only 1024x1024 was run.
+
+Measured here, 1024x1024, temperature 0.9, after a warm load:
+
+| | One image | Two together |
+|---|---|---|
+| Load | 6.7 s | 6.7 s |
+| Prompt (77 tokens) | 0.7 s | 0.7 s |
+| 4174 tokens | 90.9 s, 21.8 ms/token | 130.6 s, 31.3 ms/step |
+| Experts read from VRAM | 82.4% (580 GB copied) | 82.8% (1125 GB copied) |
+| Decoder | 431 ms | 804 ms |
+| Total | 98.8 s | 138.9 s |
+
+625 of the 2,944 experts fit in VRAM; the rest are copied from pinned RAM when chosen, which is most of the time per
+token. A seed gives the same image alone or in a batch, and through `comfy-server` over HTTP the same pixels as the CLI.
+
+Against the model's own code, `tools/nemotron_image_ref.py` runs the reference blocks in f32 on the same converted
+weights: over the prompt and the first 40 generated tokens the logits are 1e-7 to 9e-6 apart, relative, with the same
+likeliest token and the same top 10 every step. So that check doesn't cover the nvfp4 error itself. The decoder hasn't
+been compared with the reference code; its images are clean.
+
+Refused: LoRAs, reference and init images, other text encoders or VAEs, samplers, `--steer`, batches above 8, sizes that
+aren't multiples of 16, and any file but the converter's. Not tested: sizes other than 1024x1024, temperature 0, and
+batches above 2.

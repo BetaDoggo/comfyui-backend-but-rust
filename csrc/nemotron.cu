@@ -327,8 +327,7 @@ __global__ void __launch_bounds__(1024) sample_kernel(const float* logits, int64
 
 // ---------------------------------------------------------------------------------------------
 // Attention of a few query rows against the cached keys: a block per (row, head), 128 threads for 128-wide heads. Row i
-// reads the first min(lk, i + offset) keys. The shared kernels' block_max pads idle warps with 0, which turns a row whose
-// scores are all below about -87 into 0/0; this one reduces from -inf.
+// reads the first min(lk, i + offset) keys.
 // ---------------------------------------------------------------------------------------------
 __global__ void __launch_bounds__(128) attn_rows_kernel(const float* q, int64_t q_stride, const float* kp, const float* vp, int64_t kv_stride, int hq,
                                                         int hk, int lk, float* out, int64_t out_stride, float scale, int offset) {

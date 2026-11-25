@@ -60,7 +60,9 @@ __device__ __forceinline__ float block_max(float v, float* red) {
     if (lane == 0) red[wid] = v;
     __syncthreads();
     if (wid == 0) {
-        float t = lane < nw ? red[lane] : 0.f;
+        // idle slots hold -inf, not 0: a 0 there would floor the max of an all-negative row (a softmax whose scores are
+        // all below about -87 then underflows to 0/0)
+        float t = lane < nw ? red[lane] : -INFINITY;
         t = warp_max(t);
         if (lane == 0) red[32] = t;
     }

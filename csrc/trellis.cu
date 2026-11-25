@@ -284,29 +284,13 @@ GPU_API int gpu_cast(int in_dt, int out_dt, const void* in, void* out, int64_t n
     return 0;
 }
 
-// block_max for values of any sign (common.cuh's pads unused lanes with 0, which suits absolute maxima only).
-__device__ __forceinline__ float block_max_signed(float v, float* red) {
-    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = (blockDim.x + 31) >> 5;
-    v = warp_max(v);
-    __syncthreads();
-    if (lane == 0) red[wid] = v;
-    __syncthreads();
-    if (wid == 0) {
-        float t = lane < nw ? red[lane] : -INFINITY;
-        t = warp_max(t);
-        if (lane == 0) red[32] = t;
-    }
-    __syncthreads();
-    return red[32];
-}
-
 // Row softmax in place, f32: x[r] = softmax(x[r] * scale).
 __global__ void softmax_f32_kernel(float* x, int n, float scale) {
     __shared__ float red[33];
     float* row = x + (int64_t)blockIdx.x * n;
     float mx = -INFINITY;
     for (int j = threadIdx.x; j < n; j += blockDim.x) mx = fmaxf(mx, row[j] * scale);
-    mx = block_max_signed(mx, red);
+    mx = block_max(mx, red);
     float sum = 0.f;
     for (int j = threadIdx.x; j < n; j += blockDim.x) {
         const float e = expf(row[j] * scale - mx);

@@ -269,14 +269,12 @@ impl Dino3 {
         let qkv = DevBuf::alloc_async(l * 3 * d * 4, st)?;
         let attn = DevBuf::alloc_async(l * d * 4, st)?;
         let y = DevBuf::alloc_async(l * mlp * if gated { 2 } else { 1 } * 4, st)?;
-        let scores = DevBuf::alloc_async(l * l * 4, st)?;
         let (di, li) = (d as i64, l as i64);
         let gemm = |a: PM, lda: usize, w: PM, ldb: usize, bias: PM, out: PM, ldd: usize, m: usize, n: usize, kd: usize, transb: i32|
             -> Result<()> {
             k!(gpu_gemm(a, lda as i64, w, ldb as i64, out, ldd as i64, bias, m as i64, n as i64, kd as i64, transb, DT_F32, DT_F32, 1.0,
                 0.0, s(st)))
         };
-        let nil = std::ptr::null_mut();
         let Some(layers) = self.layers.as_mut() else { bail!("the DINOv3 weights were freed") };
         // f16 staging and the f32 copy of one layer, for bf16 weights
         let wide = DevBuf::alloc_async(if bf16 { layers.layouts.iter().map(|l| l.size).max().unwrap_or(0) * 3 } else { 1 }, st)?;
@@ -307,12 +305,9 @@ impl Dino3 {
                 k!(gpu_rope_rows(off(qkv.ptr(), (PREFIX * 3 * d + part * d) * 4), (3 * d) as i64, rope_d.ptr(), np as i32, heads as i32,
                     HD as i32, s(st)))?;
             }
-            for hh in 0..heads {
-                let q = off(qkv.ptr(), hh * HD * 4);
-                gemm(q, 3 * d, off(q, d * 4), 3 * d, nil, scores.ptr(), l, l, l, HD, 1)?;
-                k!(gpu_softmax_f32(scores.ptr(), l as i32, l as i32, 1.0 / (HD as f32).sqrt(), s(st)))?;
-                gemm(scores.ptr(), l, off(q, 2 * d * 4), 3 * d, nil, off(attn.ptr(), hh * HD * 4), d, l, HD, l, 0)?;
-            }
+            let q = qkv.ptr();
+            k!(gpu_attn_small(DT_F32, q, (3 * d) as i64, off(q, d * 4), off(q, 2 * d * 4), (3 * d) as i64, heads as i32, heads as i32, HD as i32,
+                l as i32, l as i32, attn.ptr(), d as i64, 1.0 / (HD as f32).sqrt(), 0, s(st)))?;
             if i == 0 {
                 if let Some(p) = probe.as_mut() {
                     p("dbg attn", &attn, l * d);

@@ -72,7 +72,8 @@ libtorch. CUTLASS and FlashAttention-2 are not in this repository. The build fin
 
 `csrc/kernels.cu` is the code ComfyUI would express as many separate tensor operations. One kernel does several of those
 steps in a single pass: normalization, modulation, the ConvRot Hadamard rotation and int8 quantization. It also covers RoPE, activations,
-the delta-rule recursion for Qwen3.5, GroupNorm, the VAE helpers and the small attention kernel the text encoders use. `csrc/gemm.cu` and `csrc/attn*.cu` wrap the libraries above
+the delta-rule recursion for Qwen3.5, GroupNorm, the VAE helpers, and the exact f32 attention of the text encoders, vision
+towers and DINOv3: one block per query row for short prompts, and 64-row tiles with an online softmax from 64 queries up. `csrc/gemm.cu` and `csrc/attn*.cu` wrap the libraries above
 behind a C ABI, and instantiate only the variants the pipelines need.
 
 LoRAs ([`src/lora.rs`](../src/lora.rs)) follow ComfyUI's own path for quantized weights: dequantize, patch in bf16, then

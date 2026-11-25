@@ -598,7 +598,156 @@ __global__ void attn_small_kernel(const T* q, int64_t q_stride, const T* kp, con
     stf(out, (int64_t)i * out_stride + h * d + e0, acc / sum);
 }
 
-GPU_API int gpu_attn_small(int dtype, const void* q, int64_t q_stride, const void* k, const void* v,
+// ---------------------------------------------------------------------------------------------
+// Tiled exact attention in f32, for the long sequences of text encoders with pictures and of vision towers: one block
+// takes 64 query rows of one head through the keys 64 at a time with an online softmax. The scores are the same dot
+// products as attn_small_kernel's, summed in the same order; only the softmax's sums run in another order.
+// q: [lq, hq*d], k and v: [lk, hk*d], out: [lq, hq*d]; d a multiple of 4, up to 64 * DC.
+// ---------------------------------------------------------------------------------------------
+constexpr int TA_BQ = 64, TA_BK = 64, TA_LQ = TA_BQ + 4, TA_LK = TA_BK + 4;
+
+__host__ __device__ inline int attn_tiled_kv_floats(int d, int dp) { return d * TA_LK > TA_BK * dp ? d * TA_LK : TA_BK * dp; }
+
+template <int DC>
+__global__ void __launch_bounds__(256) attn_tiled_f32_kernel(const float* q, int64_t q_stride, const float* kp, const float* vp,
+                                                             int64_t kv_stride, int hq, int hk, int lq, int lk, float* out,
+                                                             int64_t out_stride, float scale, int causal, int d) {
+    constexpr int DP = DC * 64;
+    extern __shared__ __align__(16) float sm[];
+    float* sq = sm;                                       // q tile, transposed: [d][TA_LQ]
+    float* skv = sq + d * TA_LQ;                          // k tile transposed [d][TA_LK], then v [TA_BK][DP]
+    float* sp = skv + attn_tiled_kv_floats(d, DP);        // probabilities [TA_BQ][TA_LK]
+    const int tid = threadIdx.x, ty = tid >> 4, tx = tid & 15;
+    const int q0 = blockIdx.x * TA_BQ, h = blockIdx.y, kh = h / (hq / hk);
+
+    for (int i = tid; i < TA_BQ * d; i += 256) {
+        const int r = i / d, e = i % d;
+        sq[e * TA_LQ + r] = q0 + r < lq ? q[(int64_t)(q0 + r) * q_stride + h * d + e] : 0.f;
+    }
+    // query row i reads the first min(lk, i + causal) keys
+    const int end = causal ? min(lk, q0 + TA_BQ - 1 + causal) : lk;
+    float m[4], l[4], o[4][DC * 4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        m[i] = -INFINITY;
+        l[i] = 0.f;
+#pragma unroll
+        for (int c = 0; c < DC * 4; ++c) o[i][c] = 0.f;
+    }
+
+    for (int k0 = 0; k0 < end; k0 += TA_BK) {
+        __syncthreads();  // the previous tile's v and probabilities are read
+        for (int i = tid; i < TA_BK * d; i += 256) {
+            const int j = i / d, e = i % d;
+            skv[e * TA_LK + j] = k0 + j < lk ? kp[(int64_t)(k0 + j) * kv_stride + kh * d + e] : 0.f;
+        }
+        __syncthreads();
+        float s[4][4] = {};
+        for (int e = 0; e < d; ++e) {
+            const float4 a = *reinterpret_cast<const float4*>(sq + e * TA_LQ + ty * 4);
+            const float4 b = *reinterpret_cast<const float4*>(skv + e * TA_LK + tx * 4);
+            const float av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) s[i][j] += av[i] * bv[j];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = q0 + ty * 4 + i;
+            const int lim = causal ? min(lk, row + causal) : lk;
+            float mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                s[i][j] = k0 + tx * 4 + j < lim ? s[i][j] * scale : -INFINITY;
+                mx = fmaxf(mx, s[i][j]);
+            }
+            // the 16 threads of a row are one half of a warp
+#pragma unroll
+            for (int w = 8; w; w >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, w));
+            const float nm = fmaxf(m[i], mx);
+            float p[4], sum = 0.f;
+            if (nm == -INFINITY) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) p[j] = 0.f;
+            } else {
+                const float corr = expf(m[i] - nm);
+                l[i] *= corr;
+#pragma unroll
+                for (int c = 0; c < DC * 4; ++c) o[i][c] *= corr;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    p[j] = expf(s[i][j] - nm);
+                    sum += p[j];
+                }
+                m[i] = nm;
+            }
+#pragma unroll
+            for (int w = 8; w; w >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, w);
+            l[i] += sum;
+            *reinterpret_cast<float4*>(sp + (ty * 4 + i) * TA_LK + tx * 4) = make_float4(p[0], p[1], p[2], p[3]);
+        }
+        __syncthreads();  // the k tile is read and the probabilities are written
+        for (int i = tid; i < TA_BK * DP; i += 256) {
+            const int j = i / DP, e = i % DP;
+            skv[i] = k0 + j < lk && e < d ? vp[(int64_t)(k0 + j) * kv_stride + kh * d + e] : 0.f;
+        }
+        __syncthreads();
+        for (int j0 = 0; j0 < TA_BK; j0 += 4) {
+            float pv[4][4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float4 t = *reinterpret_cast<const float4*>(sp + (ty * 4 + i) * TA_LK + j0);
+                pv[i][0] = t.x, pv[i][1] = t.y, pv[i][2] = t.z, pv[i][3] = t.w;
+            }
+#pragma unroll
+            for (int jb = 0; jb < 4; ++jb)
+#pragma unroll
+                for (int c = 0; c < DC; ++c) {
+                    const float4 v4 = *reinterpret_cast<const float4*>(skv + (j0 + jb) * DP + c * 64 + tx * 4);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        o[i][c * 4 + 0] += pv[i][jb] * v4.x;
+                        o[i][c * 4 + 1] += pv[i][jb] * v4.y;
+                        o[i][c * 4 + 2] += pv[i][jb] * v4.z;
+                        o[i][c * 4 + 3] += pv[i][jb] * v4.w;
+                    }
+                }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int row = q0 + ty * 4 + i;
+        if (row >= lq) continue;
+#pragma unroll
+        for (int c = 0; c < DC; ++c)
+#pragma unroll
+            for (int x = 0; x < 4; ++x) {
+                const int e = c * 64 + tx * 4 + x;
+                if (e < d) out[(int64_t)row * out_stride + h * d + e] = o[i][c * 4 + x] / l[i];
+            }
+    }
+}
+
+// The tiled kernel, or -1 when d doesn't suit it.
+static int attn_tiled_f32(const float* q, int64_t q_stride, const float* k, const float* v, int64_t kv_stride, int hq, int hk,
+                          int d, int lq, int lk, float* out, int64_t out_stride, float scale, int causal, cudaStream_t st) {
+    if (d % 4 || d > 128 || d <= 0) return -1;
+    const int dc = d > 64 ? 2 : 1;
+    const size_t smem = ((size_t)d * TA_LQ + attn_tiled_kv_floats(d, dc * 64) + (size_t)TA_BQ * TA_LK) * sizeof(float);
+    dim3 grid((lq + TA_BQ - 1) / TA_BQ, hq);
+#define TILED(DC)                                                                                                   \
+    cudaFuncSetAttribute(attn_tiled_f32_kernel<DC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);          \
+    attn_tiled_f32_kernel<DC><<<grid, 256, smem, st>>>(q, q_stride, k, v, kv_stride, hq, hk, lq, lk, out, out_stride, scale, \
+                                                       causal, d)
+    if (dc == 1) { TILED(1); }
+    else { TILED(2); }
+#undef TILED
+    return 0;
+}
+
+// attn_small_kernel alone, whatever the lengths: the tiled kernel's check
+GPU_API int gpu_attn_small_ref(int dtype, const void* q, int64_t q_stride, const void* k, const void* v,
                              int64_t kv_stride, int hq, int hk, int d, int lq, int lk, void* out, int64_t out_stride,
                              float scale, int causal, void* stream) {
     dim3 grid(lq, hq);
@@ -614,6 +763,19 @@ GPU_API int gpu_attn_small(int dtype, const void* q, int64_t q_stride, const voi
 #undef ATTN
     KCHECK();
     return 0;
+}
+
+// f32 queries of 64 rows or more go through the tiled kernel; the rest, and bf16, through attn_small_kernel
+GPU_API int gpu_attn_small(int dtype, const void* q, int64_t q_stride, const void* k, const void* v,
+                             int64_t kv_stride, int hq, int hk, int d, int lq, int lk, void* out, int64_t out_stride,
+                             float scale, int causal, void* stream) {
+    if (dtype == DT_F32 && lq >= TA_BQ &&
+        attn_tiled_f32((const float*)q, q_stride, (const float*)k, (const float*)v, kv_stride, hq, hk, d, lq, lk, (float*)out,
+                       out_stride, scale, causal, (cudaStream_t)stream) == 0) {
+        KCHECK();
+        return 0;
+    }
+    return gpu_attn_small_ref(dtype, q, q_stride, k, v, kv_stride, hq, hk, d, lq, lk, out, out_stride, scale, causal, stream);
 }
 
 // ---------------------------------------------------------------------------------------------

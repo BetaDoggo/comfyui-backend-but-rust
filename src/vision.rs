@@ -359,9 +359,6 @@ impl Vision {
         let qkv = DevBuf::alloc_async(n * 3 * dm * 4, st)?;
         let attn = DevBuf::alloc_async(n * dm * 4, st)?;
         let y = DevBuf::alloc_async(n * dm * 4, st)?;
-        // query rows per chunk of the attention: the f32 scores stay under ~256 MB
-        let chunk = ((256 << 20) / (n * 4)).clamp(64, n);
-        let scores = DevBuf::alloc_async(chunk * n * 4, st)?;
         let ff = DevBuf::alloc_async(n * ff_w * 4, st)?;
         let x = xb.ptr();
         // y = x @ w^T + b, from a bf16 weight
@@ -414,19 +411,10 @@ impl Vision {
             let (kp, vp) = (off(q, dm * 4), off(q, 2 * dm * 4));
             k!(gpu_rope_rows(q, (3 * dm) as i64, rope.ptr(), n as i32, HEADS as i32, hd as i32, s(st)))?;
             k!(gpu_rope_rows(kp, (3 * dm) as i64, rope.ptr(), n as i32, HEADS as i32, hd as i32, s(st)))?;
-            // per head, a chunk of query rows at a time: scores, softmax, then the weighted values
+            // every patch sees every other, through the tiled f32 attention
             let row = (3 * dm) as i64;
-            for h in 0..HEADS {
-                let col = h * hd * 4;
-                for r0 in (0..n).step_by(chunk) {
-                    let rows = chunk.min(n - r0);
-                    k!(gpu_gemm(off(q, r0 * 3 * dm * 4 + col), row, off(kp, col), row, scores.ptr(), n as i64, null(), rows as i64, n as i64, hd as i64, 1,
-                        DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
-                    k!(gpu_softmax_f32(scores.ptr(), rows as i32, n as i32, 1.0 / (hd as f32).sqrt(), s(st)))?;
-                    k!(gpu_gemm(scores.ptr(), n as i64, off(vp, col), row, off(attn.ptr(), r0 * dm * 4 + col), dm as i64, null(), rows as i64, hd as i64,
-                        n as i64, 0, DT_F32, DT_F32, 1.0, 0.0, s(st)))?;
-                }
-            }
+            k!(gpu_attn_small(DT_F32, q, row, kp, vp, row, HEADS as i32, HEADS as i32, hd as i32, n as i32, n as i32, attn.ptr(), dm as i64,
+                1.0 / (hd as f32).sqrt(), 0, s(st)))?;
             lin(attn.ptr(), w("proj"), w("projb"), nf, dm, dm, y.ptr())?;
             add(x, y.ptr(), n * dm)?;
             norm(x, w("n2w"), w("n2b"), dm, n, normed.ptr())?;
@@ -492,5 +480,83 @@ mod tests {
     fn bilinear_keeps_a_constant_image() {
         let img = PromptImage { width: 3, height: 2, rgb: vec![0.25; 18] };
         assert!(bilinear(&img, 5, 7).iter().all(|v| (v - 0.25).abs() < 1e-6));
+    }
+
+    /// The tiled f32 attention against the one-block-per-row kernel, on packed q, k and v rows as the text encoders and
+    /// vision towers lay them out, then both timed on a text encoder's picture-sized prompt. Needs a GPU.
+    #[test]
+    #[ignore]
+    fn tiled_attention_matches_small() {
+        crate::cuda::init(0).unwrap();
+        let st = Stream::new().unwrap();
+        let mut seed = 7u64;
+        let mut rnd = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    ((seed >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 3.0
+                })
+                .collect()
+        };
+        // (heads, kv heads, head dim, queries, keys, causal): Qwen3 text, a later run of text after earlier keys, the
+        // vision towers, and lengths off the 64-row tiles
+        let cases = [(32, 8, 128, 300, 300, 1), (16, 8, 128, 150, 400, 251), (16, 16, 64, 257, 257, 0), (16, 16, 72, 200, 200, 0), (4, 4, 128, 64, 65, 0)];
+        for (hq, hk, d, lq, lk, causal) in cases {
+            // packed rows: q heads, then k, then v, with the queries the last lq of the lk rows
+            let row = (hq + 2 * hk) * d;
+            let x = rnd(lk * row);
+            let buf = DevBuf::alloc(x.len() * 4).unwrap();
+            buf.upload(0, &f32_bytes(&x), &st).unwrap();
+            let q = off(buf.ptr(), (lk - lq) * row * 4);
+            let (kp, vp) = (off(buf.ptr(), hq * d * 4), off(buf.ptr(), (hq + hk) * d * 4));
+            let run = |reference: bool| -> Vec<f32> {
+                let o = DevBuf::alloc(lq * hq * d * 4).unwrap();
+                let args = (q, row as i64, kp, vp, row as i64, hq as i32, hk as i32, d as i32, lq as i32, lk as i32, o.ptr(), (hq * d) as i64);
+                let scale = 1.0 / (d as f32).sqrt();
+                if reference {
+                    k!(gpu_attn_small_ref(DT_F32, args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9, args.10, args.11,
+                        scale, causal, s(&st)))
+                    .unwrap();
+                } else {
+                    k!(gpu_attn_small(DT_F32, args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9, args.10, args.11,
+                        scale, causal, s(&st)))
+                    .unwrap();
+                }
+                let mut raw = vec![0u8; lq * hq * d * 4];
+                o.download(0, &mut raw, &st).unwrap();
+                st.sync().unwrap();
+                raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+            };
+            let (ours, theirs) = (run(false), run(true));
+            let err = ours.iter().zip(&theirs).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let mag = theirs.iter().map(|x| x.abs()).fold(0f32, f32::max);
+            eprintln!("{hq}/{hk} heads, d {d}, {lq} of {lk}, causal {causal}: max error {err:e} of {mag}");
+            assert!(ours.iter().all(|v| v.is_finite()) && err <= 1e-5 * mag, "max error {err}");
+        }
+
+        // a 4B text encoder layer on a 1049-token prompt
+        let (hq, hk, d, l) = (32usize, 8usize, 128usize, 1049usize);
+        let row = (hq + 2 * hk) * d;
+        let buf = DevBuf::alloc(l * row * 4).unwrap();
+        buf.upload(0, &f32_bytes(&rnd(l * row)), &st).unwrap();
+        let o = DevBuf::alloc(l * hq * d * 4).unwrap();
+        for reference in [false, true, false, true] {
+            let t = std::time::Instant::now();
+            for _ in 0..5 {
+                let (q, kp, vp) = (buf.ptr(), off(buf.ptr(), hq * d * 4), off(buf.ptr(), (hq + hk) * d * 4));
+                let scale = 1.0 / (d as f32).sqrt();
+                if reference {
+                    k!(gpu_attn_small_ref(DT_F32, q, row as i64, kp, vp, row as i64, hq as i32, hk as i32, d as i32, l as i32, l as i32, o.ptr(),
+                        (hq * d) as i64, scale, 1, s(&st)))
+                    .unwrap();
+                } else {
+                    k!(gpu_attn_small(DT_F32, q, row as i64, kp, vp, row as i64, hq as i32, hk as i32, d as i32, l as i32, l as i32, o.ptr(),
+                        (hq * d) as i64, scale, 1, s(&st)))
+                    .unwrap();
+                }
+            }
+            st.sync().unwrap();
+            eprintln!("{} kernel: {:.2} ms per layer", if reference { "one-block-per-row" } else { "tiled" }, t.elapsed().as_secs_f64() * 1e3 / 5.0);
+        }
     }
 }

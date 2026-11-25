@@ -79,6 +79,9 @@ extern "C" {
         hk: i32, qw: P, kw: P, eps: f32, rope: P, rope_mode: i32, l: i32, s: PM) -> i32;
     pub fn gpu_attn_small(dtype: i32, q: P, q_stride: i64, k: P, v: P, kv_stride: i64, hq: i32, hk: i32, d: i32,
         lq: i32, lk: i32, out: PM, out_stride: i64, scale: f32, causal: i32, s: PM) -> i32;
+    /// `gpu_attn_small` through its one-block-per-row kernel at any length, to check the tiled one
+    pub fn gpu_attn_small_ref(dtype: i32, q: P, q_stride: i64, k: P, v: P, kv_stride: i64, hq: i32, hk: i32, d: i32,
+        lq: i32, lk: i32, out: PM, out_stride: i64, scale: f32, causal: i32, s: PM) -> i32;
     pub fn gpu_embed_dequant(q: P, s_: P, out: PM, m: i32, k: i32, rotate: i32, s: PM) -> i32;
     pub fn gpu_gelu_tanh_bf16(x: PM, n: i64, s: PM) -> i32;
     pub fn gpu_add_gated_bf16(x: PM, x_stride: i64, y: P, y_stride: i64, gate: P, rows: i32, cols: i32, s: PM) -> i32;

@@ -133,8 +133,11 @@ Reference latents are sensitive to rounding: the same picture appears, but int8 
 by 27 dB and 19 dB on those two cases, so a gap of that size is expected from rounding. Passing ComfyUI's exact latent to this
 engine changed nothing. The model's first output is within about 1% in every case, the vision tokens within 0.25%, and the VAE encoder's latent within 0.6%.
 
-A prompt image at about 384x384 costs 130 ms in the vision tower and a VAE encode about 50 ms. The vision tower's attention
-grows with the square of its tokens: a 1024x1024 image, SwarmUI's Large Text Encoded Image, took 3.9 s.
+A prompt image at about 384x384 costs 130 ms in the vision tower and a VAE encode about 50 ms. A 1024x1024 picture, as the CLI
+reads one or SwarmUI's Large Text Encoded Image sends it, takes about 540 ms in the vision tower, and then 0.8 s in the
+text encoder for its 1049 tokens, down from 2.0 s before the text encoders' attention went to 64-row tiles (warm, CLI,
+512x512, 2 steps). Against the build before, the conditioning moved by 1.7e-4 and the image by 33.7 dB, from rounding
+that the int8 blocks magnify. Works in SwarmUI itself; not timed there.
 
 Differences to know about:
 

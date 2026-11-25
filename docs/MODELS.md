@@ -642,6 +642,21 @@ streaks in the later windows, so that comes from context windows at 4 steps, not
 same settings, sampling took 18.4 s for the 4 steps, against ComfyUI's 41.4 s on its warm second run. Other sizes,
 lengths, step counts and fuse methods weren't tried, and the audio wasn't judged by ear.
 
+With a pi-H3 DWD adapter, each window's evaluation at the last step keeps its DWD features, and they're blended over the
+clip with the video's own fuse weights, as `h3window::Blend` blends the denoised latents. The pixel head then decodes the
+blended features of the whole clip in one pass. This is this engine's own addition, not a port of ComfyUI's code, so
+there's nothing to compare it with. The features come out of a modulated LayerNorm, so averaging them where windows
+overlap is an approximation; `cargo test --lib h3window` checks that they get the video's weights.
+
+Through the CLI at 384x384, 260 frames, the 2-step adapter and windows of 124 and 39 frames (three windows of 37 latents,
+12 overlapping), sampling took 9.3 s and the head decoded the 260 frames in 2.2 s. The clip holds together across
+the windows, and nothing jumps where they meet: the change from frame to frame has no spike at the windows' edges.
+Fast birds smear into translucent smudges inside the overlaps, but also in the stretch only the last window covers, so
+this one clip doesn't show whether the blend adds ghosting. The VAE decode of the same final latent is badly
+artifacted, at 18.4 dB from the head's frames all along the clip, which is why a DWD run never falls back to the VAE.
+Working in SwarmUI itself, through its usual VAE Decode; other sizes, lengths, the 4-step adapter and other fuse methods weren't tried. The head holds
+the whole clip's activations at once, so a long or large clip may not fit in VRAM.
+
 ### HyperFlow H3 Flash
 
 [HyperFlow H3 Flash](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash) is a community few-step H3, which
@@ -722,11 +737,14 @@ target/release/diffusion.exe --h3 --dit "$MODELS_ROOT/Stable-diffusion/minimax_h
 otherwise) down to 0, the last step 0.6 times as long, then H3's shift. At 2 steps it gives exactly ComfyUI-piFlow's
 sigmas, and at 4 steps the same ones to the five places ComfyUI-piFlow printed. In SwarmUI it's listed on `SwarmKSampler` with `hyperflow`; ComfyUI's KSampler doesn't list it, as there.
 
-The comfy-rust SwarmUI extension swaps the video decode for `DWD Decode` when the sampler's model went through a LoRA
-loader with a DWD adapter. Server-side, `DWD Decode` returns the frames the head wrote for that video latent; the
-latest 4 runs are kept.
+On the server the head's frames travel with the sampled video latent, so SwarmUI's own workflow needs nothing
+special: its `VAEDecode` or `VAEDecodeTiled` of that latent returns them (tiling has nothing left to split), as
+ComfyUI-piFlow's `DWD Decode` does. A latent changed after sampling, by a latent node, has no frames and decodes through
+the VAE.
 
-Refused with a DWD adapter: more than one LakonLab adapter at once, context windows, regional prompts (more than one
+Context windows blend the windows' DWD features before the head, see [Context windows](#context-windows). A DWD run
+never falls back to the VAE: sampling fails if no evaluation at the last step kept features. Refused with a DWD adapter: more than one LakonLab adapter at
+once, regional prompts (more than one
 positive entry), HyperFlow and MiniMax-H3-Image. ComfyUI's `SamplerCustomAdvanced` graph, ComfyUI-piFlow's own
 example, isn't supported on the native engine, so use `SwarmKSampler`.
 

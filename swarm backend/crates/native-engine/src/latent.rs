@@ -71,7 +71,7 @@ fn output(base: &Latent, format: LatentFormat, mut data: Vec<f32>, shape: Shape)
     if !empty {
         from_comfy(&mut data, shape, format)?;
     }
-    let data = if empty { Opaque::none() } else { Opaque::new(HostLatent { data }) };
+    let data = if empty { Opaque::none() } else { Opaque::new(HostLatent::new(data)) };
     let mut out = base.with_samples(LatentSamples::Single(LatentTensor { format, shape: shape.to_vec(), data }));
     out.empty = empty;
     out.pixel.batch_size = shape[0] as u32;
@@ -109,7 +109,7 @@ fn video(l: &Latent) -> EngineResult<(&[f32], [usize; 5])> {
 
 /// `base` with a 5D SeedVR2 latent of `shape`, its pixel frames 4 (T - 1) + 1.
 fn video_output(base: &Latent, data: Vec<f32>, shape: [usize; 5]) -> Latent {
-    let t = LatentTensor { format: LatentFormat::SeedVr2, shape: shape.to_vec(), data: Opaque::new(HostLatent { data }) };
+    let t = LatentTensor { format: LatentFormat::SeedVr2, shape: shape.to_vec(), data: Opaque::new(HostLatent::new(data)) };
     let mut out = base.with_samples(LatentSamples::Single(t));
     out.empty = false;
     out.pixel.frames = (4 * (shape[2] - 1) + 1) as u32;
@@ -272,7 +272,7 @@ mod tests {
 
     fn latent_in(format: LatentFormat, data: Vec<f32>, shape: Shape) -> Latent {
         let pixel = PixelInfo::image(shape[3] as u32 * 8, shape[2] as u32 * 8, shape[0] as u32);
-        Latent::single(LatentTensor { format, shape: shape.to_vec(), data: Opaque::new(HostLatent { data }) }, pixel)
+        Latent::single(LatentTensor { format, shape: shape.to_vec(), data: Opaque::new(HostLatent::new(data)) }, pixel)
     }
 
     /// Flux 2's scale is ComfyUI's, so the bookkeeping tests can use any channel count.
@@ -294,7 +294,7 @@ mod tests {
     }
 
     fn clip(data: Vec<f32>, shape: [usize; 5]) -> Latent {
-        let t = LatentTensor { format: LatentFormat::SeedVr2, shape: shape.to_vec(), data: Opaque::new(HostLatent { data }) };
+        let t = LatentTensor { format: LatentFormat::SeedVr2, shape: shape.to_vec(), data: Opaque::new(HostLatent::new(data)) };
         Latent::single(t, PixelInfo::image(shape[4] as u32 * 8, shape[3] as u32 * 8, 1))
     }
 

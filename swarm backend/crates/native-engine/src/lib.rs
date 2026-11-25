@@ -134,23 +134,6 @@ pub struct NativeEngine {
     gen: Mutex<Generator>,
     live_previews: bool,
     threads: usize,
-    /// The frames of the latest runs with a LakonLab DWD adapter, by the fingerprint of the video latent each returned,
-    /// for `DWD Decode`, as ComfyUI-piFlow files them.
-    dwd: Mutex<Vec<(u64, ImageBatch)>>,
-}
-
-/// ComfyUI-piFlow keeps the frames of this many runs.
-const DWD_RUNS: usize = 4;
-
-/// A video latent's fingerprint, by its values.
-fn latent_fingerprint(data: &[f32]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    data.len().hash(&mut h);
-    for v in data {
-        v.to_bits().hash(&mut h);
-    }
-    h.finish()
 }
 
 /// RGB f32 `[3, frames, h, w]` in 0..1 to an image batch of `frames` images.
@@ -190,6 +173,15 @@ struct DeferredCond {
 /// Sampled latents, `[B, 16, H/8, W/8]`, or `[B, 128, H/16, W/16]` for MOSS Image.
 struct HostLatent {
     data: Vec<f32>,
+    /// MiniMax H3 with a pi-H3 DWD adapter: the frames its pixel head decoded at the last step. Any video decode of
+    /// this latent returns them, so SwarmUI's VAE Decode serves DWD runs as it serves the VAE's.
+    dwd: Option<ImageBatch>,
+}
+
+impl HostLatent {
+    fn new(data: Vec<f32>) -> Self {
+        HostLatent { data, dwd: None }
+    }
 }
 
 fn unsupported(what: impl Into<String>) -> EngineError {
@@ -1261,7 +1253,7 @@ impl NativeEngine {
             lossy: o.lossy,
             comfy_memory: o.comfy_memory,
         };
-        Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads, dwd: Mutex::new(Vec::new()) })
+        Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads })
     }
 
     /// SeedVR2's restore of the picture or clip `SeedVR2Conditioning` carries: a clip (`[1, 16, T, H/8, W/8]`) is one
@@ -1291,7 +1283,7 @@ impl NativeEngine {
         }
         let condition = seedvr_condition(&req.positive, &tensor.shape)?.to_vec();
         let finish = |data| {
-            let t = LatentTensor { format: LatentFormat::SeedVr2, shape: tensor.shape.clone(), data: Opaque::new(HostLatent { data }) };
+            let t = LatentTensor { format: LatentFormat::SeedVr2, shape: tensor.shape.clone(), data: Opaque::new(HostLatent::new(data)) };
             Ok(req.latent.with_samples(LatentSamples::Single(t)))
         };
         // [16, frames, lh, lw] in the order of a [16, frames * lh, lw] picture, which is how the sampler sees it
@@ -1331,7 +1323,7 @@ impl NativeEngine {
             .collect();
         let (data, lt) = gen.encode_seedvr(&rgb, frames, w, h).map_err(internal)?;
         let shape = if frames == 1 { vec![1, 16, h / 8, w / 8] } else { vec![1, 16, lt, h / 8, w / 8] };
-        let tensor = LatentTensor { format: LatentFormat::SeedVr2, shape, data: Opaque::new(HostLatent { data }) };
+        let tensor = LatentTensor { format: LatentFormat::SeedVr2, shape, data: Opaque::new(HostLatent::new(data)) };
         let mut info = PixelInfo::image(w as u32, h as u32, 1);
         info.frames = pixels.count;
         Ok(Latent::single(tensor, info))
@@ -1365,7 +1357,7 @@ impl NativeEngine {
             return Err(unsupported(format!("{} RelayVSR keyframes for a latent of {keys}", k.count)));
         }
         let finish = |data| {
-            let t = LatentTensor { format: LatentFormat::RelayVsr, shape: tensor.shape.clone(), data: Opaque::new(HostLatent { data }) };
+            let t = LatentTensor { format: LatentFormat::RelayVsr, shape: tensor.shape.clone(), data: Opaque::new(HostLatent::new(data)) };
             Ok(req.latent.with_samples(LatentSamples::Single(t)))
         };
         // [48, keys, lh, lw] in the order of a [48, keys * lh, lw] picture, which is how the sampler sees it
@@ -1637,7 +1629,7 @@ impl NativeEngine {
         let tensor = LatentTensor {
             format: LatentFormat::QwenImage21,
             shape: vec![pixels.count as usize, diffusion::qwen21::CH, lh, lw],
-            data: Opaque::new(HostLatent { data }),
+            data: Opaque::new(HostLatent::new(data)),
         };
         let scale = diffusion::vae21::SCALE as u32;
         Ok(Latent::single(tensor, PixelInfo::image(lw as u32 * scale, lh as u32 * scale, pixels.count)))
@@ -1663,7 +1655,7 @@ impl NativeEngine {
         let tensor = LatentTensor {
             format: LatentFormat::Flux2,
             shape: vec![pixels.count as usize, diffusion::moss::CH, lh, lw],
-            data: Opaque::new(HostLatent { data }),
+            data: Opaque::new(HostLatent::new(data)),
         };
         Ok(Latent::single(tensor, PixelInfo::image(lw as u32 * 16, lh as u32 * 16, pixels.count)))
     }
@@ -1847,18 +1839,13 @@ impl NativeEngine {
             .sample_h3(&r, |step| report(mode, progress, 1, step, |x0| (preview::h3(x0, t, lh, lw), lh, lw)), None)
             .map_err(internal)?;
         tracing::info!("h3: text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
-        let dwd = gen.take_h3_dwd_pixels();
+        // the pixel head's frames ride with the video latent, for its decode
+        let dwd = gen.take_h3_dwd_pixels().map(|clip| clip_images(&clip, clip.t));
         drop(gen);
         let audio_data = latent.split_off(shape.video_len());
-        if let Some(clip) = dwd {
-            let mut runs = self.dwd.lock().unwrap_or_else(|e| e.into_inner());
-            runs.push((latent_fingerprint(&latent), clip_images(&clip, clip.t)));
-            let excess = runs.len().saturating_sub(DWD_RUNS);
-            runs.drain(..excess);
-        }
         Ok(req.latent.with_samples(LatentSamples::AudioVideo {
-            video: LatentTensor { format: video.format, shape: video.shape.clone(), data: Opaque::new(HostLatent { data: latent }) },
-            audio: LatentTensor { format: audio.format, shape: audio.shape.clone(), data: Opaque::new(HostLatent { data: audio_data }) },
+            video: LatentTensor { format: video.format, shape: video.shape.clone(), data: Opaque::new(HostLatent { data: latent, dwd }) },
+            audio: LatentTensor { format: audio.format, shape: audio.shape.clone(), data: Opaque::new(HostLatent::new(audio_data)) },
         }))
     }
 
@@ -1903,7 +1890,7 @@ impl NativeEngine {
             .sample_h3(&r, |step| report(mode, progress, 1, step, |x0| (preview::h3(x0, 1, lh, lw), lh, lw)), None)
             .map_err(internal)?;
         tracing::info!("h3 image: text {:.0} ms, sampling {:.0} ms", stats.text_ms, stats.sample_ms);
-        let video = LatentTensor { format: tensor.format, shape: tensor.shape.clone(), data: Opaque::new(HostLatent { data: out }) };
+        let video = LatentTensor { format: tensor.format, shape: tensor.shape.clone(), data: Opaque::new(HostLatent::new(out)) };
         Ok(latent.with_samples(LatentSamples::Single(video)))
     }
 
@@ -1927,7 +1914,7 @@ impl NativeEngine {
             rgb.extend_from_slice(&img.rgb[((y0 + y) * img.width + x0) * 3..][..w * 3]);
         }
         let z = self.gen().encode_h3(&file.path, &PromptImage { width: w, height: h, rgb }).map_err(internal)?;
-        let tensor = LatentTensor { format: LatentFormat::MiniMaxH3Video, shape: vec![1, 24, 1, h / 16, w / 16], data: Opaque::new(HostLatent { data: z }) };
+        let tensor = LatentTensor { format: LatentFormat::MiniMaxH3Video, shape: vec![1, 24, 1, h / 16, w / 16], data: Opaque::new(HostLatent::new(z)) };
         Ok(Latent::single(tensor, PixelInfo::image(w as u32, h as u32, 1)))
     }
 
@@ -2066,7 +2053,7 @@ impl NativeEngine {
         let tensor = LatentTensor {
             format: LatentFormat::Image4Ch,
             shape: vec![pixels.count as usize, diffusion::unet::CH, lh, lw],
-            data: Opaque::new(HostLatent { data }),
+            data: Opaque::new(HostLatent::new(data)),
         };
         Ok(Latent::single(tensor, PixelInfo::image(lw as u32 * 8, lh as u32 * 8, pixels.count)))
     }
@@ -2447,7 +2434,7 @@ impl Engine for NativeEngine {
             Ok(latent.with_samples(LatentSamples::Single(LatentTensor {
                 format: tensor.format.clone(),
                 shape: tensor.shape.clone(),
-                data: Opaque::new(HostLatent { data }),
+                data: Opaque::new(HostLatent::new(data)),
             })))
         };
         let shape = (batch, lh, lw);
@@ -2469,6 +2456,12 @@ impl Engine for NativeEngine {
     }
 
     fn vae_decode(&self, req: &VaeDecodeRequest, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        // a pi-H3 DWD run's frames come from its adapter's pixel head, which decoded them at the last step: they take
+        // the VAE's place, and tiling has nothing left to split
+        let (LatentSamples::AudioVideo { video: t, .. } | LatentSamples::Single(t)) = &req.latent.samples;
+        if let Some(frames) = t.data.downcast_ref::<HostLatent>().filter(|_| t.format == LatentFormat::MiniMaxH3Video).and_then(|d| d.dwd.as_ref()) {
+            return Ok(frames.clone());
+        }
         match &req.latent.samples {
             LatentSamples::AudioVideo { video, .. } => return self.decode_h3(req, video),
             LatentSamples::Single(t) if t.format == LatentFormat::MiniMaxH3Video => return self.decode_h3(req, t),
@@ -2582,7 +2575,7 @@ impl Engine for NativeEngine {
             size = (r.height, r.width);
         }
         let (lh, lw) = size;
-        let tensor = LatentTensor { format: LatentFormat::Image16Ch, shape: vec![frames.len(), 16, lh, lw], data: Opaque::new(HostLatent { data }) };
+        let tensor = LatentTensor { format: LatentFormat::Image16Ch, shape: vec![frames.len(), 16, lh, lw], data: Opaque::new(HostLatent::new(data)) };
         Ok(Latent::single(tensor, PixelInfo::image(lw as u32 * 8, lh as u32 * 8, frames.len() as u32)))
     }
 
@@ -2662,14 +2655,9 @@ impl Engine for NativeEngine {
             _ => return Err(unsupported("DWD Decode of a latent other than MiniMax H3's (only pi-H3's DWD adapters have a pixel head)")),
         };
         let data = video.data.downcast_ref::<HostLatent>().ok_or_else(|| unsupported("DWD Decode of a latent this engine didn't sample"))?;
-        let key = latent_fingerprint(&data.data);
-        let runs = self.dwd.lock().unwrap_or_else(|e| e.into_inner());
-        match runs.iter().rev().find(|(k, _)| *k == key) {
-            Some((_, images)) => Ok(images.clone()),
-            None => Err(EngineError::InvalidInput(format!(
-                "no DWD frames for this latent: connect the output of a sampler whose model has a pi-H3 DWD adapter (the latest {DWD_RUNS} runs are kept)"
-            ))),
-        }
+        data.dwd.clone().ok_or_else(|| {
+            EngineError::InvalidInput("no DWD frames for this latent: connect the output of a sampler whose model has a pi-H3 DWD adapter".into())
+        })
     }
 
     fn vae_decode_audio(&self, req: &VaeDecodeAudioRequest) -> EngineResult<AudioData> {

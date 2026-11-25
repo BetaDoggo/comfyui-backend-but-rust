@@ -623,9 +623,6 @@ impl Generator {
         }
         let windowed = r.windows.as_ref().is_some_and(|w| w.applies(&r.shape));
         let dwd = dit.has_dwd();
-        if dwd && windowed {
-            return Err(lora::Unsupported("context windows with a DWD adapter (its pixel head decodes the whole clip at the last step)".into()).into());
-        }
         if dwd && r.positive.len() > 1 {
             // ComfyUI-piFlow only decodes an evaluation of one positive entry, and finds no pixels otherwise
             return Err(lora::Unsupported("several positive conditioning entries with a DWD adapter".into()).into());
@@ -749,6 +746,9 @@ impl Generator {
         // the DWD head decodes the positive evaluation at the schedule's last sigma above zero, as `torch.isclose` finds it
         let last = sigmas.iter().rev().copied().find(|s| *s > 0.0).unwrap_or(0.0);
         f.dwd_pixels = None;
+        // the features the DWD head decodes: the last step's positive evaluation's, or with context windows, its
+        // windows' blended as their denoised outputs are
+        let mut dwd_features: Option<(DevBuf, (usize, usize, usize))> = None;
         let mut model = |x: &DevBuf, den: &DevBuf, sigma: f32, side: Side, e: usize| -> Result<()> {
             let u = *map[usize::from(side.negative)].get(side.entry).context("no such conditioning entry")?;
             let (ctx, text, tags) = encoded[u];
@@ -768,26 +768,56 @@ impl Generator {
                     }
                 }
             };
-            let mut call = |x: &DevBuf, sh: &h3::Shape, den: &DevBuf, probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>| -> Result<()> {
+            // returns the DWD features the evaluation kept, if it kept any
+            let mut call = |x: &DevBuf, sh: &h3::Shape, den: &DevBuf, probe: Option<&mut dyn FnMut(&str, &DevBuf, usize)>| -> Result<Option<(DevBuf, (usize, usize, usize))>> {
                 let (.., rope) = ropes.iter().find(|(l, e, k, _)| *l == text && *e == extra && k == sh).context("no rope table for this window")?;
-                dit.predict(x, sh, ctx, text, pack, rope, sigma, next, den, st, probe)
+                dit.predict(x, sh, ctx, text, pack, rope, sigma, next, den, st, probe)?;
+                Ok(dit.take_dwd_features())
             };
             match windows {
-                None => call(x, &r.shape, den, Some(&mut keep))?,
+                None => {
+                    if let Some(kept) = call(x, &r.shape, den, Some(&mut keep))? {
+                        dwd_features = Some(kept);
+                    }
+                }
                 Some(c) => {
                     let mut b = vec![0u8; n * 4];
                     x.download(0, &mut b, st)?;
                     let full: Vec<f32> = b.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect();
-                    let fused = c.run(&full, &r.shape, |pack, sh| {
+                    // the windows' DWD features, `[t, th * tw * width]`, blended with the video's weights
+                    let mut blend: Option<(h3window::Blend, (usize, usize, usize))> = None;
+                    let fused = c.run(&full, &r.shape, |pack, w, sh| {
                         let wx = DevBuf::alloc_async(pack.len() * 4, st)?;
                         wx.upload(0, &f32_bytes(pack), st)?;
                         let wd = DevBuf::alloc_async(pack.len() * 4, st)?;
-                        call(&wx, sh, &wd, None)?;
+                        if let Some((feat, (t, th, tw))) = call(&wx, sh, &wd, None)? {
+                            if t != w.video.len() {
+                                bail!("DWD features of {t} latents for a window of {}", w.video.len());
+                            }
+                            let tokens = t * th * tw;
+                            let width = feat.size() / 2 / tokens.max(1);
+                            let mut v = vec![0u8; tokens * width * 2];
+                            feat.download(0, &mut v, st)?;
+                            drop(feat);
+                            let v: Vec<f32> = v.chunks_exact(2).map(|h| f32::from_bits(u32::from(u16::from_le_bytes([h[0], h[1]])) << 16)).collect();
+                            let (b, grid) = blend.get_or_insert_with(|| (c.video_blend(&r.shape, 1, th * tw * width), (r.shape.t, th, tw)));
+                            if (grid.1, grid.2) != (th, tw) {
+                                bail!("DWD features of a {th}x{tw} grid in one window and {}x{} in another", grid.1, grid.2);
+                            }
+                            b.add(&w.video, &v)?;
+                        }
                         let mut o = vec![0u8; pack.len() * 4];
                         wd.download(0, &mut o, st)?;
                         Ok(o.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect())
                     })?;
                     den.upload(0, &f32_bytes(&fused), st)?;
+                    if let Some((b, grid)) = blend {
+                        // every window's evaluation keeps features or none does: an uncovered latent is an error
+                        let v = b.finish()?;
+                        let feat = DevBuf::alloc_async(v.len() * 2, st)?;
+                        feat.upload(0, &crate::st::bf16_bytes(&v), st)?;
+                        dwd_features = Some((feat, grid));
+                    }
                 }
             }
             if let (true, Some(d)) = (dumped, first.as_mut()) {
@@ -801,7 +831,7 @@ impl Generator {
         let pos_regions = regions(&r.positive);
         let neg_regions = if r.sampling.uses_negative() { regions(&r.negative) } else { PLAIN.to_vec() };
         let mut out = run_sampler(&r.sampling, &r.noise, [&pos_regions, &neg_regions], st, &mut stats, &mut model, &mut progress)?;
-        if let Some((features, grid)) = dit.take_dwd_features() {
+        if let Some((features, grid)) = dwd_features {
             if let Some(d) = first.as_mut() {
                 let mut v = vec![0u8; features.size()];
                 features.download(0, &mut v, st)?;
@@ -825,7 +855,8 @@ impl Generator {
             eprintln!("DWD head: {} frames of {}x{} in {:.2}s", pixels.t, pixels.w, pixels.h, t1.elapsed().as_secs_f64());
             f.dwd_pixels = Some(pixels);
         } else if dwd {
-            eprintln!("DWD adapter: no evaluation at the schedule's last sigma kept features, so there are no DWD frames");
+            // the clip would only decode through the VAE, which a DWD adapter isn't meant for: fail instead
+            bail!("a DWD adapter's run kept no features at the schedule's last sigma above zero, so its pixel head has nothing to decode");
         }
         // the sampler carries the audio scaled onto the video schedule
         let scale = shifts.0 / shifts.1;

@@ -142,11 +142,124 @@ impl ContextWindows {
         shuffle(audio, ACH * 2, sh.audio_t, 1, al, ao, seed);
     }
 
+    /// A blend of the windows' outputs over the clip's video latents, `run` values per latent and channel (or per
+    /// latent, for rows laid out with time outermost), weighted as [`Self::run`] weighs the video.
+    pub fn video_blend(&self, sh: &Shape, rows: usize, run: usize) -> Blend {
+        Blend::new(self.fuse, rows, run, sh.t, self.overlap)
+    }
+
+    /// One model evaluation over windows: `predict` takes a window's pack, the window and its shape, and returns its
+    /// denoised pack. Returns the fused denoised pack of the whole clip.
+    pub fn run(&self, x: &[f32], sh: &Shape, mut predict: impl FnMut(&[f32], &Window, &Shape) -> Result<Vec<f32>>) -> Result<Vec<f32>> {
+        let (vn, an) = (sh.video_len(), sh.audio_len());
+        if x.len() != vn + an {
+            bail!("a pack of {} values for {sh:?}", x.len());
+        }
+        let hw = sh.h * sh.w;
+        let windows = self.windows(sh);
+        let (_, audio_overlap) = self.audio_settings(sh);
+        let mut video = self.video_blend(sh, VCH, hw);
+        let mut audio = Blend::new(self.fuse, ACH * 2, 1, sh.audio_t, audio_overlap);
+        for w in &windows {
+            let ws = w.shape(sh);
+            let mut pack = Vec::with_capacity(ws.video_len() + ws.audio_len());
+            for c in 0..VCH {
+                pack.extend_from_slice(&x[(c * sh.t + w.video.start) * hw..(c * sh.t + w.video.end) * hw]);
+            }
+            for r in 0..ACH * 2 {
+                pack.extend_from_slice(&x[vn + r * sh.audio_t + w.audio.start..vn + r * sh.audio_t + w.audio.end]);
+            }
+            let out = predict(&pack, w, &ws)?;
+            if out.len() != pack.len() {
+                bail!("a window's prediction has {} values, not {}", out.len(), pack.len());
+            }
+            let (vo, ao) = out.split_at(ws.video_len());
+            video.add(&w.video, vo)?;
+            audio.add(&w.audio, ao)?;
+        }
+        let mut fused = video.finish()?;
+        fused.extend(audio.finish()?);
+        Ok(fused)
+    }
+}
+
+/// The windows' outputs over one stream, laid out `[rows, full, run]`, blended where they overlap as
+/// `IndexListContextHandler` blends them.
+pub struct Blend {
+    fuse: Fuse,
+    rows: usize,
+    run: usize,
+    full: usize,
+    overlap: usize,
+    out: Vec<f32>,
+    /// per latent: the total weight, or the relative method's running bias
+    count: Vec<f32>,
+    bias: Vec<f64>,
+}
+
+impl Blend {
+    pub fn new(fuse: Fuse, rows: usize, run: usize, full: usize, overlap: usize) -> Self {
+        Blend { fuse, rows, run, full, overlap, out: vec![0f32; rows * full * run], count: vec![0f32; full], bias: vec![0f64; full] }
+    }
+
+    /// Adds a window's output over `span`, laid out `[rows, span, run]`.
+    pub fn add(&mut self, span: &Range<usize>, out: &[f32]) -> Result<()> {
+        let (rows, run, full, len) = (self.rows, self.run, self.full, span.len());
+        if span.end > full || out.len() != rows * len * run {
+            bail!("a window output of {} values over {span:?}, for {rows} rows of {full} latents of {run}", out.len());
+        }
+        if self.fuse == Fuse::Relative {
+            // a running average weighted by each position's closeness to the window's centre
+            let (first, last) = (span.start as f64, (span.end - 1) as f64);
+            for (pos, idx) in span.clone().enumerate() {
+                let b = (1.0 - (idx as f64 - (first + last) / 2.0).abs() / ((last - first + 1e-2) / 2.0)).max(1e-2);
+                let total = self.bias[idx];
+                let (prev, new) = ((total / (total + b)) as f32, (b / (total + b)) as f32);
+                for r in 0..rows {
+                    let dst = &mut self.out[(r * full + idx) * run..][..run];
+                    let src = &out[(r * len + pos) * run..][..run];
+                    dst.iter_mut().zip(src).for_each(|(d, s)| *d = *d * prev + s * new);
+                }
+                self.bias[idx] = total + b;
+                self.count[idx] += 1.0;
+            }
+        } else {
+            let wt = self.fuse.weights(span, full, self.overlap);
+            for (pos, idx) in span.clone().enumerate() {
+                for r in 0..rows {
+                    let dst = &mut self.out[(r * full + idx) * run..][..run];
+                    let src = &out[(r * len + pos) * run..][..run];
+                    dst.iter_mut().zip(src).for_each(|(d, s)| *d += s * wt[pos]);
+                }
+                self.count[idx] += wt[pos];
+            }
+        }
+        Ok(())
+    }
+
+    /// The blended stream. Every latent must have been covered by a window.
+    pub fn finish(mut self) -> Result<Vec<f32>> {
+        if let Some(idx) = self.count.iter().position(|c| *c <= 0.0) {
+            bail!("latent {idx} of {} wasn't covered by a window", self.full);
+        }
+        if self.fuse != Fuse::Relative {
+            let (full, run) = (self.full, self.run);
+            for r in 0..self.rows {
+                for (idx, c) in self.count.iter().enumerate() {
+                    self.out[(r * full + idx) * run..][..run].iter_mut().for_each(|v| *v /= c);
+                }
+            }
+        }
+        Ok(self.out)
+    }
+}
+
+impl Fuse {
     /// The weight of each position of a window (`get_context_weights`). `span` is the window's
     /// range in a stream of `full` latents, and `overlap` that stream's overlap.
-    fn weights(&self, span: &Range<usize>, full: usize, overlap: usize) -> Vec<f32> {
+    fn weights(self, span: &Range<usize>, full: usize, overlap: usize) -> Vec<f32> {
         let len = span.len();
-        match self.fuse {
+        match self {
             Fuse::Flat => vec![1.0; len],
             Fuse::Pyramid | Fuse::Relative => {
                 let half = len.div_ceil(2);
@@ -164,80 +277,6 @@ impl ContextWindows {
                 w
             }
         }
-    }
-
-    /// One model evaluation over windows: `predict` takes a window's pack and shape and returns
-    /// its denoised pack. Returns the fused denoised pack of the whole clip.
-    pub fn run(&self, x: &[f32], sh: &Shape, mut predict: impl FnMut(&[f32], &Shape) -> Result<Vec<f32>>) -> Result<Vec<f32>> {
-        let (vn, an) = (sh.video_len(), sh.audio_len());
-        if x.len() != vn + an {
-            bail!("a pack of {} values for {sh:?}", x.len());
-        }
-        let hw = sh.h * sh.w;
-        let windows = self.windows(sh);
-        let (_, audio_overlap) = self.audio_settings(sh);
-        let mut fused = vec![0f32; vn + an];
-        // per latent of each stream: total weight, or the relative method's running bias
-        let (mut vcount, mut acount) = (vec![0f32; sh.t], vec![0f32; sh.audio_t]);
-        let (mut vbias, mut abias) = (vec![0f64; sh.t], vec![0f64; sh.audio_t]);
-        for w in &windows {
-            let ws = w.shape(sh);
-            let mut pack = Vec::with_capacity(ws.video_len() + ws.audio_len());
-            for c in 0..VCH {
-                pack.extend_from_slice(&x[(c * sh.t + w.video.start) * hw..(c * sh.t + w.video.end) * hw]);
-            }
-            for r in 0..ACH * 2 {
-                pack.extend_from_slice(&x[vn + r * sh.audio_t + w.audio.start..vn + r * sh.audio_t + w.audio.end]);
-            }
-            let out = predict(&pack, &ws)?;
-            if out.len() != pack.len() {
-                bail!("a window's prediction has {} values, not {}", out.len(), pack.len());
-            }
-            let (vo, ao) = out.split_at(ws.video_len());
-            // (rows, run, stream offset, stream length, window, window output, counts, biases, overlap)
-            let streams = [
-                (VCH, hw, 0, sh.t, &w.video, vo, &mut vcount, &mut vbias, self.overlap),
-                (ACH * 2, 1, vn, sh.audio_t, &w.audio, ao, &mut acount, &mut abias, audio_overlap),
-            ];
-            for (rows, run, base, full, span, out, count, bias, overlap) in streams {
-                let len = span.len();
-                if self.fuse == Fuse::Relative {
-                    // a running average weighted by each position's closeness to the window's centre
-                    let (first, last) = (span.start as f64, (span.end - 1) as f64);
-                    for (pos, idx) in span.clone().enumerate() {
-                        let b = (1.0 - (idx as f64 - (first + last) / 2.0).abs() / ((last - first + 1e-2) / 2.0)).max(1e-2);
-                        let total = bias[idx];
-                        let (prev, new) = ((total / (total + b)) as f32, (b / (total + b)) as f32);
-                        for r in 0..rows {
-                            let dst = &mut fused[base + (r * full + idx) * run..][..run];
-                            let src = &out[(r * len + pos) * run..][..run];
-                            dst.iter_mut().zip(src).for_each(|(d, s)| *d = *d * prev + s * new);
-                        }
-                        bias[idx] = total + b;
-                    }
-                } else {
-                    let wt = self.weights(span, full, overlap);
-                    for (pos, idx) in span.clone().enumerate() {
-                        for r in 0..rows {
-                            let dst = &mut fused[base + (r * full + idx) * run..][..run];
-                            let src = &out[(r * len + pos) * run..][..run];
-                            dst.iter_mut().zip(src).for_each(|(d, s)| *d += s * wt[pos]);
-                        }
-                        count[idx] += wt[pos];
-                    }
-                }
-            }
-        }
-        if self.fuse != Fuse::Relative {
-            for (rows, run, base, full, count) in [(VCH, hw, 0, sh.t, &vcount), (ACH * 2, 1, vn, sh.audio_t, &acount)] {
-                for r in 0..rows {
-                    for (idx, c) in count.iter().enumerate() {
-                        fused[base + (r * full + idx) * run..][..run].iter_mut().for_each(|v| *v /= c);
-                    }
-                }
-            }
-        }
-        Ok(fused)
     }
 }
 
@@ -311,12 +350,44 @@ mod tests {
 
     #[test]
     fn weights_match_comfy() {
-        let c = cw(124, 39, Fuse::Pyramid);
+        let c = Fuse::Pyramid;
         assert_eq!(c.weights(&(0..4), 10, 2), vec![1.0, 2.0, 2.0, 1.0]);
         assert_eq!(c.weights(&(0..5), 10, 2), vec![1.0, 2.0, 3.0, 2.0, 1.0]);
-        let o = cw(124, 39, Fuse::OverlapLinear);
+        let o = Fuse::OverlapLinear;
         assert_eq!(o.weights(&(0..5), 10, 2), vec![1.0, 1.0, 1.0, 1.0, 1e-37]);
         assert_eq!(o.weights(&(5..10), 10, 3), vec![1e-37, 0.5, 1.0, 1.0, 1.0]);
+    }
+
+    /// A blend over rows laid out with time outermost (a DWD adapter's features, `[t, tokens, width]`) weighs each
+    /// latent as the video's blend does.
+    #[test]
+    fn feature_blend_weighs_like_the_video() {
+        let sh = Shape::new(64, 64, 260);
+        let per = 3;
+        for fuse in [Fuse::Pyramid, Fuse::Relative, Fuse::Flat, Fuse::OverlapLinear] {
+            let c = cw(56, 22, fuse);
+            // every window predicts a constant of its own, on every video value and every feature of its latents
+            let mut video = c.video_blend(&sh, VCH, sh.h * sh.w);
+            let mut feats = c.video_blend(&sh, 1, per);
+            for (i, w) in c.windows(&sh).iter().enumerate() {
+                let v = i as f32 * 10.0 + 1.0;
+                video.add(&w.video, &vec![v; VCH * w.video.len() * sh.h * sh.w]).unwrap();
+                feats.add(&w.video, &vec![v; w.video.len() * per]).unwrap();
+            }
+            let (video, feats) = (video.finish().unwrap(), feats.finish().unwrap());
+            for t in 0..sh.t {
+                let want = video[t * sh.h * sh.w];
+                assert!(feats[t * per..(t + 1) * per].iter().all(|f| (f - want).abs() <= 1e-5 * want), "{fuse:?} at {t}");
+            }
+        }
+    }
+
+    #[test]
+    fn blend_needs_every_latent() {
+        let mut b = Blend::new(Fuse::Pyramid, 1, 2, 10, 2);
+        b.add(&(0..6), &[1.0; 12]).unwrap();
+        assert!(b.add(&(6..10), &[1.0; 6]).is_err());
+        assert!(b.finish().is_err());
     }
 
     /// Every fuse method blends identical windows back to the input.
@@ -327,7 +398,7 @@ mod tests {
         for fuse in [Fuse::Pyramid, Fuse::Relative, Fuse::Flat, Fuse::OverlapLinear] {
             let c = cw(56, 22, fuse);
             let mut calls = 0;
-            let out = c.run(&x, &sh, |p, ws| {
+            let out = c.run(&x, &sh, |p, _, ws| {
                 calls += 1;
                 assert_eq!(p.len(), ws.video_len() + ws.audio_len());
                 Ok(p.to_vec())

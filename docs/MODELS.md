@@ -542,8 +542,13 @@ matter: 25 of the 50 blocks were streamed, and the waits for their copies came t
 of the step, run at about 230 TOPS, near this card's int8 peak. These int8 runs sampled, but their clips weren't
 watched, and int8 and flash weren't compared on H3. Nothing above 768x512 or 124 frames was tried.
 
-Compared with ComfyUI on the same noise, the context is within 8.6e-4, and the first step within 3.4% on video and 13% on audio. Frames come to 21 dB with the same composition.
+Compared with ComfyUI on the same noise, the context is within 8.6e-4, and the first step within 3.4% on video. Frames come to 21 dB with the same composition.
 That gap is rounding: both engines are about 1.2% from an exact float32 run of the token refiner (`tools/h3_refiner_check.py`), and differ by 1.5% from each other because their int8 activations round differently.
+The audio's first-step figure isn't given, because it was measured on the denoised latent: at sigma 1 that is the noise
+less a velocity of nearly the same size, since the audio's predicted latent is small, so it multiplies the network's
+error several times (it read 13% here). In the same trace the audio rows' hidden states after the last block were 3.75%
+from ComfyUI's, closer than the video's 6.2%. `tools/h3_cmp.py` now also prints the network's own outputs; they haven't
+been measured again.
 The audio hasn't been listened to or judged by ear. `tools/h3_ref.py` and `tools/h3_cmp.py` repeat the comparison.
 
 The LoRA's diffusers file, `minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors`, matches no key here or in ComfyUI. Use the `_comfyui` file.
@@ -562,13 +567,13 @@ Reference videos work in SwarmUI per the maintainer; only the CLI runs below wer
 Compared with ComfyUI (`tools/h3_ref.py --ref-image` or `--ref-video`, then `tools/h3_cmp.py`), the base model with no
 LoRA, 640x640, 22 frames, seed 11, the same noise, one reference of 640x640:
 
-| Reference | Text encoder output | Reference latent | First evaluation, video / audio |
+| Reference | Text encoder output | Reference latent | First evaluation, video |
 |---|---|---|---|
-| A picture (a clip's first frame) | 2.3% | 0.12% | 4.3% / 19% |
-| A 22-frame clip | 1.5% | 0.13% | 4.3% / 20% |
+| A picture (a clip's first frame) | 2.3% | 0.12% | 4.3% |
+| A 22-frame clip | 1.5% | 0.13% | 4.3% |
 
 Before 2026-11-24 the vision tower's DeepStack features were overwritten on the 32B tower, whose merger is wider than the
-4B's and 8B's: the text encoder output was 108% from ComfyUI's with a picture, and the first evaluation 9.7% / 40%.
+4B's and 8B's: the text encoder output was 108% from ComfyUI's with a picture, and the first evaluation 9.7% on video.
 Pictures still showed in the clips, through the merged tokens and the reference rows.
 
 * **Pictures** go through the 32B text encoder's vision tower (the 8B's tower with a 5120-wide merger, under `visual.`),
@@ -639,8 +644,8 @@ clip no longer than one window samples as it would without the node. Other famil
 
 The windows, the audio split and FreeNoise were checked against ComfyUI's own functions (`cargo test --lib h3window`). On
 the CLI, 384x384, 260 frames (77 latents), the turbo LoRA's 4 steps and windows of 124 and 39 frames, against
-`tools/h3_ref.py --context-windows 124,39` on the same noise, the first fused evaluation is within 4.6% on video and 11.3%
-on audio. That is close to the 3.4% and 13% without windows, and the error is flat across the clip, with no rise where
+`tools/h3_ref.py --context-windows 124,39` on the same noise, the first fused evaluation is within 4.6% on video, close to
+the 3.4% without windows, and the error is flat across the clip, with no rise where
 windows meet. Decoded with ComfyUI's VAE, the two clips have the same composition at 16.6 dB. Both break up into blocks and
 streaks in the later windows, so that comes from context windows at 4 steps, not from this port. Through SwarmUI with the
 same settings, sampling took 18.4 s for the 4 steps, against ComfyUI's 41.4 s on its warm second run. Other sizes,

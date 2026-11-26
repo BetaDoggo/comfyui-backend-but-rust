@@ -30,6 +30,20 @@ if "denoised0" in o and "step0_out" in r:
         print("step 0 sigma", r["step0_sigma"].flatten()[:2].tolist(), "shapes", r["step0_in"].shape, r["step0_out"].shape)
     print(f"step 0 denoised video rel {rel(d[:n], ref[:n]):.3e}, audio rel {rel(d[n:], ref[n:]):.3e}")
     print(f"step 0 norms ours {d[:n].norm():.1f} / {d[n:].norm():.1f}, ref {ref[:n].norm():.1f} / {ref[n:].norm():.1f}")
+    if "step0_in" in r:
+        # Near sigma 1 the audio's denoised pack is the noise minus a velocity of almost the same size, so its relative
+        # error is several times the network's own. Undo denoised = x - sigma * v, and on audio ModelSamplingAV's carry
+        # (H3's shifts 12 and 3), to compare the network's outputs. Both runs start from the reference's input.
+        x, sv = r["step0_in"].flatten(), r["step0_sigma"].flatten()[0].item()
+        base = sv / (12.0 + sv * (1.0 - 12.0))
+        sa, s = 3.0 * base / (1.0 + 2.0 * base), 12.0 / 3.0
+
+        def net(den):
+            v = (x - den) / sv
+            return v[:n], (v[n:] - (1.0 - s) * (sa / sv) * x[n:]) / (1.0 + (s - 1.0) * sa)
+
+        (ov, oa), (rv, ra) = net(d), net(ref)
+        print(f"step 0 network output video rel {rel(ov, rv):.3e}, audio rel {rel(oa, ra):.3e}")
 for name, rk in [("ctx", "ctx"), ("b0.out_proj.in", "b0.out_proj.in")] + [(f"b{i}.out", f"b{i}.out") for i in range(50)]:
     if name in o and rk in r:
         a, b = o[name].float().flatten(), r[rk].float().flatten()

@@ -11,7 +11,7 @@
 //! The layers are int8 ConvRot like the video VAE's, and run with its kernels: int8 attention in the windows, exact
 //! attention for the global rows, as ComfyUI does.
 
-use crate::cuda::{DevBuf, Stream};
+use crate::cuda::{DevBuf, Event, PinnedBuf, Stream};
 use crate::ffi::{k, null, off, s, DT_BF16, PM, PRO_LN_AFFINE, PRO_PLAIN, PRO_RMS, PRO_SWIGLU};
 use crate::h3vae::Clip;
 use crate::offload::{plan, Layout, Plan, WeightSet};
@@ -44,13 +44,36 @@ const PAIRS: usize = 24;
 const MAX_WINDOWS: usize = 32;
 /// Rows each norm, quantization and GEMM runs at once, for the size of their buffers.
 const CHUNK_ROWS: usize = 16384;
+/// Bytes of each of the two pinned buffers the frames download through.
+const STAGE_BYTES: usize = 32 << 20;
 /// `RGBColorEncoder`'s affine codec of the head's ImageNet-normalized RGB, to [-1, 1].
 const COLOR_MEAN: [f32; 3] = [-0.03, -0.088, -0.188];
 const COLOR_STD: [f32; 3] = [0.458, 0.448, 0.45];
 
-/// True if `st` holds a DWD pixel head this module runs.
-pub fn has_head(st: &SafeTensors) -> bool {
-    st.has(&format!("{PREFIX}register_tokens"))
+/// The DWD pixel head in `st` is one this module runs, on features `width` wide: checked from the header alone, so an
+/// adapter is refused when it applies rather than after sampling. Returns the head's layer count.
+pub fn check(st: &SafeTensors, width: usize) -> Result<usize> {
+    let n = |x: &str| format!("{PREFIX}{x}");
+    ensure!(st.has(&n("register_tokens")), "a DWD adapter without the pixel head this engine runs (no {PREFIX}register_tokens)");
+    let layers = (0..).take_while(|i| st.has(&n(&format!("blocks.{i}.attn.to_qkv.weight")))).count();
+    ensure!(layers > 0, "a DWD pixel head without layers");
+    let shape = |x: &str| st.info(&n(x)).map(|i| i.shape.clone());
+    if shape("feature_expand.weight")? != [4 * D, width] || shape("register_tokens")? != [1, REGISTERS, D]
+        || shape("first_frame_proj_out.weight")? != [3 * FIRST_T * PATCH * PATCH, D] || shape("proj_out.weight")? != [3 * PATCH_T * PATCH * PATCH, D]
+    {
+        bail!("a DWD pixel head of another shape than pi-H3's (Sol tokens {D} wide, 2x2 per H3 token, features {width} wide)");
+    }
+    for i in 0..layers {
+        let b = |x: &str| n(&format!("blocks.{i}.{x}"));
+        for (m, want) in [("attn.to_qkv", [QKV, D]), ("attn.to_out", [D, D]), ("ff.w1", [2 * FF, D]), ("ff.w2", [D, FF])] {
+            let q = st.bytes(&b(&format!("{m}.comfy_quant"))).ok().and_then(|v| serde_json::from_slice::<serde_json::Value>(v).ok());
+            if !q.is_some_and(|q| q["format"] == "int8_tensorwise" && q["convrot"] == true && q["convrot_groupsize"] == 256) {
+                bail!("{}: the DWD head runs int8 ConvRot weights with 256-wide groups, as the int8_convrot adapters have them", b(m));
+            }
+            ensure!(shape(&format!("blocks.{i}.{m}.weight"))? == want, "{}: a DWD head layer of another shape than pi-H3's", b(m));
+        }
+    }
+    Ok(layers)
 }
 
 /// Rough VRAM [`Refiner::decode`] takes for a `(t, th, tw)` H3 token grid, besides the features and the layers.
@@ -86,6 +109,8 @@ struct Batch {
 /// (t, y, x) order and then its global rows.
 struct Geometry {
     rows: Vec<(usize, usize)>,
+    /// runs of consecutive blocks with the same row count: (first row, rows per block, blocks)
+    global_runs: Vec<(usize, usize, usize)>,
     /// rope tables of the plain and the shifted layers, a row of `PAIRS` (cos, sin) per row
     rope: [DevBuf; 2],
     windows: [Vec<Batch>; 2],
@@ -105,6 +130,22 @@ fn geometry((t, h, w): (usize, usize, usize), st: &Stream) -> Result<Geometry> {
     for (sp, stt) in [(0, 0), (WINDOW / 2, TIME_SHIFT)] {
         // window-local ids in [-1, 1], in the activations' bf16; the global rows keep 0, no rotation
         let id = |i: usize, o: usize, m: usize| bf16::from_f32((((i + o) % m) as f32 + 0.5) / m as f32 * 2.0 - 1.0).to_f32();
+        // an axis's 8 (cos, sin) pairs depend on its window-local position alone: `m` of them per axis
+        let axis = |o: usize, m: usize| -> Vec<[f32; 16]> {
+            (0..m)
+                .map(|i| {
+                    let v = id(i, o, m);
+                    let mut p = [0f32; 16];
+                    for (j, fr) in inv.iter().enumerate() {
+                        let ang = 2.0 * std::f32::consts::PI * v * fr;
+                        p[j * 2] = bf16::from_f32(ang.cos()).to_f32();
+                        p[j * 2 + 1] = bf16::from_f32(ang.sin()).to_f32();
+                    }
+                    p
+                })
+                .collect()
+        };
+        let (at, ay, ax) = (axis(stt, BLOCK), axis(sp, WINDOW), axis(sp, WINDOW));
         let mut table = vec![0f32; n * PAIRS * 2];
         for r in table.chunks_exact_mut(2) {
             r[0] = 1.0;
@@ -113,19 +154,13 @@ fn geometry((t, h, w): (usize, usize, usize), st: &Stream) -> Result<Geometry> {
             for y in 0..h {
                 for x in 0..w {
                     let dst = &mut table[row(f, y, x) * PAIRS * 2..][..PAIRS * 2];
-                    for (a, v) in [id(f, stt, BLOCK), id(y, sp, WINDOW), id(x, sp, WINDOW)].into_iter().enumerate() {
-                        for (j, fr) in inv.iter().enumerate() {
-                            let ang = 2.0 * std::f32::consts::PI * v * fr;
-                            dst[(a * 8 + j) * 2] = bf16::from_f32(ang.cos()).to_f32();
-                            dst[(a * 8 + j) * 2 + 1] = bf16::from_f32(ang.sin()).to_f32();
-                        }
-                    }
+                    dst[..16].copy_from_slice(&at[f % BLOCK]);
+                    dst[16..32].copy_from_slice(&ay[y % WINDOW]);
+                    dst[32..].copy_from_slice(&ax[x % WINDOW]);
                 }
             }
         }
-        let d = DevBuf::alloc_async(table.len() * 4, st)?;
-        d.upload(0, &f32_bytes(&table), st)?;
-        rope.push(d);
+        rope.push(table);
         // every window, keyed by its query and key counts
         let mut groups: Vec<((usize, usize), Vec<i32>, Vec<i32>)> = Vec::new();
         for (t0, t1) in spans(t, stt, BLOCK) {
@@ -149,20 +184,36 @@ fn geometry((t, h, w): (usize, usize, usize), st: &Stream) -> Result<Geometry> {
                 }
             }
         }
-        let mut batches = Vec::with_capacity(groups.len());
-        for ((lq, lk), q, k) in groups {
-            let up = |v: &[i32]| -> Result<DevBuf> {
-                let d = DevBuf::alloc_async(v.len() * 4, st)?;
-                d.upload(0, &v.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>(), st)?;
-                Ok(d)
-            };
-            batches.push(Batch { lq, lk, n: q.len() / lq, q: up(&q)?, k: up(&k)? });
-        }
-        windows.push(batches);
+        windows.push(groups);
     }
+    // the uploads wait for the stream, so they come after all the host work, which runs behind the GPU's
+    let rope = rope
+        .iter()
+        .map(|table| -> Result<DevBuf> {
+            let d = DevBuf::alloc_async(table.len() * 4, st)?;
+            d.upload(0, &f32_bytes(table), st)?;
+            Ok(d)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let up = |v: &[i32]| -> Result<DevBuf> {
+        let d = DevBuf::alloc_async(v.len() * 4, st)?;
+        d.upload(0, &v.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>(), st)?;
+        Ok(d)
+    };
+    let windows = windows
+        .into_iter()
+        .map(|groups| groups.into_iter().map(|((lq, lk), q, k)| Ok(Batch { lq, lk, n: q.len() / lq, q: up(&q)?, k: up(&k)? })).collect::<Result<Vec<_>>>())
+        .collect::<Result<Vec<_>>>()?;
     let [r0, r1]: [DevBuf; 2] = rope.try_into().map_err(|_| anyhow::anyhow!("two rope tables"))?;
     let [w0, w1]: [Vec<Batch>; 2] = windows.try_into().map_err(|_| anyhow::anyhow!("two window sets"))?;
-    Ok(Geometry { rows, rope: [r0, r1], windows: [w0, w1] })
+    let mut global_runs: Vec<(usize, usize, usize)> = Vec::new();
+    for &(a, b) in &rows {
+        match global_runs.last_mut() {
+            Some(r) if r.1 == b - a => r.2 += 1,
+            _ => global_runs.push((a, b - a, 1)),
+        }
+    }
+    Ok(Geometry { rows, global_runs, rope: [r0, r1], windows: [w0, w1] })
 }
 
 pub struct Refiner {
@@ -171,6 +222,10 @@ pub struct Refiner {
     gl: Layout,
     /// width of the features: H3's hidden size
     width: usize,
+    /// threads that convert the downloaded frames
+    threads: usize,
+    /// the pinned buffers of [`Self::download`], made on the first decode
+    stage: Option<[PinnedBuf; 2]>,
     prof: crate::prof::Prof,
 }
 
@@ -178,25 +233,15 @@ impl Refiner {
     /// The head's tensors in a pi-H3 DWD adapter. The layers take no VRAM until [`Self::place`].
     pub fn load(st: &Arc<SafeTensors>, threads: usize, st0: &Stream) -> Result<Self> {
         let n = |x: &str| format!("{PREFIX}{x}");
-        let layers = (0..).take_while(|i| st.has(&n(&format!("blocks.{i}.attn.to_qkv.weight")))).count();
-        ensure!(layers > 0, "a DWD pixel head without layers");
         let fe = st.info(&n("feature_expand.weight"))?.shape.clone();
-        let shape = |x: &str| st.info(&n(x)).map(|i| i.shape.clone());
-        if fe.len() != 2 || fe[0] != 4 * D || shape("register_tokens")? != [1, REGISTERS, D] || shape("first_frame_proj_out.weight")? != [3 * FIRST_T * PATCH * PATCH, D]
-            || shape("proj_out.weight")? != [3 * PATCH_T * PATCH * PATCH, D] || shape("blocks.0.attn.to_qkv.weight")? != [QKV, D]
-        {
-            bail!("a DWD pixel head of another shape than pi-H3's (Sol tokens {D} wide, 2x2 per H3 token)");
-        }
+        ensure!(fe.len() == 2, "a DWD feature expansion of shape {fe:?}");
+        let layers = check(st, fe[1])?;
         let mut lay = Vec::with_capacity(layers);
         for i in 0..layers {
             let b = |x: &str| n(&format!("blocks.{i}.{x}"));
             let mut l = Layout::new();
             for (key, m) in [("qkv", "attn.to_qkv"), ("o", "attn.to_out"), ("w1", "ff.w1"), ("w2", "ff.w2")] {
                 let weight = b(&format!("{m}.weight"));
-                let q = st.bytes(&b(&format!("{m}.comfy_quant"))).ok().and_then(|v| serde_json::from_slice::<serde_json::Value>(v).ok());
-                if !q.is_some_and(|q| q["format"] == "int8_tensorwise" && q["convrot"] == true && q["convrot_groupsize"] == 256) {
-                    bail!("{}: the DWD head runs int8 ConvRot weights with 256-wide groups, as the int8_convrot adapters have them", b(m));
-                }
                 l.raw(st, &format!("w_{key}"), &[weight])?;
                 l.raw(st, &format!("s_{key}"), &[b(&format!("{m}.weight_scale"))])?;
                 l.bf16(st, &format!("b_{key}"), &[b(&format!("{m}.bias"))])?;
@@ -222,7 +267,7 @@ impl Refiner {
         let globals = DevBuf::alloc(gl.size)?;
         globals.upload(0, &host, st0)?;
         st0.sync()?;
-        Ok(Refiner { ws, globals, gl, width: fe[1], prof: crate::prof::Prof::new() })
+        Ok(Refiner { ws, globals, gl, width: fe[1], threads, stage: None, prof: crate::prof::Prof::new() })
     }
 
     /// Width of the features it reads.
@@ -251,18 +296,29 @@ impl Refiner {
         let hw = h * w;
         let tokens = t * th * tw;
         ensure!(features.size() >= tokens * self.width * 2, "DWD features of {} bytes for {tokens} tokens", features.size());
-        let geo = geometry((t, h, w), st)?;
-        let n = geo.rows.last().map_or(0, |r| r.1);
-        let di = D as i64;
+        // the frames' host memory, written once on another thread while the GPU works: a fresh allocation's page
+        // faults would otherwise land on the download
+        let frames = t * PATCH_T - (PATCH_T - FIRST_T) * t.div_ceil(BLOCK);
+        let len = 3 * frames * h * PATCH * w * PATCH;
+        let host = std::thread::spawn(move || {
+            let mut v = Vec::with_capacity(len);
+            v.resize(len, 0f32);
+            v
+        });
 
         // feature_expand, then the rows of x gathered from its outputs: each H3 token's four Sol tokens, and the
-        // register and zero rows after them
+        // register and zero rows after them. The GEMM runs while the host builds the geometry.
         let src_rows = tokens * 4 + S;
         let e = DevBuf::alloc_async(src_rows * D * 2, st)?;
         k!(gpu_gemm(features.ptr(), self.width as i64, self.g("feature_expand.weight"), self.width as i64, e.ptr(), (4 * D) as i64, self.g("feature_expand.bias"),
             tokens as i64, (4 * D) as i64, self.width as i64, 1, DT_BF16, DT_BF16, 1.0, 0.0, s(st)))?;
         crate::cuda::memcpy_d2d(off(e.ptr(), tokens * 4 * D * 2), self.g("register_tokens"), REGISTERS * D * 2, st)?;
-        e.upload((tokens * 4 + REGISTERS) * D * 2, &vec![0u8; D * 2], st)?;
+        e.upload((tokens * 4 + REGISTERS) * D * 2, &[0u8; D * 2], st)?;
+        let tg = std::time::Instant::now();
+        let geo = geometry((t, h, w), st)?;
+        self.prof.host("geometry", tg);
+        let n = geo.rows.last().map_or(0, |r| r.1);
+        let di = D as i64;
         let mut idx = vec![0i32; n];
         for (b, &(r0, r1)) in geo.rows.iter().enumerate() {
             let frames = (r1 - r0 - S) / hw;
@@ -303,7 +359,7 @@ impl Refiner {
         let gbuf = DevBuf::alloc_async(gather * QKV * 2, st)?;
         let obuf = DevBuf::alloc_async(wout * D * 2, st)?;
         let ws = DevBuf::alloc_async(wsz, st)?;
-        let lse = DevBuf::alloc_async(HEADS * S * 4, st)?;
+        let lse = DevBuf::alloc_async(geo.rows.len() * HEADS * S * 4, st)?;
         let (xp, q) = (x.ptr(), qkv.ptr());
         let (rs, hs) = (QKV as i64, (3 * DH) as i64);
         let sc = 1.0 / (DH as f32).sqrt();
@@ -331,12 +387,13 @@ impl Refiner {
                     kbs, rs, hs, kbs, rs, hs, kbs, rs, hs, obs, di, DH as i64, sc, s(st)))?;
                 k!(gpu_scatter_rows(obuf.ptr(), (D * 2) as i64, bt.q.ptr() as _, (bt.n * bt.lq) as i32, attn.ptr(), s(st)))?;
             }
-            // the global rows attend to their whole block, exactly
-            for &(r0, r1) in &geo.rows {
-                let (gq, kb) = (off(q, (r1 - S) * QKV * 2), off(q, r0 * QKV * 2));
-                let lk = (r1 - r0) as i32;
-                k!(gpu_flash_attn_d(gq, off(kb, DH * 2), off(kb, 2 * DH * 2), off(attn.ptr(), (r1 - S) * D * 2), lse.ptr(), 1, S as i32, lk, HEADS as i32, HEADS as i32,
-                    DH as i32, 0, rs, hs, 0, rs, hs, 0, rs, hs, 0, di, DH as i64, sc, 0, s(st)))?;
+            // the global rows attend to their whole block, exactly: one call per run of same-sized blocks, which lie
+            // evenly spaced, so the calls fill the GPU rather than one block's 32 heads at a time
+            for &(r0, lk, nblk) in &geo.global_runs {
+                let (gq, kb) = (off(q, (r0 + lk - S) * QKV * 2), off(q, r0 * QKV * 2));
+                let (qbs, obs) = ((lk * QKV) as i64, (lk * D) as i64);
+                k!(gpu_flash_attn_d(gq, off(kb, DH * 2), off(kb, 2 * DH * 2), off(attn.ptr(), (r0 + lk - S) * D * 2), lse.ptr(), nblk as i32, S as i32, lk as i32,
+                    HEADS as i32, HEADS as i32, DH as i32, qbs, rs, hs, qbs, rs, hs, qbs, rs, hs, obs, di, DH as i64, sc, 0, s(st)))?;
             }
             self.prof.mark("attn", st)?;
             for &(r0, r1) in &chunks {
@@ -354,11 +411,11 @@ impl Refiner {
         drop((qkv, a8, asc, hid, gbuf, obuf, ws));
 
         // norm_out and the pixel projections, block by block
-        let frames: usize = geo.rows.iter().map(|&(r0, r1)| FIRST_T + ((r1 - r0 - S) / hw - 1) * PATCH_T).sum();
-        let mut clip = Clip { c: 3, t: frames, h: h * PATCH, w: w * PATCH, data: vec![0.0; 3 * frames * h * PATCH * w * PATCH] };
+        debug_assert_eq!(frames, geo.rows.iter().map(|&(r0, r1)| FIRST_T + ((r1 - r0 - S) / hw - 1) * PATCH_T).sum::<usize>());
+        let mut clip = Clip { c: 3, t: frames, h: h * PATCH, w: w * PATCH, data: Vec::new() };
         let (first_n, rest_n) = (3 * FIRST_T * PATCH * PATCH, 3 * PATCH_T * PATCH * PATCH);
         let out = DevBuf::alloc_async(block_rows * rest_n * 2, st)?;
-        let pix = DevBuf::alloc_async(clip.data.len() * 2, st)?;
+        let pix = DevBuf::alloc_async(len * 2, st)?;
         let mut f0 = 0;
         for &(r0, r1) in &geo.rows {
             let lat = (r1 - r0 - S) / hw;
@@ -379,12 +436,46 @@ impl Refiner {
         }
         self.prof.mark("head", st)?;
         let t0 = std::time::Instant::now();
-        let mut half = vec![f16::ZERO; clip.data.len()];
-        pix.download(0, unsafe { std::slice::from_raw_parts_mut(half.as_mut_ptr().cast::<u8>(), half.len() * 2) }, st)?;
-        half.convert_to_f32_slice(&mut clip.data);
+        clip.data = host.join().map_err(|_| anyhow::anyhow!("the frames' host buffer"))?;
+        self.download(&pix, &mut clip.data, st)?;
         self.prof.host("download", t0);
         self.prof.report("dwd", st)?;
         Ok(clip)
+    }
+
+    /// fp16 `pix` to `out` in f32, through two pinned staging buffers: one chunk converts on every thread while the
+    /// next copies. A pageable copy of a whole clip runs at a few GB/s, and its conversion on one thread as long again.
+    fn download(&mut self, pix: &DevBuf, out: &mut [f32], st: &Stream) -> Result<()> {
+        if self.stage.is_none() {
+            self.stage = Some([PinnedBuf::alloc(STAGE_BYTES)?, PinnedBuf::alloc(STAGE_BYTES)?]);
+        }
+        let stage = self.stage.as_ref().unwrap();
+        let per = STAGE_BYTES / 2;
+        let chunks: Vec<(usize, usize)> = (0..out.len()).step_by(per).map(|a| (a, (a + per).min(out.len()))).collect();
+        let done = [Event::new()?, Event::new()?];
+        let copy = |i: usize| -> Result<()> {
+            let (a, b) = chunks[i];
+            crate::cuda::memcpy_2d_d2h(stage[i % 2].ptr(), (b - a) * 2, off(pix.ptr(), a * 2), (b - a) * 2, (b - a) * 2, 1, st)?;
+            done[i % 2].record(st)
+        };
+        if !chunks.is_empty() {
+            copy(0)?;
+        }
+        let threads = self.threads.max(1);
+        for (i, &(a, b)) in chunks.iter().enumerate() {
+            if i + 1 < chunks.len() {
+                copy(i + 1)?;
+            }
+            done[i % 2].sync()?;
+            let src = unsafe { std::slice::from_raw_parts(stage[i % 2].ptr().cast::<f16>(), b - a) };
+            let part = (b - a).div_ceil(threads);
+            std::thread::scope(|sc| {
+                for (s, d) in src.chunks(part).zip(out[a..b].chunks_mut(part)) {
+                    sc.spawn(move || s.convert_to_f32_slice(d));
+                }
+            });
+        }
+        Ok(())
     }
 }
 
@@ -398,5 +489,17 @@ mod tests {
         assert_eq!(spans(32, 8, 16), vec![(0, 8), (8, 24), (24, 32)]);
         assert_eq!(spans(2, 2, 5), vec![(0, 2)]);
         assert_eq!(spans(12, 2, 5), vec![(0, 3), (3, 8), (8, 12)]);
+    }
+
+    /// Reads only the headers of pi-H3's int8 ConvRot DWD adapters in `$MODELS_ROOT/Lora`.
+    #[test]
+    #[ignore]
+    fn check_takes_the_pi_h3_adapters() {
+        let root = std::path::PathBuf::from(std::env::var("MODELS_ROOT").expect("MODELS_ROOT")).join("Lora");
+        for steps in [2, 4] {
+            let st = SafeTensors::open(&root.join(format!("pi_h3_{steps}step_dwd_adapter_int8_convrot.safetensors"))).unwrap();
+            assert_eq!(check(&st, 5376).unwrap(), 8);
+            assert!(check(&st, 4096).is_err());
+        }
     }
 }

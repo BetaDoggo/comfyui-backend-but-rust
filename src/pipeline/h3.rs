@@ -627,6 +627,12 @@ impl Generator {
             // ComfyUI-piFlow only decodes an evaluation of one positive entry, and finds no pixels otherwise
             return Err(lora::Unsupported("several positive conditioning entries with a DWD adapter".into()).into());
         }
+        if dwd && r.sampling.uses_negative() {
+            // the head decodes the positive evaluation's features alone, so its frames would ignore the guidance the
+            // latent got; ComfyUI-piFlow finds no pixels when cond and uncond run together
+            let what = format!("CFG {} or the {} sampler with a DWD adapter (it runs at CFG 1, without the negative prompt)", r.sampling.cfg, r.sampling.sampler);
+            return Err(lora::Unsupported(what).into());
+        }
         let conditioned = |c: &H3Conds| !c.keyframes.is_empty() || c.pictures.iter().any(|p| p.latent.is_some()) || c.videos.iter().any(|v| v.latent.is_some());
         if r.conds.iter().any(conditioned) && (windowed || r.sparse.is_some()) {
             bail!("keyframes and reference pictures or videos with context windows or sparse attention");

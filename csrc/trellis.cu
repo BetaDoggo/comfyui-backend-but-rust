@@ -181,8 +181,33 @@ __global__ void gather_rows_kernel(const uint16_t* x, int64_t w, const int* idx,
     out[t] = x[(int64_t)idx[i] * w + c];
 }
 
+// The two kernels for rows of whole 16-byte words: a block per row and 16 bytes per thread, so wide rows (attention's
+// q, k and v) move at the memory's speed. `scatter` writes out[idx[i]] = x[i] instead.
+template <bool scatter>
+__global__ void move_rows16_kernel(const uint4* x, int64_t w, const int* idx, uint4* out) {
+    const int64_t i = blockIdx.x, j = idx[i];
+    const uint4* src = x + (scatter ? i : j) * w;
+    uint4* dst = out + (scatter ? j : i) * w;
+    for (int64_t c = threadIdx.x; c < w; c += blockDim.x) dst[c] = src[c];
+}
+
+static bool rows16(const void* x, int64_t bytes, const void* out) {
+    return bytes % 16 == 0 && ((uintptr_t)x | (uintptr_t)out) % 16 == 0;
+}
+
+template <bool scatter>
+static void move_rows16(const void* x, int64_t bytes, const int* idx, int n, void* out, void* stream) {
+    if (n > 0 && bytes > 0)
+        move_rows16_kernel<scatter><<<(unsigned)n, 128, 0, (cudaStream_t)stream>>>((const uint4*)x, bytes / 16, idx, (uint4*)out);
+}
+
 GPU_API int gpu_gather_rows(const void* x, int64_t bytes, const int* idx, int n, void* out, void* stream) {
     if (bytes % 2) return -1;
+    if (rows16(x, bytes, out)) {
+        move_rows16<false>(x, bytes, idx, n, out, stream);
+        KCHECK();
+        return 0;
+    }
     const int64_t total = (int64_t)n * (bytes / 2);
     if (total > 0)
         gather_rows_kernel<<<(unsigned)((total + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const uint16_t*)x, bytes / 2, idx,
@@ -201,6 +226,11 @@ __global__ void scatter_rows_kernel(const uint16_t* x, int64_t w, const int* idx
 
 GPU_API int gpu_scatter_rows(const void* x, int64_t bytes, const int* idx, int n, void* out, void* stream) {
     if (bytes % 2) return -1;
+    if (rows16(x, bytes, out)) {
+        move_rows16<true>(x, bytes, idx, n, out, stream);
+        KCHECK();
+        return 0;
+    }
     const int64_t total = (int64_t)n * (bytes / 2);
     if (total > 0)
         scatter_rows_kernel<<<(unsigned)((total + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const uint16_t*)x, bytes / 2, idx,

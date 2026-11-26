@@ -351,7 +351,9 @@ so they ran one GEMM per segment. They now run one GEMM over every row, and `gpu
 gate, rounded as the residual epilogue rounds, so the results are the same bits. The audio decoder's wide convolutions
 are tiled through shared memory in the same summation order, and its weights stay in pinned RAM between clips. A DWD
 head streams through the cast buffers like a text encoder, so it doesn't push the blocks out of VRAM, runs its norms
-and GEMMs over all rows at once, and writes its frames on the GPU, in fp16.
+and GEMMs over all rows at once, and writes its frames on the GPU, in fp16. Its global rows attend in one call per run
+of same-sized blocks, its geometry is built on the host while the feature expansion runs, and the frames come back
+through two pinned buffers, each chunk converted to f32 on every thread while the next copies.
 
 ## Source layout
 

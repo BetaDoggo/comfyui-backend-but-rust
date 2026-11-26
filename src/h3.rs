@@ -932,9 +932,16 @@ impl Dit {
                 if w.len() != 2 * F * self.tdim || b.len() != 2 * F {
                     bail!("a DWD output norm of {} values, not MiniMax H3's", w.len());
                 }
+                // the head runs only after sampling: refuse one it can't run now, not after the whole clip
+                crate::h3dwd::check(a, F)?;
                 Some(DwdNorm { w, b })
             }
-            None => None,
+            None => {
+                if ad.is_some_and(|a| a.tensors.keys().any(|k| k.starts_with("dwd_pixel_refiner."))) {
+                    bail!("a DWD pixel head without its output norm (dwd_norm_out), so it has no features to decode");
+                }
+                None
+            }
         };
         self.dwd_features = None;
         Ok(())

@@ -749,7 +749,10 @@ the VAE.
 Context windows blend the windows' DWD features before the head, see [Context windows](#context-windows). A DWD run
 never falls back to the VAE: sampling fails if no evaluation at the last step kept features. Refused with a DWD adapter: more than one LakonLab adapter at
 once, regional prompts (more than one
-positive entry), HyperFlow and MiniMax-H3-Image. ComfyUI's `SamplerCustomAdvanced` graph, ComfyUI-piFlow's own
+positive entry), HyperFlow, MiniMax-H3-Image, and CFG other than 1 or a sampler that reads the negative prompt, since
+the head decodes the positive evaluation alone and its frames would ignore the guidance. The pixel head is checked
+(layers, shapes, int8 ConvRot format, feature width) when the adapter applies, not after sampling, and an adapter with
+a pixel head but no `dwd_norm_out` is refused. ComfyUI's `SamplerCustomAdvanced` graph, ComfyUI-piFlow's own
 example, isn't supported on the native engine, so use `SwarmKSampler`.
 
 Against ComfyUI-piFlow on SwarmUI's ComfyUI (`tools/pih3_ref.py`), seed 42, the lighthouse prompt above:
@@ -785,6 +788,20 @@ ComfyUI's sampling took 15.08 s. Earlier, through the server at 512x512, 5 frame
 4-step one has the same layout and loads through the same path, but hasn't been compared with ComfyUI. Both work in
 SwarmUI itself. Not tried: the adapters without DWD, anything larger than 512x512 or longer than 22 frames. Audio not
 judged by ear.
+
+The head alone, timed warm with `examples/dwd_bench.rs` on synthetic features (no DiT loaded), before and after
+vectorized row gathers, one batched call for the global rows, and a pinned, multithreaded download of the frames:
+
+| Clip | Before | After |
+|---|---|---|
+| 512x384, 22 frames | 58 ms | 48 ms |
+| 384x384, 260 frames | 480 ms | 397 ms |
+| 1280x704, 124 frames | 1.47 s | 1.18 s |
+
+The frames are the same bytes before and after. At 1280x704, the int8 GEMMs take about 0.8 s and windowed attention
+about 0.12 s, near the card's rate; the row gathers run near its memory bandwidth, and the f16 to f32 conversion of the
+frames takes about 0.12 s. The maintainer confirmed this build, the CFG refusal and the early head check included, in
+SwarmUI itself; the speedups weren't timed there or through the CLI.
 
 ## MiniMax-H3-Image
 

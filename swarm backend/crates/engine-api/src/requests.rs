@@ -113,6 +113,54 @@ pub struct UpscaleImageRequest {
     pub image: ImageBatch,
 }
 
+/// NVIDIA's RTX Video Super Resolution model (the VFX SDK's `VideoSuperRes`), listed among the upscale models. It runs
+/// on NVIDIA's VFX runtime, which sits in the same folder.
+pub const NVIDIA_VSR_MODEL: &str = "nvngx_vsr.dll";
+
+/// How hard one RTX Video Super Resolution pass works: faster to slower and finer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NvidiaVsrLevel {
+    Low,
+    Medium,
+    High,
+    Ultra,
+}
+
+impl NvidiaVsrLevel {
+    /// `LOW`, `MEDIUM`, `HIGH` or `ULTRA`, as the ComfyUI node's combos name them.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "LOW" => Self::Low,
+            "MEDIUM" => Self::Medium,
+            "HIGH" => Self::High,
+            "ULTRA" => Self::Ultra,
+            _ => return None,
+        })
+    }
+}
+
+/// What one RTX Video Super Resolution pass does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NvidiaVsrMode {
+    /// Upscale to the request's size, at least the input's on each side.
+    Upscale(NvidiaVsrLevel),
+    /// Sharpen at the input's size.
+    Deblur(NvidiaVsrLevel),
+}
+
+/// One pass of NVIDIA's RTX Video Super Resolution over every image (`RTXVideoSuperResolution`, which may run a
+/// deblur pass before its upscale, and `ImageUpscaleWithModel` on [`NVIDIA_VSR_MODEL`]). Images are RGB; the result is
+/// `width` x `height`. Frames are independent: the effect keeps no state between them.
+#[derive(Clone, Debug)]
+pub struct NvidiaVsrRequest {
+    /// The [`NVIDIA_VSR_MODEL`] file.
+    pub model: ModelFile,
+    pub images: ImageBatch,
+    pub width: u32,
+    pub height: u32,
+    pub mode: NvidiaVsrMode,
+}
+
 /// `SwarmUnsampler` (Unsampler Prompt): sample *backwards* from the init image towards noise,
 /// over the reversed sigma schedule (`sigmas.flip(0) + 1e-4`), stopping `start_at_step` steps
 /// short, so a forward pass with an edited prompt reproduces the image closely. Zero noise,

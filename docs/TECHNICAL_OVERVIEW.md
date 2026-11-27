@@ -64,6 +64,7 @@ There is no Rust binding to a tensor library. CUDA, NVML and the kernels are cal
 | [SageAttention](https://github.com/thu-ml/SageAttention) | Reaches us through comfy-kitchen, Apache-2.0 | Origin of the INT8 attention, the default for the diffusion models |
 | [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) | Build-time checkout, BSD-3-Clause | bf16 attention, selected with `--attention flash` |
 | NVML, DXCore | NVML linked, DXCore loaded at run time | How much VRAM is really free under Windows |
+| NVIDIA Video Effects SDK | The user's `nvngx_vsr.dll` and its runtime, from the `nvidia-vfx` wheel, loaded at run time from an `upscale_models` folder; NVIDIA's license, never linked or shipped | RTX Video Super Resolution, through the SDK's C API in `src/nvvfx.rs` |
 
 `csrc/compat/` holds small stand-ins for the PyTorch headers that FlashAttention-2 includes, so it builds without
 libtorch. CUTLASS and FlashAttention-2 are not in this repository. The build finds them in

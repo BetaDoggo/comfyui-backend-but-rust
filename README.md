@@ -27,6 +27,7 @@ It really generates with these image, video and image-to-3D models, from specifi
 | Pixal3D | Image to a vertex-coloured 3D mesh (GLB), cutting the object out first with BiRefNet | 40 s per mesh at resolution 1024, 110 s at 1536 | not timed |
 | Idol (TripoSplat) | Image to a 3D gaussian splat (PLY), cutting the object out first with BiRefNet | 14.4 s per splat, 0.57 s/step at CFG 3 | 111 s/step headless here, not tuned |
 | SeedVR2 3B | Restores a picture or clip, as SwarmUI's SeedVR stage | 0.79 s per 1024 restore, DiT 145 ms | DiT 235 ms |
+| RTX Video Super Resolution | NVIDIA's VFX SDK upscaler, up to x4, as ComfyUI's `RTXVideoSuperResolution` node and as an upscale model; works in SwarmUI, byte-identical to the node | 7 to 10 ms per 512x768 frame to 2x, after a 0.6 to 0.9 s load | NVIDIA's own code |
 | Nemotron-Labs-Image | Text to image, written as visual tokens by a 30B-A3B language model; CLI, and SwarmUI through its extension | 99 s per image, 21.8 ms/token; 2 together in 139 s | not in ComfyUI |
 
 The image and video models take every ComfyUI sampler and scheduler and LoRAs, with exceptions listed in
@@ -87,6 +88,13 @@ RelayVSR, video upscaling x2 or x4, uses `diffusion_models/relayvsr_x2_lightx2v_
 `relayvsr_flash_vae_x4_fp32.safetensors`. All four are from [Comfy-Org/RelayVSR](https://huggingface.co/Comfy-Org/RelayVSR).
 In SwarmUI it is a stage added by the [RelayVSR extension](swarm%20backend/relayvsr-extension/README.md). It works in
 SwarmUI, and it has been compared with ComfyUI through the CLI.
+
+RTX Video Super Resolution uses NVIDIA's `nvngx_vsr.dll` in an `upscale_models` folder, such as
+`upscale_models/nvidia-vfx/`, with `cudart64_12.dll`, `NVCVImage.dll`, `nvngxruntime.dll`, `NVVideoEffects.dll` and
+`nvVFXVideoSuperRes.dll` beside it. All six are in the `nvvfx/libs` folder of NVIDIA's `nvidia-vfx` wheel
+(`pip install nvidia-vfx --extra-index-url https://pypi.nvidia.com`), under NVIDIA's license. In SwarmUI it shows as an
+upscale model, and runs the `RTXVideoSuperResolution` node the RTXVSRExtension adds; see
+[Models](docs/MODELS.md#rtx-video-super-resolution).
 
 Idol uses `diffusion_models/idol_fp16.safetensors`, `clip_vision/dino_v3_vit_h_bf16.safetensors`, and
 `VAE/idol_decoder_fp16.safetensors` with the Flux 2 VAE (`flux2-vae.safetensors`, anywhere in `VAE/`), all from

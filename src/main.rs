@@ -352,6 +352,19 @@ struct Args {
     /// BiRefNet: compare every stage with a dump of tools/birefnet_ref.py instead of running
     #[arg(long)]
     birefnet_check: Option<PathBuf>,
+    /// RTX Video Super Resolution: write the image upscaled by --vsr-scale to --output (needs --vsr)
+    #[arg(long)]
+    super_res: Option<PathBuf>,
+    /// NVIDIA's nvngx_vsr.dll, with the VFX runtime beside it (see docs/USAGE.md)
+    #[arg(long)]
+    vsr: Option<PathBuf>,
+    /// RTX Video Super Resolution: scale factor, 1 to 4, rounded to a multiple of 8 pixels as ComfyUI's node does
+    #[arg(long, default_value_t = 2.0)]
+    vsr_scale: f64,
+    /// RTX Video Super Resolution: low | medium | high | ultra, or any nvvfx QualityLevel (deblur-high, denoise-low,
+    /// highbitrate-ultra, ...). Denoise and deblur keep the size and ignore --vsr-scale
+    #[arg(long, default_value = "ultra")]
+    vsr_mode: String,
     /// Run Qwen Image 2.1 (--dit, --te and --vae then default to its files, --shift to its 0.69 at 1024x1024)
     #[arg(long)]
     qwen21: bool,
@@ -437,6 +450,7 @@ const QWEN21_DIT: &str = "Stable-diffusion/rayQwen21_v1Int8Convrot.safetensors";
 const QWEN21_TE: &str = "clip/qwen3vl_8b_int8_convrot.safetensors";
 const QWEN21_VAE: &str = "VAE/QwenImage/qwen_image_2.1_vae_bf16.safetensors";
 const BIREFNET: &str = "background_removal/birefnet.safetensors";
+const NVIDIA_VSR: &str = "upscale_models/nvidia-vfx/nvngx_vsr.dll";
 const PIXAL_DIT: &str = "diffusion_models/Pixal3D/pixal3d_int8_convrot.safetensors";
 const PIXAL_DINO: &str = "clip_vision/dino_v3_L_naf_fp32.safetensors";
 const PIXAL_SHAPE_VAE: &str = "VAE/Pixal3D/trellis_2_shape_vae_bf16.safetensors";
@@ -1262,6 +1276,29 @@ fn run_remove_background(args: &Args, image: &Path) -> Result<()> {
     Ok(())
 }
 
+fn run_super_res(args: &Args, image: &Path) -> Result<()> {
+    use diffusion::nvvfx::{self, Frame, Mode};
+    let model = args.model(&args.vsr, NVIDIA_VSR);
+    let mode = Mode::from_name(&args.vsr_mode).with_context(|| format!("unknown --vsr-mode {}", args.vsr_mode))?;
+    if !mode.same_size() && !(1.0..=4.0).contains(&args.vsr_scale) {
+        bail!("--vsr-scale is 1 to 4, got {}", args.vsr_scale);
+    }
+    let (rgba, w, h) = read_rgba(image)?;
+    let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let out_size = if mode.same_size() { (w, h) } else { nvvfx::node_output_size(w, h, args.vsr_scale) };
+    let t = Instant::now();
+    let mut sr = nvvfx::SuperRes::new(&model, mode, (w, h), out_size)?;
+    eprintln!("[vsr] loaded {} {} in {:.0} ms", model.display(), mode.name(), t.elapsed().as_secs_f64() * 1e3);
+    let t = Instant::now();
+    let out = sr.run(Frame::U8(&rgb))?;
+    eprintln!("[vsr] {w}x{h} to {}x{} in {:.1} ms", out_size.0, out_size.1, t.elapsed().as_secs_f64() * 1e3);
+    let rgba: Vec<u8> = out.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+    let path = if args.out.extension().is_some_and(|e| e == "png") { args.out.clone() } else { args.out.with_extension("png") };
+    write_rgba_png(&path, &rgba, out_size.0, out_size.1)?;
+    eprintln!("saved {}", path.display());
+    Ok(())
+}
+
 fn run_pixal3d(args: &Args, image: &Path) -> Result<()> {
     diffusion::cuda::init(0)?;
     let paths = diffusion::pixal3d::Paths {
@@ -1361,6 +1398,9 @@ fn main() -> Result<()> {
     }
     if let Some(image) = &args.remove_background {
         return run_remove_background(&args, image);
+    }
+    if let Some(image) = &args.super_res {
+        return run_super_res(&args, image);
     }
     if let Some(reference) = &args.qwen21_vae_check {
         return diffusion::vae21::check(&args.model(&args.vae, QWEN21_VAE), reference);

@@ -23,6 +23,7 @@ use diffusion::pipeline::{
     AnimaRequest, Cancelled, Cond, Generator, H3Conds, H3Request, Inpaint, KreaEntry, KreaRequest, LoadOptions, MossRequest, Prompt, Qwen21Request, Reference, Region, Sampling, SdRequest,
     SenseNovaRequest, SeedVrRequest, SizeCond, SnapRefRequest, Step, StyleRequest,
 };
+use diffusion::nvvfx;
 use diffusion::pixal3d;
 use diffusion::triposplat;
 use diffusion::preview;
@@ -162,7 +163,33 @@ pub struct NativeEngine {
     threads: usize,
     /// `--sol3`: the sparse attention every MiniMax H3 generation runs.
     sol3: Option<h3::SparseAttn>,
+    /// The last RTX Video Super Resolution effect, kept while its mode and sizes repeat: loading takes most of a second.
+    vsr: Mutex<Option<nvvfx::SuperRes>>,
 }
+
+/// The VFX SDK's quality level for one pass.
+fn vsr_mode(mode: NvidiaVsrMode) -> nvvfx::Mode {
+    use nvvfx::Mode as M;
+    use NvidiaVsrLevel as L;
+    match mode {
+        NvidiaVsrMode::Upscale(l) => match l {
+            L::Low => M::Low,
+            L::Medium => M::Medium,
+            L::High => M::High,
+            L::Ultra => M::Ultra,
+        },
+        NvidiaVsrMode::Deblur(l) => match l {
+            L::Low => M::DeblurLow,
+            L::Medium => M::DeblurMedium,
+            L::High => M::DeblurHigh,
+            L::Ultra => M::DeblurUltra,
+        },
+    }
+}
+
+/// What `ImageUpscaleWithModel` does with NVIDIA's model, which has no fixed factor: 4x at the best level, like the
+/// usual ESRGAN models, so SwarmUI's resize to the target size afterwards only ever shrinks.
+const VSR_MODEL_SCALE: u32 = 4;
 
 /// RGB f32 `[3, frames, h, w]` in 0..1 to an image batch of `frames` images.
 fn clip_images(clip: &h3vae::Clip, frames: usize) -> ImageBatch {
@@ -1281,7 +1308,64 @@ impl NativeEngine {
             lossy: o.lossy,
             comfy_memory: o.comfy_memory,
         };
-        Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads, sol3: o.sol3.map(|s| s.sparse()) })
+        Ok(Self {
+            gen: Mutex::new(Generator::new(&load)?),
+            live_previews: o.live_previews,
+            threads: o.threads,
+            sol3: o.sol3.map(|s| s.sparse()),
+            vsr: Mutex::new(None),
+        })
+    }
+
+    /// Frees the cached RTX Video Super Resolution effect.
+    fn drop_vsr(&self) {
+        self.vsr.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    /// One RTX Video Super Resolution pass of `mode` over `images`, to `width` x `height`. If the effect can't load or
+    /// run, which is most often the GPU being full, the image models leave VRAM and it's tried once more.
+    fn run_vsr(&self, model: &Path, mode: nvvfx::Mode, images: &ImageBatch, (width, height): (u32, u32), progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        if images.channels != 3 {
+            return Err(unsupported(format!("RTX Video Super Resolution of images with {} channels: it takes RGB", images.channels)));
+        }
+        if images.count == 0 {
+            return Err(EngineError::InvalidInput("RTX Video Super Resolution without images".into()));
+        }
+        let input = (images.width as usize, images.height as usize);
+        let output = (width as usize, height as usize);
+        let mut slot = self.vsr.lock().unwrap_or_else(|e| e.into_inner());
+        let attempt = |slot: &mut Option<nvvfx::SuperRes>, progress: &mut dyn ProgressSink| -> anyhow::Result<Option<Vec<u8>>> {
+            if !slot.as_ref().is_some_and(|s| s.is(model, mode, input, output)) {
+                // the old effect goes first, so its memory is free for the new one
+                *slot = None;
+                *slot = Some(nvvfx::SuperRes::new(model, mode, input, output)?);
+            }
+            let sr = slot.as_mut().expect("loaded above");
+            let mut out = Vec::with_capacity(images.count as usize * output.0 * output.1 * 3);
+            for f in 0..images.count {
+                if progress.interrupted() {
+                    return Ok(None);
+                }
+                let frame = match &images.data {
+                    PixelData::U8(_) => sr.run(nvvfx::Frame::U8(&images.frame_u8(f)))?,
+                    PixelData::F32(_) => sr.run(nvvfx::Frame::F32(&images.frame_f32(f)))?,
+                };
+                out.extend_from_slice(&frame);
+                progress.progress(f + 1, images.count);
+            }
+            Ok(Some(out))
+        };
+        let out = match attempt(&mut slot, progress) {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::warn!("native: RTX Video Super Resolution failed ({e:#}); unloading the image models and trying again");
+                *slot = None;
+                self.gen().unload().map_err(internal)?;
+                attempt(&mut slot, progress).map_err(internal)?
+            }
+        };
+        let out = out.ok_or(EngineError::Interrupted)?;
+        Ok(ImageBatch::from_u8(images.count, height, width, 3, out))
     }
 
     /// SeedVR2's restore of the picture or clip `SeedVR2Conditioning` carries: a clip (`[1, 16, T, H/8, W/8]`) is one
@@ -2754,7 +2838,35 @@ impl Engine for NativeEngine {
         Ok(())
     }
 
+    fn nvidia_vsr(&self, req: &NvidiaVsrRequest, progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        if !nvvfx::is_model(&req.model.path) {
+            return Err(unsupported(format!("RTX Video Super Resolution with {}, which isn't NVIDIA's {}", req.model.name, nvvfx::MODEL)));
+        }
+        let (w, h) = (req.images.width, req.images.height);
+        match req.mode {
+            NvidiaVsrMode::Deblur(_) if (req.width, req.height) != (w, h) => {
+                return Err(EngineError::InvalidInput(format!("RTX Video Super Resolution deblurs at the image's size, {w}x{h}, not {}x{}", req.width, req.height)))
+            }
+            NvidiaVsrMode::Upscale(_) if req.width < w || req.height < h => {
+                return Err(EngineError::InvalidInput(format!("RTX Video Super Resolution doesn't downscale: {w}x{h} to {}x{}", req.width, req.height)))
+            }
+            _ => {}
+        }
+        self.run_vsr(&req.model.path, vsr_mode(req.mode), &req.images, (req.width, req.height), progress)
+    }
+
+    fn upscale_image(&self, req: &UpscaleImageRequest) -> EngineResult<ImageBatch> {
+        let file = &req.model.source;
+        if !nvvfx::is_model(&file.path) {
+            return Err(unsupported(format!("model upscaling with {}: the engine only runs NVIDIA's RTX Video Super Resolution ({})", file.name, nvvfx::MODEL)));
+        }
+        let img = &req.image;
+        let size = (img.width * VSR_MODEL_SCALE, img.height * VSR_MODEL_SCALE);
+        self.run_vsr(&file.path, nvvfx::Mode::Ultra, img, size, &mut NullProgress)
+    }
+
     fn idle(&self) {
+        self.drop_vsr();
         if let Err(e) = self.gen().idle() {
             tracing::warn!("native: releasing VRAM failed: {e:#}");
         }
@@ -2918,6 +3030,9 @@ impl Engine for NativeEngine {
     }
 
     fn free_memory(&self, unload_models: bool, free_memory: bool) {
+        if unload_models || free_memory {
+            self.drop_vsr();
+        }
         let mut gen = self.gen();
         let r = if unload_models {
             gen.unload()

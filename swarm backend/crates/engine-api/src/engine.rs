@@ -184,6 +184,11 @@ pub trait Engine: Send + Sync + 'static {
         Err(EngineError::Unsupported("model upscaling (ImageUpscaleWithModel)".into()))
     }
 
+    /// See [`NvidiaVsrRequest`]: the images after one RTX Video Super Resolution pass. Default: unsupported.
+    fn nvidia_vsr(&self, _req: &NvidiaVsrRequest, _progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        Err(EngineError::Unsupported("NVIDIA RTX Video Super Resolution".into()))
+    }
+
     /// `RelayVSRConditioning`: low-quality pixels per latent pixel of `model`, a RelayVSR keyframe model (16 over its
     /// upscale factor), which sizes the latent. Default: unsupported.
     fn relayvsr_latent_stride(&self, _model: &ModelHandle) -> EngineResult<u32> {

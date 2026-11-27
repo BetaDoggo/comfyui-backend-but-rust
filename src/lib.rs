@@ -21,6 +21,7 @@ pub mod lora;
 mod lora_adapters;
 pub mod moss;
 pub mod nemotron;
+pub mod nvvfx;
 pub mod offload;
 pub mod pipeline;
 pub mod pixal3d;

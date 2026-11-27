@@ -113,7 +113,7 @@ test in [`swarm_compat.rs`](../crates/comfy-server/tests/swarm_compat.rs).
 | Use Inpainting Encode | `VAEEncodeForInpaint`, `InpaintModelConditioning` | `VaeEncodeRequest` on the masked image; `CondMeta.inpaint = InpaintConcat { latent, mask }`. |
 | Init Image Reset To Norm, Batch Size with init images, Unsampler Prompt | `LatentAdd` / `LatentMultiply` / `SwarmLatentBlendMasked` / `RepeatLatentBatch` / `LatentFromBatch`, `SwarmUnsampler` | `Engine::latent_op(LatentOp::..)`, `Engine::unsample`. |
 | `<segment:text>`, `<segment:yolo-...>`, `<clear:>`, Remove Background | `SwarmClipSeg`, `SwarmYoloDetection`, `SwarmRemBg` | `Engine::segment(SegmentRequest::{ClipSeg, Yolo})`, `Engine::remove_background`. The node's mask is `1 - alpha`. |
-| Refiner Upscale Method `model-*` / `latent-*`, Refiner HyperTile | `UpscaleModelLoader` + `ImageUpscaleWithModel`, `LatentUpscaleBy`, `HyperTile` | `Engine::upscale_image`, `LatentOp::UpscaleBy`, `ModelPatch::HyperTile`. |
+| Refiner Upscale Method `model-*` / `latent-*`, Refiner HyperTile | `UpscaleModelLoader` + `ImageUpscaleWithModel`, `LatentUpscaleBy`, `HyperTile` | `Engine::upscale_image`, `LatentOp::UpscaleBy`, `ModelPatch::HyperTile`. The native engine upscales only with NVIDIA's `nvngx_vsr.dll` (section 16). |
 | Use Style Model + Multiply / Merge Strength / Apply Start | `CLIPVisionEncode`, `StyleModelApply`, `ConditioningAverage`, `ConditioningSetTimestepRange`, `ConditioningCombine` | `Engine::clip_vision_encode` → `ClipVisionOutput`. Then `CondMeta.embedding_ops = [Style {..}, Average {from, to_strength}]` (applied in order), with `start_percent` / `end_percent` splitting the plain and styled prompts. |
 | Use Reference Only | `SwarmReferenceOnly`, then `LatentFromBatch(1)` | `ModelPatch::ReferenceOnly { batch }` + `LatentOp::PrependReference`. The noise mask keeps the reference frame (0). |
 | ReVision (unCLIP) | `unCLIPConditioning` | `CondMeta.unclip`. SwarmUI only allows it for SDXL. |
@@ -554,3 +554,16 @@ Nemotron-Labs-Image model is selected. They need the single file `tools/nemotron
 Image `i` of a batch takes seed `seed + i`. The engine refuses a file without the converter's `nemotron_image` metadata,
 sizes off the 16-pixel grid and batches over 8. There is no sampler, scheduler, CFG, negative prompt, LoRA, VAE or text
 encoder to send.
+
+## 16. RTX Video Super Resolution (NVIDIA VFX)
+
+NVIDIA's `nvngx_vsr.dll`, in an `upscale_models` folder with its runtime beside it, is listed by `UpscaleModelLoader`
+like any upscale model; the runtime libraries beside it aren't. Two routes reach it:
+
+| Node | Inputs | Engine |
+|---|---|---|
+| `RTXVideoSuperResolution` (from the RTXVSRExtension, after the image or video is decoded) | `images`, `scale` (1 to 4), `quality` (`LOW`, `MEDIUM`, `HIGH`, `ULTRA`), `deblur` (`OFF` or a level) | With `deblur` on, `NvidiaVsrRequest` with `NvidiaVsrMode::Deblur` at the input's size; then `NvidiaVsrMode::Upscale` to `int(side * scale)` rounded to a multiple of 8, half to even. The model is the first `nvngx_vsr.dll` among the upscale models |
+| `UpscaleModelLoader` + `ImageUpscaleWithModel` (Refiner, SeedVR or `<segment:>` upscale method `model-...nvngx_vsr.dll`) | the model and an RGB image | `Engine::upscale_image`: 4x at `ULTRA`. SwarmUI then resizes to the target with `ImageScale` |
+
+Both run `Engine::nvidia_vsr`, frame by frame. Images with alpha, downscales, and a deblur to another size are refused.
+The mock engine resizes bilinearly.

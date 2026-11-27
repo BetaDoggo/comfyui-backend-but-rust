@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use swarm_engine_api::{ModelFile, ModelFolder};
+use swarm_engine_api::{ModelFile, ModelFolder, NVIDIA_VSR_MODEL};
 
 const MODEL_EXTENSIONS: &[&str] = &["safetensors", "sft", "ckpt", "pt", "pth", "bin", "gguf", "engine", "onnx"];
 
@@ -125,7 +125,7 @@ impl ModelPaths {
     pub fn list(&self, folder: ModelFolder) -> Vec<String> {
         let mut names = BTreeSet::new();
         for dir in self.dirs(folder) {
-            walk(&dir, &dir, &mut names);
+            walk(&dir, &dir, folder, &mut names);
         }
         names.into_iter().collect()
     }
@@ -153,17 +153,23 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn walk(base: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+/// True if `path` is a model of `folder`: a file with a model extension, or NVIDIA's RTX Video Super Resolution
+/// library among the upscale models (but not the VFX runtime libraries beside it).
+fn is_model(folder: ModelFolder, path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if folder == ModelFolder::UpscaleModels && name.eq_ignore_ascii_case(NVIDIA_VSR_MODEL) {
+        return true;
+    }
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| MODEL_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+fn walk(base: &Path, dir: &Path, folder: ModelFolder, out: &mut BTreeSet<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            walk(base, &path, out);
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| MODEL_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-        {
+            walk(base, &path, folder, out);
+        } else if is_model(folder, &path) {
             if let Ok(rel) = path.strip_prefix(base) {
                 out.insert(rel.to_string_lossy().replace('\\', "/"));
             }
@@ -201,6 +207,24 @@ mod tests {
         assert!(paths.list(ModelFolder::Vae).is_empty());
         assert_eq!(paths.list(ModelFolder::BackgroundRemoval), ["birefnet.safetensors"]);
         assert_eq!(paths.resolve(ModelFolder::Checkpoints, "b.safetensors").unwrap().path, two.join("Custom SD/b.safetensors"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lists_nvidia_vsr_among_upscalers_only() {
+        let root = std::env::temp_dir().join(format!("model-paths-{}", uuid::Uuid::new_v4()));
+        let vfx = root.join("upscale_models/nvidia-vfx");
+        std::fs::create_dir_all(&vfx).unwrap();
+        std::fs::create_dir_all(root.join("checkpoints")).unwrap();
+        for f in ["nvngx_vsr.dll", "NVVideoEffects.dll", "cudart64_12.dll"] {
+            std::fs::write(vfx.join(f), b"").unwrap();
+        }
+        std::fs::write(root.join("upscale_models/4x_test.pth"), b"").unwrap();
+        std::fs::write(root.join("checkpoints/nvngx_vsr.dll"), b"").unwrap();
+        let paths = ModelPaths::new(vec![root.clone()]);
+        assert_eq!(paths.list(ModelFolder::UpscaleModels), ["4x_test.pth", "nvidia-vfx/nvngx_vsr.dll"]);
+        assert!(paths.list(ModelFolder::Checkpoints).is_empty());
+        assert_eq!(paths.resolve(ModelFolder::UpscaleModels, "nvidia-vfx\\nvngx_vsr.dll").unwrap().path, vfx.join("nvngx_vsr.dll"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

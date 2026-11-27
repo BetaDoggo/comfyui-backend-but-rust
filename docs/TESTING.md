@@ -89,6 +89,7 @@ the ones on `ref/ComfyUI` with `ref/venv/Scripts/python.exe`.
 | SwarmUI's, with the SwarmUI folder as the first argument | `cfg_ref`, `latent_ops_ref`, `partial_ref`, `swarm_prompt_ref` |
 | `ref/ComfyUI` | `anima_ref`, `moss_ref`, `ref_dump` (Krea 2), `sampler_ref`, `sd_ref` (or `COMFY_DIR`), `te_hidden`, `te_l0`, `chk_dtypes`, `chk_te` |
 | None: the model's own code from its Hugging Face repository | `nemotron_image_ref` (Nemotron-Labs-Image; run with SwarmUI's Python, which has torch and transformers) |
+| None: NVIDIA's `nvvfx` package | `nvidia_vsr_ref` (RTX Video Super Resolution; run with a Python that has torch and `nvidia-vfx`, such as SwarmUI's after `pip install nvidia-vfx --extra-index-url https://pypi.nvidia.com`) |
 | None: they compare, inspect or write files | Every `*_cmp.py` except `qwen21_cmp`, `compare.py`, `psnr.py`, `glb_preview.py`, `st_header.py`, `h3_refiner_check`, `lora_formats` |
 
 `pih3_ref` also needs [ComfyUI-piFlow](https://github.com/Lakonik/ComfyUI-piFlow), cloned to `ref/ComfyUI-piFlow` or

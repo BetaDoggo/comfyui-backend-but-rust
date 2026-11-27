@@ -183,6 +183,14 @@ An image without transparency is cut out first by ComfyUI's own `LoadBackgroundR
 (`Engine::background_mask`), which read BiRefNet from the `background_removal` model folder and give the foreground mask
 to the node's `mask` input. The mock engine's mask is an ellipse.
 
+## RTX Video Super Resolution
+
+NVIDIA's `nvngx_vsr.dll`, with its runtime from the `nvidia-vfx` wheel beside it in an `upscale_models` folder (see
+[Models](../docs/MODELS.md#rtx-video-super-resolution)), shows in SwarmUI's upscale model lists, and runs the
+`RTXVideoSuperResolution` node that the RTXVSRExtension sends, through `Engine::nvidia_vsr`. Nothing to install in
+SwarmUI's Python for this backend: the engine loads NVIDIA's libraries itself. The effect stays loaded while its mode and
+sizes repeat, and is freed when the server goes idle or is asked to free memory.
+
 ## Idle memory
 
 Diffusion blocks stay in VRAM between prompts, as in ComfyUI, until an allocation or another application needs the room.

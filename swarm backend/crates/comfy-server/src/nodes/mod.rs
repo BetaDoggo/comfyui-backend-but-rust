@@ -23,6 +23,7 @@ mod snapref;
 mod broke_style_ref;
 mod three_d;
 mod nemotron;
+mod nvidia_vsr;
 mod video;
 mod vae;
 
@@ -161,6 +162,7 @@ impl NodeRegistry {
         broke_style_ref::register(&mut r, env);
         seedvr::register(&mut r, env);
         relayvsr::register(&mut r, env);
+        nvidia_vsr::register(&mut r, env);
         r
     }
 

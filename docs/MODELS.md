@@ -19,6 +19,7 @@ PCIe 5.0 and 64 GB of RAM. The files each family reads are listed in the [README
 | Idol (TripoSplat) | A 3D gaussian splat from one image | `dpmpp_2m`, `simple`, 20 steps, CFG 3 | Comfy-Org's fp16 files |
 | SeedVR2 3B | A restored copy of a picture (SwarmUI's SeedVR stage) | `euler`, `simple`, 1 step, CFG 1 | int8 ConvRot (`seedvr2_3b_int8_convrot`) only |
 | RelayVSR | A video upscaled x2 or x4 (the RelayVSR extension's stage); works in SwarmUI, compared with ComfyUI through the CLI | `euler`, `simple`, 1 step, CFG 1 | int8 ConvRot keyframe models, fp32 Flash decoders |
+| RTX Video Super Resolution | A picture or video upscaled up to x4, or deblurred, by NVIDIA's VFX SDK; works in SwarmUI, byte-identical to ComfyUI's node | none: no sampling | NVIDIA's `nvngx_vsr.dll` from `nvidia-vfx` 0.2.0.0, with its runtime |
 | Nemotron-Labs-Image | Images, as visual tokens from a language model | none: token temperature 0.9 | the file `tools/nemotron_image_convert.py` writes (`nvfp4-v1`) only |
 
 ## Support matrix
@@ -50,7 +51,7 @@ shows, and never drops the setting. **Not tested** means the code accepts it but
 | VAE tiling, Seamless Tileable | Refused | Refused | Refused | Refused | Refused | Only the 256 / 64 tile | - |
 | Background removal | - | - | - | - | - | - | Yes (BiRefNet) |
 
-HyperFlow H3 Flash, pi-H3, MiniMax-H3-Image, SenseNova U1.6, Idol, SeedVR2, RelayVSR and Nemotron-Labs-Image aren't in this matrix; their own sections below say what they
+HyperFlow H3 Flash, pi-H3, MiniMax-H3-Image, SenseNova U1.6, Idol, SeedVR2, RelayVSR, RTX Video Super Resolution and Nemotron-Labs-Image aren't in this matrix; their own sections below say what they
 take. ControlNet, regions, IP-Adapter, style models, GLIGEN, LoRA hooks and embeddings are refused on every family. Anima
 takes both `(word:1.2)` and `<weight>`; Qwen Image 2.1's encoder reads `(word:1.2)` as plain text. SD 1.x and SDXL take
 `(word:1.2)` in a plain prompt and `<weight>` through SwarmUI's text node, which reads parentheses literally, as
@@ -1260,6 +1261,48 @@ Each of these is refused with an error SwarmUI shows:
 | `VAEDecode` of a RelayVSR latent, or `VAEEncode` with the Flash decoder | The decoder needs the low-quality frames, so only `VSRDecode` decodes |
 
 The key cache stays in VRAM. At 1080p to 4K x2 it is about 4.5 GB (estimated, not measured).
+
+## RTX Video Super Resolution
+
+NVIDIA's video super resolution, the `VideoSuperRes` effect of its Video Effects SDK, as the `nvidia-vfx` Python package
+(`nvvfx`) and ComfyUI's `RTXVideoSuperResolution` node run it. The network is compiled into `nvngx_vsr.dll`, so there
+are no weights to port: [`src/nvvfx.rs`](../src/nvvfx.rs) loads NVIDIA's libraries at run time and drives the SDK's C
+API. They are NVIDIA's files under NVIDIA's license; nothing in this repository links against them or ships them.
+
+**Files.** Put `nvngx_vsr.dll` in an `upscale_models` folder (for example `upscale_models/nvidia-vfx/`) with these from
+the same release beside it: `cudart64_12.dll`, `NVCVImage.dll`, `nvngxruntime.dll`, `NVVideoEffects.dll` and
+`nvVFXVideoSuperRes.dll`, 63 MB with the model. They are in the `nvvfx/libs` folder of the `nvidia-vfx` wheel
+(`pip install nvidia-vfx --extra-index-url https://pypi.nvidia.com`; PyPI itself holds only a stub). The wheel's
+other libraries (NPP, TrueHDR, frame generation) aren't needed. Hard links from an installed copy save the space. The
+NGX core comes from the NVIDIA driver. A process loads the runtime once, from the first folder it's used from. Only
+`nvidia-vfx` 0.2.0.0 (VFX SDK 1.3.0) was tested.
+
+**How it's reached.** `upscale_models/` lists `nvngx_vsr.dll` alongside the other upscale models, but not the runtime
+files beside it. So it shows in SwarmUI's upscale model lists:
+
+* `RTXVideoSuperResolution`, the node the RTXVSRExtension sends, with the same inputs: `scale` (1 to 4), `quality`
+  (`LOW` to `ULTRA`) and `deblur` (`OFF` or `LOW` to `ULTRA`). As in that node, a deblur pass runs first at the image's
+  size, and the output is `int(side * scale)` rounded to a multiple of 8 (half to even). It uses the first
+  `nvngx_vsr.dll` among the upscale models.
+* `UpscaleModelLoader` + `ImageUpscaleWithModel` (Refiner Upscale Method `model-...nvngx_vsr.dll`): 4x at `ULTRA`, the
+  usual ESRGAN factor, so SwarmUI's resize to the target size afterwards only shrinks.
+* The CLI's `--super-res`, which also takes the SDK's other modes: `denoise-*`, `highbitrate-*`, `streaming-*` and
+  `bicubic`.
+
+Frames are upscaled one by one, and the effect keeps no state between them. RGB only: images with alpha are refused
+(SwarmUI splits the alpha off around model upscalers). The SDK refuses to downscale.
+
+**Parity.** Byte-identical to `nvvfx` and to the node's own code, every value, with `tools/nvidia_vsr_ref.py`: through
+the CLI (2x `ULTRA`, 2x `LOW`, `DEBLUR_HIGH` and 1.37x `MEDIUM`), and through comfy-server with the native engine over
+HTTP (2x `ULTRA` after `HIGH` deblur, 1.37x `LOW`, a batch of two, and `ImageUpscaleWithModel` at 4x).
+
+**Speed.** Loading the effect takes 0.6 to 0.9 s; the server keeps the last one while its mode and sizes repeat. A
+512x768 frame then takes 7 to 10 ms to 1024x1536 through the CLI, including the copies to and from the GPU, and
+1024x1536 to 4096x6144 takes 20 ms. The effect used 90 to 150 MB of VRAM at 512x768 to 2x, and 714 MB at 1024x1536 to
+4x. If it can't load or run, the server unloads the image models and tries once more.
+
+It works in SwarmUI, tested by the maintainer. Not tested: videos, other `nvidia-vfx` releases, and GPUs other than an
+RTX 5070.
 
 ## Nemotron-Labs-Image
 

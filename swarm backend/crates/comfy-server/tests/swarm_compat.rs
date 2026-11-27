@@ -44,6 +44,8 @@ const MODEL_FILES: &[&str] = &[
     "Embeddings/bad_hands.safetensors",
     "gligen/gligen_test.safetensors",
     "upscale_models/4x_test.safetensors",
+    "upscale_models/nvidia-vfx/nvngx_vsr.dll",
+    "upscale_models/nvidia-vfx/NVVideoEffects.dll",
     "latent_upscale_models/latent_up_test.safetensors",
     "clip_vision/clip_vision_test.safetensors",
     "clip_vision/sigclip_vision_patch14_384.safetensors",
@@ -1508,6 +1510,40 @@ async fn upload_load_save_view_roundtrip() {
     assert_eq!(png_dims(&bytes), (60, 40));
     let traversal = s.http.get(s.url("view?filename=../../Cargo.toml&type=output")).send().await.unwrap();
     assert_ne!(traversal.status(), 200);
+}
+
+/// `RTXVideoSuperResolution` as the RTXVSRExtension sends it: a deblur pass at the input's size, then the upscale to
+/// the scaled size rounded to a multiple of 8; and `nvngx_vsr.dll` listed as an upscale model, without the VFX runtime
+/// beside it.
+#[tokio::test(flavor = "multi_thread")]
+async fn rtx_video_super_resolution_upscales() {
+    let s = TestServer::start(0).await;
+    let info = s.get("object_info").await;
+    let upscalers = &info["UpscaleModelLoader"]["input"]["required"]["model_name"][0];
+    assert_eq!(upscalers, &json!(["4x_test.safetensors", "nvidia-vfx/nvngx_vsr.dll"]));
+    let rtx = &info["RTXVideoSuperResolution"]["input"]["required"];
+    assert_eq!(rtx["quality"][1]["default"], "ULTRA");
+    assert_eq!(rtx["deblur"][1]["default"], "OFF");
+
+    let img = ImageBatch::from_u8(1, 40, 72, 3, (0..40 * 72 * 3).map(|i| (i % 211) as u8).collect());
+    let b64 = base64::engine::general_purpose::STANDARD.encode(encode::png8(&img, 0).unwrap());
+    let mut wf = json!({
+        "1": { "class_type": "SwarmLoadImageB64", "inputs": { "image_base64": b64 } },
+        "2": { "class_type": "RTXVideoSuperResolution", "inputs": { "images": ["1", 0], "scale": 1.5, "quality": "HIGH", "deblur": "LOW" } },
+        "3": { "class_type": "SaveImage", "inputs": { "images": ["2", 0], "filename_prefix": "tests/rtxvsr" } }
+    });
+    let r = run_like_swarm(&s, wf.clone(), |_| {}).await;
+    assert_eq!(r.status(), "success", "{:#}", r.history);
+    let images = r.history_entry()["outputs"]["3"]["images"].as_array().unwrap().clone();
+    let url = format!("view?filename={}&type=output&subfolder={}", images[0]["filename"].as_str().unwrap(), images[0]["subfolder"].as_str().unwrap());
+    let bytes = s.http.get(s.url(&url)).send().await.unwrap().bytes().await.unwrap();
+    // 72 * 1.5 = 108 -> 13.5 * 8 rounds to 14 * 8; 40 * 1.5 = 60 -> 7.5 * 8 rounds to 8 * 8
+    assert_eq!(png_dims(&bytes), (112, 64));
+
+    // ComfyUI's node only knows these levels
+    wf["2"]["inputs"]["quality"] = json!("EXTREME");
+    let resp = s.post("prompt", json!({ "prompt": wf })).await;
+    assert_eq!(resp.status(), 400);
 }
 
 /// The RelayVSR stage relayvsr-extension emits, on a 17-frame 40x72 clip: keyframes 0, 15 and 16 reach the sampler as a

@@ -687,6 +687,14 @@ impl Engine for MockEngine {
         crate::encode::resize(&req.image, req.image.width * factor, req.image.height * factor, "bilinear", "disabled").map_err(EngineError::Internal)
     }
 
+    fn nvidia_vsr(&self, req: &NvidiaVsrRequest, _progress: &mut dyn ProgressSink) -> EngineResult<ImageBatch> {
+        tracing::info!("[mock] nvidia_vsr {} {:?} to {}x{} {:?}", req.model.name, req.mode, req.width, req.height, req.images);
+        if req.width < req.images.width || req.height < req.images.height {
+            return Err(EngineError::InvalidInput("RTX Video Super Resolution doesn't downscale".into()));
+        }
+        crate::encode::resize(&req.images, req.width, req.height, "bilinear", "disabled").map_err(EngineError::Internal)
+    }
+
     fn latent_op(&self, op: &LatentOp) -> EngineResult<Latent> {
         // The mock keeps no real tensors: track shapes and pixel sizes, and derive a new content key.
         fn with_shape(l: &Latent, f: impl Fn(&mut Vec<usize>), key: u64) -> Latent {

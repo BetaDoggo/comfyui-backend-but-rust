@@ -1,7 +1,8 @@
 //! Compiles csrc/*.cu with nvcc into a static library.
 //!
 //! Environment overrides:
-//!   CUDA_PATH            CUDA toolkit root (default: the toolkit nvcc reports)
+//!   CUDA_PATH       CUDA toolkit root (default: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0;
+//!                   the CUDA installer sets it)
 //!   CUTLASS_DIR     CUTLASS checkout (default: ref/comfy-kitchen/third_party/cutlass)
 //!   FLASH_ATTN_DIR  flash-attention checkout (default: ref/comfy-kitchen/third_party/flash-attention)
 //!   CUDA_ARCH       e.g. "120" (default 120)

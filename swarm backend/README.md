@@ -30,7 +30,8 @@ reference/          (gitignored, local) SwarmUI + ComfyUI clones used as the pro
 cargo run --release -p comfy-server -- --models-root "C:/path/to/SwarmUI/Models"
 ```
 
-Flags: `--engine mock --listen 127.0.0.1 --port 8188 --models-root <dir> (repeatable) --output-dir --input-dir --temp-dir --ffmpeg ffmpeg --mock-step-ms 40 --mock-native-only --advertise-todo-nodes`.
+Flags: `--engine mock --listen 127.0.0.1 --port 8188 --models-root <dir> (repeatable) --output-dir --input-dir --temp-dir --ffmpeg ffmpeg --mock-step-ms 40 --mock-native-only --advertise-todo-nodes --max-history 1000`. `--max-history` is how many finished
+prompts `/history` keeps.
 Set `RUST_LOG=debug` for per-node logs. The mock engine logs every typed request it receives at `info`.
 
 Point `--models-root` at the **same** folder SwarmUI uses, so model names match. The server searches

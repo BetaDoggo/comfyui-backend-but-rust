@@ -17,7 +17,7 @@ fn make_engine(cfg: &Config) -> anyhow::Result<Arc<dyn Engine>> {
         "mock" => Ok(Arc::new(if cfg.mock_native_only { MockEngine::native_only(cfg.mock_step_ms) } else { MockEngine::new(cfg.mock_step_ms) })),
         #[cfg(feature = "native")]
         "native" => {
-            // Serves Krea 2, Anima and MOSS Image; the checkpoint picks which.
+            // Serves every family the diffusion library runs; the checkpoint picks which.
             let options = native_engine::NativeOptions {
                 reserve_vram_mb: cfg.reserve_vram.unwrap_or(512),
                 comfy_memory: (!cfg.legacy_offload).then(|| cfg.reserve_vram.unwrap_or(native_engine::COMFY_HEADROOM_MB)),

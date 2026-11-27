@@ -1,4 +1,4 @@
-//! diffusion: Rust + CUDA reimplementation of ComfyUI's generation, for quantized checkpoints of Krea 2, Anima, MOSS Image and MiniMax H3.
+//! The `diffusion` CLI: every model family the library runs, from the command line. docs/USAGE.md lists the flags.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -11,7 +11,9 @@ use std::time::Instant;
 
 
 #[derive(Parser, Debug, Clone)]
-#[command(version, about = "Int8 text-to-image for Krea 2, Anima and MOSS Image, ComfyUI-compatible")]
+#[command(version, about = "ComfyUI-compatible generation from quantized checkpoints; Krea 2 unless a model flag picks another \
+    family (docs/USAGE.md)")]
+// The flags in the `mode` group pick the model or tool that runs, so clap refuses any two of them together.
 struct Args {
     /// Text prompt
     #[arg(short, long, default_value = "a red fox sitting in a snowy forest, golden hour, photograph")]
@@ -23,11 +25,13 @@ struct Args {
     width: usize,
     #[arg(long, default_value_t = 1024)]
     height: usize,
-    #[arg(long, default_value_t = 8)]
-    steps: usize,
-    /// ModelSamplingFlux shift
-    #[arg(long, default_value_t = 1.15)]
-    shift: f64,
+    /// Steps (default 8; 20 on SD 1.x and SDXL; the distilled grid's own on MiniMax-H3-Image)
+    #[arg(long)]
+    steps: Option<usize>,
+    /// Sampling shift (default the family's: 1.15 on Krea 2, 3 on Anima, 5 on MOSS Image, 0.69 on Qwen Image 2.1).
+    /// Refused where the model fixes its own, as on MiniMax H3
+    #[arg(long)]
+    shift: Option<f64>,
     /// File with one prompt per line (models are loaded once for all of them)
     #[arg(long)]
     prompt_file: Option<PathBuf>,
@@ -88,7 +92,7 @@ struct Args {
     #[arg(long)]
     dump: Option<PathBuf>,
     /// Run Anima instead of Krea 2 (--dit and --te then default to the Anima files, --shift to 3)
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     anima: bool,
     /// Anima: record each block's mean image token and mean token norm, per step, averaged over every image of the
     /// run, to this safetensors file (activation steering, see docs/STEERING.md)
@@ -177,14 +181,14 @@ struct Args {
     #[arg(long, default_value_t = 33)]
     steer_token_stride: usize,
     /// Run MOSS Image instead of Krea 2 (--dit, --te and --vae then default to the MOSS files, --shift to 5)
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     moss: bool,
     /// Run an SD 1.x checkpoint (--dit defaults to SD 1.5; its text encoder and VAE come from the same file unless
     /// --vae is given). --steps defaults to 20 and --cfg to 7
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     sd: bool,
     /// Run an SDXL checkpoint, as --sd does (--dit defaults to SDXL base 1.0)
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     sdxl: bool,
     /// SD 1.x and SDXL: CLIPSetLastLayer's stop_at_clip_layer, -1 for the last layer, -2 for "clip skip 2"
     #[arg(long, allow_hyphen_values = true)]
@@ -198,14 +202,14 @@ struct Args {
     #[arg(long)]
     lossy: bool,
     /// Run MiniMax H3 (text to video with audio); --dit and --te then default to its files
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     h3: bool,
     /// Run MiniMax-H3-Image (text to image); --dit, --te and --vae then default to its files, --steps to its 6
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     h3_image: bool,
     /// Run Nemotron-Labs-Image (autoregressive text to image); --dit then defaults to its converted file. Takes --prompt,
     /// --prompt-file, --seed, --width, --height (multiples of 16), --count, --batch (up to 8) and --temperature
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     nemotron: bool,
     /// Nemotron-Labs-Image: softmax temperature of the image tokens (the model card's 0.9); 0 takes the likeliest token
     #[arg(long, default_value_t = 0.9)]
@@ -245,9 +249,9 @@ struct Args {
     /// Negative prompt (used when --cfg isn't 1, and by the cfg_pp samplers)
     #[arg(long, default_value = "")]
     negative: String,
-    /// CFG scale
-    #[arg(long, default_value_t = 1.0)]
-    cfg: f64,
+    /// CFG scale (default 1; 7 on SD 1.x and SDXL)
+    #[arg(long)]
+    cfg: Option<f64>,
     /// Any ComfyUI sampler, default er_sde for Anima, euler otherwise
     #[arg(long)]
     sampler: Option<String>,
@@ -294,7 +298,7 @@ struct Args {
     #[arg(long, default_value = "index")]
     ref_method: String,
     /// Pixal3D: an RGBA PNG whose alpha masks the object, turned into a vertex-coloured mesh written to --output (GLB)
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     pixal3d: Option<PathBuf>,
     /// Pixal3D: horizontal field of view of the photo, in degrees
     #[arg(long, default_value_t = 49.13)]
@@ -323,7 +327,7 @@ struct Args {
     pixal3d_seeds: Option<String>,
     /// TripoSplat / Idol: an RGBA PNG whose alpha masks the object, turned into a gaussian splat written to --output
     /// (PLY). --dit, --clip-vision and --vae pick the flow model, DINOv3 ViT-H and Flux 2 VAE
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     triposplat: Option<PathBuf>,
     /// TripoSplat: the octree gaussian decoder
     #[arg(long)]
@@ -344,16 +348,16 @@ struct Args {
     #[arg(long)]
     triposplat_check: Option<PathBuf>,
     /// Background removal: write the PNG with its background made transparent to --output (needs the BiRefNet file)
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     remove_background: Option<PathBuf>,
     /// BiRefNet checkpoint for --remove-background, and for --pixal3d on an image without transparency
     #[arg(long)]
     birefnet: Option<PathBuf>,
     /// BiRefNet: compare every stage with a dump of tools/birefnet_ref.py instead of running
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     birefnet_check: Option<PathBuf>,
     /// RTX Video Super Resolution: write the image upscaled by --vsr-scale to --output (needs --vsr)
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     super_res: Option<PathBuf>,
     /// NVIDIA's nvngx_vsr.dll, with the VFX runtime beside it (see docs/USAGE.md)
     #[arg(long)]
@@ -366,20 +370,20 @@ struct Args {
     #[arg(long, default_value = "ultra")]
     vsr_mode: String,
     /// Run Qwen Image 2.1 (--dit, --te and --vae then default to its files, --shift to its 0.69 at 1024x1024)
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     qwen21: bool,
     /// Qwen Image 2.1: compare the VAE with a dump of tools/qwen21_ref.py --vae-only instead of generating
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     qwen21_vae_check: Option<PathBuf>,
     /// MOSS Image: compare the Flux 2 VAE's encoder with a dump of tools/flux2_vae_ref.py instead of generating
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     flux2_vae_check: Option<PathBuf>,
     /// SeedVR2: compare each stage with a dump of tools/seedvr_ref.py (with --dit and --vae) instead of generating
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     seedvr_check: Option<PathBuf>,
     /// RelayVSR: compare the keyframe model and the Flash decoder with a dump of tools/relayvsr_ref.py (with --dit and
     /// --vae) instead of generating
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     relayvsr_check: Option<PathBuf>,
 }
 
@@ -469,8 +473,23 @@ impl Args {
         }
     }
 
+    /// `--steps`, else the family's default.
+    fn steps(&self) -> usize {
+        self.steps.unwrap_or(if self.sd || self.sdxl { 20 } else { 8 })
+    }
+
+    /// `--cfg`, else the family's default.
+    fn cfg(&self) -> f64 {
+        self.cfg.unwrap_or(if self.sd || self.sdxl { 7.0 } else { 1.0 })
+    }
+
+    /// `--shift`, else `default`, the family's.
+    fn shift(&self, default: f64) -> f64 {
+        self.shift.unwrap_or(default)
+    }
+
     fn sampling(&self, default: &str, ms: ModelSampling, seed: u64, latent: (usize, usize)) -> Result<pipeline::Sampling> {
-        pipeline::Sampling::new(self.sampler.as_deref().unwrap_or(default), &self.scheduler, ms, self.steps, self.cfg, seed, latent)
+        pipeline::Sampling::new(self.sampler.as_deref().unwrap_or(default), &self.scheduler, ms, self.steps(), self.cfg(), seed, latent)
     }
 
     /// The sampling of images `first..first + k` of a prompt, sampled together.
@@ -506,7 +525,7 @@ impl Args {
 
 fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     let (dit, te) = (args.model(&args.dit, ANIMA_DIT), args.model(&args.te, ANIMA_TE));
-    let shift = if args.shift == 1.15 { 3.0 } else { args.shift };
+    let shift = args.shift(3.0);
     let mut gen = pipeline::Generator::new(&load)?;
     gen.ensure_vae(&args.model(&args.vae, QWEN_VAE))?;
     gen.ensure_anima(&dit)?;
@@ -541,7 +560,7 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         None => None,
     };
     if args.steer_record.is_some() {
-        gen.record_anima(args.steps)?;
+        gen.record_anima(args.steps())?;
     }
     if args.steer_tokens.is_some() {
         let blocks = args.steer_token_blocks.split(',').map(|b| b.trim().parse::<usize>()).collect::<Result<Vec<_>, _>>()?;
@@ -619,7 +638,7 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
                 if let Some(l) = &init {
                     let (sampler, sched, lat) = (s.sampler.clone(), args.scheduler.clone(), (args.width / 8, args.height / 8));
                     let schedule = |k| diffusion::samplers::sigmas(ModelSampling::Flow { shift }, &sampler, &sched, k, lat, None);
-                    s.sigmas = diffusion::samplers::ksampler_sigmas(args.steps, args.denoise, 0, args.steps, false, schedule)?
+                    s.sigmas = diffusion::samplers::ksampler_sigmas(args.steps(), args.denoise, 0, args.steps(), false, schedule)?
                         .context("--denoise leaves no step")?;
                     s.latent = Some(l.repeat(group.1));
                 }
@@ -659,7 +678,7 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
 
 fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     let (dit, te, vae) = (args.model(&args.dit, MOSS_DIT), args.model(&args.te, MOSS_TE), args.model(&args.vae, MOSS_VAE));
-    let shift = if args.shift == 1.15 { 5.0 } else { args.shift };
+    let shift = args.shift(5.0);
     let mut gen = pipeline::Generator::new(&load)?;
     gen.ensure_moss(&dit)?;
     gen.ensure_qwen35(&te)?;
@@ -701,14 +720,9 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
 
 fn run_sd(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     let dit = args.model(&args.dit, if args.sdxl { SDXL_DIT } else { SD1_DIT });
-    let mut args = args.clone();
-    if args.steps == 8 {
-        args.steps = 20;
+    if args.shift.is_some() {
+        bail!("--shift doesn't apply to SD 1.x and SDXL, which sample with discrete sigmas");
     }
-    if args.cfg == 1.0 {
-        args.cfg = 7.0;
-    }
-    let args = &args;
     let mut gen = pipeline::Generator::new(&load)?;
     gen.ensure_sd(&dit)?;
     if let Some(vae) = &args.vae {
@@ -761,7 +775,7 @@ fn run_sd(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
 fn run_qwen21(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     let (dit, te, vae) = (args.model(&args.dit, QWEN21_DIT), args.model(&args.te, QWEN21_TE), args.model(&args.vae, QWEN21_VAE));
     // ComfyUI's value for 1024x1024, whatever the size
-    let shift = if args.shift == 1.15 { 0.69 } else { args.shift };
+    let shift = args.shift(0.69);
     let mut gen = pipeline::Generator::new(&load)?;
     gen.ensure_qwen21(&dit)?;
     gen.ensure_te(&te)?;
@@ -842,8 +856,8 @@ fn run_h3_image(args: &Args, load: pipeline::LoadOptions, dit: PathBuf, te: Path
         None => diffusion::sampling::torch_randn(args.seed, shape.video_len()),
     };
     // the heads are distilled for their grid's steps: --steps left at its default takes them
-    let steps = if args.steps == 8 { grid.len() - 1 } else { args.steps };
-    let sampling = pipeline::Sampling::new(args.sampler.as_deref().unwrap_or("euler"), &args.scheduler, ms, steps, args.cfg, args.seed, (args.width / 16, args.height / 16))?;
+    let steps = args.steps.unwrap_or(grid.len() - 1);
+    let sampling = pipeline::Sampling::new(args.sampler.as_deref().unwrap_or("euler"), &args.scheduler, ms, steps, args.cfg(), args.seed, (args.width / 16, args.height / 16))?;
     // MiniMaxH3ImageConditioning's edit pictures, through the image VAE
     let images = args.image.iter().map(|p| read_png(p)).collect::<Result<Vec<_>>>()?;
     if !args.ref_video.is_empty() {
@@ -908,6 +922,7 @@ fn run_nemotron(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         (args.style_image.is_some() || args.snapref.is_some(), "--style-image / --snapref"),
         (args.te.is_some() || args.vae.is_some(), "--te / --vae (the file holds its tokenizer and decoder)"),
         (args.sampler.is_some(), "--sampler"),
+        (args.steps.is_some() || args.cfg.is_some() || args.shift.is_some(), "--steps / --cfg / --shift"),
         (args.ref_noise.is_some() || args.dump.is_some(), "--ref-noise / --dump"),
         (!args.steer.is_empty() || args.concept.is_some(), "--steer / --concept"),
     ];
@@ -957,6 +972,9 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     use diffusion::h3;
     let t_all = Instant::now();
     let (dit, te) = (args.model(&args.dit, H3_DIT), args.model(&args.te, H3_TE));
+    if args.shift.is_some() {
+        bail!("--shift doesn't apply to MiniMax H3 or MiniMax-H3-Image, which fix their own sigmas");
+    }
     if args.h3_image || h3::is_h3_image(|k| st::SafeTensors::open(&dit).is_ok_and(|f| f.has(k))) {
         let dit = if args.h3_image { args.model(&args.dit, H3_IMAGE_DIT) } else { dit };
         return run_h3_image(args, load, dit, te);
@@ -1483,7 +1501,7 @@ fn run_krea(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             }
             let img = read_png(p)?;
             let (rgb, w, h) = diffusion::snapref::shrink(&img.rgb, img.width, img.height, args.style_megapixels);
-            let mut s = pipeline::StyleRequest::node(gen.encode_image(&rgb, w, h)?, args.style_adain, false, args.steps);
+            let mut s = pipeline::StyleRequest::node(gen.encode_image(&rgb, w, h)?, args.style_adain, false, args.steps());
             s.steps = diffusion::steer::parse_range(&args.style_steps)?;
             s.adain_blocks = args.style_adain_blocks.as_deref().map(diffusion::steer::parse_range).transpose()?.unwrap_or((0, usize::MAX));
             s.caption = Prompt::text(args.style_caption.as_deref().unwrap_or(pipeline::StyleRequest::KREA2_NODE_CAPTION));
@@ -1501,7 +1519,7 @@ fn run_krea(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             seed: args.seed + group.0 as u64,
             width: args.width,
             height: args.height,
-            sampling: args.batch_sampling("euler", ModelSampling::Flux { shift: args.shift }, group, (args.width / 8, args.height / 8))?,
+            sampling: args.batch_sampling("euler", ModelSampling::Flux { shift: args.shift(1.15) }, group, (args.width / 8, args.height / 8))?,
             noise: Some(args.noise(group, n)?),
             attn_token_weights: None,
             style: style.clone(),

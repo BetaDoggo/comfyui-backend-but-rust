@@ -159,6 +159,7 @@ folders, so `MODELS_ROOT` isn't needed.
 For users:
 
 * [Usage](docs/USAGE.md): command line flags, LoRAs and samplers
+* [Activation steering](docs/STEERING.md): Anima's training-free style and concept steering, experimental
 * [Models](docs/MODELS.md): each family's timings, closeness to ComfyUI and limits
 * [SwarmUI backend](swarm%20backend/README.md): running the server and what SwarmUI can use
 * [Status](docs/STATUS.md): everything that works and everything left to do
@@ -167,6 +168,7 @@ For contributors:
 
 * [AGENTS.md](AGENTS.md): working rules for people and coding agents
 * [Technical overview](docs/TECHNICAL_OVERVIEW.md): how the pieces fit and what they're built on
+* [Testing](docs/TESTING.md): setting up ComfyUI and SwarmUI to check the engine against them
 * [Adding models](swarm%20backend/docs/ADDING_MODELS.md): how to add a model family
 * [Input mapping](swarm%20backend/docs/INPUT_MAPPING.md): what SwarmUI sends and what the engine receives
 * [Compatibility](swarm%20backend/docs/COMPATIBILITY.md): what the server accepts for every SwarmUI parameter

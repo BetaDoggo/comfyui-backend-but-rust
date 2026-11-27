@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/engine-api", "crates/comfy-server", "crates/native-engine"]
+# native-engine needs the CUDA toolkit, so plain `cargo test` / `cargo build` leave it out. It is still built by
+# `-p comfy-server --features native`, or `--workspace`.
+default-members = ["crates/engine-api", "crates/comfy-server"]
 
 [workspace.package]
 version = "0.1.0"

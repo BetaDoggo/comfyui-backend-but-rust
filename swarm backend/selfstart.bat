@@ -5,7 +5,8 @@ rem It doesn't build, so SwarmUI isn't held up: build first, or use start-backen
 cd /D "%~dp0"
 
 set "CUDA_BIN=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin"
-set "SERVER=target\release\comfy-server.exe"
+rem The repository is one Cargo workspace, so the server is built into the root's target folder.
+set "SERVER=..\target\release\comfy-server.exe"
 
 if not exist "%SERVER%" (
     echo %SERVER% is missing. Build it with: cargo build --release -p comfy-server --features native

@@ -11,7 +11,8 @@ if not defined MODELS (
     goto failed
 )
 set "CUDA_BIN=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin"
-set "SERVER=target\release\comfy-server.exe"
+rem The repository is one Cargo workspace, so the server is built into the root's target folder.
+set "SERVER=..\target\release\comfy-server.exe"
 
 rem A stray quote in PATH hides every later entry from cmd, including cargo, so drop quotes here.
 set "PATH=%CUDA_BIN%;!PATH:"=!"

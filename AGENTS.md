@@ -47,18 +47,13 @@ models folder instead of downloading checkpoints.
 | `swarm backend/tools/` | Node catalog and COMPATIBILITY.md generators |
 | `ref/`, `refout/`, `prof/`, `data/`, `swarm backend/reference/`, `swarm backend/scratch/`, `swarm backend/data/` | Local and gitignored; may not exist |
 
-`swarm backend/` is a separate Cargo workspace, so run its commands from that folder.
+The repository is one Cargo workspace: the `diffusion` crate at the root and the server crates under
+`swarm backend/crates`. Cargo commands work from any folder in it, and everything builds into the root's `target/`.
 
 ## Commands
 
-Build and test the server without CUDA, on the mock engine, from `swarm backend/`:
-
-```bash
-cargo test
-```
-
-Build the CLI, and check the samplers against ComfyUI's recorded output, from the repository root. Both need the CUDA
-toolkit, and neither test needs a checkpoint:
+Build the CLI, and run every crate's tests: the samplers against ComfyUI's recorded output, the server on the mock
+engine, and the native engine's request mapping. They need the CUDA toolkit and a GPU, but no checkpoint:
 
 ```bash
 cargo build --release
@@ -68,18 +63,21 @@ cargo build --release
 cargo test --release
 ```
 
-Test the native engine's request mapping (prompts, latents, noise, shifts), from `swarm backend/`. Plain `cargo test`
-there leaves it out because it needs the CUDA build, but no checkpoint:
+Test only the server, on the mock engine, which needs no CUDA:
 
 ```bash
-cargo test --release -p native-engine
+cargo test -p comfy-server -p swarm-engine-api
 ```
 
-Build the server with the real engine, from `swarm backend/`:
+Build the server with the real engine, `target/release/comfy-server.exe`, which the start scripts run:
 
 ```bash
 cargo build --release -p comfy-server --features native
 ```
+
+The `comfy-server` binary needs the `native` feature, so tests and plain builds never replace it with a mock-only build.
+Without CUDA, `comfy-server-mock` is the same server with only `--engine mock`. Compiled kernels are kept in
+`target/cuda-objs` and shared by every profile and `cargo clippy`, so only a changed unit compiles again.
 
 The kernels build for `sm_120` unless `CUDA_ARCH` is set. Windows x64 is the only supported platform. `PROFILE=1` prints
 stage timings, and `RUST_LOG=debug` prints per-node server logs.

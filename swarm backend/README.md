@@ -26,8 +26,11 @@ reference/          (gitignored, local) SwarmUI + ComfyUI clones used as the pro
 
 ## Run
 
+This folder's crates are part of the repository's one Cargo workspace, so these commands work from any folder in it, and
+build into the root's `target/`. Without the CUDA toolkit, the mock-only server is its own binary:
+
 ```bash
-cargo run --release -p comfy-server -- --models-root "C:/path/to/SwarmUI/Models"
+cargo run --release -p comfy-server --bin comfy-server-mock -- --models-root "C:/path/to/SwarmUI/Models"
 ```
 
 Flags: `--engine mock --listen 127.0.0.1 --port 8188 --models-root <dir> (repeatable) --output-dir --input-dir --temp-dir --ffmpeg ffmpeg --mock-step-ms 40 --mock-native-only --advertise-todo-nodes --max-history 1000`. `--max-history` is how many finished
@@ -44,8 +47,9 @@ and video inputs. PNG/JPEG/GIF/WAV are handled natively.
 ## Run the native engine
 
 The native engine needs the parent repository's build requirements (CUDA 13, MSVC Build Tools, CUTLASS and
-flash-attention checkouts). The first build takes several minutes, so it's behind a feature and the default
-build stays mock-only.
+flash-attention checkouts). The first build takes several minutes, so it's behind the `native` feature. The
+`comfy-server` binary needs that feature, so a test or a plain build never replaces the native
+`target/release/comfy-server.exe` with a mock-only one.
 
 ```bash
 cargo run --release -p comfy-server --features native -- --engine native --models-root "C:/path/to/SwarmUI/Models"
@@ -210,16 +214,14 @@ Measured on Krea 2 (RTX 5070, 768x768, 8 steps): VRAM in use went from 10.1 GB t
 
 ## Test
 
-```bash
-cargo test
-```
-
-That runs everything but `native-engine`, which needs the CUDA build. Its own tests, which need a GPU but no
-checkpoint:
+Without CUDA, on the mock engine:
 
 ```bash
-cargo test --release -p native-engine
+cargo test -p comfy-server -p swarm-engine-api
 ```
+
+With the CUDA build and a GPU, `cargo test --release` runs these, `native-engine`'s own tests and the `diffusion`
+crate's, with no checkpoint needed.
 
 `crates/comfy-server/tests/swarm_compat.rs` drives the server the way SwarmUI's `ComfyUIAPIAbstractBackend`
 does (websocket handshake, `/prompt`, frame classification, `/history`), using workflows shaped like

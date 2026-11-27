@@ -7,9 +7,8 @@ The checks, cheapest first:
 
 | Check | Needs | Command |
 |---|---|---|
-| Server on the mock engine | Rust | `cargo test` in `swarm backend/` |
-| Samplers, latent ops, CFG tweaks, prompts and sparse attention against ComfyUI's recorded output | The CUDA build | `cargo test --release` in the repository root |
-| The native engine's request mapping: prompts, latents, noise, shifts | The CUDA build and a GPU | `cargo test --release -p native-engine` in `swarm backend/` |
+| Server on the mock engine | Rust | `cargo test -p comfy-server -p swarm-engine-api` |
+| Everything above, plus samplers, latent ops, CFG tweaks, prompts and sparse attention against ComfyUI's recorded output, and the native engine's request mapping | The CUDA build and a GPU | `cargo test --release` |
 | One model against ComfyUI, tensor by tensor | Checkpoints and a ComfyUI to run | A `tools/*_ref.py` script, then `diffusion --dump`, then a `*_cmp.py` script |
 | SwarmUI end to end | A SwarmUI install | A separate SwarmUI instance pointed at `comfy-server` |
 
@@ -156,7 +155,7 @@ states before PSNR, warm runs against warm runs, and `int8` against `flash` atte
 Test against a separate SwarmUI instance, so the real install's settings and backends are never touched. Only run live
 tests when asked.
 
-1. **Start `comfy-server`** with the native engine and the same models folder as SwarmUI, from `swarm backend/`:
+1. **Start `comfy-server`** with the native engine and the same models folder as SwarmUI:
 
    ```bash
    cargo run --release -p comfy-server --features native -- --engine native --port 8188 --models-root "<models folder>"

@@ -6,6 +6,9 @@
 //!   CUTLASS_DIR     CUTLASS checkout (default: ref/comfy-kitchen/third_party/cutlass)
 //!   FLASH_ATTN_DIR  flash-attention checkout (default: ref/comfy-kitchen/third_party/flash-attention)
 //!   CUDA_ARCH       e.g. "120" (default 120)
+//!
+//! Compiled units go to `<target>/cuda-objs`, keyed by everything that goes into them, so every profile, `cargo clippy`
+//! and the server crates' builds share them, and only a unit whose inputs changed is compiled again.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -50,6 +53,9 @@ fn hash_file_tree(h: &mut DefaultHasher, dir: &Path, recurse: bool) {
 fn main() {
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    // OUT_DIR is <target>/<profile>/build/diffusion-<hash>/out
+    let cache = out.ancestors().nth(4).map_or_else(|| out.clone(), |t| t.join("cuda-objs"));
+    std::fs::create_dir_all(&cache).unwrap();
     let csrc = root.join("csrc");
     println!("cargo:rerun-if-changed=csrc");
 
@@ -72,12 +78,14 @@ fn main() {
     hash_file_tree(&mut base_hash, &csrc, false);
     hash_file_tree(&mut base_hash, &csrc.join("compat"), true);
     arch.hash(&mut base_hash);
+    cuda.hash(&mut base_hash);
     // A different CUTLASS or flash-attention means different headers, so it rebuilds every unit; and anything but the
     // tested commits gets a warning.
     for (name, dir, want) in [("CUTLASS", &cutlass, CUTLASS_COMMIT), ("flash-attention", &flash, FLASH_ATTN_COMMIT)] {
         let head = git_head(dir);
         if let Some(h) = head.as_deref().filter(|h| *h != want) {
-            println!("cargo:warning={name} at {} is at {h}, not the tested {want} (comfy-kitchen {COMFY_KITCHEN_COMMIT}):                 see the README's Quick start", dir.display());
+            let at = dir.display();
+            println!("cargo:warning={name} at {at} is at {h}, not the tested {want} (comfy-kitchen {COMFY_KITCHEN_COMMIT}): see the README's Quick start");
         }
         head.hash(&mut base_hash);
     }
@@ -128,6 +136,7 @@ fn main() {
     ];
 
     let mut handles = Vec::new();
+    let mut stems = Vec::new();
     for u in units {
         let mut h = base_hash.clone();
         u.src.hash(&mut h);
@@ -138,7 +147,10 @@ fn main() {
         u.fast_math.hash(&mut h);
         let key = h.finish();
         let stem = u.src.file_stem().unwrap().to_string_lossy().to_string();
-        let obj = out.join(format!("{stem}-{key:016x}.obj"));
+        let obj = cache.join(format!("{stem}-{key:016x}.obj"));
+        // written under another name, then renamed: a build running beside this one never links half an object
+        let tmp = cache.join(format!("{stem}-{key:016x}.{}.tmp", std::process::id()));
+        stems.push(stem);
         // nvcc would otherwise run vcvars64.bat, which breaks on unusual PATH entries; a clean,
         // ready MSVC environment (cl.exe on PATH, INCLUDE/LIB set) skips that step.
         let mut cmd = Command::new(&nvcc);
@@ -155,7 +167,7 @@ fn main() {
                 cmd.env(k, v);
             }
         }
-        cmd.arg("-c").arg(&u.src).arg("-o").arg(&obj);
+        cmd.arg("-c").arg(&u.src).arg("-o").arg(&tmp);
         cmd.args(["-O3", "-std=c++17", "--expt-relaxed-constexpr", "--expt-extended-lambda", "-DNDEBUG", "-D_USE_MATH_DEFINES"]);
         cmd.arg(format!("-gencode=arch=compute_{arch},code=sm_{arch}"));
         cmd.arg("-Xcompiler=/MD,/O2,/Zc:__cplusplus,/Zc:preprocessor,/EHsc,/bigobj");
@@ -171,12 +183,13 @@ fn main() {
             cmd.arg(format!("-I{}", i.display()));
         }
         if obj.exists() {
-            handles.push((obj, None));
+            handles.push((obj, tmp, None));
             continue;
         }
         let src = u.src.clone();
         handles.push((
             obj,
+            tmp,
             Some(std::thread::spawn(move || {
                 let t = std::time::Instant::now();
                 let o = cmd.output().expect("failed to run nvcc");
@@ -187,15 +200,20 @@ fn main() {
 
     let mut objs = Vec::new();
     let mut failed = false;
-    for (obj, h) in handles {
+    for (obj, tmp, h) in handles {
         if let Some(h) = h {
             let (src, o, dt) = h.join().unwrap();
             if !o.status.success() {
                 failed = true;
                 eprintln!("nvcc failed for {}:\n{}\n{}", src.display(), String::from_utf8_lossy(&o.stdout),
                     String::from_utf8_lossy(&o.stderr));
-                let _ = std::fs::remove_file(&obj);
+                let _ = std::fs::remove_file(&tmp);
             } else {
+                if std::fs::rename(&tmp, &obj).is_err() {
+                    // another build finished the same unit first
+                    assert!(obj.exists(), "couldn't move {} to {}", tmp.display(), obj.display());
+                    let _ = std::fs::remove_file(&tmp);
+                }
                 println!("cargo:warning=compiled {} in {:.0}s", src.file_name().unwrap().to_string_lossy(), dt.as_secs_f64());
             }
         }
@@ -203,6 +221,16 @@ fn main() {
     }
     if failed {
         panic!("CUDA compilation failed");
+    }
+    // Drop each unit's older objects. Units of another CUDA_ARCH go too, and are compiled again when it comes back.
+    let current: std::collections::HashSet<_> = objs.iter().filter_map(|o| o.file_name()).map(|n| n.to_owned()).collect();
+    for e in std::fs::read_dir(&cache).unwrap().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(key) = name.strip_suffix(".obj").and_then(|n| n.rsplit_once('-')) else { continue };
+        let ours = stems.iter().any(|s| *s == key.0) && key.1.len() == 16 && key.1.chars().all(|c| c.is_ascii_hexdigit());
+        if ours && !current.contains(&e.file_name()) {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 
     let lib_tool = cc::windows_registry::find_tool(TARGET, "lib.exe").expect("lib.exe not found");

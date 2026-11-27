@@ -1,8 +1,29 @@
-[package]
-name = "diffusion"
+# One workspace: the diffusion library and CLI here, and the SwarmUI server crates under `swarm backend/crates`. They share
+# one Cargo.lock and one target folder, so the CUDA kernels and common dependencies are built once.
+[workspace]
+resolver = "2"
+members = [".", "swarm backend/crates/engine-api", "swarm backend/crates/comfy-server", "swarm backend/crates/native-engine"]
+# `cargo test --release` runs every crate's tests. Without the CUDA toolkit, pick the server crates with
+# `-p comfy-server -p swarm-engine-api`, which don't depend on this one.
+default-members = [".", "swarm backend/crates/engine-api", "swarm backend/crates/comfy-server", "swarm backend/crates/native-engine"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
+
+[workspace.dependencies]
+swarm-engine-api = { path = "swarm backend/crates/engine-api" }
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[package]
+name = "diffusion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Rust + CUDA reimplementation of ComfyUI's image generation for int8 ConvRot models"
 
 [lib]
@@ -43,3 +64,17 @@ codegen-units = 16
 
 [profile.dev]
 opt-level = 1
+
+# GIF/PNG encoding is very slow unoptimized, and the server's video tests encode dozens of frames.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.gif]
+opt-level = 3
+[profile.dev.package.color_quant]
+opt-level = 3
+[profile.dev.package.weezl]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3

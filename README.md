@@ -148,7 +148,8 @@ is refused or reaches a mock engine. See the [SwarmUI backend guide](swarm%20bac
 To have SwarmUI start and stop the server itself, use the comfy-rust backend extension instead. It uses SwarmUI's own model
 folders, so `MODELS_ROOT` isn't needed.
 
-1. Build the server from `swarm backend/`, with the CUDA toolkit's `bin` folder on `PATH`. SwarmUI doesn't build it, so
+1. Build the server, from anywhere in this repository, with the CUDA toolkit's `bin` folder on `PATH`. It goes to
+   `target/release/comfy-server.exe`. SwarmUI doesn't build it, so
    repeat this after pulling changes:
 
    ```bash

@@ -8,9 +8,17 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+# The server SwarmUI starts, with the real engine (and the mock, through --engine mock). It needs the `native` feature,
+# so a test or a plain build, which leave it out, never replaces it with a mock-only build.
 [[bin]]
 name = "comfy-server"
 path = "src/main.rs"
+required-features = ["native"]
+
+# The same server with only the mock engine, for machines without the CUDA toolkit.
+[[bin]]
+name = "comfy-server-mock"
+path = "src/bin/comfy-server-mock.rs"
 
 [features]
 # The real engine. Needs the CUDA toolkit and MSVC, so the default build stays mock-only.

@@ -1030,7 +1030,8 @@ pub fn decode_audio(dec: &AudioDecoder, latent: &[f32], t: usize, st: &Stream) -
     let mark = |stage: &'static str| prof.borrow_mut().mark(stage, st);
     mark("start")?;
     let w = DevBuf::alloc_async(gl.size, st)?;
-    crate::cuda::memcpy_h2d(w.ptr(), dec.host.ptr(), gl.size, st)?;
+    // SAFETY: the decoder's pinned weights hold `gl.size` bytes and live as long as `dec`
+    unsafe { crate::cuda::memcpy_h2d(w.ptr(), dec.host.ptr(), gl.size, st) }?;
     mark("upload")?;
     let g = |n: &str| w.at(gl.off(n));
     let mut z = vec![0f32; 2 * 32 * t];

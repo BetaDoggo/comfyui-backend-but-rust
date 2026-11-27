@@ -34,7 +34,10 @@ pub fn read_in_background() {
 const PIN_CHUNK: usize = 64 << 20;
 
 /// Bring `len` mapped bytes at `ptr` into this process from the file, on the calling thread and at its I/O priority.
-pub fn read_in(ptr: *const u8, len: usize) {
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes, such as part of a live mapping.
+pub unsafe fn read_in(ptr: *const u8, len: usize) {
     let mut sum = 0u8;
     for o in (0..len).step_by(4096) {
         sum = sum.wrapping_add(unsafe { ptr.add(o).read_volatile() });

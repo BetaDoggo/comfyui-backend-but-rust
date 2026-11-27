@@ -13,6 +13,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from golden_source import source  # noqa: E402
 COMFY = os.path.join(sys.argv[1], "dlbackend", "comfy", "ComfyUI")
 sys.path.insert(0, COMFY)
 sys.argv = [sys.argv[0]]
@@ -126,4 +128,4 @@ for kind, shift, scheduler, steps, cfg in [("flow", 3.0, "simple", 12, 1.0), ("f
                              add_noise=add_noise, inpaint=inpaint, sigmas=recorded, evals=short(evals), x=short(v.tolist())))
             print(f"{name:20} {kind} {start}-{end} {inpaint or '':18} {len(evals):3} evals  rms {v.pow(2).mean().sqrt():.5f}", file=sys.stderr, flush=True)
 
-json.dump(dict(seed=SEED, latent=short(LATENT.flatten().tolist()), mask=short(mask.flatten().tolist()), schedules=schedules, runs=runs), sys.stdout)
+json.dump(dict(source=source(comfyui=COMFY), seed=SEED, latent=short(LATENT.flatten().tolist()), mask=short(mask.flatten().tolist()), schedules=schedules, runs=runs), sys.stdout)

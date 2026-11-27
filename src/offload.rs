@@ -462,7 +462,8 @@ impl Image {
     fn read_in(&self) {
         if let Image::Mapped { rest, parts } = self {
             let own = rest.ptr() as usize..rest.ptr() as usize + rest.size();
-            parts.iter().filter(|(_, p, _)| !own.contains(p)).for_each(|&(_, p, len)| crate::st::read_in(p as *const u8, len));
+            // SAFETY: the parts lie in the unit's file mapping, which lives as long as the image
+            parts.iter().filter(|(_, p, _)| !own.contains(p)).for_each(|&(_, p, len)| unsafe { crate::st::read_in(p as *const u8, len) });
         }
     }
 }
@@ -643,7 +644,8 @@ impl WeightSet {
             for (i, r) in done_rx.iter() {
                 let buf = r?;
                 let d = dev[i].as_ref().unwrap();
-                memcpy_h2d(d.ptr(), buf.ptr(), layouts[i].size, &copy)?;
+                // SAFETY: `buf` is pinned and kept until `copy` syncs below
+                unsafe { memcpy_h2d(d.ptr(), buf.ptr(), layouts[i].size, &copy) }?;
                 copy.sync()?;
                 let _ = free_tx.send(buf);
             }
@@ -889,7 +891,8 @@ impl WeightSet {
     /// Copy `unit`'s pieces to `dst` on the copy stream.
     fn copy_direct(&mut self, unit: usize, parts: &[(usize, usize, usize)], dst: *mut c_void) -> Result<Event> {
         for &(off, src, len) in parts {
-            memcpy_h2d(unsafe { (dst as *mut u8).add(off) }.cast(), src as *const u8, len, &self.copy)?;
+            // SAFETY: the parts lie in the unit's page-locked mapping, which outlives the copy stream's work on it
+            unsafe { memcpy_h2d((dst as *mut u8).add(off).cast(), src as *const u8, len, &self.copy) }?;
         }
         let done = Event::new()?;
         done.record(&self.copy)?;
@@ -953,7 +956,8 @@ impl WeightSet {
             let parts = self.direct(unit).context("a unit left its mapping while it was read")?;
             return self.copy_direct(unit, &parts, dst);
         };
-        memcpy_h2d(dst, buf.ptr(), size, &self.copy)?;
+        // SAFETY: `buf` is pinned, and goes back to the staging pool with the copy's event, so it isn't reused early
+        unsafe { memcpy_h2d(dst, buf.ptr(), size, &self.copy) }?;
         let done = Event::new()?;
         done.record(&self.copy)?;
         l.staging.put((Some(buf), Some(Event::new_like(&done, &self.copy)?)));
@@ -1021,7 +1025,8 @@ impl WeightSet {
             if self.stores[i].dev.is_none() {
                 let d = DevBuf::alloc(self.layouts[i].size)?;
                 let h = self.stores[i].host.as_ref().unwrap();
-                memcpy_h2d(d.ptr(), h.ptr(), h.size(), &self.copy)?;
+                // SAFETY: the store's pinned copy lives as long as the store
+                unsafe { memcpy_h2d(d.ptr(), h.ptr(), h.size(), &self.copy) }?;
                 self.copied_bytes += h.size();
                 self.stores[i].dev = Some(d);
             }
@@ -1130,7 +1135,8 @@ impl WeightSet {
             self.fill(unit, dst)?;
         } else {
             let h = self.stores[unit].host.as_ref().expect("streamed unit without host copy");
-            memcpy_h2d(self.slots[si].buf.ptr(), h.ptr(), h.size(), &self.copy)?;
+            // SAFETY: the store's pinned copy lives as long as the store
+            unsafe { memcpy_h2d(self.slots[si].buf.ptr(), h.ptr(), h.size(), &self.copy) }?;
             self.copied_bytes += h.size();
         }
         let slot = &mut self.slots[si];
@@ -1221,7 +1227,8 @@ impl WeightSet {
         }
         let size = self.layouts[unit].size;
         let h = self.stores[unit].host.as_ref().context("streamed unit without host copy")?;
-        memcpy_h2d(dst, h.ptr(), size, &self.copy)?;
+        // SAFETY: the store's pinned copy lives as long as the store
+        unsafe { memcpy_h2d(dst, h.ptr(), size, &self.copy) }?;
         let done = Event::new()?;
         done.record(&self.copy)?;
         self.copied_bytes += size;

@@ -260,12 +260,14 @@ impl TextEncoder {
             lin(n.ptr(), &[0, 1, 2], null(), D, qkv.ptr(), QKV, 0.0)?;
             k!(gpu_qk_norm_rope(DT_F32, HD as i32, qkv.ptr(), QKV as i64, 0, (HQ * HD) as i32, HQ as i32, HK as i32, w("qn"), w("kn"), EPS, rope_rows, 2, m, s(st)))?;
             if let Some(b) = &keep {
-                memcpy_2d_d2h(unsafe { b.ptr().add(i * l * KV) }, KV, keys, QKV * 4, KV, l, st)?;
+                // SAFETY: `b` is pinned and holds every layer's `l` rows of KV bytes; it is read after the stream syncs
+                unsafe { memcpy_2d_d2h(b.ptr().add(i * l * KV), KV, keys, QKV * 4, KV, l, st) }?;
             }
             let scale = 1.0 / (HD as f32).sqrt();
             match (&kv, &prefix) {
                 (Some(kv), Some(p)) => {
-                    memcpy_h2d(kv.ptr(), unsafe { p.kv.ptr().add(i * p.ids.len() * KV) }, kept * KV, st)?;
+                    // SAFETY: the prefix's pinned keys hold every layer's rows, and the prefix outlives the encode
+                    unsafe { memcpy_h2d(kv.ptr(), p.kv.ptr().add(i * p.ids.len() * KV), kept * KV, st) }?;
                     memcpy_2d_d2d(off(kv.ptr(), kept * KV), KV, keys, QKV * 4, KV, rows, st)?;
                     k!(gpu_attn_small(DT_F32, qkv.ptr(), QKV as i64, kv.ptr(), off(kv.ptr(), HK * HD * 4), (KV / 4) as i64, HQ as i32, HK as i32, HD as i32, m, l as i32, attn.ptr(),
                         (HQ * HD) as i64, scale, kept as i32 + 1, s(st)))?;

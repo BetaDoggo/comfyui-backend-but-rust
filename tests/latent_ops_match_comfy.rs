@@ -16,7 +16,8 @@ fn latent(v: &Value) -> (Vec<f32>, Shape) {
 
 #[test]
 fn latent_nodes_match_comfy() {
-    let cases: Value = serde_json::from_str(include_str!("latent_ops_golden.json")).unwrap();
+    let golden: Value = serde_json::from_str(include_str!("latent_ops_golden.json")).unwrap();
+    let cases = &golden["cases"];
     let mut worst = 0f32;
     for c in cases.as_array().unwrap() {
         let op = c["op"].as_str().unwrap();

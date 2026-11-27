@@ -9,6 +9,8 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from golden_source import source  # noqa: E402
 root = sys.argv[1]
 comfy_dir = os.path.join(root, "dlbackend", "comfy", "ComfyUI")
 sys.path.insert(0, comfy_dir)
@@ -69,4 +71,4 @@ for sb, mask_shape, factor in [((2, 4, 6, 8), (6, 8), 0.5), ((2, 4, 5, 7), (48, 
     out = result(SwarmLatentBlendMasked().blend({"samples": a}, {"samples": b}, factor, mask))
     cases.append({"op": "blend_masked", "factor": factor, "a": t(a), "b": t(b), "mask": t(mask), "out": t(out)})
 
-json.dump(cases, sys.stdout)
+json.dump({"source": source(comfyui=comfy_dir, swarmui=root), "cases": cases}, sys.stdout)

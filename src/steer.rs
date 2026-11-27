@@ -38,6 +38,7 @@ impl Recorder {
     }
 
     /// Add block `b`'s output, bf16 [rows, width] at `x`, to step `step`'s sums. Block 0 counts the rows.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // device addresses: a bad one is a CUDA error or a wrong result, not host UB
     pub fn record(&mut self, step: usize, b: usize, x: PM, rows: usize, st: &Stream) -> Result<()> {
         if step >= self.steps() || b >= self.blocks {
             return Ok(());
@@ -194,6 +195,7 @@ impl Steer {
     }
 
     /// Steer block `b`'s output, bf16 [rows, width] at `x`, if `step` and `b` are chosen.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // device addresses: a bad one is a CUDA error or a wrong result, not host UB
     pub fn apply(&self, step: usize, b: usize, x: PM, rows: usize, st: &Stream) -> Result<()> {
         if !(self.steps.0..self.steps.1).contains(&step) {
             return Ok(());

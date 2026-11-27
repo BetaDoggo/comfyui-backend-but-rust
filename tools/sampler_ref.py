@@ -13,6 +13,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from golden_source import source  # noqa: E402
 COMFY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ref", "ComfyUI")
 sys.path.insert(0, os.path.abspath(COMFY))
 out_path = sys.argv[1]
@@ -144,4 +146,4 @@ for kind, shift, scheduler, steps, cfg in CASES:
         runs.append(dict(kind=kind, shift=shift, scheduler=scheduler, steps=steps, cfg=cfg, sampler=name, evals=short(evals), x=short(v[:KEPT].tolist())))
         print(f"{name:32} {kind} {scheduler:8} {len(evals):4} evals  rms {v.pow(2).mean().sqrt():.5f}", flush=True)
 
-json.dump(dict(seed=SEED, schedules=schedules, runs=runs), open(out_path, "w"))
+json.dump(dict(source=source(comfyui=COMFY), seed=SEED, schedules=schedules, runs=runs), open(out_path, "w"))

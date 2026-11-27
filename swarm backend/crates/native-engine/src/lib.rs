@@ -1534,8 +1534,17 @@ impl NativeEngine {
     }
 
     fn gen(&self) -> std::sync::MutexGuard<'_, Generator> {
-        // A panic mid-generation leaves nothing the next prompt depends on.
-        self.gen.lock().unwrap_or_else(|e| e.into_inner())
+        self.gen.lock().unwrap_or_else(|e| {
+            // A job panicked while it held the generator, possibly halfway through updating a cache (modulation,
+            // cross-attention k and v, baked LoRAs). Trust none of it: unload every model, and the next job loads
+            // them fresh.
+            let mut gen = e.into_inner();
+            if let Err(e) = gen.unload() {
+                tracing::warn!("native: unloading after a panic failed: {e:#}");
+            }
+            self.gen.clear_poison();
+            gen
+        })
     }
 
     fn load_model(&self, file: &ModelFile) -> EngineResult<ModelHandle> {
@@ -3051,6 +3060,19 @@ impl Engine for NativeEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Needs a CUDA GPU, but no checkpoint.
+    #[test]
+    fn a_panic_unloads_and_unpoisons_the_generator() {
+        let engine = NativeEngine::new(&NativeOptions::default()).unwrap();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _gen = engine.gen();
+            panic!("a job failed while it held the generator");
+        }));
+        assert!(r.is_err() && engine.gen.is_poisoned());
+        drop(engine.gen());
+        assert!(!engine.gen.is_poisoned());
+    }
 
     #[test]
     fn sparse_block_lists() {

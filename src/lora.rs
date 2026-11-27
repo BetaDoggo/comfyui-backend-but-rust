@@ -623,7 +623,8 @@ impl Model<'_> {
             let clean = *self.clean.entry((store, unit)).or_insert(image.is_some_and(|(_, rewritten)| !rewritten));
             if let (true, Some((base, _))) = (clean, image) {
                 let d = DevBuf::alloc_async(p.len, st)?;
-                memcpy_h2d(d.ptr(), unsafe { base.add(p.off) }, p.len, st)?;
+                // SAFETY: the unit's image is mapped or pinned for as long as its store, and holds the piece
+                unsafe { memcpy_h2d(d.ptr(), base.add(p.off), p.len, st) }?;
                 return Ok(d);
             }
         }

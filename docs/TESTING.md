@@ -9,6 +9,7 @@ The checks, cheapest first:
 |---|---|---|
 | Server on the mock engine | Rust | `cargo test` in `swarm backend/` |
 | Samplers, latent ops, CFG tweaks, prompts and sparse attention against ComfyUI's recorded output | The CUDA build | `cargo test --release` in the repository root |
+| The native engine's request mapping: prompts, latents, noise, shifts | The CUDA build and a GPU | `cargo test --release -p native-engine` in `swarm backend/` |
 | One model against ComfyUI, tensor by tensor | Checkpoints and a ComfyUI to run | A `tools/*_ref.py` script, then `diffusion --dump`, then a `*_cmp.py` script |
 | SwarmUI end to end | A SwarmUI install | A separate SwarmUI instance pointed at `comfy-server` |
 
@@ -19,7 +20,7 @@ Every test image must be safe: scenery or objects with no people. See [AGENTS.md
 | Piece | Where | Used for |
 |---|---|---|
 | This repository, built | See the [README](../README.md#quick-start) | Everything |
-| `ref/comfy-kitchen` | `git clone --recursive https://github.com/Comfy-Org/comfy-kitchen ref/comfy-kitchen` | The CUDA build (CUTLASS and FlashAttention-2) |
+| `ref/comfy-kitchen` | At the pinned commit, see the [README](../README.md#quick-start) | The CUDA build (CUTLASS and FlashAttention-2) |
 | A models folder in SwarmUI's layout | Anywhere, named by `MODELS_ROOT` | The CLI, the server and the reference scripts |
 | SwarmUI with its bundled ComfyUI | Its own folder, named by `SWARM_DIR` | Most reference scripts, and the live tests |
 | `ref/ComfyUI` with `ref/venv` | Inside this repository | The older reference scripts |
@@ -111,6 +112,12 @@ checkpoint. Regenerate one when ComfyUI changes the code it records:
 | `tests/sparse_golden.json` | `tools/sparse_attn_ref.py` |
 | `tests/sol3_golden.json` | `tools/sol3_ref.py`; `tests/sol3_attn_match.rs` skips until it is recorded |
 | `tests/swarm_tokens_golden.json` | `tools/swarm_prompt_ref.py` |
+
+Each script writes a `source` key into its file through `tools/golden_source.py`: the script, and the commit of the
+ComfyUI (and SwarmUI) checkout or the version of the package it ran, with `+dirty` for uncommitted changes. Compare it
+with the previous file's to see what moved the numbers. Files recorded before that have no `source` key, so what they
+came from wasn't recorded. Write the JSON from Git Bash or with the script's own output path: PowerShell 5.1's `>`
+writes UTF-16 or a byte-order mark, and the tests can't read either.
 
 ## Comparing one model with ComfyUI
 

@@ -455,7 +455,8 @@ impl Refiner {
         let done = [Event::new()?, Event::new()?];
         let copy = |i: usize| -> Result<()> {
             let (a, b) = chunks[i];
-            crate::cuda::memcpy_2d_d2h(stage[i % 2].ptr(), (b - a) * 2, off(pix.ptr(), a * 2), (b - a) * 2, (b - a) * 2, 1, st)?;
+            // SAFETY: a stage buffer holds STAGE_BYTES of pinned memory, and is read only after `done` for its copy
+            unsafe { crate::cuda::memcpy_2d_d2h(stage[i % 2].ptr(), (b - a) * 2, off(pix.ptr(), a * 2), (b - a) * 2, (b - a) * 2, 1, st) }?;
             done[i % 2].record(st)
         };
         if !chunks.is_empty() {

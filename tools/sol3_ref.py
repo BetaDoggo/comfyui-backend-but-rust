@@ -10,7 +10,10 @@ sol3_attn is github.com/FofGofx/sol3 at 21a509a1cf232168fefddcc06983ee1456588bca
 """
 
 import json
+import os
 import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from golden_source import source  # noqa: E402
 
 import torch
 
@@ -66,7 +69,7 @@ def main():
         print(f"{name}: {sum(r[0] for r in rows)} exact, {sum(r[1] for r in rows)} pure, {sum(r[2] for r in rows)} mixed "
               f"pairs, {sum(r[3] for r in rows)} selected tokens")
     with open(sys.argv[1], "w", encoding="utf-8") as f:
-        json.dump({"h": H, "stride": STRIDE, "cases": cases}, f)
+        json.dump({"source": source(packages=["sol3_attn"]), "h": H, "stride": STRIDE, "cases": cases}, f)
     print(f"wrote {len(cases)} cases")
 
 

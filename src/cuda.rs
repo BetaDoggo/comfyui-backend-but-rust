@@ -323,18 +323,29 @@ impl Drop for DevBuf {
     }
 }
 
-pub fn memcpy_h2d(dst: *mut c_void, src: *const u8, n: usize, s: &Stream) -> Result<()> {
+/// Host to device, issued on `s`.
+///
+/// # Safety
+/// `src` must point to `n` readable bytes that stay alive and unchanged until `s` has run the copy. For an asynchronous
+/// copy that means page-locked memory, which the caller keeps until it synchronizes `s`.
+pub unsafe fn memcpy_h2d(dst: *mut c_void, src: *const u8, n: usize, s: &Stream) -> Result<()> {
     ck!(cudaMemcpyAsync(dst, src as *const c_void, n, H2D, s.0))
 }
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // device addresses: a bad one is a CUDA error or a wrong result, not host UB
 pub fn memcpy_d2d(dst: *mut c_void, src: *const c_void, n: usize, s: &Stream) -> Result<()> {
     ck!(cudaMemcpyAsync(dst, src, n, D2D, s.0))
 }
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // device addresses: a bad one is a CUDA error or a wrong result, not host UB
 pub fn memcpy_2d_d2d(dst: *mut c_void, dpitch: usize, src: *const c_void, spitch: usize, width: usize,
     height: usize, s: &Stream) -> Result<()> {
     ck!(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, D2D, s.0))
 }
 /// Rows of device memory to page-locked host memory. Issued on `s`: the rows are there once it is synchronized.
-pub fn memcpy_2d_d2h(dst: *mut u8, dpitch: usize, src: *const c_void, spitch: usize, width: usize, height: usize, s: &Stream) -> Result<()> {
+///
+/// # Safety
+/// `dst` must point to `height` rows of `dpitch` writable bytes, which nothing else reads or writes until `s` has run
+/// the copy.
+pub unsafe fn memcpy_2d_d2h(dst: *mut u8, dpitch: usize, src: *const c_void, spitch: usize, width: usize, height: usize, s: &Stream) -> Result<()> {
     ck!(cudaMemcpy2DAsync(dst as *mut c_void, dpitch, src, spitch, width, height, D2H, s.0))
 }
 

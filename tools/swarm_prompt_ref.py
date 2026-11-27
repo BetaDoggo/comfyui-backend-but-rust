@@ -10,6 +10,8 @@ import os
 import sys
 import types
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from golden_source import source  # noqa: E402
 root = sys.argv[1]
 comfy_dir = os.path.join(root, "dlbackend", "comfy", "ComfyUI")
 sys.path.insert(0, comfy_dir)
@@ -54,4 +56,4 @@ for name, clip in (("moss", Clip(comfy.text_encoders.moss_image.MOSSImageTokeniz
             chunks.append({"ids": [t[0] for t in batch], "weights": [t[1] for t in batch]})
         cases.append({"prompt": prompt, "chunks": chunks})
     out[name] = cases
-json.dump(out, sys.stdout)
+json.dump({"source": source(comfyui=comfy_dir, swarmui=root), **out}, sys.stdout)

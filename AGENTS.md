@@ -68,6 +68,13 @@ cargo build --release
 cargo test --release
 ```
 
+Test the native engine's request mapping (prompts, latents, noise, shifts), from `swarm backend/`. Plain `cargo test`
+there leaves it out because it needs the CUDA build, but no checkpoint:
+
+```bash
+cargo test --release -p native-engine
+```
+
 Build the server with the real engine, from `swarm backend/`:
 
 ```bash

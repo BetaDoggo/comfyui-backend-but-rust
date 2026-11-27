@@ -376,6 +376,7 @@ impl Dino3 {
 
     /// `NAF.forward`: upsample `lr` (f32 [h * h, D] NHWC patches) to `out_size`^2 guided by `rgb` (the composite
     /// resized to `img_size`), as an f16 NHWC map [out_size^2, D].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // device addresses: a bad one is a CUDA error or a wrong result, not host UB
     pub fn naf(&self, rgb: &[f32], img_size: usize, lr: PM, h: usize, out_size: usize, st: &Stream) -> Result<DevBuf> {
         if img_size > 4 * out_size || img_size % out_size != 0 || out_size % h != 0 {
             bail!("unsupported NAF sizes {img_size} -> {out_size} over {h}");

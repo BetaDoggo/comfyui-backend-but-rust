@@ -908,9 +908,10 @@ impl Generator {
         self.relayvsr_int8_attention(on);
     }
 
-    /// Drop every model and give their VRAM and pinned RAM back. `ensure_*` loads them again.
+    /// Drop every model and give their VRAM and pinned RAM back. `ensure_*` loads them again. The models go even when
+    /// the stream reports an error, so a failed job can't leave one behind with half-updated caches.
     pub fn unload(&mut self) -> Result<()> {
-        self.env.st.sync()?;
+        let synced = self.env.st.sync();
         self.family = Family::None;
         self.te = None;
         self.vae = None;
@@ -918,6 +919,7 @@ impl Generator {
         self.seedvr_vae = None;
         self.relayvsr = None;
         self.relayvsr_vae = None;
+        synced?;
         cuda::trim_pool()
     }
 

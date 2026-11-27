@@ -7,7 +7,10 @@ the top-k thresholds. Run with SwarmUI's ComfyUI Python, which has comfy_kitchen
 """
 
 import json
+import os
 import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from golden_source import source  # noqa: E402
 
 import torch
 
@@ -63,7 +66,7 @@ def main():
             "out": flat[::STRIDE].tolist(), "threshold": thr,
         })
     with open(sys.argv[1], "w", encoding="utf-8") as f:
-        json.dump({"t": T, "h": H, "stride": STRIDE, "cases": out}, f)
+        json.dump({"source": source(packages=["comfy_kitchen"]), "t": T, "h": H, "stride": STRIDE, "cases": out}, f)
     print(f"wrote {len(out)} cases")
 
 

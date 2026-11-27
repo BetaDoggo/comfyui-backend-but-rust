@@ -23,6 +23,16 @@ png = "0.17"
 memmap2 = "0.9"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 
+# Lints that only fight how this code is written: constants copied in full from ComfyUI and PyTorch (some look like pi
+# fractions), kernel launchers that mirror their C signatures, nested tuples for tensor layouts, and `% n == 0` checks.
+# `cargo clippy --release` then shows real findings only.
+[lints.clippy]
+excessive_precision = "allow"
+approx_constant = "allow"
+manual_is_multiple_of = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
 [build-dependencies]
 cc = "1"
 

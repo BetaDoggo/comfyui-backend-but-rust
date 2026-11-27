@@ -42,11 +42,23 @@ ComfyUI backend. [Status](docs/STATUS.md) lists what works and what's left, in p
 You need Windows x64, an NVIDIA GPU (the default build targets RTX 50-series, `sm_120`; set `CUDA_ARCH` for others),
 [Rust](https://rustup.rs), the CUDA 13 toolkit (`CUDA_PATH`) and MSVC Build Tools 2022.
 
-The build takes CUTLASS and FlashAttention-2 from a comfy-kitchen checkout. Run this inside this repository:
+The build takes CUTLASS and FlashAttention-2 from a comfy-kitchen checkout, at the commit the kernels are tested
+against. Run these inside this repository:
 
 ```bash
-git clone --recursive https://github.com/Comfy-Org/comfy-kitchen ref/comfy-kitchen
+git clone https://github.com/Comfy-Org/comfy-kitchen ref/comfy-kitchen
 ```
+
+```bash
+git -C ref/comfy-kitchen checkout f8b7e97a1418d2e529bd5405fbf86312be198ae6
+```
+
+```bash
+git -C ref/comfy-kitchen submodule update --init --recursive
+```
+
+The build warns if CUTLASS or FlashAttention is at another commit. To move to a newer comfy-kitchen, update the commits
+at the top of `build.rs` and this step together.
 
 Then build, which takes several minutes the first time:
 

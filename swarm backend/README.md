@@ -214,6 +214,13 @@ Measured on Krea 2 (RTX 5070, 768x768, 8 steps): VRAM in use went from 10.1 GB t
 cargo test
 ```
 
+That runs everything but `native-engine`, which needs the CUDA build. Its own tests, which need a GPU but no
+checkpoint:
+
+```bash
+cargo test --release -p native-engine
+```
+
 `crates/comfy-server/tests/swarm_compat.rs` drives the server the way SwarmUI's `ComfyUIAPIAbstractBackend`
 does (websocket handshake, `/prompt`, frame classification, `/history`), using workflows shaped like
 SwarmUI's generator output for the native families (`tests/fixtures/`).

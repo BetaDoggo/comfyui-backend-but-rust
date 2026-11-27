@@ -14,6 +14,18 @@ use std::process::Command;
 
 const TARGET: &str = "x86_64-pc-windows-msvc";
 
+/// The comfy-kitchen commit the kernels are built and tested against (README, Quick start), and the CUTLASS and
+/// flash-attention commits it pins as submodules.
+const COMFY_KITCHEN_COMMIT: &str = "f8b7e97a1418d2e529bd5405fbf86312be198ae6";
+const CUTLASS_COMMIT: &str = "d4b4b494c3c51bf6507e7ab09fbafd1e9fa94f39";
+const FLASH_ATTN_COMMIT: &str = "979702c87a8713a8e0a5e9fee122b90d2ef13be5";
+
+/// The commit checked out in `dir`, when it is a git checkout.
+fn git_head(dir: &Path) -> Option<String> {
+    let o = Command::new("git").arg("-C").arg(dir).args(["rev-parse", "HEAD"]).output().ok()?;
+    o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
 fn env_path(var: &str, default: PathBuf) -> PathBuf {
     println!("cargo:rerun-if-env-changed={var}");
     std::env::var_os(var).map(PathBuf::from).unwrap_or(default)
@@ -60,6 +72,15 @@ fn main() {
     hash_file_tree(&mut base_hash, &csrc, false);
     hash_file_tree(&mut base_hash, &csrc.join("compat"), true);
     arch.hash(&mut base_hash);
+    // A different CUTLASS or flash-attention means different headers, so it rebuilds every unit; and anything but the
+    // tested commits gets a warning.
+    for (name, dir, want) in [("CUTLASS", &cutlass, CUTLASS_COMMIT), ("flash-attention", &flash, FLASH_ATTN_COMMIT)] {
+        let head = git_head(dir);
+        if let Some(h) = head.as_deref().filter(|h| *h != want) {
+            println!("cargo:warning={name} at {} is at {h}, not the tested {want} (comfy-kitchen {COMFY_KITCHEN_COMMIT}):                 see the README's Quick start", dir.display());
+        }
+        head.hash(&mut base_hash);
+    }
 
     struct Unit {
         src: PathBuf,

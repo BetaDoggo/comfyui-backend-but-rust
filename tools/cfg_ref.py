@@ -8,6 +8,8 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from golden_source import source  # noqa: E402
 root = sys.argv[1]
 comfy_dir = os.path.join(root, "dlbackend", "comfy", "ComfyUI")
 sys.path.insert(0, comfy_dir)
@@ -88,4 +90,4 @@ for tweak in TWEAKS:
         out = guide(apply(tweak), x, cond, uncond, scale, sigma_t)
         cases.append({"tweak": tweak, "scale": scale, "sigma": sigma, "x": x.flatten().tolist(), "cond": cond.flatten().tolist(),
                       "uncond": uncond.flatten().tolist(), "out": out.flatten().tolist()})
-json.dump(cases, sys.stdout)
+json.dump({"source": source(comfyui=comfy_dir), "cases": cases}, sys.stdout)

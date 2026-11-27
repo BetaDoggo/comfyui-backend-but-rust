@@ -297,7 +297,8 @@ impl Cache {
                 self.owner[sl] = Some((moe, e));
                 self.slot[key] = Some(sl);
                 // the copy waits on the stream for earlier kernels that read the slot
-                memcpy_h2d(self.pool.at(sl * EXPERT), unsafe { store.layers[moe].ptr().add(e * EXPERT) }, EXPERT, st)?;
+                // SAFETY: the layer's pinned experts hold expert `e`, and stay loaded with the model
+                unsafe { memcpy_h2d(self.pool.at(sl * EXPERT), store.layers[moe].ptr().add(e * EXPERT), EXPERT, st) }?;
                 sl
             }
         };

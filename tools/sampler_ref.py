@@ -15,8 +15,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from golden_source import source  # noqa: E402
-COMFY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ref", "ComfyUI")
-sys.path.insert(0, os.path.abspath(COMFY))
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy("ref")
 out_path = sys.argv[1]
 sys.argv = [sys.argv[0]]
 

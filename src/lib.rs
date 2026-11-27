@@ -9,6 +9,7 @@ pub mod clip;
 pub mod cuda;
 pub mod dino3;
 pub mod dit;
+pub mod families;
 pub mod ffi;
 pub mod flux2vae;
 pub mod h3;

@@ -17,9 +17,9 @@ import os
 import sys
 import time
 
-SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
-COMFY = os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI")
-sys.path.insert(0, COMFY)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy()
 PIFLOW = os.environ.get("PIFLOW_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ref", "ComfyUI-piFlow")
 
 ap = argparse.ArgumentParser()
@@ -36,13 +36,12 @@ ap.add_argument("--weights", nargs="+", help="save these modules' weights after 
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
 
-M = os.environ["MODELS_ROOT"]
+M = comfy_env.models_root()
 DIT = M + r"\Stable-diffusion\minimax_h3_fl2va_pruned_w6a8.safetensors"
 TE = M + r"\clip\qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 AUDIO_VAE = M + r"\VAE\MiniMaxH3\minimax_h3_audio_vae_fp32.safetensors"
 
-import comfy_aimdo.control
-comfy_aimdo.control.init()
+comfy_env.aimdo_start()
 
 import torch
 from safetensors.torch import save_file
@@ -51,14 +50,12 @@ comfy.options.enable_args_parsing()
 import comfy.cli_args  # noqa
 import comfy.memory_management
 import comfy.model_management
-assert comfy_aimdo.control.init_devices((d.index, int(comfy.cli_args.args.vram_headroom * 1024 ** 3)) for d in comfy.model_management.get_all_torch_devices())
-comfy.memory_management.aimdo_enabled = True
+comfy_env.aimdo_enable()
 import comfy.model_patcher
 import comfy.sample
 import comfy.samplers
 import comfy.sd
 import comfy.utils
-comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
 import nodes  # noqa: F401, sets up folder_paths and the node registry
 from comfy_extras.nodes_minimax_h3 import _empty_av_latent
 

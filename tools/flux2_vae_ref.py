@@ -11,9 +11,9 @@ import argparse
 import os
 import sys
 
-SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
-COMFY = os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI")
-sys.path.insert(0, COMFY)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy()
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")

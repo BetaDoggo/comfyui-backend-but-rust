@@ -16,10 +16,10 @@ import os
 import sys
 import time
 
-SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
-COMFY = os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI")
-sys.path.insert(0, COMFY)
-MODELS = os.environ.get("MODELS_ROOT") or sys.exit("set MODELS_ROOT to the models folder")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy()
+MODELS = comfy_env.models_root()
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
@@ -38,8 +38,7 @@ ap.add_argument("--dtype", choices=["auto", "bf16", "fp16"], default="auto", hel
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]] + {"bf16": ["--bf16-unet"], "fp16": ["--fp16-unet"]}.get(args.dtype, [])
 
-import comfy_aimdo.control
-comfy_aimdo.control.init()
+comfy_env.aimdo_start()
 
 import numpy as np
 import torch

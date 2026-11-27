@@ -103,6 +103,10 @@ Each model is written directly against its checkpoint, with no general layer or 
 operations to be fused and work to be cached. For example, Anima's cross-attention k and v are computed once per prompt,
 and block modulation is cached per sigma.
 
+Each family's defaults are in [`src/families.rs`](../src/families.rs): the files the CLI loads from a models folder, its
+model sampling (the shift when SwarmUI sends none), and the CLI's default sampler, steps and CFG. The CLI and the
+server's native engine both read them.
+
 The generator ([`src/pipeline/`](../src/pipeline/mod.rs)) holds one family at a time. Each family has a file with a state
 struct for its diffusion model, the encoders and decoders only it uses, and every prompt cache it keeps. The same file
 drops those caches when a LoRA or a text encoder changes. Loading any part of another family drops the current one. Two

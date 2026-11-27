@@ -15,8 +15,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from golden_source import source  # noqa: E402
-COMFY = os.path.join(sys.argv[1], "dlbackend", "comfy", "ComfyUI")
-sys.path.insert(0, COMFY)
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy(swarm=sys.argv[1] if len(sys.argv) > 1 else None)
 sys.argv = [sys.argv[0]]
 
 import torch

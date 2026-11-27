@@ -102,7 +102,9 @@ and [Testing](docs/TESTING.md#which-comfyui-each-script-uses) says which ComfyUI
 * Stochastic samplers, turbo paths and reference latents magnify rounding. Compare `int8` with `flash` attention in this
   engine first: they often differ by as much as this engine differs from ComfyUI.
 * Scripts that run ComfyUI's LoRA path headless must set up `comfy_aimdo` and `ModelPatcherDynamic`, or they silently take
-  the legacy path with a different seed key. `tools/lora_ref.py` shows how.
+  the legacy path with a different seed key. Call `comfy_env.aimdo_start()` before torch is imported and
+  `comfy_env.aimdo_enable()` after `comfy.model_management`, as `tools/lora_ref.py` does.
+* New scripts in `tools/` find ComfyUI, SwarmUI and the models through `tools/comfy_env.py`, not their own paths.
 * ComfyUI's `samples` are after `process_latent_out`, so compare images or step latents instead.
 * Compare warm with warm. A cold read can dominate a run.
 

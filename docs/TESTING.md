@@ -62,7 +62,7 @@ lacks the newer models and SwarmUI's nodes, which is why newer scripts use Swarm
 |---|---|
 | `MODELS_ROOT` | The models folder. The CLI, `start-backend.bat` and most reference scripts read it |
 | `SWARM_DIR` | The SwarmUI folder. Scripts that use SwarmUI's ComfyUI read it, and stop with a message when it isn't set |
-| `COMFY_DIR` | A different ComfyUI, for a model that only an unmerged ComfyUI branch has. `tools/h3_image_ref.py` reads it |
+| `COMFY_DIR` | A different ComfyUI, in place of SwarmUI's or `ref/ComfyUI` for every script, such as one with a model only an unmerged ComfyUI branch has (`tools/h3_image_ref.py`). Leave it unset otherwise |
 | `CUDA_ARCH` | The GPU architecture to build for, `120` by default |
 | `PROFILE=1`, `RUST_LOG=debug` | Stage timings, and per-node server logs |
 
@@ -76,7 +76,9 @@ setx MODELS_ROOT "<models folder>"
 setx SWARM_DIR "<SwarmUI folder>"
 ```
 
-Some scripts take the SwarmUI folder as their first argument instead of `SWARM_DIR`.
+The scripts read these through [`tools/comfy_env.py`](../tools/comfy_env.py), which also sets up `comfy_aimdo` for the
+ones that need ComfyUI's dynamic memory path. `cfg_ref`, `latent_ops_ref`, `partial_ref` and `swarm_prompt_ref` also
+take the SwarmUI folder as their first argument, in place of `SWARM_DIR`.
 
 ## Which ComfyUI each script uses
 
@@ -86,8 +88,8 @@ the ones on `ref/ComfyUI` with `ref/venv/Scripts/python.exe`.
 | ComfyUI | Scripts |
 |---|---|
 | SwarmUI's, through `SWARM_DIR` | `birefnet_ref`, `flux2_vae_ref`, `h3_ref`, `h3_image_ref`, `krea_image_ref`, `lora_ref`, `pih3_ref`, `pixal3d_ref`, `qwen21_ref`, `relayvsr_ref`, `seedvr_ref`, `sensenova_ref`, `snapref_ref`, `triposplat_ref` |
-| SwarmUI's, with the SwarmUI folder as the first argument | `cfg_ref`, `latent_ops_ref`, `partial_ref`, `swarm_prompt_ref` |
-| `ref/ComfyUI` | `anima_ref`, `moss_ref`, `ref_dump` (Krea 2), `sampler_ref`, `sd_ref` (or `COMFY_DIR`), `te_hidden`, `te_l0`, `chk_dtypes`, `chk_te` |
+| SwarmUI's, through `SWARM_DIR` or the first argument | `cfg_ref`, `latent_ops_ref`, `partial_ref`, `swarm_prompt_ref` |
+| `ref/ComfyUI` | `anima_ref`, `moss_ref`, `ref_dump` (Krea 2), `sampler_ref`, `sd_ref`, `te_hidden`, `te_l0`, `chk_dtypes`, `chk_te` |
 | None: the model's own code from its Hugging Face repository | `nemotron_image_ref` (Nemotron-Labs-Image; run with SwarmUI's Python, which has torch and transformers) |
 | None: NVIDIA's `nvvfx` package | `nvidia_vsr_ref` (RTX Video Super Resolution; run with a Python that has torch and `nvidia-vfx`, such as SwarmUI's after `pip install nvidia-vfx --extra-index-url https://pypi.nvidia.com`) |
 | None: they compare, inspect or write files | Every `*_cmp.py` except `qwen21_cmp`, `compare.py`, `psnr.py`, `glb_preview.py`, `st_header.py`, `h3_refiner_check`, `lora_formats` |

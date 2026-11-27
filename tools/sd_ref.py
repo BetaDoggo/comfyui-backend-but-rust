@@ -14,8 +14,9 @@ import os
 import sys
 import time
 
-COMFY = os.environ.get("COMFY_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ref", "ComfyUI")
-sys.path.insert(0, os.path.abspath(COMFY))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy("ref")
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")

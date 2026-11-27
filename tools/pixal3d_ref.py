@@ -13,9 +13,9 @@ import argparse
 import os
 import sys
 
-SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
-COMFY = os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI")
-sys.path.insert(0, COMFY)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy()
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
@@ -30,8 +30,7 @@ ap.add_argument("--stop-after", choices=["cond", "ss", "shape", "hr", "mesh", "t
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
 
-import comfy_aimdo.control
-comfy_aimdo.control.init()
+comfy_env.aimdo_start()
 
 import numpy as np
 import torch
@@ -43,10 +42,8 @@ import comfy.cli_args  # noqa
 import comfy.memory_management
 import comfy.model_management
 # ComfyUI's own memory management (DynamicVRAM), as the app runs it; without it this pipeline runs out of VRAM
-assert comfy_aimdo.control.init_devices((d.index, int(comfy.cli_args.args.vram_headroom * 1024 ** 3)) for d in comfy.model_management.get_all_torch_devices())
-comfy.memory_management.aimdo_enabled = True
+comfy_env.aimdo_enable()
 import comfy.model_patcher
-comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
 import comfy.clip_vision
 import comfy.sd
 import comfy.utils
@@ -58,7 +55,7 @@ from comfy_extras.nodes_model_advanced import ModelSamplingSD3, RescaleCFG
 from comfy_extras.nodes_save_3d import mesh_item_to_glb_bytes
 from comfy_extras import nodes_trellis2 as t2
 
-MODELS = os.environ["MODELS_ROOT"]
+MODELS = comfy_env.models_root()
 DIT = os.path.join(MODELS, r"diffusion_models\Pixal3D\pixal3d_int8_convrot.safetensors")
 DINO = os.path.join(MODELS, r"clip_vision\dino_v3_L_naf_fp32.safetensors")
 SHAPE_VAE = os.path.join(MODELS, r"VAE\Pixal3D\trellis_2_shape_vae_bf16.safetensors")

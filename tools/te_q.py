@@ -1,7 +1,10 @@
 import os
 import numpy as np, torch, comfy_kitchen as ck
 from safetensors import safe_open
-f = safe_open(os.path.join(os.environ["MODELS_ROOT"], r"clip\qwen3vl_4b.safetensors"), "pt")
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+f = safe_open(os.path.join(comfy_env.models_root(), r"clip\qwen3vl_4b.safetensors"), "pt")
 P = "model.language_model.layers.0."
 w = f.get_tensor(P+"self_attn.q_proj.weight").cuda(); ws = f.get_tensor(P+"self_attn.q_proj.weight_scale").cuda()
 ln = f.get_tensor(P+"input_layernorm.weight").cuda()

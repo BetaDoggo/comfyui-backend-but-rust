@@ -11,8 +11,9 @@ import os
 import sys
 import time
 
-COMFY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ref", "ComfyUI")
-sys.path.insert(0, os.path.abspath(COMFY))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy("ref")
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
@@ -39,9 +40,9 @@ import comfy.utils
 import comfy.sample
 import comfy.samplers
 
-DIT = args.dit or os.path.join(os.environ["MODELS_ROOT"], r"Stable-diffusion\moss_image_sft_int8_convrot_attn.safetensors")
-TE = os.path.join(os.environ["MODELS_ROOT"], r"clip\qwen3.5_9b_int8_convrot.safetensors")
-VAE = os.path.join(os.environ["MODELS_ROOT"], r"VAE\flux2-vae.safetensors")
+DIT = args.dit or os.path.join(comfy_env.models_root(), r"Stable-diffusion\moss_image_sft_int8_convrot_attn.safetensors")
+TE = os.path.join(comfy_env.models_root(), r"clip\qwen3.5_9b_int8_convrot.safetensors")
+VAE = os.path.join(comfy_env.models_root(), r"VAE\flux2-vae.safetensors")
 
 os.makedirs(args.out, exist_ok=True)
 dump = {}

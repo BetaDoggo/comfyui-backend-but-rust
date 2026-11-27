@@ -17,9 +17,9 @@ import os
 import sys
 import time
 
-SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
-COMFY = os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI")
-sys.path.insert(0, COMFY)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy()
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
@@ -38,8 +38,7 @@ ap.add_argument("--tokens-only", action="store_true")
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
 
-import comfy_aimdo.control
-comfy_aimdo.control.init()
+comfy_env.aimdo_start()
 
 import numpy as np
 import torch
@@ -56,7 +55,7 @@ import comfy.samplers
 import comfy.sd
 import comfy.utils
 
-MODELS = os.environ.get("MODELS_ROOT") or sys.exit("set MODELS_ROOT to the models folder")
+MODELS = comfy_env.models_root()
 CKPT = os.path.join(MODELS, r"Stable-diffusion\sensenova_u1.6_8b_mot_int8_convrot.safetensors")
 
 os.makedirs(args.out, exist_ok=True)
@@ -79,9 +78,7 @@ if args.tokens_only:
 if True:
     # DynamicVRAM, as main.py runs it: the legacy path seeds LoRA rounding differently, and runs out of VRAM on an edit's
     # long prompt
-    assert comfy_aimdo.control.init_devices((d.index, int(comfy.cli_args.args.vram_headroom * 1024 ** 3)) for d in comfy.model_management.get_all_torch_devices())
-    comfy.memory_management.aimdo_enabled = True
-    comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
+    comfy_env.aimdo_enable()
 
 t0 = time.perf_counter()
 model, clip, vae, _ = comfy.sd.load_checkpoint_guess_config(CKPT, output_vae=True, output_clip=True)

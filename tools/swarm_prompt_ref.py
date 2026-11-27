@@ -12,10 +12,9 @@ import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from golden_source import source  # noqa: E402
-root = sys.argv[1]
-comfy_dir = os.path.join(root, "dlbackend", "comfy", "ComfyUI")
-sys.path.insert(0, comfy_dir)
-os.chdir(comfy_dir)
+import comfy_env  # noqa: E402
+root = comfy_env.swarm_dir(sys.argv[1] if len(sys.argv) > 1 else None)
+comfy_dir = comfy_env.use_comfy(swarm=root, chdir=True)
 
 import comfy.text_encoders.minimax
 import comfy.text_encoders.moss_image

@@ -18,8 +18,9 @@ import os
 import sys
 import time
 
-SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
-sys.path.insert(0, os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy()
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
@@ -43,14 +44,13 @@ ap.add_argument("--ref-video", help="a reference video, <Video 1> in the prompt,
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
 
-M = os.environ["MODELS_ROOT"]
+M = comfy_env.models_root()
 DIT = M + r"\Stable-diffusion\minimax_h3_fl2va_pruned_w6a8.safetensors"
 TE = M + r"\clip\qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 VAE = M + r"\VAE\MiniMaxH3\minimax_h3_video_vae_int8_convrot.safetensors"
 AUDIO_VAE = M + r"\VAE\MiniMaxH3\minimax_h3_audio_vae_fp32.safetensors"
 
-import comfy_aimdo.control
-comfy_aimdo.control.init()
+comfy_env.aimdo_start()
 
 import torch
 from safetensors.torch import save_file
@@ -59,16 +59,14 @@ comfy.options.enable_args_parsing()
 import comfy.cli_args  # noqa
 import comfy.memory_management
 import comfy.model_management
-assert comfy_aimdo.control.init_devices((d.index, int(comfy.cli_args.args.vram_headroom * 1024 ** 3)) for d in comfy.model_management.get_all_torch_devices())
-comfy.memory_management.aimdo_enabled = True
+comfy_env.aimdo_enable()
 import comfy.model_patcher
 import comfy.nested_tensor
 import comfy.sample
 import comfy.sd
 import comfy.utils
-comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
 import nodes
-sys.path.insert(0, os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI", "comfy_extras"))
+sys.path.insert(0, os.path.join(COMFY, "comfy_extras"))
 from comfy_extras.nodes_minimax_h3 import _empty_av_latent
 
 os.makedirs(args.out, exist_ok=True)

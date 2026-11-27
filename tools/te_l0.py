@@ -1,10 +1,12 @@
 import os
 import sys, os, numpy as np
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ref", "ComfyUI"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+comfy_env.use_comfy("ref")
 out = sys.argv[1]; sys.argv = [sys.argv[0]]
 import comfy.options; comfy.options.enable_args_parsing()
 import comfy.sd, torch
-clip = comfy.sd.load_clip(ckpt_paths=[os.path.join(os.environ["MODELS_ROOT"], r"clip\qwen3vl_4b.safetensors")], clip_type=comfy.sd.CLIPType.KREA2)
+clip = comfy.sd.load_clip(ckpt_paths=[os.path.join(comfy_env.models_root(), r"clip\qwen3vl_4b.safetensors")], clip_type=comfy.sd.CLIPType.KREA2)
 m = clip.cond_stage_model.qwen3vl_4b
 lay = m.transformer.model.layers[0]
 saved = {}

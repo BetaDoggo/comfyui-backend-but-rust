@@ -15,10 +15,10 @@ import os
 import sys
 import time
 
-SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
-COMFY = os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI")
-sys.path.insert(0, COMFY)
-sys.path.insert(0, os.path.join(SWARM, "src", "BuiltinExtensions", "ComfyUIBackend", "ExtraNodes"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy()
+sys.path.insert(0, comfy_env.swarm_nodes())
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
@@ -40,8 +40,7 @@ ap.add_argument("--trace-block", type=int, action="append", default=[], help="du
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
 
-import comfy_aimdo.control
-comfy_aimdo.control.init()
+comfy_env.aimdo_start()
 
 import numpy as np
 import torch
@@ -61,7 +60,7 @@ import comfy.utils
 import node_helpers
 from SwarmComfyCommon.SwarmText import SwarmTextEncodeAdvanced
 
-MODELS = os.environ.get("MODELS_ROOT") or sys.exit("set MODELS_ROOT to the models folder")
+MODELS = comfy_env.models_root()
 DIT = os.path.join(MODELS, r"Stable-diffusion\rayQwen21_v1Int8Convrot.safetensors")
 TE = os.path.join(MODELS, r"clip\qwen3vl_8b_int8_convrot.safetensors")
 VAE = os.path.join(MODELS, r"VAE\QwenImage\qwen_image_2.1_vae_bf16.safetensors")
@@ -71,9 +70,7 @@ dump = {}
 
 if args.lora:
     # LoRAs go through DynamicVRAM as in main.py; without it ComfyUI takes the legacy path, which seeds the rounding differently
-    assert comfy_aimdo.control.init_devices((d.index, int(comfy.cli_args.args.vram_headroom * 1024 ** 3)) for d in comfy.model_management.get_all_torch_devices())
-    comfy.memory_management.aimdo_enabled = True
-    comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
+    comfy_env.aimdo_enable()
     seeds = {comfy.utils.string_to_seed(m): m for m in args.capture}
     requantize = comfy.quant_ops.QuantizedTensor.requantize_from_float
 

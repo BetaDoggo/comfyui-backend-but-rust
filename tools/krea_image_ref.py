@@ -9,10 +9,10 @@ import argparse
 import os
 import sys
 
-SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
-COMFY = os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI")
-sys.path.insert(0, COMFY)
-sys.path.insert(0, os.path.join(SWARM, "src", "BuiltinExtensions", "ComfyUIBackend", "ExtraNodes"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy()
+sys.path.insert(0, comfy_env.swarm_nodes())
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
@@ -45,7 +45,7 @@ import nodes
 import node_helpers
 from SwarmComfyCommon.SwarmText import SwarmTextEncodeAdvanced
 
-MODELS = os.environ["MODELS_ROOT"]
+MODELS = comfy_env.models_root()
 DIT = os.path.join(MODELS, r"Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors")
 TE = os.path.join(MODELS, r"clip\qwen3vl_4b.safetensors")
 VAE = os.path.join(MODELS, r"VAE\qwen_image_vae.safetensors")

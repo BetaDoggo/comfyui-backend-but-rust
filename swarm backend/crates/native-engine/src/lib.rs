@@ -36,12 +36,11 @@ use swarm_engine_api::*;
 
 /// Attention backends, default first. SwarmUI's "pytorch attention" maps to the first entry.
 const ATTENTION: [&str; 2] = ["int8", "flash"];
-/// ComfyUI's `sampling_settings`, used when SwarmUI sends no Sigma Shift.
-const KREA2_SHIFT: f64 = 1.15;
-const ANIMA_SHIFT: f64 = 3.0;
-const MOSS_SHIFT: f64 = 5.0;
-/// ComfyUI's Qwen Image 2.1 `shift`: its mu at 1024x1024.
-const QWEN21_SHIFT: f64 = 0.69;
+/// A family's model sampling from [`diffusion::families`], ComfyUI's `sampling_settings`, used when SwarmUI sends no
+/// Sigma Shift.
+fn default_sampling(d: &diffusion::families::Defaults) -> ModelSampling {
+    d.sampling.expect("a family whose sampling doesn't come from its checkpoint")
+}
 /// [`TextEncoderHandle::encoder_type`] of Krea 2's Qwen3-VL 4B, SwarmUI's own type.
 const KREA_ENCODER: &str = "krea2";
 /// [`TextEncoderHandle::encoder_type`] of Anima's Qwen3 0.6B; SwarmUI's own type is the generic
@@ -990,16 +989,16 @@ fn h3_image_sampling(path: &Path) -> EngineResult<ModelSampling> {
 fn model_settings(model: &ModelHandle, family: Family) -> EngineResult<ModelSettings> {
     let model_sampling = match family {
         Family::H3Image => h3_image_sampling(&model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?.path)?,
-        Family::Krea2 => ModelSampling::Flux { shift: KREA2_SHIFT },
-        Family::Qwen21 => ModelSampling::Flux { shift: QWEN21_SHIFT },
-        Family::Anima => ModelSampling::Flow { shift: ANIMA_SHIFT },
-        Family::Moss => ModelSampling::Flow { shift: MOSS_SHIFT },
-        Family::H3 => ModelSampling::Flow { shift: h3::SHIFT_VIDEO },
+        Family::Krea2 => default_sampling(&diffusion::families::KREA2),
+        Family::Qwen21 => default_sampling(&diffusion::families::QWEN21),
+        Family::Anima => default_sampling(&diffusion::families::ANIMA),
+        Family::Moss => default_sampling(&diffusion::families::MOSS),
+        Family::H3 => default_sampling(&diffusion::families::H3),
         // ComfyUI's SeedVR2 sampling_settings
         Family::SeedVr2 => ModelSampling::Flow { shift: 1.0 },
         // WAN22_RelayVSR keeps WAN21_T2V's sampling_settings
         Family::RelayVsr => ModelSampling::Flow { shift: 8.0 },
-        Family::Sd => ModelSampling::Discrete,
+        Family::Sd => default_sampling(&diffusion::families::SD1),
         Family::SenseNova => ModelSampling::SenseNova { shift: diffusion::sensenova::SHIFT as f64 },
     };
     let mut s = ModelSettings { model_sampling, int8_attention: true,loras: Vec::new(), audio_shift: h3::SHIFT_AUDIO, tweaks: CfgTweaks::default(), differential: None, sparse: None, windows: None, snapref: None, style: None, v_pred: None, attn_token_weights: None };

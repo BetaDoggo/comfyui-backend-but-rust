@@ -36,7 +36,9 @@ ap.add_argument("--fidelity", type=float, default=1.0)
 ap.add_argument("--latent", help="a --dump of this engine: use its reference latent instead of ComfyUI's VAE encode")
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
-sys.path.insert(0, os.path.join(os.environ["SWARM_DIR"], "dlbackend", "comfy", "ComfyUI"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+comfy_env.use_comfy()
 
 import numpy as np
 import torch
@@ -52,7 +54,7 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 
-root = os.environ["MODELS_ROOT"]
+root = comfy_env.models_root()
 DIT = os.path.join(root, "Stable-diffusion", "animaInt8Mxfp8_turboV11Int8.safetensors")
 TE = os.path.join(root, "clip", "qwen_3_600m.safetensors")
 VAE = os.path.join(root, "VAE", "qwen_image_vae.safetensors")

@@ -1,10 +1,12 @@
 import os
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ref", "ComfyUI"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+comfy_env.use_comfy("ref")
 sys.argv = [sys.argv[0]]
 import comfy.options; comfy.options.enable_args_parsing()
 import comfy.sd, torch
-m = comfy.sd.load_diffusion_model(os.path.join(os.environ["MODELS_ROOT"], r"Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors"))
+m = comfy.sd.load_diffusion_model(os.path.join(comfy_env.models_root(), r"Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors"))
 dm = m.model.diffusion_model
 print("model dtype", m.model.get_dtype(), "manual_cast", m.model.manual_cast_dtype, flush=True)
 for n, p in dm.named_parameters(recurse=True):

@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use diffusion::samplers::ModelSampling;
 use diffusion::pipeline::Prompt;
+use diffusion::families::{self, Defaults};
 use diffusion::{pipeline, st};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -435,33 +436,6 @@ fn apply_loras(gen: &mut pipeline::Generator, args: &Args) -> Result<()> {
     gen.set_text_encoder_loras(&clip)
 }
 
-const KREA_DIT: &str = "Stable-diffusion/kroma-v0.3.1-turbo-opd-W8A8.safetensors";
-const KREA_TE: &str = "clip/qwen3vl_4b.safetensors";
-const QWEN_VAE: &str = "VAE/qwen_image_vae.safetensors";
-const ANIMA_DIT: &str = "Stable-diffusion/animaInt8Mxfp8_turboV11Int8.safetensors";
-const ANIMA_TE: &str = "clip/qwen_3_600m.safetensors";
-const MOSS_DIT: &str = "Stable-diffusion/moss_image_sft_int8_convrot_attn.safetensors";
-const MOSS_TE: &str = "clip/qwen3.5_9b_int8_convrot.safetensors";
-const SD1_DIT: &str = "Stable-diffusion/v1-5-pruned-emaonly-fp16.safetensors";
-const SDXL_DIT: &str = "Stable-diffusion/sd_xl_base_1.0.safetensors";
-const MOSS_VAE: &str = "VAE/flux2-vae.safetensors";
-const SEEDVR_DIT: &str = "diffusion_models/SeedVR2/seedvr2_3b_int8_convrot.safetensors";
-const SEEDVR_VAE: &str = "VAE/SeedVR2/seedvr2_ema_vae_fp16.safetensors";
-const NEMOTRON: &str = "diffusion_models/Nemotron-Labs-Image-30B-A3B-nvfp4.safetensors";
-const RELAYVSR_DIT: &str = "diffusion_models/relayvsr_x2_lightx2v_int8_convrot.safetensors";
-const RELAYVSR_VAE: &str = "VAE/relayvsr_flash_vae_x2_fp32.safetensors";
-const QWEN21_DIT: &str = "Stable-diffusion/rayQwen21_v1Int8Convrot.safetensors";
-const QWEN21_TE: &str = "clip/qwen3vl_8b_int8_convrot.safetensors";
-const QWEN21_VAE: &str = "VAE/QwenImage/qwen_image_2.1_vae_bf16.safetensors";
-const BIREFNET: &str = "background_removal/birefnet.safetensors";
-const NVIDIA_VSR: &str = "upscale_models/nvidia-vfx/nvngx_vsr.dll";
-const PIXAL_DIT: &str = "diffusion_models/Pixal3D/pixal3d_int8_convrot.safetensors";
-const PIXAL_DINO: &str = "clip_vision/dino_v3_L_naf_fp32.safetensors";
-const PIXAL_SHAPE_VAE: &str = "VAE/Pixal3D/trellis_2_shape_vae_bf16.safetensors";
-const PIXAL_TEX_VAE: &str = "VAE/Pixal3D/trellis_2_texture_vae_bf16.safetensors";
-const SPLAT_DIT: &str = "diffusion_models/idol_fp16.safetensors";
-const SPLAT_DINO: &str = "clip_vision/dino_v3_vit_h_bf16.safetensors";
-const SPLAT_DECODER: &str = "VAE/idol_decoder_fp16.safetensors";
 
 impl Args {
     /// `--attention`: INT8 unless flash is asked for.
@@ -473,19 +447,59 @@ impl Args {
         }
     }
 
-    /// `--steps`, else the family's default.
+    /// The family the model flags pick, Krea 2 when none does.
+    fn family(&self) -> &'static Defaults {
+        if self.anima {
+            &families::ANIMA
+        } else if self.moss {
+            &families::MOSS
+        } else if self.qwen21 {
+            &families::QWEN21
+        } else if self.sd {
+            &families::SD1
+        } else if self.sdxl {
+            &families::SDXL
+        } else if self.h3_image {
+            &families::H3_IMAGE
+        } else if self.h3 {
+            &families::H3
+        } else {
+            &families::KREA2
+        }
+    }
+
+    /// `--steps`, else the family's default. MiniMax-H3-Image takes its own from the checkpoint's grid instead.
     fn steps(&self) -> usize {
-        self.steps.unwrap_or(if self.sd || self.sdxl { 20 } else { 8 })
+        self.steps.or(self.family().steps).expect("a family whose steps come from its checkpoint")
     }
 
     /// `--cfg`, else the family's default.
     fn cfg(&self) -> f64 {
-        self.cfg.unwrap_or(if self.sd || self.sdxl { 7.0 } else { 1.0 })
+        self.cfg.unwrap_or(self.family().cfg)
     }
 
-    /// `--shift`, else `default`, the family's.
-    fn shift(&self, default: f64) -> f64 {
-        self.shift.unwrap_or(default)
+    /// Refuse `--shift` where `fam` fixes its sigmas.
+    fn check_shift(&self, fam: &Defaults) -> Result<()> {
+        if self.shift.is_some() && !fam.takes_shift {
+            bail!("--shift doesn't apply to {}, which fixes its own sigmas", fam.name);
+        }
+        Ok(())
+    }
+
+    /// `fam`'s model sampling, with `--shift` in place of its own.
+    fn model_sampling(&self, fam: &Defaults) -> Result<ModelSampling> {
+        self.check_shift(fam)?;
+        fam.sampling_with(self.shift).with_context(|| format!("{} samples on its checkpoint's sigma grid", fam.name))
+    }
+
+    /// `--te`, else `fam`'s text encoder in the models folder.
+    fn te_of(&self, fam: &Defaults) -> PathBuf {
+        self.model(&self.te, fam.te.expect("a family with its own text encoder file"))
+    }
+
+    /// `--vae`, else `fam`'s VAE in the models folder.
+    fn vae_of(&self, fam: &Defaults) -> PathBuf {
+        self.model(&self.vae, fam.vae.expect("a family with its own VAE file"))
     }
 
     fn sampling(&self, default: &str, ms: ModelSampling, seed: u64, latent: (usize, usize)) -> Result<pipeline::Sampling> {
@@ -524,10 +538,11 @@ impl Args {
 }
 
 fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
-    let (dit, te) = (args.model(&args.dit, ANIMA_DIT), args.model(&args.te, ANIMA_TE));
-    let shift = args.shift(3.0);
+    let fam = &families::ANIMA;
+    let (dit, te) = (args.model(&args.dit, fam.dit), args.te_of(fam));
+    let ms = args.model_sampling(fam)?;
     let mut gen = pipeline::Generator::new(&load)?;
-    gen.ensure_vae(&args.model(&args.vae, QWEN_VAE))?;
+    gen.ensure_vae(&args.vae_of(fam))?;
     gen.ensure_anima(&dit)?;
     gen.ensure_qwen3(&te)?;
     apply_loras(&mut gen, args)?;
@@ -634,10 +649,10 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             width: args.width,
             height: args.height,
             sampling: {
-                let mut s = args.batch_sampling("er_sde", ModelSampling::Flow { shift }, group, (args.width / 8, args.height / 8))?;
+                let mut s = args.batch_sampling(fam.sampler, ms, group, (args.width / 8, args.height / 8))?;
                 if let Some(l) = &init {
                     let (sampler, sched, lat) = (s.sampler.clone(), args.scheduler.clone(), (args.width / 8, args.height / 8));
-                    let schedule = |k| diffusion::samplers::sigmas(ModelSampling::Flow { shift }, &sampler, &sched, k, lat, None);
+                    let schedule = |k| diffusion::samplers::sigmas(ms, &sampler, &sched, k, lat, None);
                     s.sigmas = diffusion::samplers::ksampler_sigmas(args.steps(), args.denoise, 0, args.steps(), false, schedule)?
                         .context("--denoise leaves no step")?;
                     s.latent = Some(l.repeat(group.1));
@@ -677,8 +692,9 @@ fn run_anima(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
 }
 
 fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
-    let (dit, te, vae) = (args.model(&args.dit, MOSS_DIT), args.model(&args.te, MOSS_TE), args.model(&args.vae, MOSS_VAE));
-    let shift = args.shift(5.0);
+    let fam = &families::MOSS;
+    let (dit, te, vae) = (args.model(&args.dit, fam.dit), args.te_of(fam), args.vae_of(fam));
+    let ms = args.model_sampling(fam)?;
     let mut gen = pipeline::Generator::new(&load)?;
     gen.ensure_moss(&dit)?;
     gen.ensure_qwen35(&te)?;
@@ -693,7 +709,7 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
                 negative: vec![pipeline::Cond::plain(Prompt::text(args.negative.trim()))],
                 width: args.width,
                 height: args.height,
-                sampling: args.batch_sampling("euler", ModelSampling::Flow { shift }, group, (args.width / 16, args.height / 16))?,
+                sampling: args.batch_sampling(fam.sampler, ms, group, (args.width / 16, args.height / 16))?,
                 noise: args.noise(group, n)?,
             };
             let mut dump = pipeline::Dump::new();
@@ -719,10 +735,9 @@ fn run_moss(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
 }
 
 fn run_sd(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
-    let dit = args.model(&args.dit, if args.sdxl { SDXL_DIT } else { SD1_DIT });
-    if args.shift.is_some() {
-        bail!("--shift doesn't apply to SD 1.x and SDXL, which sample with discrete sigmas");
-    }
+    let fam = args.family();
+    let dit = args.model(&args.dit, fam.dit);
+    let ms = args.model_sampling(fam)?;
     let mut gen = pipeline::Generator::new(&load)?;
     gen.ensure_sd(&dit)?;
     if let Some(vae) = &args.vae {
@@ -747,7 +762,7 @@ fn run_sd(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
                 negative_size: vec![size],
                 clip_layer: args.clip_layer,
                 v_pred: None,
-                sampling: args.batch_sampling("euler", ModelSampling::Discrete, group, (lw, lh))?,
+                sampling: args.batch_sampling(fam.sampler, ms, group, (lw, lh))?,
                 noise: args.noise(group, n)?,
             };
             let mut dump = pipeline::Dump::new();
@@ -773,9 +788,10 @@ fn run_sd(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
 }
 
 fn run_qwen21(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
-    let (dit, te, vae) = (args.model(&args.dit, QWEN21_DIT), args.model(&args.te, QWEN21_TE), args.model(&args.vae, QWEN21_VAE));
+    let fam = &families::QWEN21;
+    let (dit, te, vae) = (args.model(&args.dit, fam.dit), args.te_of(fam), args.vae_of(fam));
     // ComfyUI's value for 1024x1024, whatever the size
-    let shift = args.shift(0.69);
+    let ms = args.model_sampling(fam)?;
     let mut gen = pipeline::Generator::new(&load)?;
     gen.ensure_qwen21(&dit)?;
     gen.ensure_te(&te)?;
@@ -801,7 +817,7 @@ fn run_qwen21(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             negative: vec![pipeline::Cond::plain(Prompt::text(args.negative.trim()))],
             width: args.width,
             height: args.height,
-            sampling: args.batch_sampling("euler", ModelSampling::Flux { shift }, group, (args.width / 16, args.height / 16))?,
+            sampling: args.batch_sampling(fam.sampler, ms, group, (args.width / 16, args.height / 16))?,
             noise: args.noise(group, n)?,
             images: [vec![images.clone()], vec![images.clone()]],
             references: [vec![references.clone()], vec![references.clone()]],
@@ -827,12 +843,6 @@ fn run_qwen21(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     Ok(())
 }
 
-const H3_DIT: &str = "Stable-diffusion/minimax_h3_fl2va_pruned_w6a8.safetensors";
-const H3_TE: &str = "clip/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors";
-const H3_VAE: &str = "VAE/MiniMaxH3/minimax_h3_video_vae_int8_convrot.safetensors";
-const H3_AUDIO_VAE: &str = "VAE/MiniMaxH3/minimax_h3_audio_vae_fp32.safetensors";
-const H3_IMAGE_DIT: &str = "Stable-diffusion/minimax_h3_image_pruned_int8_convrot.safetensors";
-const H3_IMAGE_VAE: &str = "VAE/MiniMaxH3/minimax_h3_image_vae_fp16.safetensors";
 
 /// MiniMax-H3-Image: one image from H3's transformer without its audio, on the sigma grid its heads were distilled on.
 fn run_h3_image(args: &Args, load: pipeline::LoadOptions, dit: PathBuf, te: PathBuf) -> Result<()> {
@@ -857,7 +867,7 @@ fn run_h3_image(args: &Args, load: pipeline::LoadOptions, dit: PathBuf, te: Path
     };
     // the heads are distilled for their grid's steps: --steps left at its default takes them
     let steps = args.steps.unwrap_or(grid.len() - 1);
-    let sampling = pipeline::Sampling::new(args.sampler.as_deref().unwrap_or("euler"), &args.scheduler, ms, steps, args.cfg(), args.seed, (args.width / 16, args.height / 16))?;
+    let sampling = pipeline::Sampling::new(args.sampler.as_deref().unwrap_or(families::H3_IMAGE.sampler), &args.scheduler, ms, steps, args.cfg(), args.seed, (args.width / 16, args.height / 16))?;
     // MiniMaxH3ImageConditioning's edit pictures, through the image VAE
     let images = args.image.iter().map(|p| read_png(p)).collect::<Result<Vec<_>>>()?;
     if !args.ref_video.is_empty() {
@@ -867,7 +877,7 @@ fn run_h3_image(args: &Args, load: pipeline::LoadOptions, dit: PathBuf, te: Path
         label: "Picture {}: ".into(),
         pictures: pipeline::image_pictures(&images, true),
         videos: Vec::new(),
-        vae: Some(args.model(&args.vae, H3_IMAGE_VAE)),
+        vae: Some(args.vae_of(&families::H3_IMAGE)),
         keyframes: Vec::new(),
     };
     let prompts = args.prompts()?;
@@ -890,7 +900,7 @@ fn run_h3_image(args: &Args, load: pipeline::LoadOptions, dit: PathBuf, te: Path
         eprintln!("sampled in {:.2}s", t0.elapsed().as_secs_f64());
         dump.insert("samples".into(), ("F32".into(), vec![latent.len()], st::f32_bytes(&latent).to_vec()));
         let t1 = Instant::now();
-        let img = gen.decode_h3(&args.model(&args.vae, H3_IMAGE_VAE), &latent, shape, 1)?;
+        let img = gen.decode_h3(&args.vae_of(&families::H3_IMAGE), &latent, shape, 1)?;
         eprintln!("decoded in {:.2}s", t1.elapsed().as_secs_f64());
         let (h, w) = (img.h, img.w);
         let mut rgb = vec![0u8; h * w * 3];
@@ -934,7 +944,7 @@ fn run_nemotron(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     }
     let t_start = Instant::now();
     let mut gen = pipeline::Generator::new(&load)?;
-    gen.ensure_nemotron(&args.model(&args.dit, NEMOTRON))?;
+    gen.ensure_nemotron(&args.model(&args.dit, families::NEMOTRON))?;
     let prompts = args.prompts()?;
     let n_jobs = prompts.len() * args.count;
     for (p, prompt) in prompts.iter().enumerate() {
@@ -971,12 +981,11 @@ fn run_nemotron(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
 fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     use diffusion::h3;
     let t_all = Instant::now();
-    let (dit, te) = (args.model(&args.dit, H3_DIT), args.model(&args.te, H3_TE));
-    if args.shift.is_some() {
-        bail!("--shift doesn't apply to MiniMax H3 or MiniMax-H3-Image, which fix their own sigmas");
-    }
+    let fam = &families::H3;
+    let (dit, te) = (args.model(&args.dit, fam.dit), args.te_of(fam));
+    args.check_shift(fam)?;
     if args.h3_image || h3::is_h3_image(|k| st::SafeTensors::open(&dit).is_ok_and(|f| f.has(k))) {
-        let dit = if args.h3_image { args.model(&args.dit, H3_IMAGE_DIT) } else { dit };
+        let dit = if args.h3_image { args.model(&args.dit, families::H3_IMAGE.dit) } else { dit };
         return run_h3_image(args, load, dit, te);
     }
     if args.batch > 1 {
@@ -1005,8 +1014,8 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
         }
     };
     // HyperFlow H3 Flash was distilled with euler; res_multistep also runs on it
-    let default = if h3::hyperflow_config(&dit).is_some() { "euler" } else { "res_multistep" };
-    let ms = ModelSampling::Flow { shift: h3::SHIFT_VIDEO };
+    let default = if h3::hyperflow_config(&dit).is_some() { "euler" } else { fam.sampler };
+    let ms = args.model_sampling(fam)?;
     let method = match args.sparse.as_deref() {
         None => None,
         Some("sol") => Some(h3::SparseMethod::Sol { tau: args.sparse_tau.unwrap_or(1.3) }),
@@ -1037,7 +1046,7 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     });
     // reference pictures as MiniMaxH3ReferenceToVideo's "match" sizes them, and keyframes as SwarmUI's node stretches
     // them, all through the video VAE
-    let vae = args.model(&args.vae, H3_VAE);
+    let vae = args.vae_of(fam);
     let images = args.image.iter().map(|p| read_png(p)).collect::<Result<Vec<_>>>()?;
     let mut keyframes = Vec::new();
     for (path, index) in [(&args.first_frame, 0), (&args.last_frame, frames - 1)] {
@@ -1076,7 +1085,7 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             if let Some(w) = &windows {
                 w.freenoise(&mut noise, &shape, seed);
             }
-            let sampling = args.sampling(default, ModelSampling::Flow { shift: h3::SHIFT_VIDEO }, seed, (args.width / 16, args.height / 16))?;
+            let sampling = args.sampling(default, ms, seed, (args.width / 16, args.height / 16))?;
             let r = pipeline::H3Request {
                 positive: vec![pipeline::Cond::plain(Prompt::text(prompt))],
                 negative: vec![pipeline::Cond::plain(Prompt::text(&args.negative))],
@@ -1105,13 +1114,13 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
                     c
                 }
                 None => {
-                    let c = gen.decode_h3(&args.model(&args.vae, H3_VAE), &latent, shape, frames)?;
+                    let c = gen.decode_h3(&args.vae_of(fam), &latent, shape, frames)?;
                     eprintln!("video decoded in {:.2}s", t1.elapsed().as_secs_f64());
                     c
                 }
             };
             let t1 = Instant::now();
-            let wave = gen.decode_h3_audio(&args.model(&None, H3_AUDIO_VAE), &latent[shape.video_len()..], shape.audio_t)?;
+            let wave = gen.decode_h3_audio(&args.model(&None, families::H3_AUDIO_VAE), &latent[shape.video_len()..], shape.audio_t)?;
             eprintln!("audio decoded in {:.2}s", t1.elapsed().as_secs_f64());
             let (h, w) = (clip.h, clip.w);
             let mut frames_hwc = vec![0f32; frames * h * w * 3];
@@ -1283,7 +1292,7 @@ fn write_rgba_png(path: &Path, rgba: &[u8], w: usize, h: usize) -> Result<()> {
 
 fn run_remove_background(args: &Args, image: &Path) -> Result<()> {
     diffusion::cuda::init(0)?;
-    let model = args.model(&args.birefnet, BIREFNET);
+    let model = args.model(&args.birefnet, families::BIREFNET);
     if let Some(r) = &args.birefnet_check {
         return diffusion::birefnet::check(&model, r);
     }
@@ -1296,7 +1305,7 @@ fn run_remove_background(args: &Args, image: &Path) -> Result<()> {
 
 fn run_super_res(args: &Args, image: &Path) -> Result<()> {
     use diffusion::nvvfx::{self, Frame, Mode};
-    let model = args.model(&args.vsr, NVIDIA_VSR);
+    let model = args.model(&args.vsr, families::NVIDIA_VSR);
     let mode = Mode::from_name(&args.vsr_mode).with_context(|| format!("unknown --vsr-mode {}", args.vsr_mode))?;
     if !mode.same_size() && !(1.0..=4.0).contains(&args.vsr_scale) {
         bail!("--vsr-scale is 1 to 4, got {}", args.vsr_scale);
@@ -1320,10 +1329,10 @@ fn run_super_res(args: &Args, image: &Path) -> Result<()> {
 fn run_pixal3d(args: &Args, image: &Path) -> Result<()> {
     diffusion::cuda::init(0)?;
     let paths = diffusion::pixal3d::Paths {
-        dit: args.model(&args.dit, PIXAL_DIT),
-        dino: args.model(&args.clip_vision, PIXAL_DINO),
-        shape_vae: args.model(&args.vae, PIXAL_SHAPE_VAE),
-        texture_vae: args.model(&args.texture_vae, PIXAL_TEX_VAE),
+        dit: args.model(&args.dit, families::PIXAL3D_DIT),
+        dino: args.model(&args.clip_vision, families::PIXAL3D_DINO),
+        shape_vae: args.model(&args.vae, families::PIXAL3D_SHAPE_VAE),
+        texture_vae: args.model(&args.texture_vae, families::PIXAL3D_TEXTURE_VAE),
     };
     let (rgba, w, h) = read_rgba(image)?;
     if let Some(r) = &args.pixal3d_check {
@@ -1352,7 +1361,7 @@ fn run_pixal3d(args: &Args, image: &Path) -> Result<()> {
     let mut rgba = rgba;
     if rgba.chunks_exact(4).all(|px| px[3] == 255) {
         // nothing to mask with: cut the object out first, as the example workflow's RemoveBackground does
-        let model = args.model(&args.birefnet, BIREFNET);
+        let model = args.model(&args.birefnet, families::BIREFNET);
         if !model.exists() {
             bail!("{} has no transparency: give --pixal3d an RGBA PNG, or --birefnet the background removal model ({} not found)", image.display(), model.display());
         }
@@ -1370,10 +1379,10 @@ fn run_pixal3d(args: &Args, image: &Path) -> Result<()> {
 fn run_triposplat(args: &Args, image: &Path) -> Result<()> {
     diffusion::cuda::init(0)?;
     let paths = diffusion::triposplat::Paths {
-        dit: args.model(&args.dit, SPLAT_DIT),
-        dino: args.model(&args.clip_vision, SPLAT_DINO),
-        flux_vae: args.model(&args.vae, MOSS_VAE),
-        decoder: args.model(&args.splat_decoder, SPLAT_DECODER),
+        dit: args.model(&args.dit, families::IDOL_DIT),
+        dino: args.model(&args.clip_vision, families::IDOL_DINO),
+        flux_vae: args.model(&args.vae, families::FLUX2_VAE),
+        decoder: args.model(&args.splat_decoder, families::IDOL_DECODER),
     };
     let (mut rgba, w, h) = read_rgba(image)?;
     let mut p = diffusion::triposplat::Params::example(args.seed);
@@ -1391,7 +1400,7 @@ fn run_triposplat(args: &Args, image: &Path) -> Result<()> {
         Ok(())
     };
     if rgba.chunks_exact(4).all(|px| px[3] == 255) {
-        let model = args.model(&args.birefnet, BIREFNET);
+        let model = args.model(&args.birefnet, families::BIREFNET);
         if !model.exists() {
             bail!("{} has no transparency: give --triposplat an RGBA PNG, or --birefnet the background removal model ({} not found)", image.display(), model.display());
         }
@@ -1421,26 +1430,26 @@ fn main() -> Result<()> {
         return run_super_res(&args, image);
     }
     if let Some(reference) = &args.qwen21_vae_check {
-        return diffusion::vae21::check(&args.model(&args.vae, QWEN21_VAE), reference);
+        return diffusion::vae21::check(&args.vae_of(&families::QWEN21), reference);
     }
     if let Some(reference) = &args.seedvr_check {
-        return diffusion::seedvr::check(&args.model(&args.dit, SEEDVR_DIT), &args.model(&args.vae, SEEDVR_VAE), reference);
+        return diffusion::seedvr::check(&args.model(&args.dit, families::SEEDVR2_DIT), &args.model(&args.vae, families::SEEDVR2_VAE), reference);
     }
     if let Some(reference) = &args.relayvsr_check {
-        return diffusion::relayvsr::check(&args.model(&args.dit, RELAYVSR_DIT), &args.model(&args.vae, RELAYVSR_VAE), reference);
+        return diffusion::relayvsr::check(&args.model(&args.dit, families::RELAYVSR_DIT), &args.model(&args.vae, families::RELAYVSR_VAE), reference);
     }
     if let Some(reference) = &args.flux2_vae_check {
-        return diffusion::flux2vae::check(&args.model(&args.vae, MOSS_VAE), reference);
+        return diffusion::flux2vae::check(&args.model(&args.vae, families::FLUX2_VAE), reference);
     }
     if args.birefnet_check.is_some() {
         diffusion::cuda::init(0)?;
-        return diffusion::birefnet::check(&args.model(&args.birefnet, BIREFNET), args.birefnet_check.as_ref().unwrap());
+        return diffusion::birefnet::check(&args.model(&args.birefnet, families::BIREFNET), args.birefnet_check.as_ref().unwrap());
     }
     let int8_attn = args.int8_attention()?;
     let load = pipeline::LoadOptions {
-        dit: args.model(&args.dit, KREA_DIT),
-        te: args.model(&args.te, KREA_TE),
-        vae: args.model(&args.vae, QWEN_VAE),
+        dit: args.model(&args.dit, families::KREA2.dit),
+        te: args.te_of(&families::KREA2),
+        vae: args.vae_of(&families::KREA2),
         max_width: args.width,
         max_height: args.height,
         max_pixels: args.width * args.height,
@@ -1519,7 +1528,7 @@ fn run_krea(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
             seed: args.seed + group.0 as u64,
             width: args.width,
             height: args.height,
-            sampling: args.batch_sampling("euler", ModelSampling::Flux { shift: args.shift(1.15) }, group, (args.width / 8, args.height / 8))?,
+            sampling: args.batch_sampling(families::KREA2.sampler, args.model_sampling(&families::KREA2)?, group, (args.width / 8, args.height / 8))?,
             noise: Some(args.noise(group, n)?),
             attn_token_weights: None,
             style: style.clone(),

@@ -13,8 +13,9 @@ import os
 import sys
 import time
 
-SWARM = os.environ.get("SWARM_DIR") or sys.exit("set SWARM_DIR to the SwarmUI folder")
-sys.path.insert(0, os.path.join(SWARM, "dlbackend", "comfy", "ComfyUI"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
+COMFY = comfy_env.use_comfy()
 
 ap = argparse.ArgumentParser()
 ap.add_argument("family", choices=["krea", "anima", "moss"])
@@ -33,7 +34,7 @@ ap.add_argument("--clip-strength", type=float, default=0.0)
 args, _ = ap.parse_known_args()
 sys.argv = [sys.argv[0]]
 
-M = os.environ["MODELS_ROOT"]
+M = comfy_env.models_root()
 FAMILY = {
     "krea": dict(dit=M + r"\Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors", te=M + r"\clip\qwen3vl_4b.safetensors",
                  vae=M + r"\VAE\qwen_image_vae.safetensors", clip="KREA2", ch=16, down=8, steps=8, cfg=1.0, shift=1.15, sampler="euler",
@@ -52,8 +53,7 @@ shift = args.shift or f["shift"]
 sampler = args.sampler or f["sampler"]
 prompt = args.prompt or f["prompt"]
 
-import comfy_aimdo.control
-comfy_aimdo.control.init()
+comfy_env.aimdo_start()
 
 import torch
 from safetensors.torch import save_file
@@ -62,14 +62,12 @@ comfy.options.enable_args_parsing()
 import comfy.cli_args  # noqa
 import comfy.memory_management
 import comfy.model_management
-assert comfy_aimdo.control.init_devices((d.index, int(comfy.cli_args.args.vram_headroom * 1024 ** 3)) for d in comfy.model_management.get_all_torch_devices())
-comfy.memory_management.aimdo_enabled = True
+comfy_env.aimdo_enable()
 import comfy.model_patcher
 import comfy.quant_ops
 import comfy.sample
 import comfy.sd
 import comfy.utils
-comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
 
 os.makedirs(args.out, exist_ok=True)
 dump = {}

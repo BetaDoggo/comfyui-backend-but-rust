@@ -12,6 +12,9 @@ import os
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import comfy_env  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("family", choices=["krea", "anima", "moss"])
@@ -20,7 +23,7 @@ ap.add_argument("--te", action="store_true")
 ap.add_argument("--computable", action="store_true")
 args = ap.parse_args()
 
-M = os.environ["MODELS_ROOT"]
+M = comfy_env.models_root()
 FILES = {
     "krea": (r"\Stable-diffusion\kroma-v0.3.1-turbo-opd-W8A8.safetensors", r"\clip\qwen3vl_4b.safetensors", "model.language_model.", "qwen3vl_4b", "blocks.{}.", ["attn.wq", "attn.wk", "attn.wv", "attn.gate", "attn.wo", "mlp.gate", "mlp.up", "mlp.down"]),
     "anima": (r"\Stable-diffusion\animaInt8Mxfp8_turboV11Int8.safetensors", r"\clip\qwen_3_600m.safetensors", "model.", "qwen3_06b", "blocks.{}.", ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.output_proj", "cross_attn.q_proj", "cross_attn.k_proj", "cross_attn.v_proj", "cross_attn.output_proj"]),

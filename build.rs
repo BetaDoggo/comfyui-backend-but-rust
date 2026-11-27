@@ -87,6 +87,7 @@ fn main() {
         Unit { src: csrc.join("vendor/sage/quant_qk_int8.cu"), fast_math: true, quiet: true },
         Unit { src: csrc.join("vendor/sage/quant_v_int8.cu"), fast_math: true, quiet: true },
         Unit { src: csrc.join("sparse_attn.cu"), fast_math: false, quiet: false },
+        Unit { src: csrc.join("sol3_attn.cu"), fast_math: false, quiet: false },
     ];
     // comfy-kitchen's Sol-Attn kernels, built with its flags
     let mut units = units;

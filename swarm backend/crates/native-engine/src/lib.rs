@@ -122,11 +122,37 @@ pub struct NativeOptions {
     pub int8_weights: bool,
     /// Faster paths whose images aren't byte-identical to the default ones (`--lossy`, see `LoadOptions::lossy`).
     pub lossy: bool,
+    /// Sol³ sparse attention on every MiniMax H3 generation (`--sol3`).
+    pub sol3: Option<Sol3Options>,
+}
+
+/// MagoNodes' `MagoSol3Attention` inputs, applied to every MiniMax H3 model.
+#[derive(Clone, Copy, Debug)]
+pub struct Sol3Options {
+    pub dense_steps: usize,
+    pub dense_first_blocks: usize,
+    pub min_tokens: usize,
+}
+
+impl Sol3Options {
+    fn sparse(&self) -> h3::SparseAttn {
+        h3::SparseAttn {
+            method: h3::SparseMethod::Sol3 { dense_steps: self.dense_steps, dense_first_blocks: self.dense_first_blocks },
+            // set from the schedule by `SparseAttn::for_schedule`
+            sigma_start: f32::INFINITY,
+            sigma_end: f32::NEG_INFINITY,
+            min_tokens: self.min_tokens,
+            dense_blocks: Vec::new(),
+            sinks: h3::SparseSinks::ExactKvAndRows,
+            extra_tokens: 0,
+            verbose: true,
+        }
+    }
 }
 
 impl Default for NativeOptions {
     fn default() -> Self {
-        Self { reserve_vram_mb: 512, comfy_memory: Some(COMFY_HEADROOM_MB), max_side: 2048, threads: 6, live_previews: false, int8_weights: true, lossy: false }
+        Self { reserve_vram_mb: 512, comfy_memory: Some(COMFY_HEADROOM_MB), max_side: 2048, threads: 6, live_previews: false, int8_weights: true, lossy: false, sol3: None }
     }
 }
 
@@ -134,6 +160,8 @@ pub struct NativeEngine {
     gen: Mutex<Generator>,
     live_previews: bool,
     threads: usize,
+    /// `--sol3`: the sparse attention every MiniMax H3 generation runs.
+    sol3: Option<h3::SparseAttn>,
 }
 
 /// RGB f32 `[3, frames, h, w]` in 0..1 to an image batch of `frames` images.
@@ -1253,7 +1281,7 @@ impl NativeEngine {
             lossy: o.lossy,
             comfy_memory: o.comfy_memory,
         };
-        Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads })
+        Ok(Self { gen: Mutex::new(Generator::new(&load)?), live_previews: o.live_previews, threads: o.threads, sol3: o.sol3.map(|s| s.sparse()) })
     }
 
     /// SeedVR2's restore of the picture or clip `SeedVR2Conditioning` carries: a clip (`[1, 16, T, H/8, W/8]`) is one
@@ -1811,7 +1839,8 @@ impl NativeEngine {
         let plan = Plan { sigmas, latent: None, mask: None, differential: None };
         let sampling = sampling(req, settings, &plan, 1)?;
         let (cond, positive, conds, negative) = h3_entries(req, Family::H3, &shape, (lh, lw), sampling.uses_negative())?;
-        h3_combinations(settings.windows.as_ref(), settings.sparse.is_some(), &shape, &positive, &conds, &negative)?;
+        let refuses_conds = settings.sparse.as_ref().is_some_and(|sp| !sp.takes_conditions());
+        h3_combinations(settings.windows.as_ref(), refuses_conds, &shape, &positive, &conds, &negative)?;
         let ModelSampling::Flow { shift } = settings.model_sampling else { unreachable!("H3 is a flow model") };
         let mut gen = self.gen();
         gen.ensure_h3(&file.path).map_err(internal)?;
@@ -2407,7 +2436,15 @@ impl Engine for NativeEngine {
         let file = req.model.source.as_ref().ok_or_else(|| unsupported("a model without a source file"))?;
         let family = check_dit(file)?;
         check_sample(req)?;
-        let settings = model_settings(&req.model, family)?;
+        let mut settings = model_settings(&req.model, family)?;
+        if let (Family::H3, Some(sol3)) = (family, &self.sol3) {
+            if settings.sparse.is_some() {
+                return Err(unsupported(
+                    "a sparse attention node while this backend runs Sol³ on every MiniMax H3 generation (--sol3); turn off Use Sparse Attention",
+                ));
+            }
+            settings.sparse = Some(sol3.clone());
+        }
         if req.scheduler == "hyperflow" && h3::hyperflow_config(&file.path).is_none() {
             return Err(unsupported("the hyperflow scheduler on a model other than HyperFlow H3 Flash"));
         }

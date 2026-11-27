@@ -73,6 +73,23 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub lossy: bool,
 
+    /// native engine: Sol³ sparse attention on every MiniMax H3 generation, as MagoNodes' Sol³ Sparse Attention node.
+    /// A workflow with its own sparse attention node is refused while this is on.
+    #[arg(long, default_value_t = false)]
+    pub sol3: bool,
+
+    /// With --sol3: the first steps of each schedule that keep dense attention. Default 1.
+    #[arg(long, requires = "sol3")]
+    pub sol3_dense_steps: Option<usize>,
+
+    /// With --sol3: the leading transformer blocks that keep dense attention on every step. Default 1.
+    #[arg(long, requires = "sol3")]
+    pub sol3_dense_blocks: Option<usize>,
+
+    /// With --sol3: sequences shorter than this many tokens keep dense attention. Default 4096.
+    #[arg(long, requires = "sol3")]
+    pub sol3_min_tokens: Option<usize>,
+
     /// Mock engine only: artificial delay per sampling step, so progress/previews are visible.
     #[arg(long, default_value_t = 40)]
     pub mock_step_ms: u64,
@@ -113,6 +130,10 @@ impl Config {
             live_previews: false,
             no_quant: false,
             lossy: false,
+            sol3: false,
+            sol3_dense_steps: None,
+            sol3_dense_blocks: None,
+            sol3_min_tokens: None,
             mock_step_ms: 0,
             mock_native_only: false,
             max_history: 100,

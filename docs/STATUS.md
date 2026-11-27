@@ -126,7 +126,7 @@ What works and what doesn't, by status and priority. P0 comes first in each grou
 | P2 | Video and audio | Video generation workflow | Frames, swap, extend, boomerang, trim and end image, on the mock. |
 | P3 | LoRA and control | ControlNet preprocessors | Third-party nodes. Generic route only. |
 | P3 | Masks and detection | SAM2 points and box | Generic route only. |
-| P3 | Guidance and speed | Sparse attention and HyperTile | Sparse attention runs on H3 (Sol-Attn and top-k, kernels bitwise equal to comfy-kitchen's); VSA and other families are refused. Works through SwarmUI per the maintainer, not tested extensively; speedup above 12,288 tokens unmeasured. HyperTile: patch reaches the engine. |
+| P3 | Guidance and speed | Sparse attention and HyperTile | Sparse attention runs on H3 (Sol-Attn and top-k, kernels bitwise equal to comfy-kitchen's); VSA and other families are refused. Sol³ (`--sparse sol3`, server `--sol3`) matches sol3_attn's routing exactly, with the exact tokens in int8 by default (bf16 with `--attention flash`), and cut a 42k-token pi-H3 clip's sparse steps from 21.8 s to 16.4 s on the CLI; works in SwarmUI with the server's `--sol3`, per the maintainer. Works through SwarmUI per the maintainer, not tested extensively; speedup above 12,288 tokens unmeasured. HyperTile: patch reaches the engine. |
 | P3 | Guidance and speed | Dynamic Thresholding and TeaCache | Third-party. Generic route only. |
 | P3 | Video and audio | Video frame interpolation | RIFE and FILM. Generic route only. |
 

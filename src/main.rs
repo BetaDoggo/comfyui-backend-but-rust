@@ -211,24 +211,30 @@ struct Args {
     #[arg(long, default_value_t = 0.9)]
     temperature: f32,
     /// MiniMax H3: block-sparse attention, "sol" (Sol-Attn's adaptive threshold) or "sla" (top-k), as ComfyUI's
-    /// BlockSparseAttention node
+    /// BlockSparseAttention node, or "sol3" (Sol³, as MagoNodes' Sol³ Sparse Attention node)
     #[arg(long)]
     sparse: Option<String>,
-    /// Sol-Attn's threshold: higher is sparser
-    #[arg(long, default_value_t = 1.3)]
-    sparse_tau: f32,
-    /// Top-k: percent of key blocks each query block keeps
-    #[arg(long, default_value_t = 10.0)]
-    sparse_keep: f64,
-    /// Sparse attention starts this far into the schedule
-    #[arg(long, default_value_t = 0.2)]
-    sparse_start: f64,
-    /// Sequences shorter than this stay dense
-    #[arg(long, default_value_t = 12288)]
-    sparse_min_tokens: usize,
-    /// Extra top-scoring tokens each query block attends: 0 to 256, in steps of 64
-    #[arg(long, default_value_t = 256)]
-    sparse_extra_tokens: usize,
+    /// Sol-Attn's threshold: higher is sparser [default: 1.3]
+    #[arg(long)]
+    sparse_tau: Option<f32>,
+    /// Top-k: percent of key blocks each query block keeps [default: 10]
+    #[arg(long)]
+    sparse_keep: Option<f64>,
+    /// Sol-Attn and top-k start this far into the schedule [default: 0.2]
+    #[arg(long)]
+    sparse_start: Option<f64>,
+    /// Sequences shorter than this stay dense [default: 12288, or 4096 with sol3]
+    #[arg(long)]
+    sparse_min_tokens: Option<usize>,
+    /// Sol-Attn and top-k: extra top-scoring tokens each query block attends, 0 to 256 in steps of 64 [default: 256]
+    #[arg(long)]
+    sparse_extra_tokens: Option<usize>,
+    /// Sol³: the first steps of the schedule that stay dense [default: 1]
+    #[arg(long)]
+    sol3_dense_steps: Option<usize>,
+    /// Sol³: the leading blocks that stay dense on every step [default: 1]
+    #[arg(long)]
+    sol3_dense_blocks: Option<usize>,
     /// MiniMax H3: sample in context windows of LENGTH,OVERLAP frames (pyramid blend, FreeNoise),
     /// as SwarmUI's Video Context Window, e.g. 124,39
     #[arg(long)]
@@ -971,18 +977,30 @@ fn run_h3(args: &Args, load: pipeline::LoadOptions) -> Result<()> {
     let ms = ModelSampling::Flow { shift: h3::SHIFT_VIDEO };
     let method = match args.sparse.as_deref() {
         None => None,
-        Some("sol") => Some(h3::SparseMethod::Sol { tau: args.sparse_tau }),
-        Some("sla") => Some(h3::SparseMethod::TopK { ratio: args.sparse_keep / 100.0 }),
-        Some(m) => bail!("--sparse takes sol or sla, not {m}"),
+        Some("sol") => Some(h3::SparseMethod::Sol { tau: args.sparse_tau.unwrap_or(1.3) }),
+        Some("sla") => Some(h3::SparseMethod::TopK { ratio: args.sparse_keep.unwrap_or(10.0) / 100.0 }),
+        Some("sol3") => {
+            let sol_only = [("--sparse-tau", args.sparse_tau.is_some()), ("--sparse-keep", args.sparse_keep.is_some()),
+                ("--sparse-start", args.sparse_start.is_some()), ("--sparse-extra-tokens", args.sparse_extra_tokens.is_some())];
+            if let Some((flag, _)) = sol_only.iter().find(|(_, set)| *set) {
+                bail!("{flag} doesn't apply to --sparse sol3; its window is --sol3-dense-steps");
+            }
+            Some(h3::SparseMethod::Sol3 { dense_steps: args.sol3_dense_steps.unwrap_or(1), dense_first_blocks: args.sol3_dense_blocks.unwrap_or(1) })
+        }
+        Some(m) => bail!("--sparse takes sol, sla or sol3, not {m}"),
     };
+    if !matches!(method, Some(h3::SparseMethod::Sol3 { .. })) && (args.sol3_dense_steps.is_some() || args.sol3_dense_blocks.is_some()) {
+        bail!("--sol3-dense-steps and --sol3-dense-blocks need --sparse sol3");
+    }
+    let sol3 = matches!(method, Some(h3::SparseMethod::Sol3 { .. }));
     let sparse = method.map(|method| h3::SparseAttn {
         method,
-        sigma_start: ms.percent_to_sigma(args.sparse_start),
+        sigma_start: ms.percent_to_sigma(args.sparse_start.unwrap_or(0.2)),
         sigma_end: ms.percent_to_sigma(1.0),
-        min_tokens: args.sparse_min_tokens,
+        min_tokens: args.sparse_min_tokens.unwrap_or(if sol3 { 4096 } else { 12288 }),
         dense_blocks: Vec::new(),
         sinks: h3::SparseSinks::ExactKvAndRows,
-        extra_tokens: args.sparse_extra_tokens,
+        extra_tokens: if sol3 { 0 } else { args.sparse_extra_tokens.unwrap_or(256) },
         verbose: true,
     });
     // reference pictures as MiniMaxH3ReferenceToVideo's "match" sizes them, and keyframes as SwarmUI's node stretches

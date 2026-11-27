@@ -93,7 +93,7 @@ the ones on `ref/ComfyUI` with `ref/venv/Scripts/python.exe`.
 
 `pih3_ref` also needs [ComfyUI-piFlow](https://github.com/Lakonik/ComfyUI-piFlow), cloned to `ref/ComfyUI-piFlow` or
 wherever `PIFLOW_DIR` points; it imports the nodes itself, so they needn't be installed in SwarmUI's ComfyUI. Compare its
-output with `tools/h3_cmp.py`. `h3_ref --ref-image` and `--ref-video` add a reference through `MiniMaxH3ReferenceToVideo`, and need `ffmpeg` and `ffprobe` on `PATH` for a video. `qwen21_cmp` imports SwarmUI's ComfyUI. `sparse_attn_ref` and `te_q` need `comfy_kitchen`, which SwarmUI's Python has.
+output with `tools/h3_cmp.py`. `h3_ref --ref-image` and `--ref-video` add a reference through `MiniMaxH3ReferenceToVideo`, and need `ffmpeg` and `ffprobe` on `PATH` for a video. `qwen21_cmp` imports SwarmUI's ComfyUI. `sparse_attn_ref` and `te_q` need `comfy_kitchen`, which SwarmUI's Python has. `sol3_ref` needs a CUDA PyTorch with Triton (`triton-windows` on Windows) and [sol3_attn](https://github.com/FofGofx/sol3) at the commit its docstring names, which SwarmUI's Python doesn't have.
 `comfy_bench.py` benchmarks a running ComfyUI over HTTP.
 
 ## Golden files
@@ -108,6 +108,7 @@ checkpoint. Regenerate one when ComfyUI changes the code it records:
 | `tests/cfg_golden.json` | `tools/cfg_ref.py` |
 | `tests/latent_ops_golden.json` | `tools/latent_ops_ref.py` |
 | `tests/sparse_golden.json` | `tools/sparse_attn_ref.py` |
+| `tests/sol3_golden.json` | `tools/sol3_ref.py`; `tests/sol3_attn_match.rs` skips until it is recorded |
 | `tests/swarm_tokens_golden.json` | `tools/swarm_prompt_ref.py` |
 
 ## Comparing one model with ComfyUI

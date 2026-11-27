@@ -744,6 +744,21 @@ pub enum SparseMethod {
     Sol { tau: f32 },
     /// SLA-style: keep this fraction of the key blocks of every query block.
     TopK { ratio: f64 },
+    /// Sol³ (csrc/sol3_attn.cu), as MagoNodes' `MagoSol3Attention` runs it: dense for the first `dense_steps` steps of
+    /// the schedule and in the first `dense_first_blocks` blocks, by position. Every row before the video is its
+    /// protected prefix, so `sinks` and `extra_tokens` don't apply.
+    Sol3 { dense_steps: usize, dense_first_blocks: usize },
+}
+
+/// The heads one Sol³ call routes at a time: as many as keep its scratch near 512 MB.
+fn sol3_heads(l: usize, int8: bool) -> usize {
+    let per = unsafe { crate::ffi::gpu_sol3_workspace(l as i32, 1, 1, int8 as i32) }.max(1) as usize;
+    ((512usize << 20) / per).clamp(1, H)
+}
+
+/// Sol³'s workspace bytes for `l` tokens.
+fn sol3_bytes(l: usize, int8: bool) -> i64 {
+    unsafe { crate::ffi::gpu_sol3_workspace(l as i32, H as i32, sol3_heads(l, int8) as i32, int8 as i32) }
 }
 
 /// What of the packed text and audio rows stays exact.
@@ -766,12 +781,44 @@ impl SparseAttn {
         k.max(1).min(n as i64 - 1) as usize
     }
 
-    /// Workspace bytes for a sequence of `l` tokens.
-    fn bytes(&self, l: usize) -> usize {
+    /// Workspace bytes for a sequence of `l` tokens, Sol³'s exact rows in int8 when `int8`.
+    fn bytes(&self, l: usize, int8: bool) -> usize {
+        if let SparseMethod::Sol3 { .. } = self.method {
+            return sol3_bytes(l, int8).max(0) as usize;
+        }
         let ws = unsafe { crate::ffi::gpu_sol_attn_workspace(l as i32, H as i32, self.extra_tokens as i32) }.max(0) as usize;
         ws + match self.method {
-            SparseMethod::Sol { .. } => 0,
             SparseMethod::TopK { .. } => (unsafe { crate::ffi::gpu_sol_topk_workspace(l as i32, H as i32) }) as usize + H * l.div_ceil(64) * 4,
+            _ => 0,
+        }
+    }
+
+    /// Whether keyframes and reference pictures can run with it: Sol³ keeps them in its protected prefix.
+    pub fn takes_conditions(&self) -> bool {
+        matches!(self.method, SparseMethod::Sol3 { .. })
+    }
+
+    /// Sol³'s `dense_steps` as the window over this schedule. MagoNodes' patch runs sparse once the timestep is at or
+    /// below `sigmas[dense_steps]`, and never when `dense_steps` reaches the last step.
+    pub fn for_schedule(mut self, sigmas: &[f32]) -> Self {
+        if let SparseMethod::Sol3 { dense_steps, .. } = self.method {
+            self.sigma_start = if dense_steps == 0 {
+                f32::INFINITY
+            } else if dense_steps + 1 < sigmas.len() {
+                sigmas[dense_steps]
+            } else {
+                f32::NEG_INFINITY
+            };
+            self.sigma_end = f32::NEG_INFINITY;
+        }
+        self
+    }
+
+    /// Whether block `pos` of the model (by position), checkpoint block `id`, runs dense.
+    fn dense_block(&self, pos: usize, id: usize) -> bool {
+        match self.method {
+            SparseMethod::Sol3 { dense_first_blocks, .. } => pos < dense_first_blocks,
+            _ => self.dense_blocks.contains(&id),
         }
     }
 }
@@ -989,7 +1036,7 @@ impl Dit {
     pub fn step_activation_bytes(&self, l: usize) -> usize {
         step_activation_bytes(l)
             + if self.hyper.is_some() { l * (FFN + self.mid_width) * 2 } else { 0 }
-            + self.sparse.as_ref().filter(|sp| l >= sp.min_tokens).map_or(0, |sp| sp.bytes(l))
+            + self.sparse.as_ref().filter(|sp| l >= sp.min_tokens).map_or(0, |sp| sp.bytes(l, self.int8_attn))
     }
 
     /// Give the blocks `budget` bytes of VRAM (what they hold now counts).
@@ -1129,9 +1176,20 @@ impl Dit {
 
     /// Block-sparse attention over the packed rows: text and audio (the first `al`, audio from `text`), then video.
     #[allow(clippy::too_many_arguments)]
-    fn sparse_attention(&self, sp: &SparseAttn, q: PM, out: PM, sw: &SparseWork, l: usize, (text, al): (usize, usize), st: &Stream) -> Result<()> {
+    fn sparse_attention(&self, sp: &SparseAttn, q: PM, out: PM, ws: PM, sw: &SparseWork, l: usize, (text, al): (usize, usize), st: &Stream) -> Result<()> {
         let sc = 1.0 / (HD as f32).sqrt();
         let (kp, vp) = (off(q, INNER * 2), off(q, 2 * INNER * 2));
+        if let SparseMethod::Sol3 { .. } = sp.method {
+            // the exact rows in int8 with int8 attention, the default, and in bf16, as upstream, with flash
+            let hc = sol3_heads(l, self.int8_attn) as i32;
+            k!(gpu_sol3_attn(q, kp, vp, out, sw.ws.ptr(), l as i32, H as i32, hc, QKV as i64, HD as i64, INNER as i64, al as i32,
+                self.int8_attn as i32, s(st)))?;
+            // the prefix's queries attend everything densely, with this model's attention
+            if al > 0 {
+                self.attention_rows(q, out, ws, al, l, st)?;
+            }
+            return Ok(());
+        }
         let prefix = al.div_ceil(64) as i32;
         let (sink, sink_q) = match sp.sinks {
             SparseSinks::Off => ((0, 0), (0, 0)),
@@ -1149,6 +1207,7 @@ impl Dit {
                 k!(gpu_sol_topk_threshold(q, kp, QKV as i64, HD as i64, l as i32, H as i32, kk as i32, sc, sink.0, sink.1, thr.ptr(), sw.scratch.as_ref().unwrap().ptr(), s(st)))?;
                 (1.3, thr.ptr() as crate::ffi::P)
             }
+            SparseMethod::Sol3 { .. } => unreachable!("Sol³ returned above"),
         };
         k!(gpu_sol_attn(q, kp, vp, out, sw.ws.ptr(), l as i32, H as i32, QKV as i64, HD as i64, tau, sc, thr, sink.0, sink.1, sink_q.0, sink_q.1, sp.extra_tokens as i32, s(st)))
     }
@@ -1173,13 +1232,20 @@ impl Dit {
         if reason.is_some() {
             return Ok(None);
         }
+        if let SparseMethod::Sol3 { .. } = sp.method {
+            let n = sol3_bytes(l, self.int8_attn);
+            if n < 0 {
+                bail!("Sol³ attention can't take {l} tokens");
+            }
+            return Ok(Some((sp, SparseWork { ws: DevBuf::alloc_async(n as usize, st)?, thr: None, scratch: None })));
+        }
         let n = unsafe { crate::ffi::gpu_sol_attn_workspace(l as i32, H as i32, sp.extra_tokens as i32) };
         if n < 0 {
             bail!("sparse attention can't take {l} tokens with {} extra tokens", sp.extra_tokens);
         }
         let ws = DevBuf::alloc_async(n as usize, st)?;
         let (thr, scratch) = match sp.method {
-            SparseMethod::Sol { .. } => (None, None),
+            SparseMethod::Sol { .. } | SparseMethod::Sol3 { .. } => (None, None),
             SparseMethod::TopK { .. } => {
                 if l.div_ceil(64) * 4 > 96 * 1024 {
                     bail!("top-k sparse attention over {l} tokens: more key blocks than its selection holds");
@@ -1192,13 +1258,19 @@ impl Dit {
     }
 
     fn attention(&self, q: PM, out: PM, ws: PM, l: usize, st: &Stream) -> Result<()> {
+        self.attention_rows(q, out, ws, l, l, st)
+    }
+
+    /// The first `lq` query rows against all `l` keys.
+    fn attention_rows(&self, q: PM, out: PM, ws: PM, lq: usize, l: usize, st: &Stream) -> Result<()> {
         let (hi, hs, sc) = (H as i32, HD as i64, 1.0 / (HD as f32).sqrt());
         let (bs, rs, ob, or) = ((l * QKV) as i64, QKV as i64, (l * INNER) as i64, INNER as i64);
         let (kp, vp) = (off(q, INNER * 2), off(q, 2 * INNER * 2));
+        let (lq, lk) = (lq as i32, l as i32);
         if self.int8_attn {
-            k!(gpu_int8_attn(q, kp, vp, out, ws, 1, l as i32, l as i32, hi, hi, bs, rs, hs, bs, rs, hs, bs, rs, hs, ob, or, hs, sc, s(st)))
+            k!(gpu_int8_attn(q, kp, vp, out, ws, 1, lq, lk, hi, hi, bs, rs, hs, bs, rs, hs, bs, rs, hs, ob, or, hs, sc, s(st)))
         } else {
-            k!(gpu_flash_attn(q, kp, vp, out, ws, 1, l as i32, l as i32, hi, hi, bs, rs, hs, bs, rs, hs, bs, rs, hs, ob, or, hs, sc, self.attn_variant, s(st)))
+            k!(gpu_flash_attn(q, kp, vp, out, ws, 1, lq, lk, hi, hi, bs, rs, hs, bs, rs, hs, bs, rs, hs, ob, or, hs, sc, self.attn_variant, s(st)))
         }
     }
 
@@ -1226,7 +1298,7 @@ impl Dit {
         // [t, c, ...] -> rows of (c, y2, x2)
         let rows = patchify(vx, sh.t, sh.h, sh.w);
         let nc = pack.cond.map_or(0, |(_, e)| e.rows(sh));
-        if nc > 0 && self.sparse.is_some() {
+        if nc > 0 && self.sparse.as_ref().is_some_and(|sp| !sp.takes_conditions()) {
             bail!("keyframes and reference pictures with sparse attention");
         }
         let mut arows = vec![0f32; ar * ACH];
@@ -1399,8 +1471,8 @@ impl Dit {
             k!(gpu_rope_bf16(off(q, INNER * 2), QKV as i64, HD as i64, wp("kn"), EPS, rope.ptr(), l as i32, H as i32, HD as i32, ROPE_PAIRS as i32, s(st)))?;
             self.prof.mark("rope", st)?;
             match &sparse {
-                Some((sp, sw)) if !sp.dense_blocks.contains(&self.block_ids[b]) => {
-                    self.sparse_attention(sp, q, attn.ptr(), sw, l, (text, al), st)?;
+                Some((sp, sw)) if !sp.dense_block(b, self.block_ids[b]) => {
+                    self.sparse_attention(sp, q, attn.ptr(), ws.ptr(), sw, l, (text, al), st)?;
                     self.prof.mark("sparse attn", st)?;
                 }
                 _ => {

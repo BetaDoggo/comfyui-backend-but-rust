@@ -10,6 +10,9 @@ fn make_engine(cfg: &Config) -> anyhow::Result<Arc<dyn Engine>> {
     if (cfg.legacy_offload || cfg.comfy_memory_mode) && cfg.engine != "native" {
         anyhow::bail!("--legacy-offload and --comfy-memory-mode need --engine native");
     }
+    if cfg.sol3 && cfg.engine != "native" {
+        anyhow::bail!("--sol3 needs --engine native");
+    }
     match cfg.engine.as_str() {
         "mock" => Ok(Arc::new(if cfg.mock_native_only { MockEngine::native_only(cfg.mock_step_ms) } else { MockEngine::new(cfg.mock_step_ms) })),
         #[cfg(feature = "native")]
@@ -22,6 +25,11 @@ fn make_engine(cfg: &Config) -> anyhow::Result<Arc<dyn Engine>> {
                 live_previews: cfg.live_previews,
                 int8_weights: !cfg.no_quant,
                 lossy: cfg.lossy,
+                sol3: cfg.sol3.then(|| native_engine::Sol3Options {
+                    dense_steps: cfg.sol3_dense_steps.unwrap_or(1),
+                    dense_first_blocks: cfg.sol3_dense_blocks.unwrap_or(1),
+                    min_tokens: cfg.sol3_min_tokens.unwrap_or(4096),
+                }),
                 ..Default::default()
             };
             Ok(Arc::new(native_engine::NativeEngine::new(&options)?))

@@ -56,6 +56,11 @@ extern "C" {
         thr: PM, scratch: PM, s: PM) -> i32;
     pub fn gpu_sol_attn(q: P, k: P, v: P, out: PM, ws: PM, t: i32, h: i32, rs: i64, hs: i64, tau: f32, scale: f32, thr: P,
         s0: i32, s1: i32, q0: i32, q1: i32, n_tok: i32, s: PM) -> i32;
+    // Sol³ sparse attention (csrc/sol3_attn.cu)
+    pub fn gpu_sol3_workspace(t: i32, h: i32, hc: i32, int8: i32) -> i64;
+    pub fn gpu_sol3_route_offsets(t: i32, h: i32, hc: i32, int8: i32, out: *mut i64) -> i32;
+    pub fn gpu_sol3_attn(q: P, k: P, v: P, out: PM, ws: PM, t: i32, h: i32, hc: i32, rs: i64, hs: i64, ors: i64, prefix: i32,
+        int8: i32, s: PM) -> i32;
 
     pub fn gpu_int8_attn_workspace(b: i32, h: i32, hk: i32, lq: i32, lk: i32) -> i64;
     pub fn gpu_int8_attn(q: P, k: P, v: P, o: PM, ws: PM, b: i32, lq: i32, lk: i32, h: i32, hk: i32, q_bs: i64,

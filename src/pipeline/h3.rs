@@ -617,7 +617,7 @@ impl Generator {
             bail!("the {} sampler on HyperFlow H3 Flash (only euler and res_multistep)", r.sampling.sampler);
         }
         dit.shifts = shifts;
-        dit.sparse = r.sparse.clone();
+        dit.sparse = r.sparse.clone().map(|sp| sp.for_schedule(&r.sampling.sigmas));
         if r.conds.len() != r.positive.len() {
             bail!("{} sets of pictures and keyframes for {} positive entries", r.conds.len(), r.positive.len());
         }
@@ -634,7 +634,7 @@ impl Generator {
             return Err(lora::Unsupported(what).into());
         }
         let conditioned = |c: &H3Conds| !c.keyframes.is_empty() || c.pictures.iter().any(|p| p.latent.is_some()) || c.videos.iter().any(|v| v.latent.is_some());
-        if r.conds.iter().any(conditioned) && (windowed || r.sparse.is_some()) {
+        if r.conds.iter().any(conditioned) && (windowed || r.sparse.as_ref().is_some_and(|sp| !sp.takes_conditions())) {
             bail!("keyframes and reference pictures or videos with context windows or sparse attention");
         }
         if dit.is_image() && r.conds.iter().any(|c| !c.videos.is_empty()) {

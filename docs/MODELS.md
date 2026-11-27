@@ -632,6 +632,56 @@ Sequences that short are below the default 12,288 tokens, where both stay dense.
 through SwarmUI, though it hasn't been tested extensively. Its speedup on longer clips, above that threshold, hasn't been
 measured, and its output hasn't been compared with ComfyUI's.
 
+### Sol³
+
+Sol³ ([arXiv 2611.32562](https://arxiv.org/abs/2611.32562)) is a training-free sparse attention that builds on Sol-Attn's
+block routing. Each pair of 64-row query and key blocks is exact, represented by the key block's mean key and value, or
+mixed. In a mixed block, the tokens scoring above the row's mean plus 1.125 sigma are attended exactly and the rest by
+the block's mean. A first-order key-value covariance term corrects the represented blocks. `csrc/sol3_attn.cu` ports
+the SM120 path of [sol3_attn](https://github.com/FofGofx/sol3) at 21a509a, the commit MagoNodes pins, to CUDA, with its
+FastH3 route settings. Every row before the video is its protected prefix: text, audio, keyframes and reference pictures.
+Every query attends their keys exactly, and their own queries attend everything densely with the engine's attention,
+int8 by default, through the dense hook sol3_attn gives a host (MagoNodes leaves it at PyTorch's bf16 SDPA). So unlike
+Sol-Attn here, Sol³ runs with keyframes and reference pictures, though that combination hasn't been tried.
+
+It runs on H3, HyperFlow H3 Flash and pi-H3, from `--sparse sol3` on the CLI or `--sol3` on the server, which applies it
+to every H3 generation because SwarmUI has no option for it. Its settings are MagoNodes' `MagoSol3Attention` inputs:
+`dense_steps` (default 1) keeps the first steps of the schedule dense, `dense_first_blocks` (default 1) keeps the leading
+blocks dense by position, and sequences under `min_tokens` (default 4096) stay dense. The dense steps and blocks use the
+engine's usual attention, int8 by default. MagoNodes suggests 2 dense steps and 2 dense blocks for eight-step HyperFlow.
+
+With the engine's int8 attention, the default, the exact tokens are attended in int8 the way SageAttention does it:
+keys smoothed by their mean and scaled per token, values per channel, queries per row, probabilities as u8. The routing,
+the block representatives and the covariance term stay as upstream computes them. With `--attention flash` the whole
+sparse call is bf16, as upstream's is.
+
+`tests/sol3_attn_match.rs` runs it on inputs from `tools/sol3_ref.py`, which records sol3_attn's own Triton kernels
+(SwarmUI's Python with `triton-windows` 3.9 added). At 16,420 tokens with a 100-row prefix and at 4,000 tokens with
+none, every block class and every selected token matches, the cuts are within 2.3e-7, and the bf16 outputs differ by
+6e-7 on average and one bf16 step at worst (0.01% relative RMS). The int8 outputs are 0.19 to 0.20% RMS from upstream's. Upstream uses 128-row exact chunks below 16,385 tokens and 64 above; this port always
+uses 64, which the 4,000-token case covers.
+
+On the CLI, pi-H3's 4-step DWD adapter at 768x512, seed 7, Sol³ at its defaults (step 1 dense, then three sparse):
+
+| Clip | Tokens | Attention | Attention per sparse step | Sparse step | Whole run |
+|---|---|---|---|---|---|
+| 362 frames | 42,313 | int8 dense | 13.5 s | 21.8 s | 102.0 s |
+| | | Sol³, bf16 exact part (`--attention flash`) | 10.7 s | 18.8 s | 92.4 s |
+| | | Sol³, int8 exact part (default) | 8.2 s | 16.4 s | 85.0 s |
+
+The dense first step and the prefix rows of the bf16 row used int8 attention too, so only the sparse calls differ
+between the two Sol³ rows.
+
+At 124 frames (14,641 tokens), measured in Nsight, a Sol³ call took about 24 ms with the int8 exact part and 29.8 ms with
+bf16, prefix rows included, against 31 ms for int8 dense; the gain grows with length. The route kept 15 to 19% of the
+keys exact per query block there, about half of them from exact blocks, with about 48% of the block pairs pure.
+
+The 362-frame Sol³ clips show the same scene as dense, but the framing moved: the lighthouse sits further right and the
+cliff is wider. They are 27.6 dB (int8) and 27.7 dB (bf16) luma PSNR from dense, and 36.4 dB from each other, so the
+shift comes from Sol³'s approximation, not from int8. Neither shows blocky texture; only the frames at 60 and 300 were
+looked at. It works in SwarmUI with `--sol3`, per the maintainer. Nothing longer or wider was tried, and
+HyperFlow and plain H3 with the turbo LoRA weren't run with it.
+
 ### Context windows
 
 SwarmUI's Video Context Window (Video Context Length and Overlap) sends ComfyUI's `MiniMaxH3ContextWindows` node, which

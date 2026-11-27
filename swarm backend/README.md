@@ -54,7 +54,10 @@ On Windows, [`start-backend.bat`](start-backend.bat) does this for the folder in
 in SwarmUI. Extra arguments go to the server, so `--models-root` can add a second folder.
 
 Extra flags: `--reserve-vram MB` (left for the desktop and other apps), `--max-side 2048`, `--live-previews` (off by default), `--no-quant` (runs bf16 MOSS Image checkpoints in bf16 instead of quantizing them to int8 as they load, and keeps SD 1.x and SDXL's transformer linears in fp16), `--lossy` (faster Anima cross-attention and MOSS Image activation,
-with images that aren't byte-identical; see [MODELS.md](../docs/MODELS.md#anima))
+with images that aren't byte-identical; see [MODELS.md](../docs/MODELS.md#anima)), `--sol3` (Sol³ sparse attention on
+every MiniMax H3 generation, with `--sol3-dense-steps 1`, `--sol3-dense-blocks 1` and `--sol3-min-tokens 4096`; a workflow
+with Use Sparse Attention is refused while it is on, and its exact tokens use int8 unless Model Attention Backend is
+`flash`; see [Sol³](../docs/MODELS.md#sol³))
 and `--extra-model-paths-config <file>` (a ComfyUI `extra_model_paths` YAML, repeatable, searched before `--models-root`).
 VRAM is managed as ComfyUI's DynamicVRAM does (see
 [ComfyUI memory management](../docs/TECHNICAL_OVERVIEW.md#comfyui-memory-management)), and `--reserve-vram` defaults to
@@ -119,7 +122,7 @@ Self-Starting type can't be used, because it always runs ComfyUI's Python and pi
 3. Start SwarmUI, which builds the extension. It rebuilds it when this repository's commit changes.
 4. Server → Backends → **comfy-rust Self-Starting** → set Start Script to the full path of [`selfstart.bat`](selfstart.bat).
 
-ExtraArgs takes server flags such as `--ffmpeg <path>`, Enable Previews is off by default, No Quant keeps bf16 checkpoints in bf16, and Lossy passes `--lossy`. SwarmUI picks the port.
+ExtraArgs takes server flags such as `--ffmpeg <path>` or `--sol3`, Enable Previews is off by default, No Quant keeps bf16 checkpoints in bf16, and Lossy passes `--lossy`. SwarmUI picks the port.
 Running the server by hand with `start-backend.bat` still works, through ComfyUI API By URL.
 
 ## Connect SwarmUI

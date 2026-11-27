@@ -60,6 +60,7 @@ There is no Rust binding to a tensor library. CUDA, NVML and the kernels are cal
 | cuBLASLt | Linked from the toolkit | bf16 and fp32 GEMMs, such as text encoders and non-quantized layers |
 | [CUTLASS](https://github.com/NVIDIA/cutlass) | Build-time checkout, BSD-3-Clause | Int8 GEMMs with fused dequantization, VAE 2D convolutions, and the SD UNet's fp16 convolutions |
 | [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) | Copied into `csrc/vendor/`, Apache-2.0 | The int8 GEMM kernel, INT8 attention, and H3's Sol-Attn block-sparse attention |
+| [sol3_attn](https://github.com/FofGofx/sol3) | Ported from Triton to CUDA in `csrc/sol3_attn.cu`, Apache-2.0 | H3's Sol³ sparse attention |
 | [SageAttention](https://github.com/thu-ml/SageAttention) | Reaches us through comfy-kitchen, Apache-2.0 | Origin of the INT8 attention, the default for the diffusion models |
 | [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) | Build-time checkout, BSD-3-Clause | bf16 attention, selected with `--attention flash` |
 | NVML, DXCore | NVML linked, DXCore loaded at run time | How much VRAM is really free under Windows |
@@ -375,6 +376,7 @@ csrc/birefnet.cu    BiRefNet: im2col, deformable-conv columns, Swin window gathe
 csrc/sd.cu          SD 1.x and SDXL: fp16 CUTLASS convolutions, GroupNorm, GEGLU, CLIP pieces, int8 row quantizer
 csrc/wddm.cu        VRAM queries under Windows
 csrc/sparse_attn.cu block-sparse attention over the vendored Sol-Attn kernels, and the SLA top-k threshold
+csrc/sol3_attn.cu   Sol³ sparse attention: block and token routing, k-v covariance, the joint attention kernel
 csrc/vendor/        comfy-kitchen CUTLASS int8 GEMM, Sage INT8 attention and Sol-Attn (Apache-2.0)
 src/                Rust: loader, offloading, tokenizers, each family's models, samplers, LoRA baking, CLI
 tools/              ComfyUI reference dump / comparison / benchmark scripts
